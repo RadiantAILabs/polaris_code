@@ -99,6 +99,79 @@ The executable is named `polaris` starting with application version 0.1.1.
 The Rust library remains `polaris_code`, and recorded session and evidence
 identifiers keep their existing names.
 
+## CI and binary releases
+
+The [test and build workflow](../.github/workflows/ci.yml) runs for pull
+requests, pushes to `main`, `v*` tags, and manual dispatches. It pins Rust
+1.97.0 and uses the committed lockfile. Formatting, workspace checking and
+tests (including doctests) run alongside release builds; Linux also runs
+Clippy across all workspace targets and features. Native dependencies for the
+optional RocksDB backend are installed for that all-features check.
+The macOS test runner supplies `python` and `python3` through a virtual
+environment and uses a canonical temporary directory for workspace fixtures.
+
+Documentation and branding changes run quick Python checks, skipping Rust
+compilation, workspace tests, release builds, and Homebrew installation tests.
+The full pipeline runs when crate sources, tests, examples, benches, embedded
+documentation, ontology inputs, evaluation code or fixtures, Cargo dependencies,
+toolchain settings, or CI/build/release tooling change.
+Pushes compare the entire before/after range; pull requests
+compare against their merge base. If the range cannot be compared, CI runs
+the full pipeline. Release tags and manual dispatches always run it too.
+
+The final `CI` check verifies every job required for that change; use it as
+the required status check in branch protection. Documentation-only pushes do
+not cancel source builds already in progress. A newer source build cancels
+the older job for the same platform and branch; tagged jobs are retained.
+
+The workspace consumes the published `polaris-ai` 0.7.0 dependency rather than
+a developer's sibling checkout. The published 0.6.0 package lacks graph APIs
+that this workspace already uses. Every workspace crate still inherits the
+single root dependency.
+
+The build matrix produces:
+
+| Archive target | Minimum platform |
+| --- | --- |
+| `aarch64-apple-darwin` | Apple Silicon, macOS Sequoia 15 |
+| `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.35 (Ubuntu 22.04 baseline) |
+
+Each `polaris-code-<version>-<target>.tar.gz` contains the executable, license,
+README, and its logo assets, with a matching `.tar.gz.sha256` file. Each runner
+extracts its archive and checks the version, help, and JSON topology inventory
+without model credentials. The Linux archive uses glibc; continue using
+`scripts/build-portable-binary.sh` for the static musl benchmark executable.
+
+Download the archives from the workflow's `polaris-<target>` artifacts within
+14 days. Only after all checks and both builds pass does the workflow generate
+the `homebrew-formula` artifact. For a pushed tag in
+`RadiantAILabs/polaris_code`, it also creates a **draft** GitHub release with
+the same archives, checksums, and `polaris-code.rb`. Tags must match the
+application version exactly (`v0.1.1` for application 0.1.1); supporting crate
+versions do not determine this tag. This job does not publish registry crates.
+Separate macOS and Linux runners install the generated formula from the cached
+CI archives, run its functional tests, and check linkage before release
+creation. This tests the actual Homebrew installation without requiring the
+release URLs to be public during pull requests.
+Review and publish the draft to make its download URLs publicly available.
+If retrying release creation, remove the incomplete draft first; the workflow
+does not overwrite an existing release.
+
+Homebrew can reuse those exact binaries through the generated formula. It
+selects the archive for the OS and CPU, verifies SHA-256, and installs
+`polaris` without Rust or CMake. To regenerate it locally after downloading
+both archives and their checksum files:
+
+```bash
+python3 scripts/homebrew_formula.py 0.1.1 RadiantAILabs/polaris_code dist
+```
+
+The generator requires Python 3.11 or newer and rejects missing platforms and
+checksum mismatches. It writes `dist/polaris-code.rb`. Its URLs point to the
+tagged GitHub release, so publish the release before installing from it. CI
+artifacts expire and require authentication; they are an intermediate handoff,
+not the formula's download URLs.
+
 ## Homebrew
 
 The public [Radiant AI tap](https://github.com/RadiantAILabs/homebrew-tap)
@@ -170,3 +243,23 @@ latest tap commit selected when preparation starts; if `main` changes while
 building, restart from the latest commit. Check both repositories' Actions runs:
 a successful source notification means the tap accepted the request, while the
 tap run reports build, publication, and fresh-install results.
+
+### Switching the tap to CI binaries
+
+The generated `polaris-code.rb` is an alternative to the tap's current
+source-and-bottle formula. A release archive is not a Homebrew bottle: bottles
+also contain Homebrew's installation metadata. To reuse the application's CI
+builds, copy the generated formula to the tap's `Formula/polaris-code.rb`
+after publishing the GitHub release, and replace the tap's source-staging and
+bottle-publication workflow with binary installation and `brew test` checks
+on macOS and Linux. The existing workflow expects a source archive and cannot
+consume this formula unchanged.
+
+This handoff requires a separate tap change. The test and build workflow
+generates the formula without writing to the tap or requiring a
+cross-repository token. The existing Homebrew release notifier continues to
+trigger the source-and-bottle workflow until the tap is migrated.
+The generated formula supports only the two platforms in the build matrix
+and has no source-build fallback. Keep the current tap formula if that
+fallback is required, or extend the build matrix and generator before
+migrating other platforms.

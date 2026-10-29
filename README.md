@@ -1,125 +1,149 @@
-# polaris-code
+<p align="center">
+  <img src="assets/polaris-logo.svg#gh-light-mode-only" width="560" alt="Polaris Code">
+  <img src="assets/polaris-logo-dark.svg#gh-dark-mode-only" width="560" alt="Polaris Code">
+</p>
 
-**A blazingly fast, token-efficient coding harness. Same solve rate as Claude Code, 6x fewer tokens.**
+<p align="center">
+  <strong>A fast, token-efficient coding agent. Built to compose.</strong>
+</p>
 
-Written in Rust. One static binary. Every decision,
-tool call and token is recorded where you can read it.
+<p align="center">
+  <a href="https://radiantlabs.dev"><img src="https://img.shields.io/badge/website-radiantlabs.dev-000000?labelColor=000000&amp;style=flat-square" alt="Website: radiantlabs.dev"></a>
+  <a href="https://github.com/RadiantAILabs/polaris_code/tags"><img src="https://img.shields.io/github/v/tag/RadiantAILabs/polaris_code?label=release&amp;color=000000&amp;labelColor=000000&amp;style=flat-square" alt="Latest release tag"></a>
+  <a href="https://crates.io/crates/polaris_code"><img src="https://img.shields.io/crates/v/polaris_code?color=000000&amp;labelColor=000000&amp;style=flat-square" alt="Crates.io version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-000000?labelColor=000000&amp;style=flat-square" alt="License: Apache 2.0"></a>
+</p>
 
-| 150 SWE-bench Verified tasks, Claude Opus 5.5 | Solved | Tokens | Cost | Typical task time |
-| --- | ---: | ---: | ---: | ---: |
-| **polaris-code** | **136** | **8.2M** | **$14.20** | **~30 s** |
-| Claude Code | 135 | 50.1M | $32.96 | ~110 s |
+<p align="center">
+  <a href="https://radiantlabs.dev"><strong>Website</strong></a> ·
+  <a href="#get-started"><strong>Get started</strong></a> ·
+  <a href="https://github.com/RadiantAILabs/polaris_code/releases"><strong>Releases</strong></a> ·
+  <a href="#documentation"><strong>Documentation</strong></a> ·
+  <a href="#benchmark"><strong>Benchmark</strong></a>
+</p>
 
-Same model, same tasks, same machine. polaris-code used **16% of the tokens**
-and **less than half the cost**, and finished a typical task in about 30
-seconds where Claude Code took about 110. Every number here can be re-run from
-this repo: see [Benchmark](#benchmark).
+Polaris Code is a terminal coding agent written in Rust. It reads your
+project, edits code, and runs approved commands through Anthropic or AWS
+Bedrock. Model providers, tools, memory, and agent workflows compose as
+plugins, and every decision and tool call is recorded in the session graph.
 
-## Why polaris-code
+In a comparison on 150 SWE-bench Verified tasks, Polaris Code solved
+136 tasks using **16% of the tokens** and **less than half the estimated
+cost** of Claude Code with the same model. See the
+[benchmark and reproduction guide](#benchmark) for the measurements and scope.
 
-- **Composable architecture. Everything is a plugin.** Model providers, tools,
-  memory, I/O, and the agent loop compose through explicit contracts. Swap
-  capabilities and experiment with workflows without redesigning the rest of
-  the agent.
-- **Token efficient.** It plans the task first, then runs only the steps the
-  task needs, so the model reads far less context on every turn.
-- **Blazingly fast.** Native Rust. No Node runtime, no Electron, nothing to boot.
-- **Lightweight.** One static binary. No daemon, no cloud service, no telemetry.
-- **Fully inspectable.** Each session is a graph of decisions, tool calls,
-  evidence and outcomes. You can see why it did what it did, and rewind it.
-- **Safe by default.** Edits and commands ask first. Unattended runs can write
-  or execute only with an explicit grant.
-- **Bring your model.** Anthropic API or AWS Bedrock.
+## Get started
 
-## Workspace
-
-| Path | Purpose |
-| --- | --- |
-| `crates/polaris_code` | The `polaris` binary, agent loop, tools, terminal commands, and coding-specific topology host. |
-| `crates/polaris_cosmos` | Domain-neutral composition contracts, admission rules, evidence types, and gate blocks. |
-| `crates/polaris_ontrace` | Temporal knowledge-graph support backed by Oxigraph. |
-| `crates/polaris-tui` | Reusable ratatui shell and panel registry. |
-| `crates/polaris-tui-examples` | Small binaries demonstrating the TUI crate. |
-| `evals/` | Dataset-neutral evaluation harness, SWE-bench packs, and external-agent baselines. |
-
-Every crate uses the single `polaris-ai` dependency (from crates.io) declared in
-the root `Cargo.toml`, so shared framework types resolve to one package instance
-throughout the workspace.
-
-## Install
+### Install
 
 ```bash
 brew install radiantailabs/tap/polaris-code
-polaris --help
 ```
 
-The installed command is `polaris`. The Homebrew formula is named `polaris-code`
-to distinguish it from Homebrew's unrelated Kubernetes package. Prebuilt
-Homebrew bottles are available for Apple Silicon on macOS Sequoia and newer,
-and for Linux x86-64. Other configurations build from source.
+Prebuilt Homebrew bottles are available for Apple Silicon on macOS Sequoia
+and newer, and Linux x86-64. Other configurations build from source.
+The formula is named `polaris-code`; the installed command is `polaris`.
 
-Cargo users can install the same command with:
+Or install with Cargo using Rust 1.97.0 or newer:
 
 ```bash
 cargo install polaris_code --locked
 ```
 
-## Build
+### Start a session
 
-Rust 1.97.0 is required.
+Set your Anthropic API key, then launch Polaris in your project:
 
 ```bash
-cargo +1.97.0 build --release -p polaris_code
+export ANTHROPIC_API_KEY="your-key"
+cd your-project
+polaris .
 ```
 
-The resulting binary is `target/release/polaris`. For a complete
-development check, run:
+### Run a single task
+
+Use `-p` / `--print` for one unattended turn:
 
 ```bash
-cargo +1.97.0 check --workspace
-cargo +1.97.0 test --workspace
-cargo +1.97.0 fmt -- --check
-cargo +1.97.0 clippy --all-targets --all-features -- -D warnings
+polaris -p "Summarize this workspace" --output-format json
 ```
 
-## Quick start
+Interactive sessions ask before edits and commands. Unattended runs require
+explicit per-run grants to write files or execute commands. See
+[permission modes](docs/permission-modes.md) for the available settings.
 
-The default provider is Anthropic:
+### Use AWS Bedrock
 
-```bash
-export ANTHROPIC_API_KEY=your-key
-target/release/polaris .
-```
-
-Pass `-p`/`--print` for one unattended turn:
+Bedrock uses the AWS SDK credential chain. Select it with `--provider bedrock`
+or the `POLARIS_CODE_PROVIDER` environment variable:
 
 ```bash
-target/release/polaris -p "summarize this workspace" --output-format json
-```
-
-AWS Bedrock uses the AWS SDK credential chain. Select it with either the flag
-or the environment variable:
-
-```bash
-export POLARIS_CODE_PROVIDER=bedrock
 export AWS_REGION=us-east-1
-target/release/polaris .
+polaris --provider bedrock .
 ```
 
 The SDK also accepts `AWS_PROFILE` or
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Use `--model` to select an
-available model, and run `polaris --help` for all provider, model,
-permission, output, and topology options.
+available model. Run `polaris --help` for all command-line options.
 
-Interactive sessions default to confirmation for edits and commands.
-Unattended runs are fail-closed: writing or executing commands requires the
-corresponding explicit per-run grant. See
-[`docs/permission-modes.md`](docs/permission-modes.md).
+## Why Polaris Code
+
+- **Composable by design.** Replace model providers, tools, memory, or graph
+  steps through declared plugin contracts.
+- **Token efficient.** Plan the task and project the context needed for each
+  step. The [benchmark](#benchmark) records a comparison you can reproduce.
+- **Native Rust.** One executable, with no Node runtime, daemon, or telemetry.
+- **Inspectable sessions.** Trace decisions, tool calls, evidence, and
+  outcomes. Review changes and rewind a session.
+- **Explicit permissions.** Interactive edits and commands ask first;
+  unattended execution uses explicit grants.
+- **Your provider.** Connect through the Anthropic API or AWS Bedrock.
+
+## Benchmark
+
+150 SWE-bench Verified tasks, Claude Opus 5.5 on AWS Bedrock, one run per task
+for each agent:
+
+| | Polaris Code | Claude Code |
+| --- | ---: | ---: |
+| Solved | 136 / 150 | 135 / 150 |
+| Total tokens | 8,179,965 | 50,052,324 |
+| Cost (USD, estimated) | 14.20 | 32.96 |
+| Typical task time | ~30 s | ~110 s |
+
+Tokens count input, output, cache read, and cache write. Bedrock does not return
+a measured cost, so both costs are list-price estimates. These measurements
+describe this run and task sample. The full results are published separately.
+This repository contains the code and pinned inputs to re-run the comparison:
+see the [reproduction guide](evals/reproduce/swebench-opus/README.md).
+
+## How it works
+
+The interactive terminal and headless command drive the same Polaris session
+and reflective ReAct loop. Tools read and edit files, run approved commands,
+search the workspace, query a multi-language code index, and store memories.
+The topology catalog selects and composes bounded task graphs; the session
+graph records their decisions and outcomes.
+
+Agent behavior is a graph of typed Rust systems. Replace a step or rewire a
+workflow to try another approach. The [design philosophy](docs/philosophy.md)
+explains the architecture.
+
+## Documentation
+
+| Guide | Covers |
+| --- | --- |
+| [Permission modes](docs/permission-modes.md) | Approvals and unattended execution grants. |
+| [Project instructions](docs/project-instructions.md) | How project guidance is discovered and applied. |
+| [Plugin integration](docs/reference/guide.md) | Composing and extending the existing capabilities. |
+| [Embedding](crates/polaris_code/src/docs/embedding.md) | Using the coding agent in a Rust application. |
+| [Topology selection](docs/topology-selection.md) | Graph admission, selection, and recorded explanations. |
+| [Publishing](docs/publishing.md) | Registry packages, release archives, and Homebrew. |
+| [Benchmark reproduction](evals/reproduce/swebench-opus/README.md) | Pinned inputs and commands for the comparison above. |
+
+Browse [`docs/`](docs/) for the full documentation.
 
 ## Use as a library
-
-The `polaris_code` package exposes the coding agent as a Rust library; the
-executable is `polaris`.
 
 ```toml
 [dependencies]
@@ -128,46 +152,58 @@ polaris_code = "0.1.1"
 
 Compose model, tool, and I/O plugins on a Polaris `Server`, create a session,
 then call `polaris_code::run::drive_turn`. The
-[embedding guide](crates/polaris_code/src/docs/embedding.md) includes the full
-dependency list, a complete example, and the permission and persistence
-contracts an embedding application supplies.
+[embedding guide](crates/polaris_code/src/docs/embedding.md) includes a complete
+example and the permission and persistence contracts your application supplies.
 
-## How it works
+## Development
 
-Both front ends drive the same Polaris session and reflective ReAct loop.
-Tools can read and edit files, run approved commands, search the tree, query a
-multi-language code index, and store content-hash-invalidated memories. The
-topology catalog can admit, select, compose, and explain bounded task graphs;
-the session graph records decisions, tool calls, evidence, and outcomes.
+Build with the pinned Rust 1.97.0 toolchain:
 
-Agent behavior is a graph of typed Rust systems. Replace a step or rewire a
-workflow to try a different approach to the same task. The
-[design philosophy](docs/philosophy.md) explains the architecture, and the
-[integration guide](docs/reference/guide.md) shows how to compose and extend
-the existing plugins.
+```bash
+git clone https://github.com/RadiantAILabs/polaris_code.git
+cd polaris_code
+cargo +1.97.0 build --release --locked -p polaris_code
+./target/release/polaris .
+```
 
-The detailed documentation under [`docs/`](docs/) covers topology selection,
-gate planning, the evaluation harness, permissions, session rewind, usage
-accounting, and the TUI integration.
+Run the workspace checks:
 
-## Benchmark
+```bash
+cargo +1.97.0 check --workspace --locked
+cargo +1.97.0 test --workspace --locked
+cargo +1.97.0 fmt --all -- --check
+cargo +1.97.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
 
-150 SWE-bench Verified tasks, Claude Opus 5.5 on AWS Bedrock, one run per task
-for each agent:
+GitHub Actions checks the workspace on Linux and macOS and builds release
+archives for Linux x86-64 and Apple Silicon macOS. Matching `v*` tags in the
+public repository stage a draft release with those same archives, SHA-256
+checksums, and a Homebrew formula. See
+[CI and binary releases](docs/publishing.md#ci-and-binary-releases) for
+platform requirements and the tap handoff.
 
-| | polaris-code | Claude Code |
-| --- | ---: | ---: |
-| Solved | 136 / 150 | 135 / 150 |
-| Total tokens | 8,179,965 | 50,052,324 |
-| Cost (USD) | 14.20 | 32.96 |
-| Typical task time | ~30 s | ~110 s |
+| Path | Purpose |
+| --- | --- |
+| `crates/polaris_code` | CLI, coding agent, tools, and topology host. |
+| `crates/polaris_cosmos` | Composition contracts, topology admission, and evidence. |
+| `crates/polaris_ontrace` | Temporal knowledge graph backed by Oxigraph. |
+| `crates/polaris-tui` | Reusable terminal shell and panels. |
+| `crates/polaris-tui-examples` | Example TUI binaries. |
+| `evals/` | Evaluation harness, dataset packs, and external-agent baselines. |
 
-Tokens count input, output, cache read and cache write. Bedrock does not return
-a measured cost, so both costs are list-price estimates. The full results are
-published separately. This repository contains the code and pinned inputs to
-re-run the comparison yourself: see the
-[`swebench-opus` reproduction guide](evals/reproduce/swebench-opus/README.md).
+All crates inherit the single crates.io `polaris-ai` dependency from the root
+`Cargo.toml`.
+
+## Contributing
+
+Open an [issue](https://github.com/RadiantAILabs/polaris_code/issues) for a bug
+report or feature proposal, or send a pull request with a focused change.
+For architecture changes, start with the [design philosophy](docs/philosophy.md)
+and [plugin integration guide](docs/reference/guide.md). Include the relevant
+workspace checks when submitting code.
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).
+
+Built by [Radiant Labs](https://radiantlabs.dev).
