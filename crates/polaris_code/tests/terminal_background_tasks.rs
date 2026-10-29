@@ -731,9 +731,12 @@ async fn backgrounding_abandons_the_wait_without_re_running_or_duplicating() {
     host.submit("run it");
     host.approve().await;
 
-    host.settle_when("the command starts and is tracked", |host| {
-        host.tasks.all().len() == 1
-    })
+    // Registration can precede execution of the fixture's first shell line.
+    // Observe that line before checking the spawn count or backgrounding.
+    host.settle_when(
+        "the command starts, writes its marker, and is tracked",
+        |host| host.tasks.all().len() == 1 && marker_runs(marker.path()) > 0,
+    )
     .await;
     let task = host.only_task();
     assert_eq!(marker_runs(marker.path()), 1, "the command spawned once");
