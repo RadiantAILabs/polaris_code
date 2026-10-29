@@ -21,7 +21,7 @@ correction:
 
 ```text
 predict → act → verify → compare → gate ─┬─ accept
-                                           └─ reject
+                                         └─ reject
 ```
 
 Cosmos owns these domain-neutral logical topologies, bounds, accounting rules,
