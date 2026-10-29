@@ -1,0 +1,245 @@
+# User-context ontology.
+#
+# What an LLM agent needs to remember *about the person it is helping*:
+# their role, stated preferences, working environment, intentions for
+# the current exchange, and the feedback they hand back on agent
+# output. Builds on agent:User (already declared in agent.ttl) — does
+# not redefine it — and adds richer surrounding vocabulary that the
+# coding, eval, and tracing layers can cross-link from.
+#
+# Imports: core, agent (which transitively pulls llm).
+
+@prefix ont:   <urn:ontrace:onto/user/> .
+@prefix core:  <urn:ontrace:onto/core/> .
+@prefix agent: <urn:ontrace:onto/agent/> .
+@prefix llm:   <urn:ontrace:onto/llm/> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:ontrace:onto/user> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ,
+                <urn:ontrace:onto/agent> ;
+    rdfs:label "ontrace user" ;
+    rdfs:comment "User-context vocabulary — role, preferences, environment, intentions, feedback." .
+
+# ─── Classes: identity & profile ──────────────────────────────────────
+
+ont:Role a owl:Class ;
+    rdfs:label "Role" ;
+    rdfs:comment "How the user describes themselves professionally (software engineer, data scientist, researcher, student)." .
+
+ont:Expertise a owl:Class ;
+    rdfs:label "Expertise" ;
+    rdfs:comment "A domain or technology the user is fluent in (Rust, distributed systems, frontend). Distinct from Role — one Role can carry many Expertises." .
+
+ont:Preference a owl:Class ;
+    rdfs:label "Preference" ;
+    rdfs:comment "A stated like, dislike, or stylistic ask (terse replies, no emojis, prefers small PRs). Drives downstream tone and approach." .
+
+# ─── Classes: intention & request ─────────────────────────────────────
+
+ont:Intent a owl:Class ;
+    rdfs:subClassOf agent:Objective ;
+    rdfs:label "Intent" ;
+    rdfs:comment "What the user is trying to accomplish in the current exchange. Specializes agent:Objective with a user-originated framing." .
+
+ont:Goal a owl:Class ;
+    rdfs:label "Goal" ;
+    rdfs:comment "A longer-horizon outcome the user has stated (ship feature X, reduce p95 latency, learn topic Y) that spans many sessions." .
+
+ont:Constraint a owl:Class ;
+    rdfs:label "Constraint" ;
+    rdfs:comment "A rule the user imposes on agent behavior (don't push without asking, no force-push, one PR not many)." .
+
+ont:Question a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Question" ;
+    rdfs:comment "A user utterance phrased as a question." .
+
+ont:Instruction a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Instruction" ;
+    rdfs:comment "A user utterance phrased as a directive — what to do, in what order." .
+
+ont:Clarification a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Clarification" ;
+    rdfs:comment "A user-supplied disambiguation in response to an agent question or assumption." .
+
+# ─── Classes: feedback on agent output ────────────────────────────────
+
+ont:Feedback a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "Feedback" ;
+    rdfs:comment "Any evaluative response the user gives on agent output." .
+
+ont:Approval a owl:Class ;
+    rdfs:subClassOf ont:Feedback ;
+    rdfs:label "Approval" ;
+    rdfs:comment "User accepted agent output (\"perfect\", \"ship it\", explicit confirm)." .
+
+ont:Rejection a owl:Class ;
+    rdfs:subClassOf ont:Feedback ;
+    rdfs:label "Rejection" ;
+    rdfs:comment "User declined agent output (\"no, not that\", revert, undo)." .
+
+ont:Correction a owl:Class ;
+    rdfs:subClassOf ont:Feedback ;
+    rdfs:label "Correction" ;
+    rdfs:comment "User pointed out and supplied a fix for an agent error." .
+
+# ─── Classes: environment & workspace ─────────────────────────────────
+
+ont:Environment a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Environment" ;
+    rdfs:comment "The composite runtime context the user is working in — OS, shell, editor, workspace bundled together." .
+
+ont:OperatingSystem a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "OperatingSystem" ;
+    rdfs:comment "The OS the user is on (macOS, Linux, Windows)." .
+
+ont:Shell a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Shell" ;
+    rdfs:comment "The interactive shell (bash, zsh, fish, pwsh)." .
+
+ont:Editor a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Editor" ;
+    rdfs:comment "The code editor or IDE (VS Code, Neovim, JetBrains)." .
+
+ont:Workspace a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Workspace" ;
+    rdfs:comment "The working directory or project root the user is currently in." .
+
+ont:Device a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Device" ;
+    rdfs:comment "The physical or virtual machine (laptop, workstation, remote VM) the user is working from." .
+
+# ─── Classes: conversation ────────────────────────────────────────────
+
+ont:Session a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "Session" ;
+    rdfs:comment "A single user-agent conversation period. Distinct from tracing:Trace — a Session may span many Traces." .
+
+ont:Message a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Message" ;
+    rdfs:comment "A single utterance inside a Session (user or agent turn)." .
+
+# ─── Predicates: profile ──────────────────────────────────────────────
+
+ont:has_role a owl:ObjectProperty ;
+    rdfs:label "has_role" ;
+    rdfs:domain agent:User ; rdfs:range ont:Role .
+
+ont:has_expertise a owl:ObjectProperty ;
+    rdfs:label "has_expertise" ;
+    rdfs:domain agent:User ; rdfs:range ont:Expertise .
+
+ont:has_preference a owl:ObjectProperty ;
+    rdfs:label "has_preference" ;
+    rdfs:domain agent:User ; rdfs:range ont:Preference .
+
+ont:novice_at a owl:ObjectProperty ;
+    rdfs:label "novice_at" ;
+    rdfs:domain agent:User ;
+    rdfs:comment "User has limited familiarity with the named topic or technology — softens downstream explanations." .
+
+# ─── Predicates: intention ────────────────────────────────────────────
+
+ont:has_intent a owl:ObjectProperty ;
+    rdfs:label "has_intent" ;
+    rdfs:domain agent:User ; rdfs:range ont:Intent .
+
+ont:has_goal a owl:ObjectProperty ;
+    rdfs:label "has_goal" ;
+    rdfs:domain agent:User ; rdfs:range ont:Goal .
+
+ont:imposed_constraint a owl:ObjectProperty ;
+    rdfs:label "imposed_constraint" ;
+    rdfs:domain agent:User ; rdfs:range ont:Constraint .
+
+ont:asked a owl:ObjectProperty ;
+    rdfs:label "asked" ;
+    rdfs:domain agent:User ; rdfs:range ont:Question .
+
+ont:instructed a owl:ObjectProperty ;
+    rdfs:label "instructed" ;
+    rdfs:domain agent:User ; rdfs:range ont:Instruction .
+
+ont:clarified a owl:ObjectProperty ;
+    rdfs:label "clarified" ;
+    rdfs:domain agent:User ; rdfs:range ont:Clarification .
+
+# ─── Predicates: feedback ─────────────────────────────────────────────
+
+ont:approved a owl:ObjectProperty ;
+    rdfs:label "approved" ;
+    rdfs:comment "User accepted an Event or Artifact produced by the agent." .
+
+ont:rejected a owl:ObjectProperty ;
+    rdfs:label "rejected" ;
+    rdfs:comment "User declined an Event or Artifact produced by the agent." .
+
+ont:corrected a owl:ObjectProperty ;
+    rdfs:label "corrected" ;
+    rdfs:comment "User corrected an Event or Artifact produced by the agent." .
+
+ont:gave_feedback a owl:ObjectProperty ;
+    rdfs:label "gave_feedback" ;
+    rdfs:domain agent:User ; rdfs:range ont:Feedback .
+
+# ─── Predicates: environment ──────────────────────────────────────────
+
+ont:works_in a owl:ObjectProperty ;
+    rdfs:label "works_in" ;
+    rdfs:domain agent:User ; rdfs:range ont:Environment .
+
+ont:works_on a owl:ObjectProperty ;
+    rdfs:label "works_on" ;
+    rdfs:domain agent:User ; rdfs:range core:Resource ;
+    rdfs:comment "User is working on the named Resource — a codebase, dataset, benchmark, model under evaluation." .
+
+ont:runs_os a owl:ObjectProperty ;
+    rdfs:label "runs_os" ;
+    rdfs:range ont:OperatingSystem .
+
+ont:uses_shell a owl:ObjectProperty ;
+    rdfs:label "uses_shell" ;
+    rdfs:range ont:Shell .
+
+ont:uses_editor a owl:ObjectProperty ;
+    rdfs:label "uses_editor" ;
+    rdfs:range ont:Editor .
+
+ont:located_in a owl:ObjectProperty ;
+    rdfs:label "located_in" ;
+    rdfs:range ont:Workspace ;
+    rdfs:comment "An Event or Artifact occurred inside the named Workspace." .
+
+ont:on_device a owl:ObjectProperty ;
+    rdfs:label "on_device" ;
+    rdfs:range ont:Device .
+
+# ─── Predicates: conversation ─────────────────────────────────────────
+
+ont:in_session a owl:ObjectProperty ;
+    rdfs:label "in_session" ;
+    rdfs:range ont:Session ;
+    rdfs:comment "An Event or Message belongs to the named Session. Cross-links to tracing:Trace and llm:Request via the same Session subject." .
+
+ont:has_title a owl:DatatypeProperty ;
+    rdfs:label "has_title" ;
+    rdfs:domain ont:Session ;
+    rdfs:comment "A short generated or user-set label for a Session, as an xsd:string. Message parent/child threading uses core:child_of." .
+
+ont:sent_message a owl:ObjectProperty ;
+    rdfs:label "sent_message" ;
+    rdfs:domain agent:User ; rdfs:range ont:Message .

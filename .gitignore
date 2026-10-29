@@ -1,0 +1,15 @@
+/target
+/out
+.venv-swebench/
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Agent-tool metadata
+.claude/
+data

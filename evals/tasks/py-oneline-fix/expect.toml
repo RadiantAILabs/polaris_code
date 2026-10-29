@@ -1,0 +1,35 @@
+shape = "one-line-fix"
+language = "python"
+summary = """
+A single find/replace fix submitted with a tight latency budget, so the \
+deterministic composition policy picks the leanest recipe this registration \
+approves.\
+"""
+
+[route]
+kind = "topology-edit"
+file = "app.py"
+find = "def add(a, b):\n    raise NotImplementedError"
+replace = "def add(a, b):\n    return a + b"
+intent = "fast"
+budget_ms = 1000
+allow_edit = true
+
+[outcome]
+check = "command"
+command = ["python3", "-m", "unittest", "discover", "-v"]
+
+[plan]
+expected = true
+registration_id = "code.direct-edit"
+recipe = "polaris-code.recipe.direct-verified"
+blocks = ["cosmos.verified-step", "cosmos.resolve-residuals"]
+mutating = true
+loop_shaped = false
+rationale_note = """
+Fast intent plus a <=5000ms stated budget both favour the leanest admitted \
+recipe (deterministic_pick's tight-budget rule); Fast wins registration \
+selection at cold start \
+(tests/topology_selection_learns_from_outcomes.rs, \
+an_empty_record_leaves_the_cold_start_exactly_as_it_was).\
+"""

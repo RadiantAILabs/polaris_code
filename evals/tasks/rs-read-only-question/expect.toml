@@ -1,0 +1,32 @@
+shape = "read-only-question"
+language = "rust"
+summary = """
+A point question about one file. intent=answer forbids every mutating \
+registration, so the deterministic selector picks the read-only tree-question \
+shape and nothing on disk changes.\
+"""
+
+[route]
+kind = "topology-statement"
+statement = "what is in src/lib.rs"
+intent = "answer"
+allow_edit = true
+
+[outcome]
+check = "answer_contains"
+answer_contains = ["resolved the coding task", "1 pass"]
+tree_unchanged = true
+
+[plan]
+expected = true
+registration_id = "code.tree-question"
+recipe = "polaris-code.recipe.tree-question"
+blocks = ["polaris-code.tree-survey"]
+mutating = false
+loop_shaped = false
+rationale_note = """
+intent=answer forbids SOURCE_MUTATION (cosmos/task.rs); \
+code.tree-question wins the deterministic selector first under that objective \
+at cold start (tests/answer_shape_proof.rs, \
+the_answer_shape_wins_an_objective_that_forbids_source_mutation).\
+"""

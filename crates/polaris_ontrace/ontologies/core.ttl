@@ -1,0 +1,109 @@
+# Core ontology primitives.
+#
+# Abstract base classes and relations every domain ontology in ontrace
+# specializes. Lives at the bottom of the import DAG — depends on nothing.
+#
+# The extractor reads local names (PascalCase classes, snake_case
+# predicates) — full IRIs exist for downstream RDF tooling only.
+
+@prefix ont:  <urn:ontrace:onto/core/> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<urn:ontrace:onto/core> a owl:Ontology ;
+    rdfs:label "ontrace core" ;
+    rdfs:comment "Primitives shared by every ontrace domain ontology." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:Actor a owl:Class ;
+    rdfs:label "Actor" ;
+    rdfs:comment "An entity that initiates work — agents, users, judges, services." .
+
+ont:Artifact a owl:Class ;
+    rdfs:label "Artifact" ;
+    rdfs:comment "A piece of data produced or consumed by an Event — inputs, outputs, files, samples, requests, responses." .
+
+ont:Event a owl:Class ;
+    rdfs:label "Event" ;
+    rdfs:comment "A timed unit of work — a tool call, span, build, commit, eval run, etc." .
+
+ont:Measurement a owl:Class ;
+    rdfs:label "Measurement" ;
+    rdfs:comment "A scalar observation attached to an Event — latency, token count, score." .
+
+ont:Resource a owl:Class ;
+    rdfs:label "Resource" ;
+    rdfs:comment "A named thing the system uses or references — model, provider, tool, dataset, codebase." .
+
+ont:Failure a owl:Class ;
+    rdfs:label "Failure" ;
+    rdfs:comment "An error, exception, or non-success outcome on an Event." .
+
+ont:Resolution a owl:Class ;
+    rdfs:subClassOf ont:Event ;
+    rdfs:label "Resolution" ;
+    rdfs:comment "The closing of an open item — an Intent, Question, Goal, ToolCall, EvalRun, or any Event/Artifact that started without a settled outcome. Specializes Event so it carries its own timestamp and can compose with caused_by, part_of, errored_with to describe how the closure happened. Subtype it (Fulfillment, Supersession, Abandonment) when kind-tracking becomes load-bearing." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:part_of a owl:ObjectProperty ;
+    rdfs:label "part_of" ;
+    rdfs:comment "Mereological containment — an Event is part of a larger Event, an Artifact is part of a larger Artifact." .
+
+ont:child_of a owl:ObjectProperty ;
+    rdfs:label "child_of" ;
+    rdfs:comment "Generic parent/child DAG edge — the subject is a child of the object in a tree or DAG. Domain and range are intentionally open: a tracing Span is child_of a Span, a conversation Message is child_of the Message it replies to, a sub-step is child_of its parent step. Distinct from part_of (mereological containment) — child_of threads like items into an ordered DAG rather than asserting one contains the other." .
+
+ont:produced a owl:ObjectProperty ;
+    rdfs:label "produced" ;
+    rdfs:comment "An Actor or Event produced an Artifact." ;
+    rdfs:range ont:Artifact .
+
+ont:consumed a owl:ObjectProperty ;
+    rdfs:label "consumed" ;
+    rdfs:comment "An Actor or Event consumed an Artifact as input." ;
+    rdfs:range ont:Artifact .
+
+ont:errored_with a owl:ObjectProperty ;
+    rdfs:label "errored_with" ;
+    rdfs:comment "An Event ended in a Failure." ;
+    rdfs:range ont:Failure .
+
+ont:caused_by a owl:ObjectProperty ;
+    rdfs:label "caused_by" ;
+    rdfs:comment "An Event or Failure was caused by another Event or Failure." .
+
+ont:resolved_by a owl:ObjectProperty ;
+    rdfs:label "resolved_by" ;
+    rdfs:range ont:Resolution ;
+    rdfs:comment "Links an open item (Intent, Question, Goal, ToolCall, EvalRun) to the Resolution that closed it. The Resolution itself carries timestamp and can reach the resolving work via caused_by / part_of." .
+
+ont:superseded_by a owl:ObjectProperty ;
+    rdfs:label "superseded_by" ;
+    rdfs:comment "The subject was replaced by another item of the same kind — common pattern: an Intent superseded by a newer Intent of the same Actor. Both facts persist in the append-only graph; readers project last-observed-wins via observed_at." .
+
+ont:about a owl:ObjectProperty ;
+    rdfs:label "about" ;
+    rdfs:comment "Topic-aboutness — an Event or Artifact is *about* a Resource. The commit/task/message names the topic without claiming to close it." ;
+    rdfs:range ont:Resource .
+
+ont:addresses a owl:ObjectProperty ;
+    rdfs:label "addresses" ;
+    rdfs:comment "An Event or Artifact takes on an open item (Intent, Question, Goal, Issue, ToolCall) without necessarily closing it. Use resolved_by once the item is settled." .
+
+ont:describes a owl:ObjectProperty ;
+    rdfs:label "describes" ;
+    rdfs:comment "An Artifact (document, file, comment, label) describes a Resource. Inverse-ish of defined_in: describes goes Artifact → Concept; defined_in goes Concept → Artifact." ;
+    rdfs:domain ont:Artifact ;
+    rdfs:range ont:Resource .
+
+ont:uses_technique a owl:ObjectProperty ;
+    rdfs:label "uses_technique" ;
+    rdfs:comment "An Event or Resource is implemented via, or makes use of, another Resource (a library, pattern, mechanism, technique). Covers proposal-to-mechanism and feature-to-implementation links." ;
+    rdfs:range ont:Resource .
+
+ont:instance_of a owl:ObjectProperty ;
+    rdfs:label "instance_of" ;
+    rdfs:comment "Local-name shorthand for rdf:type — the subject is an instance of the object class. Use when the line asserts class membership (e.g. `47b6bdf` instance_of Commit, `claude-opus-4-7` instance_of Model). Maps to rdf:type in the TBox via owl:equivalentProperty." ;
+    owl:equivalentProperty <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> .

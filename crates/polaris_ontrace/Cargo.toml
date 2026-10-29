@@ -1,0 +1,66 @@
+[package]
+name = "polaris_ontrace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.0"
+license = "Apache-2.0"
+description = "Polaris plugin that tails trace streams and builds a temporal knowledge graph via LLM-extracted triples"
+publish = false
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"
+semicolon_if_nothing_returned = "warn"
+
+[features]
+# Default build enables the in-memory oxigraph backend — full RDF store with
+# named graphs for ontology (`TBox`) and data (`ABox`), SPARQL toolset, and
+# the inspect REPL. The naive in-memory `KnowledgeGraph` (Vec<Triple>) path
+# remains compiled in and selectable via `--backend memory`. Drop the
+# default with `--no-default-features` for a slimmer build that exposes
+# only the naive path.
+default = ["oxigraph"]
+# Enables `polaris_ontrace::oxigraph` — `OxigraphPlugin`, `OxigraphStore`
+# (`GlobalResource`), `OxigraphSession` (`LocalResource`), and the
+# `OxigraphTools` SPARQL toolset. In-memory backend only (fast build).
+oxigraph = ["dep:oxigraph", "dep:uuid", "dep:thiserror"]
+# Adds the persistent RocksDB backend, exposing
+# `OxigraphPlugin::with_path(p)`. Pulls in `librocksdb-sys`; first build is
+# slow (~30s of C++ compilation).
+oxigraph-rocksdb = ["oxigraph", "oxigraph/rocksdb"]
+
+[dependencies]
+oxigraph = { version = "0.4", optional = true, default-features = false }
+# Standalone Turtle/N-Triples parser + RDF data model (the same crates used
+# inside `oxigraph`). Pulled in unconditionally for the naive seed loader so
+# IRI-aware Turtle parsing — catchall-IRI bridge, `rdfs:domain` / `rdfs:range`
+# shape hints — is feature-independent. Both crates are small (no C deps) and
+# already in the dep tree when the `oxigraph` feature is on, so build-time
+# cost is negligible.
+oxttl = "0.1"
+oxrdf = "0.2"
+uuid = { version = "1", optional = true, features = ["v4"] }
+thiserror = { version = "2", optional = true }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
+# From the workspace, so this crate and `polaris-tui` share one `polaris-ai`.
+polaris = { workspace = true, features = ["anthropic", "tiktoken"] }
+polaris-tui.workspace = true
+# Match polaris-tui's pin so `TuiEvent::Key(KeyEvent)` resolves to the same
+# `crossterm::event::KeyEvent` type the panel match arms expect.
+crossterm = "0.29"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "fs", "sync", "time", "signal", "net"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+dotenvy = "0.15"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

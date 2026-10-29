@@ -1,0 +1,35 @@
+[package]
+name = "polaris-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Composable terminal UI for Polaris — plugins contribute in-process ratatui panels to a shared TUI shell."
+keywords = ["polaris", "tui", "ratatui", "terminal", "agent"]
+categories = ["command-line-interface", "asynchronous"]
+
+[features]
+default = ["panels"]
+# Built-in panels (conversation, logs, sessions, help) and their contribution
+# plugins. Disable for a bare framework with no concrete panels.
+panels = ["dep:tracing-subscriber", "dep:serde_json", "dep:pulldown-cmark"]
+
+[dependencies]
+polaris.workspace = true
+# `unstable-rendered-line-info` surfaces `Paragraph::line_count`, which
+# `widgets::ScrollableTranscript` uses to clamp scroll against the *wrapped*
+# row count. Reimplementing ratatui's word-wrap to get that number ourselves
+# would be fragile; the unstable API is hidden behind our widget.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+crossterm.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+tracing-subscriber = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+pulldown-cmark = { workspace = true, optional = true }

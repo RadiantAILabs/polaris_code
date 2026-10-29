@@ -1,0 +1,169 @@
+# LLM substrate ontology.
+#
+# Providers, models, requests/responses, and the operational measurements
+# (latency, token usage, rate limits) every LLM call carries. The
+# tracing, agent, and eval layers all sit on top of this.
+#
+# Imports: core.
+
+@prefix ont:   <urn:ontrace:onto/llm/> .
+@prefix core:  <urn:ontrace:onto/core/> .
+@prefix agent: <urn:ontrace:onto/agent/> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:ontrace:onto/llm> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ;
+    rdfs:label "ontrace llm" ;
+    rdfs:comment "LLM call substrate — providers, models, requests, responses, usage." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:Provider a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Provider" ;
+    rdfs:comment "An LLM service provider (anthropic, openai, ...)." .
+
+ont:Model a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Model" ;
+    rdfs:comment "A specific LLM identifier (e.g. claude-haiku-4-5)." .
+
+ont:Request a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Request" ;
+    rdfs:comment "An outbound call to an LLM provider." .
+
+ont:Response a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Response" ;
+    rdfs:comment "The reply (or partial stream) returned for a Request." .
+
+ont:TokenUsage a owl:Class ;
+    rdfs:subClassOf core:Measurement ;
+    rdfs:label "TokenUsage" ;
+    rdfs:comment "Counts of input and output tokens for a single call." .
+
+ont:Latency a owl:Class ;
+    rdfs:subClassOf core:Measurement ;
+    rdfs:label "Latency" ;
+    rdfs:comment "Reified duration measurement on a call — a node carrying percentile breakdowns, units, attribution. The scalar shortcut is `has_latency` (xsd:decimal) directly on the Event; instantiate Latency only when the structured form is needed." .
+
+ont:RateLimit a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "RateLimit" ;
+    rdfs:comment "A provider-enforced throughput cap (requests/tokens per window)." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:hit_provider a owl:ObjectProperty ;
+    rdfs:label "hit_provider" ;
+    rdfs:range ont:Provider .
+
+ont:used_model a owl:ObjectProperty ;
+    rdfs:label "used_model" ;
+    rdfs:range ont:Model .
+
+ont:sent_request a owl:ObjectProperty ;
+    rdfs:label "sent_request" ;
+    rdfs:range ont:Request .
+
+ont:received_response a owl:ObjectProperty ;
+    rdfs:label "received_response" ;
+    rdfs:range ont:Response .
+
+ont:responded_to a owl:ObjectProperty ;
+    rdfs:label "responded_to" ;
+    rdfs:domain ont:Response ; rdfs:range ont:Request .
+
+ont:has_token_usage a owl:ObjectProperty ;
+    rdfs:label "has_token_usage" ;
+    rdfs:range ont:TokenUsage .
+
+ont:has_latency a owl:DatatypeProperty ;
+    rdfs:label "has_latency" ;
+    rdfs:comment "Scalar duration on a call Event — TTFB, total, etc. — as an xsd:decimal. Shortcut: when percentile breakdowns or attribution matter, type a node as Latency and attach with a domain-specific predicate instead." .
+
+ont:rate_limited_by a owl:ObjectProperty ;
+    rdfs:label "rate_limited_by" ;
+    rdfs:range ont:Provider .
+
+ont:exceeded_quota a owl:ObjectProperty ;
+    rdfs:label "exceeded_quota" ;
+    rdfs:range ont:RateLimit .
+
+ont:timed_out a owl:ObjectProperty ;
+    rdfs:label "timed_out" ;
+    rdfs:comment "An Event exceeded its time budget." .
+
+# ─── Call detail (scalars) ────────────────────────────────────────────
+# The numbers every call carries. TokenUsage is the reified node; these
+# datatype properties hang the actual counts off it instead of leaving it
+# an opaque blank node.
+
+ont:input_tokens a owl:DatatypeProperty ;
+    rdfs:label "input_tokens" ;
+    rdfs:domain ont:TokenUsage ;
+    rdfs:comment "Prompt tokens billed for a call, as an xsd:integer." .
+
+ont:output_tokens a owl:DatatypeProperty ;
+    rdfs:label "output_tokens" ;
+    rdfs:domain ont:TokenUsage ;
+    rdfs:comment "Completion tokens billed for a call, as an xsd:integer." .
+
+ont:cache_read_tokens a owl:DatatypeProperty ;
+    rdfs:label "cache_read_tokens" ;
+    rdfs:domain ont:TokenUsage ;
+    rdfs:comment "Tokens served from the prompt cache, as an xsd:integer." .
+
+ont:cache_creation_tokens a owl:DatatypeProperty ;
+    rdfs:label "cache_creation_tokens" ;
+    rdfs:domain ont:TokenUsage ;
+    rdfs:comment "Tokens written into the prompt cache, as an xsd:integer." .
+
+ont:service_tier a owl:DatatypeProperty ;
+    rdfs:label "service_tier" ;
+    rdfs:domain ont:TokenUsage ;
+    rdfs:comment "Provider service tier the call was billed at (standard, priority, batch), as an xsd:string." .
+
+ont:stop_reason a owl:DatatypeProperty ;
+    rdfs:label "stop_reason" ;
+    rdfs:domain ont:Response ;
+    rdfs:comment "Why generation ended for a Response (end_turn, tool_use, max_tokens, stop_sequence), as an xsd:string." .
+
+# ─── SHACL shapes ─────────────────────────────────────────────────────
+# Call observables hang off the timed Event that made the call — ToolCall,
+# Span, EvalRun, an LlmCall-leaf, anything subclassing core:Event. The
+# validator's subclass walk lets every Event leaf class pass; mis-attached
+# observables (User, File, Workspace) fail and route to the repair pass.
+#
+# Range / nodeKind on each property restates the entity-vs-scalar contract:
+# `has_latency` is the scalar shortcut (xsd:decimal); the rest point at
+# curated TBox classes. The harvester takes `rdfs:range` first per field
+# and SHACL only fills gaps, so the `sh:class` restatements here are
+# intentional documentation, not overriding declarations.
+
+[] a sh:NodeShape ;
+    sh:targetClass core:Event ;
+    sh:property [ sh:path ont:has_token_usage ; sh:class ont:TokenUsage ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:has_latency ; sh:datatype xsd:decimal ] ;
+    sh:property [ sh:path ont:hit_provider ; sh:class ont:Provider ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:used_model ; sh:class ont:Model ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:sent_request ; sh:class ont:Request ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:received_response ; sh:class ont:Response ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:rate_limited_by ; sh:class ont:Provider ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:exceeded_quota ; sh:class ont:RateLimit ; sh:nodeKind sh:IRI ] .
+
+[] a sh:NodeShape ;
+    sh:targetClass ont:TokenUsage ;
+    sh:property [ sh:path ont:input_tokens ; sh:datatype xsd:integer ] ;
+    sh:property [ sh:path ont:output_tokens ; sh:datatype xsd:integer ] ;
+    sh:property [ sh:path ont:cache_read_tokens ; sh:datatype xsd:integer ] ;
+    sh:property [ sh:path ont:cache_creation_tokens ; sh:datatype xsd:integer ] ;
+    sh:property [ sh:path ont:service_tier ; sh:datatype xsd:string ] .
+
+[] a sh:NodeShape ;
+    sh:targetClass ont:Response ;
+    sh:property [ sh:path ont:stop_reason ; sh:datatype xsd:string ] .

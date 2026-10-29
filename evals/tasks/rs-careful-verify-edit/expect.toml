@@ -1,0 +1,34 @@
+shape = "careful-verify-edit"
+language = "rust"
+summary = """
+The same one-line stated edit as py-oneline-fix, submitted with intent=careful \
+and no latency budget, so the deterministic composition policy escalates to \
+the predict/apply/verify/compare loop instead of the leanest recipe.\
+"""
+
+[route]
+kind = "topology-edit"
+file = "src/lib.rs"
+find = "pub fn add(a: i32, b: i32) -> i32 {\n    todo!()\n}"
+replace = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}"
+intent = "careful"
+allow_edit = true
+
+[outcome]
+check = "command"
+command = ["cargo", "test"]
+
+[plan]
+expected = true
+registration_id = "code.prediction-error-edit"
+recipe = "polaris-code.recipe.prediction-error"
+blocks = ["cosmos.prediction-error-loop"]
+mutating = true
+loop_shaped = true
+rationale_note = """
+success_check=stated-edits with no tight budget escalates to the \
+predict/verify/compare recipe (deterministic_pick); Careful intent also wins \
+this registration at cold start \
+(tests/topology_selection_learns_from_outcomes.rs, \
+an_empty_record_leaves_the_cold_start_exactly_as_it_was).\
+"""

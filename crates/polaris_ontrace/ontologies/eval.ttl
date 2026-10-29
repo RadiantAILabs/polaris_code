@@ -1,0 +1,121 @@
+# Evaluation / benchmarking ontology.
+#
+# Eval runs, datasets, judges, rubrics, metrics — how an agent or model
+# is scored, and how runs compare to baselines.
+#
+# Imports: core, agent.
+
+@prefix ont:   <urn:ontrace:onto/eval/> .
+@prefix core:  <urn:ontrace:onto/core/> .
+@prefix agent: <urn:ontrace:onto/agent/> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:ontrace:onto/eval> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ,
+                <urn:ontrace:onto/agent> ;
+    rdfs:label "ontrace eval" ;
+    rdfs:comment "Evaluation runs, datasets, judges, rubrics, metrics." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:EvalRun a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "EvalRun" ;
+    rdfs:comment "A single execution of an evaluation over a model or agent." .
+
+ont:Dataset a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Dataset" ;
+    rdfs:comment "A named collection of samples used as eval inputs." .
+
+ont:Benchmark a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Benchmark" ;
+    rdfs:comment "A standardized eval (MMLU, HumanEval, SWE-bench, a custom harness)." .
+
+ont:Sample a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Sample" ;
+    rdfs:comment "A single input/expected-output pair inside a dataset." .
+
+ont:Judge a owl:Class ;
+    rdfs:subClassOf core:Actor ;
+    rdfs:label "Judge" ;
+    rdfs:comment "A model or human assigning scores to samples." .
+
+ont:Rubric a owl:Class ;
+    rdfs:label "Rubric" ;
+    rdfs:comment "The criteria a Judge applies when scoring." .
+
+ont:Metric a owl:Class ;
+    rdfs:subClassOf core:Measurement ;
+    rdfs:label "Metric" ;
+    rdfs:comment "A scalar measurement produced by an EvalRun (accuracy, pass@1, etc.)." .
+
+ont:Regression a owl:Class ;
+    rdfs:label "Regression" ;
+    rdfs:comment "A drop in a Metric relative to a baseline EvalRun." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:evaluated a owl:ObjectProperty ;
+    rdfs:label "evaluated" ;
+    rdfs:domain ont:EvalRun .
+
+ont:used_dataset a owl:ObjectProperty ;
+    rdfs:label "used_dataset" ;
+    rdfs:domain ont:EvalRun ; rdfs:range ont:Dataset .
+
+ont:used_benchmark a owl:ObjectProperty ;
+    rdfs:label "used_benchmark" ;
+    rdfs:domain ont:EvalRun ; rdfs:range ont:Benchmark .
+
+ont:judged_by a owl:ObjectProperty ;
+    rdfs:label "judged_by" ;
+    rdfs:range ont:Judge .
+
+ont:scored_by a owl:ObjectProperty ;
+    rdfs:label "scored_by" ;
+    rdfs:domain ont:Sample ; rdfs:range ont:Judge .
+
+ont:rated_by a owl:ObjectProperty ;
+    rdfs:label "rated_by" ;
+    rdfs:domain ont:Sample .
+
+ont:has_score a owl:DatatypeProperty ;
+    rdfs:label "has_score" ;
+    rdfs:comment "Scalar score on a Sample or EvalRun (accuracy, pass@1, judge rating) as an xsd:decimal. For structured scores with rubric breakdowns or percentiles, point at a Metric node via has_metric instead." .
+
+ont:has_metric a owl:ObjectProperty ;
+    rdfs:label "has_metric" ;
+    rdfs:domain ont:EvalRun ; rdfs:range ont:Metric .
+
+ont:applied_rubric a owl:ObjectProperty ;
+    rdfs:label "applied_rubric" ;
+    rdfs:domain ont:Judge ; rdfs:range ont:Rubric .
+
+ont:regressed_on a owl:ObjectProperty ;
+    rdfs:label "regressed_on" ;
+    rdfs:domain ont:EvalRun ; rdfs:range ont:EvalRun .
+
+ont:improved_on a owl:ObjectProperty ;
+    rdfs:label "improved_on" ;
+    rdfs:domain ont:EvalRun ; rdfs:range ont:EvalRun .
+
+ont:compared_to a owl:ObjectProperty ;
+    rdfs:label "compared_to" ;
+    rdfs:domain ont:EvalRun ; rdfs:range ont:EvalRun .
+
+# ─── SHACL shapes ─────────────────────────────────────────────────────
+# has_score is scalar-only. Domain is intentionally left unconstrained:
+# legitimate has_score subjects span Sample (an Artifact subclass) and
+# EvalRun (an Event subclass) — no shared concrete ancestor below Thing,
+# so a single sh:targetClass would reject one of the two valid cases.
+# The datatype constraint alone catches the actually-frequent mistake of
+# attaching a string or an IRI to has_score.
+
+[] a sh:NodeShape ;
+    sh:property [ sh:path ont:has_score ; sh:datatype xsd:decimal ] .

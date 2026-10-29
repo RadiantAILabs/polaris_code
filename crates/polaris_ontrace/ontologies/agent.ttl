@@ -1,0 +1,105 @@
+# Agent feedback-loop ontology.
+#
+# Agents, tools, tool calls, plans, objectives — the structures that
+# describe an autonomous LLM-driven actor running a loop. The eval and
+# coding layers specialize this layer.
+#
+# Imports: core, llm.
+
+@prefix ont:  <urn:ontrace:onto/agent/> .
+@prefix core: <urn:ontrace:onto/core/> .
+@prefix llm:  <urn:ontrace:onto/llm/> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:ontrace:onto/agent> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ,
+                <urn:ontrace:onto/llm> ;
+    rdfs:label "ontrace agent" ;
+    rdfs:comment "Agent loop vocabulary — actors, tools, plans, objectives." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:Agent a owl:Class ;
+    rdfs:subClassOf core:Actor ;
+    rdfs:label "Agent" ;
+    rdfs:comment "An autonomous LLM-driven actor that takes inputs and produces outputs via tools." .
+
+ont:User a owl:Class ;
+    rdfs:subClassOf core:Actor ;
+    rdfs:label "User" ;
+    rdfs:comment "The human or upstream agent that issued the request." .
+
+ont:Tool a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Tool" ;
+    rdfs:comment "A capability the agent can invoke (search, code-exec, file-read, ...)." .
+
+ont:ToolCall a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "ToolCall" ;
+    rdfs:comment "A single invocation of a Tool by an Agent." .
+
+ont:Objective a owl:Class ;
+    rdfs:label "Objective" ;
+    rdfs:comment "A goal the agent is pursuing in this run." .
+
+ont:Plan a owl:Class ;
+    rdfs:label "Plan" ;
+    rdfs:comment "A multi-step strategy the agent is executing." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:uses_provider a owl:ObjectProperty ;
+    rdfs:label "uses_provider" ;
+    rdfs:domain ont:Agent ; rdfs:range llm:Provider .
+
+ont:has_tool a owl:ObjectProperty ;
+    rdfs:label "has_tool" ;
+    rdfs:domain ont:Agent ; rdfs:range ont:Tool .
+
+ont:invoked a owl:ObjectProperty ;
+    rdfs:label "invoked" ;
+    rdfs:domain ont:Agent ; rdfs:range ont:ToolCall .
+
+ont:called_tool a owl:ObjectProperty ;
+    rdfs:label "called_tool" ;
+    rdfs:domain ont:ToolCall ; rdfs:range ont:Tool .
+
+ont:pursues a owl:ObjectProperty ;
+    rdfs:label "pursues" ;
+    rdfs:domain ont:Agent ; rdfs:range ont:Objective .
+
+ont:requested_by a owl:ObjectProperty ;
+    rdfs:label "requested_by" ;
+    rdfs:range ont:User .
+
+ont:followed_plan a owl:ObjectProperty ;
+    rdfs:label "followed_plan" ;
+    rdfs:domain ont:Agent ; rdfs:range ont:Plan .
+
+ont:retried_after a owl:ObjectProperty ;
+    rdfs:label "retried_after" ;
+    rdfs:range core:Failure .
+
+ont:exit_code a owl:DatatypeProperty ;
+    rdfs:label "exit_code" ;
+    rdfs:domain ont:ToolCall ;
+    rdfs:comment "Process exit status of a ToolCall that shelled out, as an xsd:integer — 0 is success. The scalar shortcut; the structured form is errored_with → core:Failure." .
+
+# ─── SHACL shapes ─────────────────────────────────────────────────────
+# `requested_by` and `retried_after` lack rdfs:domain — fill the gap via
+# SHACL targetClass. Both naturally sit on a timed Event (a ToolCall, an
+# LlmCall, a Span); the subclass walk in the validator accepts every
+# Event leaf class.
+
+[] a sh:NodeShape ;
+    sh:targetClass core:Event ;
+    sh:property [ sh:path ont:requested_by ; sh:class ont:User ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:retried_after ; sh:class core:Failure ; sh:nodeKind sh:IRI ] .
+
+[] a sh:NodeShape ;
+    sh:targetClass ont:ToolCall ;
+    sh:property [ sh:path ont:exit_code ; sh:datatype xsd:integer ] .

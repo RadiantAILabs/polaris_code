@@ -1,0 +1,32 @@
+# ontrace alias seed pack.
+#
+# Each non-blank, non-`#` line is `alias|target` — `Aliases::with_seeds`
+# registers an `owl:sameAs` link from any observed surface form whose
+# normalized key matches `alias` over to the canonical `target` entity.
+#
+# Normalization (see `Aliases::normalize`) is case-insensitive and treats
+# `-`, `_`, and whitespace as equivalent — `request_context`,
+# `request-context`, and `request context` all collide on the same key.
+#
+# Keep this file empty by default and let curation accumulate from real
+# capture traces. The starter rows below cover the highest-frequency
+# Claude Code drift seen in early capture traces.
+
+# Assistant role: the harness uses several spellings.
+assistant|claude
+
+# Tool names: Claude Code mixes title and lower casings in user text vs.
+# structured tool_use blocks. Pin them to the lower-case form the
+# extraction prompt asks for.
+Read|read
+Write|write
+Edit|edit
+Grep|grep
+Bash|bash
+Glob|glob
+
+# Common shorthand the LLM sometimes coins. Canonical form is lowercase
+# to match the prompt rule "use lowercase canonical entity names".
+API|api
+IDE|ide
+CLI|cli

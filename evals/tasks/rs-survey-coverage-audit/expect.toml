@@ -1,0 +1,28 @@
+shape = "survey-then-answer"
+language = "rust"
+summary = """
+A read-only survey of every unresolved stub across three files. Runs \
+conversationally: the request is stated in prose and is not directed at \
+code.coverage-audit (see task.md).\
+"""
+
+[route]
+kind = "conversational"
+prompt = """
+Survey this crate for unresolved stubs (functions that still say todo!()) \
+and report, in your answer, every file that has one. Do not fix anything.\
+"""
+requires_live_model = true
+allow_edit = false
+
+[outcome]
+check = "answer_contains"
+answer_contains = ["alpha.rs", "beta.rs", "gamma.rs"]
+tree_unchanged = true
+
+[plan]
+expected = false
+rationale_note = """
+The request is stated in prose and is not directed at code.coverage-audit, \
+so no topology decision is made — see task.md.\
+"""

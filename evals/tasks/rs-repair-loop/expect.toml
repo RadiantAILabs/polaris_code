@@ -1,0 +1,27 @@
+shape = "repair-loop"
+language = "rust"
+summary = """
+A failing cargo test must be reproduced and fixed. Runs conversationally: the \
+task is stated in prose and is not directed at a topology (see task.md).\
+"""
+
+[route]
+kind = "conversational"
+prompt = """
+Running `cargo test` in this crate currently fails. Find the bug and fix it \
+so every test passes. Do not change the tests themselves.\
+"""
+requires_live_model = true
+allow_edit = true
+allow_command = ["cargo *"]
+
+[outcome]
+check = "command"
+command = ["cargo", "test"]
+
+[plan]
+expected = false
+rationale_note = """
+The task is stated in prose and is not directed at a topology, so no \
+topology decision is made — see task.md.\
+"""

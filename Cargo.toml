@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/polaris_code_core",
+    "crates/polaris_cosmos",
+    "crates/polaris_ontrace",
+    "crates/polaris-tui",
+    "crates/polaris-tui-examples",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/RadiantAILabs/polaris_code"
+authors = ["Radiant AI"]
+rust-version = "1.97.0"
+
+# Every crate in this workspace takes `polaris-ai` from here, so the whole build
+# resolves to one package instance and the shared types (`Server`, `Plugin`,
+# `UserIO`, …) unify across crates. Each crate adds the features it needs.
+[workspace.dependencies]
+# The agent runtime. `package = "polaris-ai"` keeps `use polaris::…` short.
+polaris = { package = "polaris-ai", version = "0.7.0", default-features = false }
+# Domain-neutral cognition: the topology catalog and admission boundary, the
+# selection policy points, the evidence provider contract, and the shared value
+# vocabulary. `polaris_code_core` supplies the *coding* embodiment of those
+# contracts (see `crates/polaris_code_core/src/cosmos/`).
+polaris_cosmos = { path = "crates/polaris_cosmos" }
+# Composable ratatui TUI: panels contributed via a shared registry.
+polaris-tui = { path = "crates/polaris-tui" }
+# Ontology-driven tools/resources/agents: oxigraph RDF store + SPARQL toolset.
+polaris_ontrace = { path = "crates/polaris_ontrace", default-features = false, features = [
+    "oxigraph",
+] }
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "fs",
+    "sync",
+    "time",
+    "signal",
+] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Diff engine — used to render unified-diff previews from the `edit_file` tool.
+similar = "2"
+
+# polaris-tui's pinned UI stack. Custom TUI widgets should use the
+# `polaris_tui::ratatui` re-export rather than depending on `ratatui` or
+# `crossterm` directly, to stay on these versions.
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+parking_lot = "0.12"
+futures = "0.3"
+# Composer measurement: a terminal caret is positioned in display columns, which
+# neither bytes nor `char`s predict once text leaves ASCII. Segmentation groups
+# combining marks and emoji sequences into the clusters a user perceives as one
+# character; width reports how many cells each cluster occupies.
+unicode-segmentation = "1"
+unicode-width = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false }

@@ -1,0 +1,5 @@
+# Python bytecode from the evaluation adapter. The adapter is stdlib-only and
+# is run in place with `python -m evals.packs.swebench_multilingual`, so
+# nothing here is ever built or installed.
+__pycache__/
+*.py[cod]

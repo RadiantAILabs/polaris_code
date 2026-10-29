@@ -1,0 +1,38 @@
+# Distributed tracing ontology.
+#
+# Trace/Span concepts under the OpenTelemetry idiom. Span specializes
+# core:Event so it can carry token usage, latency, and errors via the
+# llm and core predicates directly.
+#
+# Imports: core, llm.
+
+@prefix ont:  <urn:ontrace:onto/tracing/> .
+@prefix core: <urn:ontrace:onto/core/> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<urn:ontrace:onto/tracing> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ,
+                <urn:ontrace:onto/llm> ;
+    rdfs:label "ontrace tracing" ;
+    rdfs:comment "OpenTelemetry-style traces and spans." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:Trace a owl:Class ;
+    rdfs:label "Trace" ;
+    rdfs:comment "A distributed-trace root grouping causally related Spans." .
+
+ont:Span a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "Span" ;
+    rdfs:comment "A single timed operation inside a Trace." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:belongs_to_trace a owl:ObjectProperty ;
+    rdfs:label "belongs_to_trace" ;
+    rdfs:domain ont:Span ; rdfs:range ont:Trace .
+
+# Span parent/child threading uses core:child_of — the generic DAG edge
+# lifted into core so Spans and conversation Messages share one predicate.

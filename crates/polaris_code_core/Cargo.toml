@@ -1,0 +1,69 @@
+[package]
+name = "polaris_code_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "A terminal coding agent built on Polaris, polaris-tui, and ontrace."
+publish = false
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"
+
+[dependencies]
+polaris = { workspace = true, features = ["anthropic", "bedrock", "tiktoken", "file-store"] }
+# Domain-neutral cognition contracts; the coding embodiment lives in `src/cosmos/`.
+polaris_cosmos.workspace = true
+polaris-tui.workspace = true
+polaris_ontrace.workspace = true
+tokio.workspace = true
+# `.then` stream combinator for live token accounting in the agent loop.
+futures-util = "0.3"
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+anyhow = "1"
+# Deterministic Rust AST indexing → Code ABox triples.
+syn = { version = "2", features = ["full", "visit", "parsing"] }
+# `span-locations` makes source line numbers available outside proc-macro context.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+walkdir = "2"
+# Pattern dialect for the `search` tool. The walk and the `.gitignore` matching
+# it needs are already in-tree (`walkdir` + `terminal::IgnoreRules`); a regex
+# engine is the one part of that job worth a dependency.
+regex = "1"
+percent-encoding = "2"
+# Direct handle on the RDF store + SPARQL types for the code graph. We only ever
+# use the in-memory store (`OxigraphStore::in_memory`), so disable the default
+# `rocksdb` backend — it pulls a native C++/bindgen build tree (oxrocksdb-sys,
+# clang-sys, libloading) into the workspace via feature unification. Mirrors
+# `polaris_ontrace`'s own `default-features = false`.
+oxigraph = { version = "0.4", default-features = false }
+# Loads ANTHROPIC_API_KEY from a .env at startup (binary only).
+dotenvy = "0.15"
+# CLI parsing for the binary's interactive/non-interactive front-end flags.
+clap = { version = "4", features = ["derive", "env"] }
+# Builds the `SdkConfig` for `--provider bedrock --region <region>`; without an
+# explicit region, `BedrockPlugin::from_env()` alone covers it (the AWS SDK's
+# own default chain reads `AWS_REGION`/`AWS_DEFAULT_REGION`/the local profile).
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+# Embedded syntax parsers for the approved zero-setup non-Rust index. Keep the
+# runtime and grammars pinned as one tested ABI-compatible set.
+tree-sitter = "=0.25.10"
+tree-sitter-python = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+# A topology comparison runs each arm against its own private copy of the
+# workspace (`cosmos::compare`), so this moved out of dev-dependencies: the
+# isolation it provides is load-bearing at runtime, not only in tests.
+tempfile = "3"
+
+[[bin]]
+name = "polaris-code"
+path = "src/main.rs"

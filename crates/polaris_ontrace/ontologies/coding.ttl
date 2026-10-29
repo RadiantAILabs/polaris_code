@@ -1,0 +1,162 @@
+# Coding-agent workflow ontology.
+#
+# Codebase structure (files, modules, functions), VCS workflow events
+# (commits, PRs, issues), and code-knowledge concepts (design patterns)
+# specific to an agent that reads, edits, tests, and ships code.
+#
+# Imports: core, agent.
+
+@prefix ont:   <urn:ontrace:onto/coding/> .
+@prefix core:  <urn:ontrace:onto/core/> .
+@prefix agent: <urn:ontrace:onto/agent/> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+
+<urn:ontrace:onto/coding> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ,
+                <urn:ontrace:onto/agent> ;
+    rdfs:label "ontrace coding" ;
+    rdfs:comment "Coding-agent specialization — codebase, VCS, design patterns." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:Codebase a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Codebase" ;
+    rdfs:comment "A repository or root collection of related files." .
+
+ont:Branch a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Branch" ;
+    rdfs:comment "A named line of development in a codebase's VCS." .
+
+ont:File a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "File" ;
+    rdfs:comment "A single source file inside a codebase." .
+
+ont:Module a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Module" ;
+    rdfs:comment "A logical grouping of code (package, module, namespace, crate)." .
+
+ont:Function a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Function" ;
+    rdfs:comment "A named callable defined in code." .
+
+ont:TestSuite a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "TestSuite" ;
+    rdfs:comment "A collection of automated tests run together." .
+
+ont:BuildJob a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "BuildJob" ;
+    rdfs:comment "A compilation, type-check, or CI build invocation." .
+
+ont:Commit a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "Commit" ;
+    rdfs:comment "A single VCS commit." .
+
+ont:PullRequest a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "PullRequest" ;
+    rdfs:comment "A branch-merge proposal under review." .
+
+ont:Issue a owl:Class ;
+    rdfs:subClassOf core:Artifact ;
+    rdfs:label "Issue" ;
+    rdfs:comment "A bug report, feature request, or task ticket." .
+
+ont:DesignPattern a owl:Class ;
+    rdfs:label "DesignPattern" ;
+    rdfs:comment "A reusable software design solution (factory, observer, strategy, ...)." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:read_file a owl:ObjectProperty ;
+    rdfs:label "read_file" ;
+    rdfs:range ont:File .
+
+ont:edited_file a owl:ObjectProperty ;
+    rdfs:label "edited_file" ;
+    rdfs:range ont:File .
+
+ont:wrote_file a owl:ObjectProperty ;
+    rdfs:label "wrote_file" ;
+    rdfs:range ont:File .
+
+ont:ran_test a owl:ObjectProperty ;
+    rdfs:label "ran_test" ;
+    rdfs:range ont:TestSuite .
+
+ont:ran_build a owl:ObjectProperty ;
+    rdfs:label "ran_build" ;
+    rdfs:range ont:BuildJob .
+
+ont:committed a owl:ObjectProperty ;
+    rdfs:label "committed" ;
+    rdfs:range ont:Commit .
+
+ont:opened_pr a owl:ObjectProperty ;
+    rdfs:label "opened_pr" ;
+    rdfs:range ont:PullRequest .
+
+ont:closed_issue a owl:ObjectProperty ;
+    rdfs:label "closed_issue" ;
+    rdfs:range ont:Issue .
+
+ont:applied_pattern a owl:ObjectProperty ;
+    rdfs:label "applied_pattern" ;
+    rdfs:range ont:DesignPattern .
+
+ont:refactored a owl:ObjectProperty ;
+    rdfs:label "refactored" ;
+    rdfs:comment "Restructured a function, module, or file without changing external behavior." .
+
+ont:defined_in a owl:ObjectProperty ;
+    rdfs:label "defined_in" ;
+    rdfs:domain ont:Function ; rdfs:range ont:File .
+
+ont:references a owl:ObjectProperty ;
+    rdfs:label "references" ;
+    rdfs:comment "A function, module, or file references another." .
+
+ont:depends_on a owl:ObjectProperty ;
+    rdfs:label "depends_on" ;
+    rdfs:comment "A file, module, or codebase has a build-time or runtime dependency on another." .
+
+ont:fixed_bug a owl:ObjectProperty ;
+    rdfs:label "fixed_bug" ;
+    rdfs:domain ont:Commit ; rdfs:range ont:Issue .
+
+ont:on_branch a owl:ObjectProperty ;
+    rdfs:label "on_branch" ;
+    rdfs:range ont:Branch ;
+    rdfs:comment "An Event (commit, build, tool call) or Artifact occurred on the named VCS Branch." .
+
+# ─── SHACL shapes ─────────────────────────────────────────────────────
+# File-touching and VCS verbs target core:Actor — the subclass walk in
+# the validator accepts Agent, User, Judge, and anything else under Actor.
+# applied_pattern and on_branch are event-domain (a build, commit, or
+# refactor applies a pattern / runs on a branch), so they target
+# core:Event separately.
+
+[] a sh:NodeShape ;
+    sh:targetClass core:Actor ;
+    sh:property [ sh:path ont:read_file ; sh:class ont:File ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:edited_file ; sh:class ont:File ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:wrote_file ; sh:class ont:File ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:ran_test ; sh:class ont:TestSuite ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:ran_build ; sh:class ont:BuildJob ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:committed ; sh:class ont:Commit ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:opened_pr ; sh:class ont:PullRequest ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:closed_issue ; sh:class ont:Issue ; sh:nodeKind sh:IRI ] .
+
+[] a sh:NodeShape ;
+    sh:targetClass core:Event ;
+    sh:property [ sh:path ont:applied_pattern ; sh:class ont:DesignPattern ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:on_branch ; sh:class ont:Branch ; sh:nodeKind sh:IRI ] .

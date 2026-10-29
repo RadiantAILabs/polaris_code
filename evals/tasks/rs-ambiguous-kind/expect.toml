@@ -1,0 +1,29 @@
+shape = "ambiguous-kind"
+language = "rust"
+summary = """
+A deliberately open request that names no file, no edit and no recognised \
+question shape. Runs conversationally with no topology decision at all; the \
+outcome bar is lenient on purpose (see task.md).\
+"""
+
+[route]
+kind = "conversational"
+prompt = """
+Something about how errors are handled in this crate doesn't feel right. \
+Take a look and improve it if you think it's worth doing.\
+"""
+requires_live_model = true
+allow_edit = true
+allow_command = ["cargo *"]
+
+[outcome]
+check = "command"
+command = ["cargo", "test"]
+
+[plan]
+expected = false
+rationale_note = """
+Matches neither the exact-edit nor the statement grammar of --topology-task, \
+and matches none of CodingQuestion::parse's lexical prefixes, so auto_route \
+does not promote it either — see task.md.\
+"""

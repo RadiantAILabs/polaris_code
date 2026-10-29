@@ -1,0 +1,112 @@
+# Agent-harness runtime ontology.
+#
+# The runtime an agent runs *inside* — permission modes, checkpoints,
+# packaged capabilities (skills, slash commands, hooks), MCP servers.
+# Vendor-neutral on purpose: Claude Code, Codex, Cursor, aider all have
+# analogues. Wire-format specifics (JSON field names, delta encodings)
+# live in the source plugin and extractor prompt, never here.
+#
+# Imports: core, agent.
+
+@prefix ont:   <urn:ontrace:onto/harness/> .
+@prefix core:  <urn:ontrace:onto/core/> .
+@prefix agent: <urn:ontrace:onto/agent/> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+<urn:ontrace:onto/harness> a owl:Ontology ;
+    owl:imports <urn:ontrace:onto/core> ,
+                <urn:ontrace:onto/agent> ;
+    rdfs:label "ontrace harness" ;
+    rdfs:comment "Agent-harness runtime — permission modes, checkpoints, capabilities, MCP servers." .
+
+# ─── Classes ──────────────────────────────────────────────────────────
+
+ont:Capability a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "Capability" ;
+    rdfs:comment "A named, packaged capability the harness exposes. Subclasses differ only by invocation trigger — Skill (agent-invoked), SlashCommand (user-invoked), Hook (event-triggered). agent:Tool is the fourth member of this cluster but stays in agent.ttl as the generic agent-invoked primitive — emit a Capability subclass only when the trigger is the distinguishing fact." .
+
+ont:Skill a owl:Class ;
+    rdfs:subClassOf ont:Capability ;
+    rdfs:label "Skill" ;
+    rdfs:comment "An agent-invoked packaged capability — a bundle of instructions and tools the agent loads on demand." .
+
+ont:SlashCommand a owl:Class ;
+    rdfs:subClassOf ont:Capability ;
+    rdfs:label "SlashCommand" ;
+    rdfs:comment "A user-invoked capability triggered by an explicit command token in the input." .
+
+ont:Hook a owl:Class ;
+    rdfs:subClassOf ont:Capability ;
+    rdfs:label "Hook" ;
+    rdfs:comment "An event-triggered capability — the harness runs it automatically in response to a lifecycle event." .
+
+ont:MCPServer a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "MCPServer" ;
+    rdfs:comment "An external Model Context Protocol server the harness connects to — itself a source of tools." .
+
+ont:PermissionMode a owl:Class ;
+    rdfs:subClassOf core:Resource ;
+    rdfs:label "PermissionMode" ;
+    rdfs:comment "The approval policy an Event or Session runs under (default, accept-edits, plan, bypass)." .
+
+ont:Checkpoint a owl:Class ;
+    rdfs:subClassOf core:Event ;
+    rdfs:label "Checkpoint" ;
+    rdfs:comment "A point-in-time snapshot of workspace state the harness can restore — the undo-stack entry behind a file-history snapshot." .
+
+# ─── Predicates ───────────────────────────────────────────────────────
+
+ont:has_capability a owl:ObjectProperty ;
+    rdfs:label "has_capability" ;
+    rdfs:domain agent:Agent ; rdfs:range ont:Capability ;
+    rdfs:comment "The agent has a Skill, SlashCommand, or Hook available in its harness." .
+
+ont:has_mcp_server a owl:ObjectProperty ;
+    rdfs:label "has_mcp_server" ;
+    rdfs:domain agent:Agent ; rdfs:range ont:MCPServer .
+
+ont:provides_tool a owl:ObjectProperty ;
+    rdfs:label "provides_tool" ;
+    rdfs:domain ont:MCPServer ; rdfs:range agent:Tool ;
+    rdfs:comment "An MCP server exposes a Tool into the agent's toolset." .
+
+ont:runs_as a owl:ObjectProperty ;
+    rdfs:label "runs_as" ;
+    rdfs:range ont:PermissionMode ;
+    rdfs:comment "An Event or Session executed under the named PermissionMode." .
+
+ont:captured a owl:ObjectProperty ;
+    rdfs:label "captured" ;
+    rdfs:domain ont:Checkpoint ; rdfs:range core:Artifact ;
+    rdfs:comment "A Checkpoint recorded the state of an Artifact so it can be restored." .
+
+ont:harness_version a owl:DatatypeProperty ;
+    rdfs:label "harness_version" ;
+    rdfs:comment "The harness build identifier in effect for an Event or Session, as an xsd:string." .
+
+# ─── SHACL shapes ─────────────────────────────────────────────────────
+# runs_as and harness_version lack a single natural rdfs:domain (they sit
+# on Events and Sessions alike) — SHACL targets core:Event and the
+# validator's subclass walk accepts every Event leaf class. captured is
+# Checkpoint-domain, itself a core:Event subclass, so the same target
+# covers it.
+
+[] a sh:NodeShape ;
+    sh:targetClass agent:Agent ;
+    sh:property [ sh:path ont:has_capability ; sh:class ont:Capability ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:has_mcp_server ; sh:class ont:MCPServer ; sh:nodeKind sh:IRI ] .
+
+[] a sh:NodeShape ;
+    sh:targetClass ont:MCPServer ;
+    sh:property [ sh:path ont:provides_tool ; sh:class agent:Tool ; sh:nodeKind sh:IRI ] .
+
+[] a sh:NodeShape ;
+    sh:targetClass core:Event ;
+    sh:property [ sh:path ont:runs_as ; sh:class ont:PermissionMode ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:captured ; sh:class core:Artifact ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path ont:harness_version ; sh:datatype xsd:string ] .

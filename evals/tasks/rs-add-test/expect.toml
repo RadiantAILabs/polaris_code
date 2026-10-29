@@ -1,0 +1,31 @@
+shape = "add-a-test"
+language = "rust"
+summary = """
+An untested function needs unit tests. Runs conversationally: the task is \
+stated in prose and is not directed at a topology (see task.md).\
+"""
+
+[route]
+kind = "conversational"
+prompt = """
+`is_even` in src/lib.rs has no tests. Add unit tests covering at least one \
+even and one odd input.\
+"""
+requires_live_model = true
+allow_edit = true
+allow_command = ["cargo *"]
+
+[outcome]
+check = "command"
+command = [
+  "bash", "-c",
+  "set -e; cargo test; count=$(cargo test -- --list 2>/dev/null | grep -c ': test$'); test \"$count\" -ge 2",
+]
+
+[plan]
+expected = false
+rationale_note = """
+The task is stated in prose and is not directed at a topology; code.create-file \
+is reachable through the planner-driven gates composition policy — see \
+task.md.\
+"""

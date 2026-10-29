@@ -1,0 +1,32 @@
+shape = "refactor-rename-across-files"
+language = "rust"
+summary = """
+Rename a function across its definition, its re-export and its one call site. \
+Runs conversationally: a topology spec states every edit up front, while this \
+task leaves the agent to find the sites (see task.md).\
+"""
+
+[route]
+kind = "conversational"
+prompt = """
+Rename the function `rectangle_area` to `area_of_rectangle` everywhere it is \
+defined, re-exported or called in this crate. Keep it compiling and keep the \
+existing test passing.\
+"""
+requires_live_model = true
+allow_edit = true
+allow_command = ["cargo *"]
+
+[outcome]
+check = "command"
+command = [
+  "bash", "-c",
+  "set -e; ! grep -R rectangle_area src; grep -q area_of_rectangle src/shapes.rs; grep -q area_of_rectangle src/lib.rs; grep -q area_of_rectangle src/consumer.rs; cargo test",
+]
+
+[plan]
+expected = false
+rationale_note = """
+The task is stated in prose and is not directed at a topology, so no \
+topology decision is made — see task.md.\
+"""

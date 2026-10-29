@@ -1,0 +1,34 @@
+[package]
+name = "polaris_cosmos"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.0"
+license = "Apache-2.0"
+description = "Domain-neutral cognitive models and world-model substrate for Polaris agents"
+repository = "https://github.com/RadiantAILabs/polaris_code"
+publish = false
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"
+semicolon_if_nothing_returned = "warn"
+
+[dependencies]
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# The Polaris agent runtime, from the workspace so every crate shares one
+# `polaris-ai`. `default-features = false` keeps the crate lean — cognitive
+# models add features only as they need them.
+polaris.workspace = true
+
+[dev-dependencies]
+# Drives async execution tests for cognitive-model graphs. "time" backs a
+# fixture step that sleeps past a configured Guard timeout.
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+# Round-trips a gate plan through its wire format in materializer tests.
+serde_json = "1"
