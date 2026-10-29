@@ -64,10 +64,16 @@ class PolarisCode < Formula
     bin.install "polaris"
     if OS.linux?
       # Use Homebrew's GCC runtime and, when present, its glibc loader.
-      args = ["--set-rpath", "#{{Formula["gcc"].opt_lib}}/gcc/current:#{{HOMEBREW_PREFIX}}/lib"]
+      rpath = "#{{Formula["gcc"].opt_lib}}/gcc/current:#{{HOMEBREW_PREFIX}}/lib"
+      args = ["--set-rpath", rpath]
+      patcher = [Formula["patchelf"].opt_bin/"patchelf"]
       loader = HOMEBREW_PREFIX/"lib/ld.so"
-      args += ["--set-interpreter", loader.to_s] if loader.exist?
-      system Formula["patchelf"].opt_bin/"patchelf", *args, bin/"polaris"
+      if loader.exist?
+        args += ["--set-interpreter", loader.to_s]
+        # The patchelf bottle can also require Homebrew's newer glibc.
+        patcher.prepend(loader.to_s, "--library-path", rpath)
+      end
+      system *patcher, *args, bin/"polaris"
     end
   end
 

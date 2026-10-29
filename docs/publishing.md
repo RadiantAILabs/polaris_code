@@ -168,7 +168,9 @@ Homebrew can reuse those exact binaries through the generated formula. It
 selects the archive for the OS and CPU, verifies SHA-256, and installs
 `polaris` without Rust or CMake. On Linux, GCC supplies the runtime libraries
 and `patchelf` adjusts the installed copy's library search path and optional
-Homebrew glibc loader. The downloaded archive and its checksum stay intact.
+Homebrew glibc loader. When that loader is present, it also runs `patchelf`
+with Homebrew's libraries so the tool can run on the Ubuntu 22.04 baseline.
+The downloaded archive and its checksum stay intact.
 To regenerate it locally after downloading both archives and their checksum
 files:
 
