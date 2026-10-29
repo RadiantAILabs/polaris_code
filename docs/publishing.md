@@ -109,6 +109,13 @@ Clippy across all workspace targets and features. Native dependencies for the
 optional RocksDB backend are installed for that all-features check.
 The macOS test runner supplies `python` and `python3` through a virtual
 environment and uses a canonical temporary directory for workspace fixtures.
+With `polaris-ai` 0.7.0, macOS can conservatively report
+`cleanup_completed: false` after the last live process in a group exits:
+Darwin rejects signaling a group containing only zombies. The consumer tests
+check that the leader PID is fully reaped instead of equating that report with
+a surviving process. The separate descendant-cleanup test still requires a
+successful cleanup report and proves that a descendant ignoring `SIGTERM`
+does not survive cancellation.
 
 Documentation and branding changes run quick Python checks, skipping Rust
 compilation, workspace tests, release builds, and Homebrew installation tests.
