@@ -49,6 +49,8 @@ class PolarisCode < Formula
 
   on_linux do
     depends_on arch: :x86_64
+    depends_on "gcc"
+    depends_on "patchelf" => :build
 
     on_intel do
       url "{release_url}/polaris-code-{version}-x86_64-unknown-linux-gnu.tar.gz"
@@ -60,6 +62,13 @@ class PolarisCode < Formula
 
   def install
     bin.install "polaris"
+    if OS.linux?
+      # Use Homebrew's GCC runtime and, when present, its glibc loader.
+      args = ["--set-rpath", "#{{Formula["gcc"].opt_lib}}/gcc/current:#{{HOMEBREW_PREFIX}}/lib"]
+      loader = HOMEBREW_PREFIX/"lib/ld.so"
+      args += ["--set-interpreter", loader.to_s] if loader.exist?
+      system Formula["patchelf"].opt_bin/"patchelf", *args, bin/"polaris"
+    end
   end
 
   test do

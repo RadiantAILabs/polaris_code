@@ -166,8 +166,11 @@ does not overwrite an existing release.
 
 Homebrew can reuse those exact binaries through the generated formula. It
 selects the archive for the OS and CPU, verifies SHA-256, and installs
-`polaris` without Rust or CMake. To regenerate it locally after downloading
-both archives and their checksum files:
+`polaris` without Rust or CMake. On Linux, GCC supplies the runtime libraries
+and `patchelf` adjusts the installed copy's library search path and optional
+Homebrew glibc loader. The downloaded archive and its checksum stay intact.
+To regenerate it locally after downloading both archives and their checksum
+files:
 
 ```bash
 python3 scripts/homebrew_formula.py 0.1.1 RadiantAILabs/polaris_code dist
