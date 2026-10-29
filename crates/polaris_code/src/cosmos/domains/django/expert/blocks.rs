@@ -512,7 +512,14 @@ mod tests {
     }
 
     fn shell(dir: &tempfile::TempDir, allow: bool) -> ShellExecutor {
-        std::os::unix::fs::symlink("/usr/bin/python3", dir.path().join("python"))
+        // macOS's /usr/bin/python3 is an Xcode launcher, not the interpreter.
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("discover test Python");
+        assert!(python.status.success(), "test Python discovery failed");
+        let executable = String::from_utf8(python.stdout).expect("Python executable path");
+        std::os::unix::fs::symlink(executable.trim(), dir.path().join("python"))
             .or_else(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     Ok(())

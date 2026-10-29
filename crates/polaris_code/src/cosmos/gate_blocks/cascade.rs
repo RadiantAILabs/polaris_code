@@ -658,7 +658,16 @@ mod tests {
         .unwrap();
         let shim = tempfile::tempdir().unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink("/usr/bin/python3", shim.path().join("python")).unwrap();
+        {
+            // Resolve the interpreter behind macOS's /usr/bin/python3 launcher.
+            let python = Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("discover test Python");
+            assert!(python.status.success(), "test Python discovery failed");
+            let executable = String::from_utf8(python.stdout).expect("Python executable path");
+            std::os::unix::fs::symlink(executable.trim(), shim.path().join("python")).unwrap();
+        }
         let shell = ShellExecutor::new(
             polaris::shell::ShellConfig::new()
                 .with_working_dir(root)

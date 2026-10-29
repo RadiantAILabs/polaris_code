@@ -597,7 +597,9 @@ const MARKER_COMMAND: &str = "printf 'ran\\n' >> '{marker}'";
 
 #[tokio::test]
 async fn approved_run_command_runs_exactly_one_process() {
-    let turn = CodingTurn::build(MARKER_COMMAND, Answer::Approve, ToolPermission::Confirm).await;
+    // Record the OS pid independently of the executor's cleanup report.
+    let command = format!("{MARKER_COMMAND}; printf '%s\\n' \"$$\" > '{{marker}}.pid'");
+    let turn = CodingTurn::build(&command, Answer::Approve, ToolPermission::Confirm).await;
     let outcome = turn.drive().await;
 
     assert_eq!(outcome.reason, TurnReason::Completed);
@@ -623,10 +625,17 @@ async fn approved_run_command_runs_exactly_one_process() {
         result["process"], 1,
         "the approved run is the executor's first accepted identity: {result}"
     );
-    assert!(
-        result["cleanup_completed"].as_bool().unwrap_or(false),
-        "{result}"
-    );
+    #[cfg(unix)]
+    {
+        let pid = std::fs::read_to_string(format!("{}.pid", turn.marker.display()))
+            .expect("approved command recorded its pid")
+            .trim()
+            .parse()
+            .expect("recorded pid is numeric");
+        assert_leader_cleanup(&result, pid).await;
+    }
+    #[cfg(not(unix))]
+    assert_eq!(result["cleanup_completed"], true, "{result}");
 
     // Nothing is left live or retained: `execute` consumed the one result.
     assert!(turn.executor().processes().is_empty());
@@ -957,7 +966,7 @@ async fn timeout_returns_partial_output_and_truthful_cleanup() {
     let server = tool_server(config).await;
     let registry = server.get_global::<ToolRegistry>().unwrap();
 
-    let (sink, _events) = ChannelSink::new(sink_capacity(8));
+    let (sink, mut events) = ChannelSink::new(sink_capacity(8));
     let (_cancel_tx, cancel) = watch_cancel();
     let ctx = tool_context(sink, cancel);
     let args = json!({ "command": "printf partial; sleep 30", "timeout_secs": 1 });
@@ -977,6 +986,9 @@ async fn timeout_returns_partial_output_and_truthful_cleanup() {
             .contains("partial"),
         "a timed-out command still returns what it printed: {result}"
     );
+    #[cfg(unix)]
+    assert_leader_cleanup(&result, started_pid(&mut events).await).await;
+    #[cfg(not(unix))]
     assert_eq!(result["cleanup_completed"], true, "{result}");
 }
 
@@ -987,7 +999,7 @@ async fn a_latched_watch_signal_cancels_the_running_command() {
     let server = tool_server(config).await;
     let registry = server.get_global::<ToolRegistry>().unwrap();
 
-    let (sink, _events) = ChannelSink::new(sink_capacity(8));
+    let (sink, mut events) = ChannelSink::new(sink_capacity(8));
     let (cancel_tx, cancel) = watch_cancel();
     let ctx = tool_context(sink, cancel);
     let args = json!({ "command": "printf started; sleep 30" });
@@ -1001,6 +1013,9 @@ async fn a_latched_watch_signal_cancels_the_running_command() {
     let result = value.expect("cancellation is a result, not an error");
     assert_eq!(result["outcome"], "cancelled", "{result}");
     assert_eq!(result["timed_out"], false, "{result}");
+    #[cfg(unix)]
+    assert_leader_cleanup(&result, started_pid(&mut events).await).await;
+    #[cfg(not(unix))]
     assert_eq!(result["cleanup_completed"], true, "{result}");
     assert!(
         result["stdout"]
@@ -1081,6 +1096,49 @@ fn process_alive(pid: &str) -> bool {
                 .trim_start()
                 .starts_with('Z')
         })
+}
+
+/// Read the actual leader identity recorded when the managed process started.
+#[cfg(unix)]
+async fn started_pid(events: &mut polaris::shell::ShellEventReceiver) -> u32 {
+    match events.recv().await {
+        Some(ShellEvent::Started {
+            os_pid: Some(pid), ..
+        }) => pid,
+        event => panic!("expected a started process with an OS pid, got {event:?}"),
+    }
+}
+
+/// Verify reaping independently of the platform's process-group signal report.
+#[cfg(unix)]
+async fn assert_leader_cleanup(result: &Value, pid: u32) {
+    let deadline = tokio::time::Instant::now() + DESCENDANT_EXIT_DEADLINE;
+    loop {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "pid=", "-p", &pid.to_string()])
+            .output()
+            .expect("inspect the managed leader");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "ps could not inspect leader {pid}: {output:?}"
+        );
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed leader {pid} was not reaped: {result}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reported = result["cleanup_completed"]
+        .as_bool()
+        .expect("cleanup_completed remains a boolean");
+    // Darwin excludes zombies when signaling a process group and can return
+    // EPERM once its last live member exits. Polaris 0.7.0 conservatively reports
+    // false in that case; the PID check above still requires the leader to be
+    // reaped. Keep the Linux report assertion and the live-descendant proof.
+    assert!(reported || cfg!(target_os = "macos"), "{result}");
 }
 
 /// How long a signalled descendant may take to disappear before the group

@@ -1,0 +1,330 @@
+name: Test and build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.97.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Elapsed-time integration checks should not compete with other harness tests.
+  RUST_TEST_THREADS: "1"
+  # Keep the AWS SDK and all-features RocksDB builds within runner disk limits.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  prepare:
+    name: Validate version and detect source changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      run_rust: ${{ steps.changes.outputs.run_rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Compare complete push/PR ranges, including commits before a docs-only head.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changes requiring Rust and release jobs
+        id: changes
+        run: python3 scripts/ci_changes.py
+      - name: Read application version and validate release tag
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("crates/polaris_code/Cargo.toml").read_text())
+          version = manifest["package"]["version"]
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              tag = os.environ["GITHUB_REF_NAME"]
+              if tag != f"v{version}":
+                  raise SystemExit(f"Release tag {tag!r} must match application version v{version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
+
+  format:
+    name: Quick checks
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        if: needs.prepare.outputs.run_rust == 'true'
+        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt
+      - name: Check Rust formatting
+        if: needs.prepare.outputs.run_rust == 'true'
+        run: cargo +1.97.0 fmt --all -- --check
+      - run: python3 -m unittest discover -s scripts/tests
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: prepare
+    if: needs.prepare.outputs.run_rust == 'true'
+    concurrency:
+      group: ci-${{ github.workflow }}-test-${{ matrix.os }}-${{ github.ref }}
+      cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang libclang-dev cmake pkg-config
+      - name: Prepare macOS test environment
+        if: runner.os == 'macOS'
+        run: |
+          # Project-runner fixtures invoke both python and python3.
+          python3 -m venv "$RUNNER_TEMP/polaris-test-python"
+          echo "$RUNNER_TEMP/polaris-test-python/bin" >> "$GITHUB_PATH"
+          # Avoid /var -> /private/var aliases in temporary workspace fixtures.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          temporary = Path(os.environ["RUNNER_TEMP"]).resolve()
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"TMPDIR={temporary}\n")
+          PY
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}-1.97.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check workspace
+        run: cargo +1.97.0 check --workspace --locked
+      - name: Check framework dependency unification
+        run: cargo +1.97.0 tree -i polaris-ai --locked
+      - name: Test workspace including doctests
+        run: cargo +1.97.0 test --workspace --locked
+      - name: Lint all targets and features
+        if: runner.os == 'Linux'
+        run: cargo +1.97.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    if: needs.prepare.outputs.run_rust == 'true'
+    concurrency:
+      group: ci-${{ github.workflow }}-build-${{ matrix.target }}-${{ github.ref }}
+      cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35 baseline; do not silently raise it with ubuntu-latest.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake pkg-config
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}-1.97.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build release executable
+        run: cargo +1.97.0 build --release --locked -p polaris_code --bin polaris --target "${{ matrix.target }}"
+      - name: Package release executable
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="polaris-code-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p dist/package/assets
+          cp "target/${TARGET}/release/polaris" LICENSE README.md dist/package/
+          cp assets/polaris-logo.svg assets/polaris-logo-dark.svg dist/package/assets/
+          tar -czf "dist/${archive}" -C dist/package polaris LICENSE README.md assets
+          (cd dist && shasum -a 256 "$archive" > "${archive}.sha256")
+      - name: Smoke test the packaged executable
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="polaris-code-${VERSION}-${TARGET}.tar.gz"
+          (cd dist && shasum -a 256 --check "${archive}.sha256")
+          mkdir -p "$RUNNER_TEMP/polaris-smoke"
+          tar -xzf "dist/${archive}" -C "$RUNNER_TEMP/polaris-smoke"
+          binary="$RUNNER_TEMP/polaris-smoke/polaris"
+          test "$("$binary" --version)" = "polaris ${VERSION}"
+          "$binary" --help
+          "$binary" "$RUNNER_TEMP/polaris-smoke" --list-topologies --output-format json > inventory.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          inventory = json.loads(Path("inventory.json").read_text())
+          assert "code.direct-edit" in {entry["id"] for entry in inventory["entries"]}
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: polaris-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  homebrew:
+    name: Prepare Homebrew formula
+    needs: [prepare, format, test, build]
+    if: needs.prepare.outputs.run_rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: polaris-*
+          path: dist
+          merge-multiple: true
+      - name: Generate formula from verified release archives
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 scripts/homebrew_formula.py "$VERSION" "$GITHUB_REPOSITORY" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: homebrew-formula
+          path: dist/polaris-code.rb
+          if-no-files-found: error
+          retention-days: 14
+
+  homebrew-test:
+    name: Test Homebrew install (${{ matrix.os }})
+    needs: [prepare, homebrew]
+    if: needs.prepare.outputs.run_rust == 'true'
+    concurrency:
+      group: ci-${{ github.workflow }}-homebrew-${{ matrix.target }}-${{ github.ref }}
+      cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@ae72030040bc05e2d65c41c577092cb98bc0a27e
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: polaris-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: homebrew-formula
+          path: dist
+      - name: Install and test the generated formula with the built archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          formula="polaris/ci-artifacts/polaris-code"
+          brew tap-new --no-git polaris/ci-artifacts
+          cp dist/polaris-code.rb "$(brew --repository polaris/ci-artifacts)/Formula/polaris-code.rb"
+          brew trust --formula "$formula"
+          # Cache the exact archive so PRs can test release URLs before publication.
+          archive_cache="$(brew --cache --build-from-source "$formula")"
+          mkdir -p "$(dirname "$archive_cache")"
+          cp dist/*-"${TARGET}".tar.gz "$archive_cache"
+          brew install "$formula"
+          brew test "$formula"
+          brew linkage --test "$formula"
+
+  ci:
+    name: CI
+    needs: [prepare, format, test, build, homebrew, homebrew-test]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check required job results
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          jobs = json.loads(os.environ["JOB_RESULTS"])
+          required = ["prepare", "format"]
+          if jobs["prepare"]["outputs"].get("run_rust") == "true":
+              required += ["test", "build", "homebrew", "homebrew-test"]
+          unsuccessful = {
+              name: jobs[name]["result"]
+              for name in required
+              if jobs[name]["result"] != "success"
+          }
+          if unsuccessful:
+              raise SystemExit(f"Required CI jobs did not succeed: {unsuccessful}")
+          print("All required CI jobs passed.")
+          PY
+
+  release:
+    name: Stage GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'RadiantAILabs/polaris_code'
+    needs: [prepare, homebrew-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: ci-${{ github.workflow }}-release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create draft with the tested build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 dist/polaris-code.rb \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes \
+            --title "Polaris ${VERSION}"
