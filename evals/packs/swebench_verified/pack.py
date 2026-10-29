@@ -44,7 +44,7 @@ _NOTES_VARIANT_BY_ARM = {
 def notes_digest(domain: str, arm: str) -> str | None:
     """The digest of the notes text `arm` reads for `domain`, or `None`.
 
-    Reads `crates/polaris_code_core/src/cosmos/domains/<domain>/<variant>/notes.md`
+    Reads `crates/polaris_code/src/cosmos/domains/<domain>/<variant>/notes.md`
     straight from this checkout rather than from the agent's own report: the
     notes are public source text compiled into the binary via `include_str!`,
     so hashing the checked-in file is the same identity the binary itself
@@ -55,7 +55,7 @@ def notes_digest(domain: str, arm: str) -> str | None:
     if variant is None or domain == "none":
         return None
     root = Path(__file__).resolve().parents[3]
-    notes = root / "crates" / "polaris_code_core" / "src" / "cosmos" / "domains" / domain / variant / "notes.md"
+    notes = root / "crates" / "polaris_code" / "src" / "cosmos" / "domains" / domain / variant / "notes.md"
     return f"sha256:{hashlib.sha256(notes.read_bytes()).hexdigest()}"
 
 

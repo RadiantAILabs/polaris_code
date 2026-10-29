@@ -94,7 +94,7 @@
 //! plus `interrupting` and `cancelled` are visible content; other types are retained and revealed with Ctrl-O.
 //! A withheld count appears in the meta line. A producer
 //! typically sends a `status` before a long step and a `tokens` delta after each
-//! LLM call; see `polaris_code_core`'s `ProgressMiddlewarePlugin` for a reference driver.
+//! LLM call; see `polaris_code`'s `ProgressMiddlewarePlugin` for a reference driver.
 //!
 //! # Interrupting a turn
 //!

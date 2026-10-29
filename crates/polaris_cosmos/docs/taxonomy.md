@@ -15,12 +15,12 @@ philosophy these layers serve, see the shared [philosophy](./philosophy.md).
 | Systems, graphs, signatures, execution, resources, hooks, and lifecycle | `polaris` |
 | Domain-neutral topology identities, contract/catalog types, discovery, and selection policy | `polaris_cosmos` |
 | Domain-neutral reasoning models, memory, learning, credit, and adaptation policy | `polaris_cosmos` |
-| Embodiment-specific contracts, concrete topology registrations, domain actions, observations, tools, verifiers, and environment integration | Embodiments such as `polaris_code_core` |
+| Embodiment-specific contracts, concrete topology registrations, domain actions, observations, tools, verifiers, and environment integration | Embodiments such as `polaris_code` |
 
 The boundary follows a portability test: if logic remains meaningful when
 "edit code and run tests" becomes "move a robot and inspect a camera" or
 "research a question and check sources," it belongs in Cosmos. Files, IDEs,
-compilers, repositories, and code-specific scoring belong in `polaris_code_core`.
+compilers, repositories, and code-specific scoring belong in `polaris_code`.
 
 Polaris owns the graph *mechanism*. Cosmos owns reusable cognitive graphs and
 the semantic discovery substrate built with that mechanism. Embodiments fill
@@ -256,7 +256,7 @@ contract claims come from the Layer 3 embodiment.
 |---|---|
 | Is it graph execution, context flow, structural validation, or generic lifecycle? | `polaris` |
 | Is it domain-neutral reasoning, learning, memory, control, or adaptation? | `polaris_cosmos` |
-| Does it mention files, repositories, IDEs, compilers, coding tools, or code-specific correctness? | `polaris_code_core` |
+| Does it mention files, repositories, IDEs, compilers, coding tools, or code-specific correctness? | `polaris_code` |
 | Does it define a structural interface between graphs? | Use `GraphSignature`; do not create a parallel contract system |
 | Does it define stable topology identity, semantic discovery metadata, or catalog admission? | Cosmos Layer 1; retain native graph/signature authority |
 | Does it define one reasoning topology or policy? | Layer 2 model point; keep the axis open |

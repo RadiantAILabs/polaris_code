@@ -2,7 +2,7 @@
 
 `polaris-code` can serve a normal conversational turn or execute one bounded
 coding topology. Both paths share the outer session driver in
-`crates/polaris_code_core/src/run.rs`; topology selection occurs there before
+`crates/polaris_code/src/run.rs`; topology selection occurs there before
 the conversational agent graph starts.
 
 An empty coding-task queue leaves the topology path inert. No catalog lookup,

@@ -35,7 +35,7 @@ this repo: see [Benchmark](#benchmark).
 
 | Path | Purpose |
 | --- | --- |
-| `crates/polaris_code_core` | The `polaris-code` binary, agent loop, tools, terminal commands, and coding-specific topology host. |
+| `crates/polaris_code` | The `polaris-code` binary, agent loop, tools, terminal commands, and coding-specific topology host. |
 | `crates/polaris_cosmos` | Domain-neutral composition contracts, admission rules, evidence types, and gate blocks. |
 | `crates/polaris_ontrace` | Temporal knowledge-graph support backed by Oxigraph. |
 | `crates/polaris-tui` | Reusable ratatui shell and panel registry. |
@@ -51,7 +51,7 @@ throughout the workspace.
 Rust 1.97.0 is required.
 
 ```bash
-cargo +1.97.0 build --release -p polaris_code_core
+cargo +1.97.0 build --release -p polaris_code
 ```
 
 The resulting binary is `target/release/polaris-code`. For a complete
@@ -97,6 +97,22 @@ Interactive sessions default to confirmation for edits and commands.
 Unattended runs are fail-closed: writing or executing commands requires the
 corresponding explicit per-run grant. See
 [`docs/permission-modes.md`](docs/permission-modes.md).
+
+## Use as a library
+
+The `polaris_code` package exposes the coding agent as a Rust library; the
+executable remains `polaris-code`.
+
+```toml
+[dependencies]
+polaris_code = "0.1.0"
+```
+
+Compose model, tool, and I/O plugins on a Polaris `Server`, create a session,
+then call `polaris_code::run::drive_turn`. The
+[embedding guide](crates/polaris_code/src/docs/embedding.md) includes the full
+dependency list, a complete example, and the permission and persistence
+contracts an embedding application supplies.
 
 ## How it works
 

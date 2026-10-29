@@ -14,7 +14,7 @@ this file.
 - `polaris_cosmos` owns reusable cognitive logic expressed with those
   primitives: reasoning models, memory (`W`), recall, consolidation, rewire,
   credit, and learning policies.
-- Embodiment crates such as `crates/polaris_code_core` supply domain actions,
+- Embodiment crates such as `crates/polaris_code` supply domain actions,
   observations, tools, verifiers, and environment resources.
 
 A self-improving agent remains `M = (G, W)`: a graph schema `G` coupled to
@@ -28,7 +28,7 @@ shared payload types, capability names, role schedules, documentation, and
 behavioral tests supply semantics. Optional long-lived surfaces may be packaged
 as `polaris::Plugin`s when lifecycle integration is needed.
 
-**Rust edition:** 2024 (MSRV 1.97.0) · **License:** Apache-2.0 · `publish = false`
+**Rust edition:** 2024 (MSRV 1.97.0) · **License:** Apache-2.0 · crates.io package
 
 Read [`docs/taxonomy.md`](docs/taxonomy.md) for the ownership boundary, the
 `M = (G, W)` model, and the cognitive-model layers.
@@ -184,7 +184,7 @@ lifetime, policies, and behavioral tests.
   tests.
 - Apply the embodiment test: logic meaningful across coding, robotics, research,
   or another domain belongs in Cosmos; code-, IDE-, compiler-, repository-, or
-  tool-specific behavior belongs in `crates/polaris_code_core`.
+  tool-specific behavior belongs in `crates/polaris_code`.
 - Every substrate or policy is a point on an axis, not the axis. Ship a trivial
   default and keep the slot open.
 - Cognitive and world-model contracts have whole-system blast radius. Discuss

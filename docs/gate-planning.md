@@ -1085,7 +1085,7 @@ policy identity `GatePlannerMode::as_str` names.
 
 ## Domain plans and arms
 
-`cosmos::domains` (`crates/polaris_code_core/src/cosmos/domains/`) is a second,
+`cosmos::domains` (`crates/polaris_code/src/cosmos/domains/`) is a second,
 orthogonal axis over the scripted planner. It asks whether a plan informed by
 one project's conventions performs differently from the generic plan.
 

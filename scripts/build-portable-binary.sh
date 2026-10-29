@@ -31,7 +31,7 @@ docker run --rm \
     --env CARGO_TARGET_DIR=/cargo-target \
     "${builder_image}" \
     cargo build --quiet --locked --release --target x86_64-unknown-linux-musl \
-        -p polaris_code_core --bin polaris-code
+        -p polaris_code --bin polaris-code
 
 test -x "${artifact}"
 file "${artifact}"

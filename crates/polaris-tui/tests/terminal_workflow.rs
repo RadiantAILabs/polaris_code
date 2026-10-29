@@ -1,6 +1,6 @@
 //! Terminal presentation proof for the daily coding workflow.
 //!
-//! The coding-host half lives in `polaris_code_core/tests/terminal_workflow.rs`.
+//! The coding-host half lives in `polaris_code/tests/terminal_workflow.rs`.
 //! These tests stay at the generic TUI boundary: real composer events, the
 //! bounded IO channel, transcript rendering, resize reflow, Unicode cell
 //! widths, and browse/search selection on a long transcript.

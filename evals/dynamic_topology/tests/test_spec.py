@@ -4,7 +4,7 @@ grammar the binary parses them with.
 This package has no FFI into the Rust crate, so it cannot call the real
 parser. Instead, ``_reference_split_fields``/``_reference_read_value`` below
 are a direct, deliberately literal port of
-``crates/polaris_code_core/src/terminal/topology.rs``'s ``split_fields``/
+``crates/polaris_code/src/terminal/topology.rs``'s ``split_fields``/
 ``read_value`` (as read at the time this suite was written — cite the
 functions, not just this file, if that parser ever changes): same
 whitespace-skipping, same `key=value` split, same quote and `\\n`/`\\t`/`\\r`/

@@ -179,7 +179,7 @@ class ChooserCapMirrorsTheHost(unittest.TestCase):
 
         source = (
             Path(__file__).resolve().parents[3]
-            / "crates/polaris_code_core/src/cosmos/composition.rs"
+            / "crates/polaris_code/src/cosmos/composition.rs"
         ).read_text(encoding="utf-8")
         found = re.search(
             r"pub const MAX_MODEL_CHOOSER_ATTEMPTS_PER_TURN: usize = (\d+);", source

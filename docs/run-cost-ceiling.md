@@ -35,7 +35,7 @@ starts. It is never coerced to "no limit".
 ## Where the run stops
 
 On a **turn boundary**, which is the only place either front end decides
-whether to take another turn (`crates/polaris_code_core/src/run.rs`). The
+whether to take another turn (`crates/polaris_code/src/run.rs`). The
 ceiling is checked on both sides of that boundary and never inside a turn:
 
 - **before** a turn starts — above the topology-selection point, so a run
@@ -63,7 +63,7 @@ The session is saved exactly as for any other ending, before the process exits.
 `3` is distinct from `0` so an unattended caller can tell "stopped because it
 ran out of budget" from "stopped because it was done" without parsing any
 output, and distinct from `1` because reaching a limit the operator set is not
-a failure. The constant is `polaris_code_core::run::CEILING_EXIT_CODE`.
+a failure. The constant is `polaris_code::run::CEILING_EXIT_CODE`.
 
 ## What the run reports
 
@@ -176,7 +176,7 @@ across its turns, so there the ceiling bounds the session.
 
 ## Proof
 
-`crates/polaris_code_core/tests/run_cost_ceiling.rs` proves all of the above
+`crates/polaris_code/tests/run_cost_ceiling.rs` proves all of the above
 against a scripted model provider — no API key, no network, no spend. The
 scripted provider counts its own calls, so "the run took no further turn" is
 asserted from that counter rather than inferred from an absent side effect.

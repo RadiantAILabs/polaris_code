@@ -10,8 +10,8 @@ Nothing to fix — the point is that answering does not touch the tree.
 
 Through `--topology-task`, as `statement="what is in src/lib.rs" intent=answer`.
 `CodingQuestion::parse` recognises the `what is in <path>` prefix
-(`crates/polaris_code_core/src/cosmos/payload.rs`) as an
-[`Inspect`](../../../crates/polaris_code_core/src/cosmos/payload.rs) question.
+(`crates/polaris_code/src/cosmos/payload.rs`) as an
+[`Inspect`](../../../crates/polaris_code/src/cosmos/payload.rs) question.
 `intent=answer` forbids every source-mutating registration on the hard-
 constraint channel (the `SOURCE_MUTATION` constraint in `cosmos/task.rs`), and
 the deterministic selector returns `code.tree-question` first under that

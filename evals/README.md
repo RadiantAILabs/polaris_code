@@ -77,12 +77,12 @@ Every fixture's route is one of:
 
 | Route | Needs a model? | Why |
 |---|---|---|
-| `topology-edit` / `topology-statement`, `deterministic` policy | No | `cosmos::composition::deterministic_pick` (`crates/polaris_code_core/src/cosmos/composition.rs`) never calls a model, and none of the five registrations this build admits with no test runner and no model provider wired (`code.direct-edit`, `code.prediction-error-edit`, `code.worklist-sweep-edit`, `code.tree-question`, `code.coverage-audit`) call one inside their own graph either. |
+| `topology-edit` / `topology-statement`, `deterministic` policy | No | `cosmos::composition::deterministic_pick` (`crates/polaris_code/src/cosmos/composition.rs`) never calls a model, and none of the five registrations this build admits with no test runner and no model provider wired (`code.direct-edit`, `code.prediction-error-edit`, `code.worklist-sweep-edit`, `code.tree-question`, `code.coverage-audit`) call one inside their own graph either. |
 | `topology-edit` / `topology-statement`, `model` policy | Yes, once per fixture | `composition::choose`'s `Model` arm makes one real, billed call to pick the recipe (`composition.rs`), even though the graph itself still does not call a model. |
 | `conversational` | Yes | The ordinary agent loop decides what to do and how, which is a model call by construction. |
 
 `polaris-code` itself refuses to start at all without `ANTHROPIC_API_KEY` set
-(`crates/polaris_code_core/src/main.rs`), regardless of whether the turn it is
+(`crates/polaris_code/src/main.rs`), regardless of whether the turn it is
 about to run needs a model — so a `topology-*`/`deterministic` fixture still
 needs the variable *present*, just not valid. `runner.py` supplies the
 deliberately invalid placeholder `not-a-real-key` whenever the environment has
@@ -146,6 +146,6 @@ python3 -m unittest discover -s evals/dynamic_topology/tests -t .
 ```
 
 `cargo test --workspace` already runs it too, with no change needed there:
-`crates/polaris_code_core/tests/harness_eval.rs`'s
+`crates/polaris_code/tests/harness_eval.rs`'s
 `workspace_tests_execute_the_external_adapter_suite` discovers every test
 under `evals/`, this package included.

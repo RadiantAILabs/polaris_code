@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/polaris_code_core",
+    "crates/polaris_code",
     "crates/polaris_cosmos",
     "crates/polaris_ontrace",
     "crates/polaris-tui",
@@ -24,13 +24,13 @@ rust-version = "1.97.0"
 polaris = { package = "polaris-ai", version = "0.7.0", default-features = false }
 # Domain-neutral cognition: the topology catalog and admission boundary, the
 # selection policy points, the evidence provider contract, and the shared value
-# vocabulary. `polaris_code_core` supplies the *coding* embodiment of those
-# contracts (see `crates/polaris_code_core/src/cosmos/`).
-polaris_cosmos = { path = "crates/polaris_cosmos" }
+# vocabulary. `polaris_code` supplies the *coding* embodiment of those
+# contracts (see `crates/polaris_code/src/cosmos/`).
+polaris_cosmos = { path = "crates/polaris_cosmos", version = "0.1.0" }
 # Composable ratatui TUI: panels contributed via a shared registry.
-polaris-tui = { path = "crates/polaris-tui" }
+polaris-tui = { path = "crates/polaris-tui", version = "0.1.0" }
 # Ontology-driven tools/resources/agents: oxigraph RDF store + SPARQL toolset.
-polaris_ontrace = { path = "crates/polaris_ontrace", default-features = false, features = [
+polaris_ontrace = { path = "crates/polaris_ontrace", version = "0.1.0", default-features = false, features = [
     "oxigraph",
 ] }
 

@@ -1,7 +1,7 @@
 # Integration Guide
 
 This guide goes from a goal to the `polaris_code` plugins and seams that satisfy
-it. It is the reverse index of the [plugin catalog](../../crates/polaris_code_core/src/docs/plugins.md):
+it. It is the reverse index of the [plugin catalog](../../crates/polaris_code/src/docs/plugins.md):
 the catalog answers "what does this plugin do?", this guide answers "I want to
 do X — what do I register or extend?".
 
@@ -9,7 +9,7 @@ do X — what do I register or extend?".
 contributors extending the agent. The exception is the last row: a program that
 only wants to *drive* a turn — an eval runner, a test harness, a second front
 end — starts at the [embedding
-guide](../../crates/polaris_code_core/src/docs/embedding.md) instead, and needs
+guide](../../crates/polaris_code/src/docs/embedding.md) instead, and needs
 none of the rest.
 
 ## Common Integration Patterns
@@ -37,6 +37,6 @@ none of the rest.
 | **Add a new agent decision seam** | extend `policy` (read) and `trajectory` (write) under `src/agents/` | Keep the read-policy / write-trajectory discipline; don't hardcode behavior in the loop. |
 | **Track token usage / cost** | read `TokenMeter` (global) | Consumer-facing; `summary(model_id)` formats the session total + estimated cost. |
 | **Read what a headless run spent, from a script** | `--output-format json` and read `usage`, or `stream-json` and read the closing `io_type = "usage"` message | One versioned shape, `polaris-code-run-usage/v1`, built by `TokenMeter::snapshot` and emitted by `exec::usage_message`: four token tiers, estimated USD, model id and price-table identity. The mid-stream `io_type = "tokens"` deltas are a display signal, not the accounting. See [headless usage accounting](../headless-usage-accounting.md). |
-| **Drive a turn from your own program (embed the agent)** | compose the plugins yourself, create a session with an `AgentConfig`, call `run::drive_turn` | There is no `Harness` type, no builder and no `init()` — the entry point is the run surface plus the plugins you choose. Read [`src/docs/embedding.md`](../../crates/polaris_code_core/src/docs/embedding.md) for what you must supply, what the outcome hands back, and what an embedder **cannot** do (notably: `PolicySnapshot::defaults()` is not a safe posture). Runnable: `examples/embed_turn.rs`; proved: `tests/embedding_entry_point.rs`. |
+| **Drive a turn from your own program (embed the agent)** | compose the plugins yourself, create a session with an `AgentConfig`, call `run::drive_turn` | There is no `Harness` type, no builder and no `init()` — the entry point is the run surface plus the plugins you choose. Read [`src/docs/embedding.md`](../../crates/polaris_code/src/docs/embedding.md) for what you must supply, what the outcome hands back, and what an embedder **cannot** do (notably: `PolicySnapshot::defaults()` is not a safe posture). Runnable: `examples/embed_turn.rs`; proved: `tests/embedding_entry_point.rs`. |
 
-For the full boot wiring, see `crates/polaris_code_core/src/main.rs`.
+For the full boot wiring, see `crates/polaris_code/src/main.rs`.

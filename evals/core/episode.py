@@ -523,7 +523,7 @@ def outcome(
 
 #: Where ``polaris-code`` keeps its session files, relative to the working
 #: directory it runs in (``STATE_DIR_NAME`` in
-#: ``crates/polaris_code_core/src/state.rs``). The directory ignores itself,
+#: ``crates/polaris_code/src/state.rs``). The directory ignores itself,
 #: so nothing in it reaches a prediction patch.
 AGENT_STATE_DIR = ".polaris"
 

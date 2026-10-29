@@ -8,7 +8,7 @@ to this file.
 `polaris_code` is a Rust 2024 workspace (MSRV 1.97.0) for the `polaris-code`
 terminal coding agent and its supporting crates:
 
-- `crates/polaris_code_core`: agent binary and library, including tools,
+- `crates/polaris_code`: agent binary and library, including tools,
   terminal front ends, session handling, and the coding topology host.
 - `crates/polaris_cosmos`: composition contracts, topology admission,
   selection, evidence, and reusable gate blocks.
@@ -70,15 +70,26 @@ cargo +1.97.0 clippy --all-targets --all-features -- -D warnings
 Build the release agent with:
 
 ```bash
-cargo +1.97.0 build --release -p polaris_code_core
+cargo +1.97.0 build --release -p polaris_code
 ```
 
 `cargo tree -i polaris-ai --locked` should show exactly one `polaris-ai`
 package, from crates.io at the version declared by the workspace.
 
+## Registry packages
+
+`polaris_code` is the public application library and ships the `polaris-code`
+binary. Its supporting crates remain independently reusable registry packages:
+`polaris_cosmos`, `polaris_ontrace`, and `polaris-tui`. Keep the examples crate
+unpublished and keep version requirements on workspace path dependencies.
+
+See [`docs/publishing.md`](docs/publishing.md) for archive verification and the
+release process. Publication checks must build the packaged sources, not only
+the workspace checkout.
+
 ## Code layout
 
-Within `crates/polaris_code_core/src/`:
+Within `crates/polaris_code/src/`:
 
 - `main.rs` assembles the server, providers, front end, tools, and agent.
 - `run.rs` is the shared interactive and headless turn driver.

@@ -495,7 +495,7 @@ To disable all built-ins and ship only the framework:
 
 ```toml
 [dependencies]
-polaris-tui = { git = "https://github.com/RadiantAILabs/polaris_code", default-features = false }
+polaris-tui = { version = "0.1.0", default-features = false }
 ```
 
 ---

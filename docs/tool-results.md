@@ -13,7 +13,7 @@ back from ceremony in the same result.
 ## Reads
 
 `read_file`, `read_span` and the code-graph `read_symbol` all render through
-`line_view` in [`tools/code.rs`](../crates/polaris_code_core/src/tools/code.rs).
+`line_view` in [`tools/code.rs`](../crates/polaris_code/src/tools/code.rs).
 The window is bounded by the requested range and by a byte budget, and neither
 bound ends it mid-line: the last line shown is a whole line whose number is a
 coordinate the model can resume from.
@@ -89,7 +89,7 @@ no matches for 'ToolRegistry' under 'crates'
 `ShellToolResponse`. Serialising that document into the model's context spends
 most of its bytes on escaped newlines and bookkeeping fields, and buries the
 exit status in the middle. Presenting a result is the consumer's job, so
-[`tools/shell_render.rs`](../crates/polaris_code_core/src/tools/shell_render.rs)
+[`tools/shell_render.rs`](../crates/polaris_code/src/tools/shell_render.rs)
 renders it at the point where tool values become tool-result blocks
 (`execute_tools` in `agents/code_agent.rs`):
 

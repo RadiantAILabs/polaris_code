@@ -63,7 +63,7 @@ def _tree_digest(root: Path) -> str:
 
     Walks in sorted order so the digest does not depend on filesystem
     enumeration order, and excludes ``.polaris`` — the agent's own state
-    directory (``crates/polaris_code_core/src/state.rs``), which every turn touches by design and which
+    directory (``crates/polaris_code/src/state.rs``), which every turn touches by design and which
     is not part of "did the work change the tree".
     """
     hasher = hashlib.sha256()

@@ -12,7 +12,7 @@ read-only survey of the whole crate, then a written answer.
 
 Conversationally, through `--print`. `code.coverage-audit` is this build's
 own read-only many-site audit registration
-(`coverage_audit_graph` in `crates/polaris_code_core/src/cosmos/graphs.rs`,
+(`coverage_audit_graph` in `crates/polaris_code/src/cosmos/graphs.rs`,
 built on `polaris_cosmos::cognition::coverage_sweep::build`). This fixture
 states the request in prose and does not direct it at that registration, so it
 runs the ordinary conversational agent loop. It can be re-pointed at

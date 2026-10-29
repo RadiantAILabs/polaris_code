@@ -116,8 +116,8 @@ MAX_TURNS_VAR = "POLARIS_CODE_MAX_TURNS"
 MAX_OUTPUT_TOKENS_VAR = "POLARIS_CODE_MAX_OUTPUT_TOKENS"
 
 #: The binary's own defaults for the two limits above
-#: (``DEFAULT_MAX_TURNS`` in ``crates/polaris_code_core/src/agents/code_agent.rs``
-#: and ``DEFAULT_MAX_OUTPUT_TOKENS`` in ``crates/polaris_code_core/src/main.rs``). The harness always
+#: (``DEFAULT_MAX_TURNS`` in ``crates/polaris_code/src/agents/code_agent.rs``
+#: and ``DEFAULT_MAX_OUTPUT_TOKENS`` in ``crates/polaris_code/src/main.rs``). The harness always
 #: passes both, so a run's limits are in its manifest rather than implied.
 DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
@@ -258,7 +258,7 @@ PLANNING_COST_PER_EPISODE_USD = 0.84
 #: How many real per-turn composition-chooser model calls the host will make
 #: before it stops trying further fallback candidates and refuses
 #: (``MAX_MODEL_CHOOSER_ATTEMPTS_PER_TURN`` in
-#: ``crates/polaris_code_core/src/cosmos/composition.rs``). Not read from the
+#: ``crates/polaris_code/src/cosmos/composition.rs``). Not read from the
 #: Rust crate — this package has no FFI into it — so the two are kept in sync
 #: by hand; a change to the host's own constant must update this one too.
 MAX_MODEL_CHOOSER_ATTEMPTS_PER_TURN = 3

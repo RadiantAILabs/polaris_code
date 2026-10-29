@@ -13,7 +13,7 @@ everywhere, keeping the crate compiling and its one test passing.
 Conversationally, through `--print`. A `--topology-task` spec states every
 exact edit up front (`file=`/`find=`/`replace=`, plus numbered
 `file2=`/`find2=`/`replace2=` triples; see `FIELDS` and `MAX_EDITS` in
-`crates/polaris_code_core/src/terminal/topology.rs`), so it suits a rename only
+`crates/polaris_code/src/terminal/topology.rs`), so it suits a rename only
 when the caller already knows every site. This fixture leaves the agent to
 find the sites, so it runs the ordinary agent loop, which finds every call site
 with its own search tools.

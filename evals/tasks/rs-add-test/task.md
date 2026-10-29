@@ -9,7 +9,7 @@ Shape: **add a test**.
 ## How it is submitted
 
 Conversationally, through `--print`. The gate-block catalogue
-(`crates/polaris_code_core/src/cosmos/gate_blocks/`) has a `code.create-file`
+(`crates/polaris_code/src/cosmos/gate_blocks/`) has a `code.create-file`
 block for exactly this task shape, which a plan can reach through the
 planner-driven `gates` composition policy. This fixture states the task in
 prose and does not direct it at a topology, so it runs the ordinary agent loop.

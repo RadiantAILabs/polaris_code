@@ -1,7 +1,7 @@
 """Builds the argv ``polaris-code`` actually runs for one fixture's route.
 
 Grounded in the spec grammar ``terminal::topology::split_fields``/``read_value``
-parse (``crates/polaris_code_core/src/terminal/topology.rs``): a quoted field
+parse (``crates/polaris_code/src/terminal/topology.rs``): a quoted field
 value may contain a real embedded newline verbatim (only `\\`, the quote
 character itself, and the four `\n`/`\t`/`\r`/`\\` escapes are special), so this
 module quotes a value by escaping just backslash and the double quote it wraps

@@ -2,7 +2,7 @@
 
 `polaris_cosmos` defines domain-neutral contracts for task profiling,
 topology admission, selection, execution evidence, and later outcome
-observations. `polaris_code_core` provides the coding-specific types,
+observations. `polaris_code` provides the coding-specific types,
 registrations, host capabilities, and verifiers that make those contracts
 executable.
 
@@ -23,7 +23,7 @@ report.
 ## Catalog and type explanations
 
 Coding topologies are registered in
-`crates/polaris_code_core/src/cosmos/topology.rs`. Each registration describes
+`crates/polaris_code/src/cosmos/topology.rs`. Each registration describes
 its purpose, graph recipe, required resources, graph-boundary types, and author
 priors.
 
@@ -94,10 +94,10 @@ and evidence failures.
 
 The contract is exercised by the workspace tests, especially:
 
-- `crates/polaris_code_core/tests/cosmos_contracts_proof.rs`;
-- `crates/polaris_code_core/tests/multi_pack_catalog_proof.rs`;
-- `crates/polaris_code_core/tests/topology_selection_host_loop.rs`;
-- `crates/polaris_code_core/tests/topology_directed_selection.rs`;
-- `crates/polaris_code_core/tests/gate_plan_selection_host_loop.rs`.
+- `crates/polaris_code/tests/cosmos_contracts_proof.rs`;
+- `crates/polaris_code/tests/multi_pack_catalog_proof.rs`;
+- `crates/polaris_code/tests/topology_selection_host_loop.rs`;
+- `crates/polaris_code/tests/topology_directed_selection.rs`;
+- `crates/polaris_code/tests/gate_plan_selection_host_loop.rs`.
 
 Run them with `cargo +1.97.0 test --workspace`.

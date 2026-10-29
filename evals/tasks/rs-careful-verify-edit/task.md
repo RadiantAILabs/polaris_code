@@ -14,7 +14,7 @@ unit test in the same file states the expected behaviour.
 
 The same exact-edit form as `py-oneline-fix`, but `intent=careful` and no
 `budget-ms`. `cosmos::composition::deterministic_pick`
-(`crates/polaris_code_core/src/cosmos/composition.rs`) escalates to the
+(`crates/polaris_code/src/cosmos/composition.rs`) escalates to the
 predict/apply/verify/compare loop whenever the success check is
 `stated-edits` (this graph's own verify is the only check the work will ever
 get) and no tight latency budget rules it out — exactly this fixture's shape.

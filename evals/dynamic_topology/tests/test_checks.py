@@ -6,7 +6,7 @@ only against this repository's own checked-in ``workspace/`` (unsolved) and
 ``solved/`` copies, which proves each checker in both directions. An
 ``answer_contains``/plan check is exercised
 against small, hand-built report dictionaries shaped like
-``crates/polaris_code_core/src/exec/report.rs``'s ``RunReport`` JSON — this
+``crates/polaris_code/src/exec/report.rs``'s ``RunReport`` JSON — this
 package has no Rust FFI, so the shape is asserted by field name rather than
 imported, and a change to that struct's serialized field names would need this
 file updated to match, exactly as it would need every downstream JSON consumer
@@ -129,7 +129,7 @@ def _report(
     blocks: list[str] | None = None,
 ) -> dict[str, Any]:
     """A minimal stand-in for one `RunReport` JSON object, shaped like
-    `crates/polaris_code_core/src/exec/report.rs`'s `Serialize` derive:
+    `crates/polaris_code/src/exec/report.rs`'s `Serialize` derive:
     top-level `status`/`result`/`topology`, and `topology.composition.{recipe,
     blocks}` when a topology ran. `registration_id=None` models a
     conversational turn, where `topology` serializes as `null`.

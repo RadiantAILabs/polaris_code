@@ -114,5 +114,5 @@ should be usable without coupling the experiment to unrelated internals.
 
 [`taxonomy.md`](taxonomy.md) maps these principles to this repository's layers.
 The [integration guide](reference/guide.md) and
-[plugin catalog](../crates/polaris_code_core/src/docs/plugins.md) show the
+[plugin catalog](../crates/polaris_code/src/docs/plugins.md) show the
 existing building blocks to compose before adding another one.

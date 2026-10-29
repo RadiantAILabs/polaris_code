@@ -14,7 +14,7 @@ Rust-specific.
 Through `--topology-task`, as one exact edit with `intent=fast` and a tight
 `budget-ms=1000`. Both facts point the same way:
 `cosmos::composition::deterministic_pick`'s tight-budget rule
-(`crates/polaris_code_core/src/cosmos/composition.rs`)
+(`crates/polaris_code/src/cosmos/composition.rs`)
 rules out the extra predict/compare round whenever a stated latency budget is
 at or under 5 seconds, and `code.direct-edit` is this build's lowest-latency
 registration for a `Fast`-intent single stated edit at cold start

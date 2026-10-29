@@ -1,8 +1,8 @@
 # Watching a graph that is not the agent loop
 
-Proof: `crates/polaris_code_core/tests/graph_execution_visibility.rs`.
-Code: `crates/polaris_code_core/src/progress.rs`,
-`crates/polaris_code_core/src/cosmos/host.rs`.
+Proof: `crates/polaris_code/tests/graph_execution_visibility.rs`.
+Code: `crates/polaris_code/src/progress.rs`,
+`crates/polaris_code/src/cosmos/host.rs`.
 
 `polaris_code` runs graphs other than the agent's `ReAct` loop — the six coding
 topologies in `cosmos/graphs.rs`, and whatever a topology pack adds later. The
@@ -115,7 +115,7 @@ directly.
 
 ## Verified
 
-`crates/polaris_code_core/tests/graph_execution_visibility.rs`, five tests over
+`crates/polaris_code/tests/graph_execution_visibility.rs`, five tests over
 a real temporary crate and a real `Server`:
 
 1. **`a_topology_graph_reports_per_node_status`** — the

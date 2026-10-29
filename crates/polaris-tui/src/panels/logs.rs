@@ -46,7 +46,7 @@ pub(crate) const FRAMEWORK_TARGET_PREFIX: &str = "polaris";
 const WHEEL_LINES: usize = 3;
 
 /// Span field carrying the graph node/system name. Emitted by a graph-execution
-/// instrumentation middleware (e.g. `polaris_code_core`'s `ProgressMiddlewarePlugin`, or the
+/// instrumentation middleware (e.g. `polaris_code`'s `ProgressMiddlewarePlugin`, or the
 /// framework's `TracingPlugin`); read here to attribute each event to the node
 /// whose span encloses it.
 const NODE_SPAN_FIELD: &str = "polaris.graph.system.name";

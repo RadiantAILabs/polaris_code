@@ -6,7 +6,10 @@ rust-version = "1.97.0"
 license = "Apache-2.0"
 description = "Domain-neutral cognitive models and world-model substrate for Polaris agents"
 repository = "https://github.com/RadiantAILabs/polaris_code"
-publish = false
+publish = ["crates-io"]
+readme = "README.md"
+keywords = ["polaris", "agent", "graph", "cognition", "composition"]
+categories = ["development-tools", "asynchronous"]
 
 [lints.rust]
 missing_docs = "warn"

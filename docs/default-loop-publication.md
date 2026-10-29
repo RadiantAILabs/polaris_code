@@ -1,7 +1,7 @@
 # Publishing the default agent loop in the topology catalog
 
-Code: `crates/polaris_code_core/src/cosmos/default_loop.rs`.
-Proof: `crates/polaris_code_core/tests/default_loop_publication.rs` (10 tests).
+Code: `crates/polaris_code/src/cosmos/default_loop.rs`.
+Proof: `crates/polaris_code/tests/default_loop_publication.rs` (10 tests).
 
 The loop `CodeAgent` builds serves ordinary turns, but without a catalog
 registration the catalog cannot name it. Every other registration in the catalog

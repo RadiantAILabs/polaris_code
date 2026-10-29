@@ -5,7 +5,11 @@ edition = "2024"
 rust-version = "1.97.0"
 license = "Apache-2.0"
 description = "Polaris plugin that tails trace streams and builds a temporal knowledge graph via LLM-extracted triples"
-publish = false
+publish = ["crates-io"]
+readme = "README.md"
+repository.workspace = true
+keywords = ["polaris", "agent", "knowledge-graph", "rdf", "tracing"]
+categories = ["development-tools", "asynchronous"]
 
 [lints.rust]
 missing_docs = "warn"

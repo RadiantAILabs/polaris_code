@@ -10,6 +10,9 @@ description = "Composable terminal UI for Polaris — plugins contribute in-proc
 keywords = ["polaris", "tui", "ratatui", "terminal", "agent"]
 categories = ["command-line-interface", "asynchronous"]
 
+publish = ["crates-io"]
+readme = "README.md"
+
 [features]
 default = ["panels"]
 # Built-in panels (conversation, logs, sessions, help) and their contribution

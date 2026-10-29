@@ -3,7 +3,7 @@
 `polaris-code` registers its topologies at compile time and seals the catalog
 at `ready`. Until now the only place that list was written down was
 `register_coding_topologies`, a non-public function in
-`crates/polaris_code_core/src/cosmos/topology.rs`. A user who wanted to know
+`crates/polaris_code/src/cosmos/topology.rs`. A user who wanted to know
 what this build has — and whether each registration could actually run on this
 machine — had to read Rust.
 
@@ -17,7 +17,7 @@ Two surfaces now answer that, and both derive the answer.
 
 Replies in the conversation panel with every registration the sealed catalog
 holds, what each one is for, and whether it can run here. Registered by
-`crates/polaris_code_core/src/terminal/topologies.rs` on the same additive
+`crates/polaris_code/src/terminal/topologies.rs` on the same additive
 `CommandRegistry` every other slash command uses.
 
 ## Scripted: `--list-topologies`
@@ -54,7 +54,7 @@ code.test-gated-edit  [not runnable]
 
 ## Where each field comes from
 
-Nothing in the listing is authored. `crates/polaris_code_core/src/cosmos/inventory.rs`
+Nothing in the listing is authored. `crates/polaris_code/src/cosmos/inventory.rs`
 joins three things this build already had:
 
 | Shown | Read from |
@@ -70,7 +70,7 @@ Consequences worth stating:
 
 - **One more registration appears with no edit to the listing.** Pinned by
   `an_invented_registration_appears_without_touching_the_listing` in
-  `crates/polaris_code_core/tests/topology_inventory_listing.rs`, which invents
+  `crates/polaris_code/tests/topology_inventory_listing.rs`, which invents
   a registration inside the test file — a name no shipped source can contain.
 - **No description is invented.** Titles and summaries are the registration's
   own. A registration that carried none would list with none; the listing has

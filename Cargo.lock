@@ -3051,7 +3051,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "polaris_code_core"
+name = "polaris_code"
 version = "0.1.0"
 dependencies = [
  "anyhow",

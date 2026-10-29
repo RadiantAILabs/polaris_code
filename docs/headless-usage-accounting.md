@@ -73,7 +73,7 @@ meter: per-step **deltas**, `in` and `out` only, as strings, with no cache
 tiers, no cost and no model identity. **Do not sum them.** They exist so a UI
 can render a rising counter; they are not, and have never been, the billed
 total. `docs/reference/guide.md` and the rustdoc on
-`polaris_code_core::exec::USAGE_IO_TYPE` say the same.
+`polaris_code::exec::USAGE_IO_TYPE` say the same.
 
 The human-readable `Session usage` block that an *interactive* session prints
 on exit (`TokenMeter::summary`) is a rendering for a person. Never parse it.
@@ -130,7 +130,7 @@ A consumer can re-derive the cost from `pricing` and the counters and get the
 same number to floating-point tolerance. That is a consistency check, not a
 second authority: the emitted value is the measurement.
 
-`crates/polaris_code_core/tests/headless_usage_accounting.rs` proves all of the
+`crates/polaris_code/tests/headless_usage_accounting.rs` proves all of the
 above against a scripted model provider — no API key, no network, no spend.
 
 The object above is verbatim output, not a sketch — including the cost's float
@@ -181,7 +181,7 @@ count it as a free run. The shipped binary always installs a meter, so a real
 `pricing_basis` names the price table a cost was derived from, so evidence
 recorded months ago still says which rates produced its number.
 
-Rates live in `crates/polaris_code_core/src/usage.rs` (`price_for`). **Changing
+Rates live in `crates/polaris_code/src/usage.rs` (`price_for`). **Changing
 any rate requires bumping `PRICE_BASIS` in the same commit**; the drift guard
 `the_pricing_basis_and_its_rates_move_together` in
 `tests/headless_usage_accounting.rs` pins the basis string and every rate

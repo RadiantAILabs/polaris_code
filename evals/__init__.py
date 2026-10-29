@@ -3,7 +3,7 @@
 Everything under ``evals/`` is *outside* the shipped agent. Code here may
 launch the released ``polaris-code`` binary as a subprocess, orchestrate
 containers and call an external grader; it may not import
-``polaris_code_core``, ``SessionsAPI``, ``GraphExecutor``, ``CodeAgent`` or any
+``polaris_code``, ``SessionsAPI``, ``GraphExecutor``, ``CodeAgent`` or any
 model API, and the harness adds no benchmark text to the agent's prompt.
 
 Two halves, and the line between them is the point:

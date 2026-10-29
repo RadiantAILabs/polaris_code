@@ -14,7 +14,7 @@ states the problem in prose, and the ordinary conversational agent loop
 reproduces the failure and fixes it using its own tools (`run_command`,
 `edit_file`). A topology spec can instead gate its verdict on a real test run:
 `command=` (with `command-args=`) builds `SuccessCheck::Command`
-(`crates/polaris_code_core/src/cosmos/task.rs`), and a stated command is what
+(`crates/polaris_code/src/cosmos/task.rs`), and a stated command is what
 makes a `ProjectTestRunner` available to `code.test-gated-edit`
 (`effective_host_capabilities` in `cosmos/host.rs`). This fixture does not use
 that route; it measures the conversational loop on a failing-test repair.
