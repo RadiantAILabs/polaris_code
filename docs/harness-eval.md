@@ -1,6 +1,6 @@
 # Harness evaluation
 
-The Python code under `evals/` evaluates the shipped `polaris-code` binary from
+The Python code under `evals/` evaluates the shipped `polaris` binary from
 outside the Rust crate. It runs each task in a disposable environment, captures
 the patch and the binary's own usage record, invokes the dataset's grader, and
 derives an immutable summary. Evaluation outputs, logs, transcripts, and score
@@ -58,7 +58,7 @@ scripts/build-portable-binary.sh
 ```
 
 The build helper produces a static musl binary at
-`target/x86_64-unknown-linux-musl/release/polaris-code`, which is the default
+`target/x86_64-unknown-linux-musl/release/polaris`, which is the default
 path used by the pack.
 
 Run `python3 -m evals.packs.swebench_verified run --help` for the full command.

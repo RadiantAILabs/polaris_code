@@ -11,7 +11,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 # Set PORTABLE_TARGET_DIR to keep the build output on another volume.
 target_dir="${PORTABLE_TARGET_DIR:-${repo_root}/target}"
-artifact="${target_dir}/x86_64-unknown-linux-musl/release/polaris-code"
+artifact="${target_dir}/x86_64-unknown-linux-musl/release/polaris"
 
 # This digest is the x86_64 image verified for this repository's Rust 1.97
 # MSRV. Updating it is an intentional build-environment change.
@@ -30,8 +30,8 @@ docker run --rm \
     --workdir /workspace \
     --env CARGO_TARGET_DIR=/cargo-target \
     "${builder_image}" \
-    cargo build --quiet --locked --release --target x86_64-unknown-linux-musl \
-        -p polaris_code --bin polaris-code
+    cargo +1.97.0 build --quiet --locked --release --target x86_64-unknown-linux-musl \
+        -p polaris_code --bin polaris
 
 test -x "${artifact}"
 file "${artifact}"

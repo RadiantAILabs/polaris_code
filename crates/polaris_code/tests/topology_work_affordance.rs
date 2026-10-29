@@ -517,7 +517,7 @@ async fn a_refused_candidate_is_reported_and_a_quiet_turn_is_not() {
         .error_line()
         .expect("a no-start turn explains itself");
     assert!(
-        error_line.starts_with("polaris-code: no topology started: "),
+        error_line.starts_with("polaris: no topology started: "),
         "{error_line}"
     );
     assert!(

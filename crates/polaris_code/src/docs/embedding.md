@@ -1,6 +1,6 @@
 # Embedding the coding agent in another program
 
-This is the starting point for a program that is **not** the `polaris-code`
+This is the starting point for a program that is **not** the `polaris`
 binary and wants to drive a coding turn itself: an evaluation runner, a test
 harness, a protocol server, another front end.
 
@@ -26,7 +26,7 @@ Add these direct dependencies to the application that runs the full example:
 
 ```toml
 [dependencies]
-polaris_code = "0.1.0"
+polaris_code = "0.1.1"
 polaris = { package = "polaris-ai", version = "0.7.0", default-features = false, features = ["anthropic"] }
 polaris_ontrace = { version = "0.1.0", default-features = false, features = ["oxigraph"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -3,7 +3,7 @@
 A domain plan carries per-repository notes (and, optionally, extra gate blocks and a plan shape)
 for one project, so a run can compare a generic statement-only plan against specialised ones.
 Which plan a run uses is chosen by `POLARIS_CODE_DOMAIN` and `POLARIS_CODE_ARM` (see
-`polaris-code --help`). This file is the "how to add a domain plan" note.
+`polaris --help`). This file is the "how to add a domain plan" note.
 
 ## Layout
 

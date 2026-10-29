@@ -2930,7 +2930,7 @@ mod tests {
             "+const SECRET_HEADER: &str = \"x-correlation-id\";",
             "test lexer::disk-usage-reporting-path ... ok",
             "https://github.com/RadiantAILabs/polaris_code/blob/main/README.md",
-            "ANTHROPIC_API_KEY=… cargo run -p polaris_code --bin polaris-code",
+            "ANTHROPIC_API_KEY=… cargo run -p polaris_code --bin polaris",
             "DATABASE_PASSWORD=${DB_PASSWORD}",
             "PASSWORD=",
             "DEBUG_TOKEN=true",

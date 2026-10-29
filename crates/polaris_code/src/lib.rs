@@ -63,7 +63,7 @@
 //!   and the self-ignore marker that keeps them out of anything git builds from
 //!   the working tree.
 //! - [`docs::embedding`] — the entry point for a program that is **not** the
-//!   `polaris-code` binary: what an embedder must supply, what a turn hands
+//!   `polaris` binary: what an embedder must supply, what a turn hands
 //!   back, and what the binary's composition root keeps to itself. Proved by
 //!   `tests/embedding_entry_point.rs` and `examples/embed_turn.rs`.
 //! - [`exec`] — the non-interactive front end: [`exec::ExecIOPlugin`] installs

@@ -50,7 +50,7 @@ From any directory:
 
 ```bash
 evals/reproduce/swebench-opus/build.sh
-export POLARIS_CODE_BIN="$PWD/target/x86_64-unknown-linux-musl/release/polaris-code"
+export POLARIS_CODE_BIN="$PWD/target/x86_64-unknown-linux-musl/release/polaris"
 ```
 
 `build.sh` delegates to `scripts/build-portable-binary.sh` and prints the

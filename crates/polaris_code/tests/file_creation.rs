@@ -9,7 +9,7 @@
 //! `main.rs` installs. The observable effect is a file on disk, so "created" and
 //! "not created" are read from the filesystem rather than inferred from a log
 //! line. The prompt is the repository's own documented headless example,
-//! `polaris-code -p "add a README"`, which could not succeed before this tool
+//! `polaris -p "add a README"`, which could not succeed before this tool
 //! existed: `edit_file` reads its target first, so no path that does not exist
 //! was addressable by any tool the agent had.
 //!
@@ -447,7 +447,7 @@ impl CodingTurn {
     }
 }
 
-/// The documented headless example, `polaris-code -p "add a README"
+/// The documented headless example, `polaris -p "add a README"
 /// --allow-edit`: an unattended run carrying the edit grant creates the file
 /// without ever asking, and the content is on disk afterwards.
 #[tokio::test]

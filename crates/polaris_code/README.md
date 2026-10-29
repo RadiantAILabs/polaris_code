@@ -1,6 +1,6 @@
 # polaris_code
 
-A composable Rust coding-agent library, also shipped as the `polaris-code`
+A composable Rust coding-agent library, also shipped as the `polaris`
 terminal executable. Build agents from replaceable plugins, sandboxed tools,
 and typed execution graphs.
 

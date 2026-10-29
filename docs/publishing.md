@@ -1,7 +1,7 @@
 # Publishing the Polaris coding agent
 
 The release contains four registry crates. `polaris_code` is the application
-library and ships the `polaris-code` binary. Its supporting crates remain
+library and ships the `polaris` binary. Its supporting crates remain
 independently reusable:
 
 | Package | Role | Workspace dependencies |
@@ -81,5 +81,45 @@ packages individually, publish `polaris-tui` and `polaris_cosmos` first, then
 available from the registry before publishing its consumers.
 
 Verify all four registry versions and their docs.rs builds, check installation
-of the `polaris-code` binary and the documented library embedding example, then
+of the `polaris` binary and the documented library embedding example, then
 push the matching release tag, for example `git push origin v0.1.0`.
+
+## Application-only releases
+
+The application version is declared in `crates/polaris_code/Cargo.toml`.
+Supporting packages keep their own versions; do not republish an unchanged
+supporting version when only the executable changes. For an application patch:
+
+```bash
+cargo +1.97.0 publish -p polaris_code --locked --dry-run
+cargo +1.97.0 publish -p polaris_code --locked
+```
+
+The executable is named `polaris` starting with application version 0.1.1.
+The Rust library remains `polaris_code`, and recorded session and evidence
+identifiers keep their existing names.
+
+## Homebrew
+
+The public [Radiant AI tap](https://github.com/RadiantAILabs/homebrew-tap)
+maintains `Formula/polaris-code.rb`. Installation is:
+
+```bash
+brew install radiantailabs/tap/polaris-code
+polaris --version
+```
+
+The formula name distinguishes this coding agent from Homebrew's unrelated
+Kubernetes `polaris` package. Both install a `polaris` executable, so the tap
+declares that conflict.
+
+For each release, publish the reviewed source tag, download its GitHub source
+archive, compute SHA-256 from those exact bytes, and update the formula's URL
+and checksum together. The formula fetches the locked Cargo dependencies and
+then installs offline. Its functional test checks the installed command's
+version, help, and a real JSON topology inventory without a model key.
+
+The tap's GitHub Actions workflow installs and tests from source on Linux and
+macOS. The initial tap has no bottles; source builds require Homebrew's Rust
+and CMake build dependencies. Keep any future bottle publication tied to the
+source commit and platform that were actually tested.

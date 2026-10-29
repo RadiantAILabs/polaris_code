@@ -425,7 +425,7 @@ async fn the_stop_has_its_own_exit_status_and_reports_spent_against_allowed() {
     let line = report.ceiling_line().expect("the stop is stated");
     assert_eq!(
         line,
-        "polaris-code: spend ceiling reached, stopping: $0.4500 of $0.4500 allowed"
+        "polaris: spend ceiling reached, stopping: $0.4500 of $0.4500 allowed"
     );
     host.provider.close().await;
 }
@@ -497,7 +497,7 @@ async fn a_token_ceiling_bounds_an_unpriced_run_normally() {
     assert_eq!(
         report.ceiling_line().unwrap(),
         format!(
-            "polaris-code: spend ceiling reached, stopping: \
+            "polaris: spend ceiling reached, stopping: \
              {TOKENS_PER_TURN} tokens of {TOKENS_PER_TURN} allowed"
         )
     );

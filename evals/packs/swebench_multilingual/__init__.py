@@ -1,7 +1,7 @@
 """The SWE-bench Multilingual Rust dataset pack.
 
 Runs the pinned 43-instance Rust slice of SWE-bench Multilingual through the
-shipped non-interactive ``polaris-code -p``
+shipped non-interactive ``polaris -p``
 entry point once per ``POLARIS_CODE_GRAPH_SEARCH`` mode, grade the collected
 patches with the official Docker grader, and collate an immutable evidence
 record whose primary number is ``100 * resolved / 43`` per mode.

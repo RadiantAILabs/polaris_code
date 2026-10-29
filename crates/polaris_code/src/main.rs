@@ -1,4 +1,4 @@
-//! `polaris-code` — a terminal coding agent driven by an ontology + knowledge graph.
+//! `polaris` — a terminal coding agent driven by an ontology + knowledge graph.
 //!
 //! Boots a Polaris [`Server`] with the ontrace RDF store as its spine: either
 //! an interactive TUI conversation front end or a non-interactive `--print`
@@ -18,8 +18,8 @@
 //! # Usage
 //!
 //! ```bash
-//! ANTHROPIC_API_KEY=… cargo run -p polaris_code --bin polaris-code -- [working_dir] [--session <id>]
-//! ANTHROPIC_API_KEY=… cargo run -p polaris_code --bin polaris-code -- -p "add a README" --output-format json
+//! ANTHROPIC_API_KEY=… cargo run -p polaris_code --bin polaris -- [working_dir] [--session <id>]
+//! ANTHROPIC_API_KEY=… cargo run -p polaris_code --bin polaris -- -p "add a README" --output-format json
 //! ```
 
 use std::io::Write;
@@ -416,7 +416,7 @@ async fn finish_host(server: &mut Server, exit_code: i32) -> i32 {
 /// A terminal coding agent built on Polaris. Mirrors Claude Code's CLI shape:
 /// no positional subcommand, `-p`/`--print` for one non-interactive turn.
 #[derive(Parser)]
-#[command(name = "polaris-code")]
+#[command(name = "polaris", version)]
 // `--print` and `--topology-task` are the two non-interactive entry points and
 // they are exclusive: one drives a conversational turn, the other a topology
 // turn, and a single run is one turn. The group also gives `--allow-edit` and
@@ -688,7 +688,7 @@ fn policy_snapshot(mode: &PermissionMode, graph_search: GraphSearchMode) -> Poli
 /// ran and failed. The interactive front end keeps the plain failure code it
 /// has always exited with, so the TUI path's behaviour is unchanged.
 fn fatal(headless: bool, message: &str) -> ! {
-    eprintln!("polaris-code: {message}");
+    eprintln!("polaris: {message}");
     std::process::exit(if headless { 2 } else { 1 });
 }
 
@@ -1115,10 +1115,10 @@ async fn main() {
             );
         }
         eprintln!(
-            "polaris-code: {API_KEY_VAR} is not set.\n\
+            "polaris: {API_KEY_VAR} is not set.\n\
              Set it in your environment or a .env file in the working directory, e.g.:\n\
              \n    export {API_KEY_VAR}=sk-ant-...\n\n\
-             Run `polaris-code --help` for all options."
+             Run `polaris --help` for all options."
         );
         std::process::exit(1);
     }
@@ -1977,7 +1977,7 @@ async fn main() {
     let active = navigation.current();
     if let Err(message) = run::shutdown_driver(&sessions, &active, &driver, TURN_STOP_GRACE).await {
         tracing::error!("{message}");
-        eprintln!("polaris-code: {message}");
+        eprintln!("polaris: {message}");
     }
 
     // Print the session token + cost summary on the restored screen, priced
@@ -2072,7 +2072,7 @@ async fn run_headless(
             if format.streams_messages() {
                 match stream_json_line(&message) {
                     Ok(line) => println!("{line}"),
-                    Err(err) => eprintln!("polaris-code: failed to serialize a message: {err}"),
+                    Err(err) => eprintln!("polaris: failed to serialize a message: {err}"),
                 }
             }
         }
@@ -2115,7 +2115,7 @@ async fn run_headless(
     let _ = drain.await;
 
     if let Err(message) = run::persist_turn(sessions, session_id).await {
-        eprintln!("polaris-code: {message}");
+        eprintln!("polaris: {message}");
     }
 
     let report = RunReport::new(session_id, &outcome, max_output_tokens);
@@ -2236,7 +2236,7 @@ mod tests {
     /// Parse a command line exactly as the operator would type it, so these
     /// tests exercise the flags rather than a hand-built `Cli`.
     fn cli(args: &[&str]) -> Cli {
-        let mut argv = vec!["polaris-code"];
+        let mut argv = vec!["polaris"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("the command line parses")
     }

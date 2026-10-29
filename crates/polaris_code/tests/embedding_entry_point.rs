@@ -2,7 +2,7 @@
 //! `src/docs/embedding.md`.
 //!
 //! Everything below is written the way a program that is *not* the
-//! `polaris-code` binary has to write it: `polaris_code::` paths only, no
+//! `polaris` binary has to write it: `polaris_code::` paths only, no
 //! access to `main.rs`'s private composition helpers, and no `ANTHROPIC_API_KEY`
 //! — the embedder supplies its own [`LlmProvider`] the same way `main.rs`
 //! supplies `AnthropicPlugin`.

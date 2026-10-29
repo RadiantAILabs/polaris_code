@@ -1,7 +1,7 @@
 # Evaluation harness
 
 Everything under `evals/` runs outside the shipped agent and launches the
-`polaris-code` binary as a subprocess.
+`polaris` binary as a subprocess.
 
 | Path | Holds |
 |---|---|
@@ -48,7 +48,7 @@ evals/run.sh     # thin wrapper around the CLI
 Build a binary once:
 
 ```bash
-cargo build --bin polaris-code
+cargo build --bin polaris
 ```
 
 Then:
@@ -58,7 +58,7 @@ bash evals/run.sh
 ```
 
 This runs every fixture whose route needs no model against
-`target/debug/polaris-code` (or `$POLARIS_CODE_BIN`, or `--binary PATH`), with
+`target/debug/polaris` (or `$POLARIS_CODE_BIN`, or `--binary PATH`), with
 a deliberately invalid `ANTHROPIC_API_KEY` placeholder if the environment has
 none (see "Cost", below), and writes a report under
 `target/eval-reports/dynamic-topology/`. Exit code is `0` unless a run fixture

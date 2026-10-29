@@ -12,7 +12,7 @@
 # The binary is located the same way evals/dynamic_topology/cli.py's own
 # default does: --binary wins, then $POLARIS_CODE_BIN, then target/debug or
 # target/release under this repository. Building one:
-#   cargo build --bin polaris-code
+#   cargo build --bin polaris
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

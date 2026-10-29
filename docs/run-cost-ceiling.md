@@ -11,8 +11,8 @@ number is made *enforceable*. The two shapes are separate on purpose — see
 ## Setting a limit
 
 ```bash
-polaris-code -p "refactor the parser" --max-cost-usd 2.50
-polaris-code -p "refactor the parser" --max-tokens 500000
+polaris -p "refactor the parser" --max-cost-usd 2.50
+polaris -p "refactor the parser" --max-tokens 500000
 polaris-code --max-cost-usd 5 --max-tokens 2000000     # both; either stops it
 ```
 
@@ -70,7 +70,7 @@ a failure. The constant is `polaris_code::run::CEILING_EXIT_CODE`.
 **stderr, every format** — one line naming both numbers:
 
 ```
-polaris-code: spend ceiling reached, stopping: $2.5013 of $2.5000 allowed
+polaris: spend ceiling reached, stopping: $2.5013 of $2.5000 allowed
 ```
 
 **`--output-format json`** — the `ceiling` member, schema
@@ -139,7 +139,7 @@ This is one rule (`RunCeiling::unenforceable_for`) applied at two points:
    `2`:
 
    ```
-   polaris-code: no price is known for model `some/unknown-model` under pricing
+   polaris: no price is known for model `some/unknown-model` under pricing
    basis `anthropic-list-2026-09`, so a $5.0000 spend ceiling cannot be
    enforced; bound the run in tokens instead
    ```

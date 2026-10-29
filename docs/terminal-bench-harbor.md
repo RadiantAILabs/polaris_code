@@ -1,7 +1,7 @@
 # Terminal-Bench through Harbor
 
 `evals/packs/terminal_bench_harbor/polaris_code.py` adapts the shipped
-`polaris-code` binary to Harbor's installed-agent interface. Harbor owns the
+`polaris` binary to Harbor's installed-agent interface. Harbor owns the
 task environments, trials, logs, and verifiers; the adapter only installs the
 binary and runs one non-interactive turn in the task container.
 
@@ -11,7 +11,7 @@ evaluation lifecycle and result model.
 ## Prerequisites
 
 - a Harbor installation compatible with the adapter imports;
-- a portable `polaris-code` binary built with
+- a portable `polaris` binary built with
   `scripts/build-portable-binary.sh`;
 - provider credentials available to Harbor's agent environment;
 - the Terminal-Bench dataset configured in Harbor.
@@ -28,11 +28,11 @@ the important adapter arguments are:
 
 | Argument | Meaning |
 | --- | --- |
-| `binary` | Absolute path to the portable `polaris-code` executable. |
+| `binary` | Absolute path to the portable `polaris` executable. |
 | `allow_command` | Optional shell-policy pattern; repeat through Harbor when more than one is required. |
 | `graph_search` | `curated`, `freeform`, or `both` (default). |
 
-Harbor must also supply a model name. The adapter invokes `polaris-code -p`
+Harbor must also supply a model name. The adapter invokes `polaris -p`
 with `--output-format stream-json`, `--allow-edit`, and any explicit command
 grants. It deliberately leaves the working directory unset so each task
 image's declared `WORKDIR` remains the containment boundary.

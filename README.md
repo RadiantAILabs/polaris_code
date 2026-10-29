@@ -35,7 +35,7 @@ this repo: see [Benchmark](#benchmark).
 
 | Path | Purpose |
 | --- | --- |
-| `crates/polaris_code` | The `polaris-code` binary, agent loop, tools, terminal commands, and coding-specific topology host. |
+| `crates/polaris_code` | The `polaris` binary, agent loop, tools, terminal commands, and coding-specific topology host. |
 | `crates/polaris_cosmos` | Domain-neutral composition contracts, admission rules, evidence types, and gate blocks. |
 | `crates/polaris_ontrace` | Temporal knowledge-graph support backed by Oxigraph. |
 | `crates/polaris-tui` | Reusable ratatui shell and panel registry. |
@@ -46,6 +46,23 @@ Every crate uses the single `polaris-ai` dependency (from crates.io) declared in
 the root `Cargo.toml`, so shared framework types resolve to one package instance
 throughout the workspace.
 
+## Install
+
+```bash
+brew install radiantailabs/tap/polaris-code
+polaris --help
+```
+
+The installed command is `polaris`. The Homebrew formula is named `polaris-code`
+to distinguish it from Homebrew's unrelated Kubernetes package. This first
+Homebrew release builds from source with Homebrew's Rust toolchain.
+
+Cargo users can install the same command with:
+
+```bash
+cargo install polaris_code --locked
+```
+
 ## Build
 
 Rust 1.97.0 is required.
@@ -54,7 +71,7 @@ Rust 1.97.0 is required.
 cargo +1.97.0 build --release -p polaris_code
 ```
 
-The resulting binary is `target/release/polaris-code`. For a complete
+The resulting binary is `target/release/polaris`. For a complete
 development check, run:
 
 ```bash
@@ -70,13 +87,13 @@ The default provider is Anthropic:
 
 ```bash
 export ANTHROPIC_API_KEY=your-key
-target/release/polaris-code .
+target/release/polaris .
 ```
 
 Pass `-p`/`--print` for one unattended turn:
 
 ```bash
-target/release/polaris-code -p "summarize this workspace" --output-format json
+target/release/polaris -p "summarize this workspace" --output-format json
 ```
 
 AWS Bedrock uses the AWS SDK credential chain. Select it with either the flag
@@ -85,12 +102,12 @@ or the environment variable:
 ```bash
 export POLARIS_CODE_PROVIDER=bedrock
 export AWS_REGION=us-east-1
-target/release/polaris-code .
+target/release/polaris .
 ```
 
 The SDK also accepts `AWS_PROFILE` or
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Use `--model` to select an
-available model, and run `polaris-code --help` for all provider, model,
+available model, and run `polaris --help` for all provider, model,
 permission, output, and topology options.
 
 Interactive sessions default to confirmation for edits and commands.
@@ -101,11 +118,11 @@ corresponding explicit per-run grant. See
 ## Use as a library
 
 The `polaris_code` package exposes the coding agent as a Rust library; the
-executable remains `polaris-code`.
+executable is `polaris`.
 
 ```toml
 [dependencies]
-polaris_code = "0.1.0"
+polaris_code = "0.1.1"
 ```
 
 Compose model, tool, and I/O plugins on a Polaris `Server`, create a session,

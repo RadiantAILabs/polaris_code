@@ -438,7 +438,7 @@ async fn an_unsatisfiable_objective_is_persisted_and_starts_nothing() {
         .error_line()
         .expect("a no-start turn explains itself");
     assert!(
-        error_line.starts_with("polaris-code: no topology started: "),
+        error_line.starts_with("polaris: no topology started: "),
         "unexpected diagnostic: {error_line}"
     );
     assert!(

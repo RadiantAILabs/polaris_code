@@ -1,7 +1,7 @@
 """One episode: its identity, its one agent invocation, and its record.
 
 The whole of this harness's contact with the shipped agent is
-:func:`agent_argv` — a single ``polaris-code -p`` invocation per episode, the
+:func:`agent_argv` — a single ``polaris -p`` invocation per episode, the
 supported non-interactive entry point, run once. There is no second loop, no
 retry of a completed turn and no benchmark text: ``problem_statement`` is
 handed over byte-for-byte as the dataset stores it.

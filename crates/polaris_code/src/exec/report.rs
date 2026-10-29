@@ -512,7 +512,7 @@ impl RunReport {
     #[must_use]
     pub fn model_line(&self) -> Option<String> {
         let usage = self.usage.as_ref()?;
-        Some(format!("polaris-code: model={}", usage.model_id))
+        Some(format!("polaris: model={}", usage.model_id))
     }
 
     /// The stderr diagnostic for a turn that produced no result — a failed
@@ -524,9 +524,9 @@ impl RunReport {
         let message = self.error.as_ref()?;
         Some(match self.reason {
             TurnReason::NoTopologyStarted => {
-                format!("polaris-code: no topology started: {message}")
+                format!("polaris: no topology started: {message}")
             }
-            _ => format!("polaris-code: turn failed: {message}"),
+            _ => format!("polaris: turn failed: {message}"),
         })
     }
 
@@ -545,7 +545,7 @@ impl RunReport {
             return None;
         }
         Some(format!(
-            "polaris-code: spend ceiling reached, stopping: {}",
+            "polaris: spend ceiling reached, stopping: {}",
             ceiling.statement()
         ))
     }
@@ -801,7 +801,7 @@ mod tests {
         let line = report.error_line().expect("the answer explains itself");
         assert_eq!(
             line,
-            "polaris-code: no topology started: no eligible candidate \
+            "polaris: no topology started: no eligible candidate \
              (verifier.capability-missing)"
                 .replace("\\\n             ", "")
         );

@@ -241,13 +241,13 @@ def lean_passthrough_names(environ: Mapping[str, str]) -> tuple[str, ...]:
 
 #: Where the harness installs the ``polaris-code`` binary inside a sandbox.
 #: Ours, not a dataset's: the path we choose to put our own binary at.
-CONTAINER_BINARY_PATH = "/opt/polaris/bin/polaris-code"
+CONTAINER_BINARY_PATH = "/opt/polaris/bin/polaris"
 
 #: Repository-relative location of the static musl artifact built by
 #: ``scripts/build-portable-binary.sh``. Benchmark images vary in their glibc
 #: version, so this is the harness default instead of the host-native release
 #: path.
-PORTABLE_BINARY_PATH = "target/x86_64-unknown-linux-musl/release/polaris-code"
+PORTABLE_BINARY_PATH = "target/x86_64-unknown-linux-musl/release/polaris"
 
 #: Conservative planning cost of one episode, in USD. It is used *only* to
 #: project spend before a run starts; it is never substituted for measured

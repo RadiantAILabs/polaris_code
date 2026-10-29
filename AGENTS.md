@@ -5,7 +5,7 @@ to this file.
 
 ## Workspace
 
-`polaris_code` is a Rust 2024 workspace (MSRV 1.97.0) for the `polaris-code`
+`polaris_code` is a Rust 2024 workspace (MSRV 1.97.0) for the `polaris`
 terminal coding agent and its supporting crates:
 
 - `crates/polaris_code`: agent binary and library, including tools,
@@ -78,7 +78,7 @@ package, from crates.io at the version declared by the workspace.
 
 ## Registry packages
 
-`polaris_code` is the public application library and ships the `polaris-code`
+`polaris_code` is the public application library and ships the `polaris`
 binary. Its supporting crates remain independently reusable registry packages:
 `polaris_cosmos`, `polaris_ontrace`, and `polaris-tui`. Keep the examples crate
 unpublished and keep version requirements on workspace path dependencies.

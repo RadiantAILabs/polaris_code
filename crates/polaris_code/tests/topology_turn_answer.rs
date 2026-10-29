@@ -249,7 +249,7 @@ async fn a_no_candidate_answer_is_delivered_with_the_selector_explanation() {
         report
             .error_line()
             .expect("the stderr diagnostic still explains it"),
-        format!("polaris-code: no topology started: {answer}")
+        format!("polaris: no topology started: {answer}")
     );
 
     // An interactive front end receives it as a closed answer block too, so
