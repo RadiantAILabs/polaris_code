@@ -1,0 +1,59 @@
+name: Homebrew release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published version tag to send to Homebrew (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      force_rebuild:
+        description: Rebuild even if Homebrew already has this version
+        type: boolean
+        default: false
+  push:
+    paths:
+      - .github/workflows/homebrew.yml
+      - scripts/notify_homebrew.py
+      - scripts/tests/test_notify_homebrew.py
+  pull_request:
+    paths:
+      - .github/workflows/homebrew.yml
+      - scripts/notify_homebrew.py
+      - scripts/tests/test_notify_homebrew.py
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s scripts/tests -p test_notify_homebrew.py
+
+  notify:
+    if: >-
+      github.repository == 'RadiantAILabs/polaris_code' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'release' && !github.event.release.prerelease))
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Trigger Homebrew bottles
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild && 'true' || 'false' }}
+        run: python3 scripts/notify_homebrew.py

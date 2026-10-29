@@ -113,11 +113,19 @@ The formula name distinguishes this coding agent from Homebrew's unrelated
 Kubernetes `polaris` package. Both install a `polaris` executable, so the tap
 declares that conflict.
 
-For each release, publish the reviewed source tag, download its GitHub source
-archive, compute SHA-256 from those exact bytes, and update the formula's URL
-and checksum together. The formula fetches the locked Cargo dependencies and
-then installs offline. Its functional test checks the installed command's
-version, help, and a real JSON topology inventory without a model key.
+After pushing the reviewed source tag, publish a stable GitHub Release in
+`RadiantAILabs/polaris_code` for `vMAJOR.MINOR.PATCH`. The Homebrew release
+workflow dispatches that tag to the tap. Pushing a tag alone does not trigger
+it; prereleases are excluded. If another workflow creates the GitHub Release,
+use a GitHub App or personal access token, since releases created with the
+repository's `GITHUB_TOKEN` do not trigger another workflow.
+
+The tap checks that the source archive declares the matching `polaris_code`
+version and `polaris` executable, computes SHA-256 from the downloaded bytes,
+and stages the new formula on its runners. The live formula keeps its previous
+bottles until both new builds pass. The formula fetches the locked Cargo
+dependencies and then installs offline. Its functional test checks the installed
+command's version, help, and a real JSON topology inventory without a model key.
 
 The tap's GitHub Actions workflow builds and tests bottles on Apple Silicon
 macOS Sequoia and Linux x86-64. It validates the archive checksums, publishes
@@ -126,8 +134,39 @@ into the formula. Separate fresh runners then install with `--force-bottle`,
 verify the installation receipt, and run the functional tests. The macOS job
 also checks that Golden Gate selects the compatible Apple Silicon bottle.
 
-Update the formula's tagged source URL and checksum, or dispatch the tap's
-workflow, to publish a new batch. Each batch uses its own download URL so
-previous bottle assets are preserved. Bottles skip Rust and CMake build
-dependencies during installation; platforms without a compatible bottle use
-the formula's existing source-build path.
+Each batch uses its own download URL so previous bottle assets are preserved.
+Bottles skip Rust and CMake build dependencies during installation; platforms
+without a compatible bottle use the formula's existing source-build path.
+
+### One-time automation setup
+
+Create a fine-grained GitHub personal access token owned by `RadiantAILabs`,
+limited to the `homebrew-tap` repository, with **Actions: write** permission
+(and automatic Metadata: read). Complete organization approval if required.
+Store it as the `HOMEBREW_TAP_TOKEN` repository Actions secret in
+[`RadiantAILabs/polaris_code` settings](https://github.com/RadiantAILabs/polaris_code/settings/secrets/actions).
+Do not commit it or reuse a broad development credential. The source repository's
+`GITHUB_TOKEN` cannot dispatch workflows in the separate tap. The tap uses its
+own job-scoped token to publish assets and push its formula; its repository
+settings must allow Actions to write contents and push to `main`.
+
+See GitHub's [workflow dispatch API permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
+and [workflow event authentication rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
+
+### Retry and verify
+
+Run the public repository's **Homebrew release** workflow manually with the
+published `release_tag` to replay a notification. An already bottled version
+is skipped; an older version cannot replace a newer formula. Enable
+`force_rebuild` to rebuild the current version. After the workflows are installed,
+a manual replay of the current release verifies authentication and release
+validation without rebuilding it.
+
+The tap's **Homebrew bottles** workflow also accepts `release_tag` and
+`force_rebuild`, or `verify_only` to test existing bottles on fresh runners.
+Use **Re-run all jobs** after a build or publication failure so both artifacts
+share the new run attempt's immutable download URL. Builds are pinned to the
+latest tap commit selected when preparation starts; if `main` changes while
+building, restart from the latest commit. Check both repositories' Actions runs:
+a successful source notification means the tap accepted the request, while the
+tap run reports build, publication, and fresh-install results.

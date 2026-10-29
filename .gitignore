@@ -13,3 +13,7 @@
 # Agent-tool metadata
 .claude/
 data
+
+# Python bytecode
+__pycache__/
+*.py[cod]
