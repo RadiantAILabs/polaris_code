@@ -5,10 +5,10 @@
 Written in Rust. One static binary. Every decision,
 tool call and token is recorded where you can read it.
 
-| 150 SWE-bench Verified tasks, Claude Opus 5.5 | Solved | Tokens | Cost |
-| --- | ---: | ---: | ---: |
-| **polaris-code** | **136** | **8.2M** | **$14.20** |
-| Claude Code | 135 | 50.1M | $32.96 |
+| 150 SWE-bench Verified tasks, Claude Opus 5.5 | Solved | Tokens | Cost | Typical task time |
+| --- | ---: | ---: | ---: | ---: |
+| **polaris-code** | **136** | **8.2M** | **$14.20** | **~30 s** |
+| Claude Code | 135 | 50.1M | $32.96 | ~110 s |
 
 Same model, same tasks, same machine. polaris-code used **16% of the tokens**
 and **less than half the cost**, and finished a typical task in about 30
@@ -126,6 +126,7 @@ for each agent:
 | Solved | 136 / 150 | 135 / 150 |
 | Total tokens | 8,179,965 | 50,052,324 |
 | Cost (USD) | 14.20 | 32.96 |
+| Typical task time | ~30 s | ~110 s |
 
 Tokens count input, output, cache read and cache write. Bedrock does not return
 a measured cost, so both costs are list-price estimates. The full results are
