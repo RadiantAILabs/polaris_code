@@ -54,8 +54,9 @@ polaris --help
 ```
 
 The installed command is `polaris`. The Homebrew formula is named `polaris-code`
-to distinguish it from Homebrew's unrelated Kubernetes package. This first
-Homebrew release builds from source with Homebrew's Rust toolchain.
+to distinguish it from Homebrew's unrelated Kubernetes package. Prebuilt
+Homebrew bottles are available for Apple Silicon on macOS Sequoia and newer,
+and for Linux x86-64. Other configurations build from source.
 
 Cargo users can install the same command with:
 

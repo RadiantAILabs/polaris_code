@@ -119,7 +119,15 @@ and checksum together. The formula fetches the locked Cargo dependencies and
 then installs offline. Its functional test checks the installed command's
 version, help, and a real JSON topology inventory without a model key.
 
-The tap's GitHub Actions workflow installs and tests from source on Linux and
-macOS. The initial tap has no bottles; source builds require Homebrew's Rust
-and CMake build dependencies. Keep any future bottle publication tied to the
-source commit and platform that were actually tested.
+The tap's GitHub Actions workflow builds and tests bottles on Apple Silicon
+macOS Sequoia and Linux x86-64. It validates the archive checksums, publishes
+them as immutable GitHub release assets, and merges Homebrew's bottle metadata
+into the formula. Separate fresh runners then install with `--force-bottle`,
+verify the installation receipt, and run the functional tests. The macOS job
+also checks that Golden Gate selects the compatible Apple Silicon bottle.
+
+Update the formula's tagged source URL and checksum, or dispatch the tap's
+workflow, to publish a new batch. Each batch uses its own download URL so
+previous bottle assets are preserved. Bottles skip Rust and CMake build
+dependencies during installation; platforms without a compatible bottle use
+the formula's existing source-build path.
