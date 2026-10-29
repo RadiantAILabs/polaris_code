@@ -24,6 +24,38 @@ dependency in the root `Cargo.toml`. All workspace crates must inherit that
 dependency so framework types unify. Do not add another `polaris-ai` source or
 change its version as part of unrelated work.
 
+## Design philosophy
+
+Read [`docs/philosophy.md`](docs/philosophy.md) and
+[`docs/taxonomy.md`](docs/taxonomy.md) when designing or reviewing a change.
+The shared principles come from
+[Polaris Core Philosophy](https://github.com/RadiantAILabs/polaris/blob/main/docs/philosophy.md).
+
+- **Everything is a plugin.** Deliver capabilities through small,
+  self-contained plugins with declared requirements and narrow public
+  resources/APIs. Compose through those contracts, never another component's
+  internals. Helpers and systems live inside capabilities; they do not each
+  need a plugin wrapper.
+- **Compose, replace, and reuse.** Extend registries and compose existing
+  building blocks before adding another abstraction. A capability should be
+  replaceable or omittable when the assembly's declared requirements remain
+  satisfied. Document its contracts using [`docs/reference/`](docs/reference/).
+- **Separate state from behavior.** Put state in scoped typed resources and
+  behavior in systems with explicit inputs. Use `Res<T>` for reads,
+  `ResMut<T>` for mutable local state, and `Out<T>` for results passed between
+  systems; avoid a catch-all struct of optional intermediate values.
+- **The graph is the agent.** Compose systems and edges to change behavior.
+  Contribute topologies through packs and the shared catalog rather than
+  special cases in the host's selection loop.
+- **Keep the composition root thin.** `main.rs` chooses and wires plugins,
+  configuration, and front ends. Tool behavior belongs in capabilities; agent
+  decisions belong in systems and policy seams. Tools must not depend on the
+  agent's `LoopState`.
+- **Make experiments observable.** Preserve the policy-read and
+  trajectory-write seams and the topology evidence contracts. Components
+  should be testable in isolation so a design hypothesis can be tried and
+  assessed without redesigning unrelated parts.
+
 ## Build and test
 
 Use the pinned toolchain for every Rust command:

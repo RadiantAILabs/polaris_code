@@ -17,6 +17,10 @@ this repo: see [Benchmark](#benchmark).
 
 ## Why polaris-code
 
+- **Composable architecture. Everything is a plugin.** Model providers, tools,
+  memory, I/O, and the agent loop compose through explicit contracts. Swap
+  capabilities and experiment with workflows without redesigning the rest of
+  the agent.
 - **Token efficient.** It plans the task first, then runs only the steps the
   task needs, so the model reads far less context on every turn.
 - **Blazingly fast.** Native Rust. No Node runtime, no Electron, nothing to boot.
@@ -101,6 +105,12 @@ Tools can read and edit files, run approved commands, search the tree, query a
 multi-language code index, and store content-hash-invalidated memories. The
 topology catalog can admit, select, compose, and explain bounded task graphs;
 the session graph records decisions, tool calls, evidence, and outcomes.
+
+Agent behavior is a graph of typed Rust systems. Replace a step or rewire a
+workflow to try a different approach to the same task. The
+[design philosophy](docs/philosophy.md) explains the architecture, and the
+[integration guide](docs/reference/guide.md) shows how to compose and extend
+the existing plugins.
 
 The detailed documentation under [`docs/`](docs/) covers topology selection,
 gate planning, the evaluation harness, permissions, session rewind, usage

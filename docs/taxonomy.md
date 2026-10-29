@@ -5,16 +5,16 @@ title: polaris_code Taxonomy
 # polaris_code Taxonomy
 
 This document defines the conceptual layers and core abstractions in
-`polaris_code`. For the design philosophy these layers serve, see the shared,
-single-source [philosophy.md](./philosophy.md) (canonical copy in
-`polaris/docs/philosophy.md`).
+`polaris_code`. For the design philosophy these layers serve, see
+[philosophy.md](./philosophy.md), which applies the shared Polaris philosophy
+to this application and links to its canonical upstream source.
 
 `polaris_code` is a terminal coding agent that composes Polaris (runtime),
-`polaris-tui` (UI), and `polaris_ontrace` (knowledge), then adds coding-specific
-tools and a reflective agent. These are not framework layers; they are *this
-application's* layers, classified by the Polaris rule — **lower layers are the
-fixed composition and capability seams, while the upper layer is the agent
-design.**
+`polaris-tui` (UI), `polaris_ontrace` (knowledge), and `polaris_cosmos`
+(cognition), then adds coding-specific tools and a reflective agent. Polaris
+comes from crates.io; the other components live in this workspace. The
+application's layers follow the Polaris rule — **lower layers are the fixed
+composition and capability seams, while the upper layer is the agent design.**
 
 ## Architecture
 
@@ -22,7 +22,7 @@ design.**
 |-------|------|------|
 | **3** | Agent & Policy | the reflective `CodeAgent`, its per-turn `PolicySnapshot` read seam, and the reified `trajectory` write seam |
 | **2** | Coding Capabilities | the coding toolsets and graph instrumentation, each a self-contained plugin |
-| **1** | Composition Root | the binary that boots the `Server` and wires runtime + UI + knowledge under one `polaris-ai`, plus cross-cutting session resources |
+| **1** | Composition Root | the binary that boots the `Server` and wires runtime + UI + knowledge + cognition under one `polaris-ai`, plus cross-cutting session resources |
 
 ## Layer 1: Composition Root
 
