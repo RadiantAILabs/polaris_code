@@ -7,6 +7,7 @@
 use crate::config::{LayoutMode, TuiConfig};
 use crate::event::TuiEvent;
 use crate::layout::{Chrome, compute_chrome, compute_panels};
+use crate::notify::Notification;
 use crate::panel::{EventOutcome, TuiPanel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -88,6 +89,16 @@ impl AppShell {
         for panel in &mut self.panels {
             panel.tick();
         }
+    }
+
+    /// Collect the attention requests panels raised since the last call, from
+    /// every panel: a background panel's approval is as urgent as the
+    /// focused one's.
+    pub(crate) fn take_notifications(&mut self) -> Vec<Notification> {
+        self.panels
+            .iter_mut()
+            .filter_map(|panel| panel.take_notification())
+            .collect()
     }
 
     /// Dispatch an input event. Global chords are handled here; the rest is
@@ -636,5 +647,54 @@ mod tests {
             shell.handle_event(chord(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             ShellOutcome::Quit
         );
+    }
+
+    /// A panel that raises one notification per `ping`, to check the shell
+    /// gathers requests from every panel and hands each over once.
+    struct PingPanel {
+        name: &'static str,
+        pending: Option<Notification>,
+    }
+
+    impl TuiPanel for PingPanel {
+        fn id(&self) -> &str {
+            self.name
+        }
+        fn take_notification(&mut self) -> Option<Notification> {
+            self.pending.take()
+        }
+        fn render(&mut self, _: &mut ratatui::Frame<'_>, _: Rect) {}
+    }
+
+    #[test]
+    fn notifications_come_from_every_panel_and_are_handed_over_once() {
+        let ping = |name, message: &str| -> Box<dyn TuiPanel> {
+            Box::new(PingPanel {
+                name,
+                pending: Some(Notification::new(message)),
+            })
+        };
+        let quiet = Box::new(PingPanel {
+            name: "quiet",
+            pending: None,
+        });
+        let mut shell = AppShell::new(
+            vec![ping("a", "first"), quiet, ping("c", "background")],
+            &TuiConfig::default(),
+        );
+        // Focus is on the first panel; the third is a background panel.
+        let messages: Vec<String> = shell
+            .take_notifications()
+            .iter()
+            .map(|notification| notification.message().to_owned())
+            .collect();
+        assert_eq!(messages, ["first", "background"]);
+        assert!(shell.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn a_panel_that_never_notifies_costs_nothing() {
+        let (mut shell, _, _) = shell_with_two_panels(LayoutMode::Single);
+        assert!(shell.take_notifications().is_empty());
     }
 }

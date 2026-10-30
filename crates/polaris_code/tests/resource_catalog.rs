@@ -34,6 +34,9 @@ const INTERNAL_RESOURCES: &[&str] = &[
     "ContextManager",
     // The agent loop's per-turn iteration state.
     "LoopState",
+    // How many attempts the current model call has used and when it began, read
+    // by the agent's own retry stage; reset for every call.
+    "AttemptLedger",
     // The published progress middleware chain, read by a host that builds its
     // own `GraphExecutor` so its graph is watched like the agent loop is.
     // Listed here rather than in `src/docs/resources.md`; it belongs in the
@@ -44,6 +47,11 @@ const INTERNAL_RESOURCES: &[&str] = &[
     // `src/docs/resources.md`; it belongs in the "Cosmos coding embodiment"
     // catalog section alongside `CodingTaskQueue`.
     "OperatorTopologyPin",
+    // The automatic reviewer's captured real user input and its per-turn denial
+    // counts. Crate-private runtime state of `AutoReviewPlugin`, read only by the
+    // review graph step; `src/docs/resources.md` describes them in prose.
+    "ReviewIntent",
+    "ReviewHistory",
 ];
 
 #[test]

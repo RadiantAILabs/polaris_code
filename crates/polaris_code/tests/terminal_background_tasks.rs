@@ -310,6 +310,7 @@ impl Host {
             })
             .add_plugins(ToolsPlugin)
             .add_plugins(ShellPlugin::new(shell_config))
+            .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin)
             // The model's half of the same surface, over the same executor and
             // the same table. Present in every test in this file on purpose:
             // the chord and `/command` proofs below are also the proof that
@@ -695,8 +696,10 @@ async fn live_output_reaches_one_block_before_the_command_finishes() {
             |s| s.contains("alpha-out"),
         )
         .await;
+    // The approval prompt that stays in the transcript names the tool too, so
+    // count tool blocks by their `name ❯ detail` row, not by the bare name.
     assert_eq!(
-        screen.matches("run_command").count(),
+        screen.matches("run_command ❯").count(),
         1,
         "live output updates one block in place rather than appending rows:\n{screen}"
     );

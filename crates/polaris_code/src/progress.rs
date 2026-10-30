@@ -144,9 +144,10 @@ impl NodeActivity {
 
     /// Creates the registry the shipped agent loop is described by.
     ///
-    /// The agent loop's own six nodes read exactly as they always have; its two
+    /// The agent loop's own six nodes read exactly as they always have; its
     /// structural nodes stay silent, because "entering the loop" is not
-    /// something a user is waiting on.
+    /// something a user is waiting on. The one stage of the model call a user
+    /// can see is a backoff, which reads "Waiting to retry…".
     #[must_use]
     pub fn with_agent_loop() -> Self {
         let activities = Self::new();
@@ -157,9 +158,19 @@ impl NodeActivity {
         activities.describe("execute_tools", "Running tools…");
         activities.describe("finalize", "Finalizing…");
         activities.describe("recover", "Recovering…");
-        // Structural: they neither wait nor work, so they say nothing.
+        // A backoff before the next attempt is the one stage of the model call
+        // that is a wait a user can see.
+        activities.describe("wait_to_retry", "Waiting to retry…");
+        // Structural: they neither wait nor work, so they say nothing. The
+        // model call's other stages are decisions and bookkeeping around `act`,
+        // which already reads "Thinking…".
         activities.silence("init_loop");
         activities.silence("apply_steering");
+        activities.silence("begin_model_call");
+        activities.silence("decide_retry");
+        activities.silence("abandon");
+        activities.silence("accept_response");
+        activities.silence("report_failure");
         activities
     }
 
@@ -388,6 +399,28 @@ mod tests {
         );
         // Structural systems leave the status untouched.
         assert_eq!(activities.activity("init_loop"), None);
+    }
+
+    #[test]
+    fn the_model_calls_stages_say_nothing_except_the_wait() {
+        let activities = NodeActivity::with_agent_loop();
+        assert_eq!(
+            activities.activity("wait_to_retry").as_deref(),
+            Some("Waiting to retry…")
+        );
+        for stage in [
+            "begin_model_call",
+            "decide_retry",
+            "abandon",
+            "accept_response",
+            "report_failure",
+        ] {
+            assert_eq!(
+                activities.activity(stage),
+                None,
+                "{stage} must not flash a status line or open a timeline entry"
+            );
+        }
     }
 
     #[test]

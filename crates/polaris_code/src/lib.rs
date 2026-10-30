@@ -72,11 +72,16 @@
 //!   vocabulary, the identity triple, the run's token and cost accounting,
 //!   and the exit code.
 
+pub mod accounts;
 pub mod agents;
 pub mod config;
+pub mod config_dir;
 pub mod cosmos;
+pub mod credentials;
 pub mod exec;
 pub mod progress;
+pub mod project_trust;
+pub mod providers;
 pub mod run;
 pub mod sparql;
 pub mod state;

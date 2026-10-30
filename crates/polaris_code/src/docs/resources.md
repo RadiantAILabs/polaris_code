@@ -21,10 +21,17 @@ provider, access pattern, and a real-shape consuming system per the
 | [`RunCeiling`](crate::RunCeiling) | Global | The operator's spend limit for the run — money, tokens, or both — installed only when one was asked for, so its *absence* means no limit was set. Decides nothing itself: `evaluate(&RunUsage)` reports a [`CeilingStatus`](crate::usage::CeilingStatus) and [`run::drive_turn`](crate::run::drive_turn) consults it on the turn boundary. Global for the same reason the meter is: the limit bounds the whole run, not one turn. |
 | [`TaskCostLimit`](crate::usage::TaskCostLimit) | Global | The validated USD limit installed when explicitly set or when the lean arm supplies its $1.50 default. Each accepted coding task gets a fresh local meter and reads this limit before its model calls; the same limit applies to each task independently. |
 
+# Model provider
+
+| Resource | Scope | What it exposes |
+|----------|-------|-----------------|
+| [`ProviderReport`](crate::providers::ProviderReport) | Global | What the provider that passed the launch check is running as: which provider, the AWS region or custom endpoint when there is one, and where its credentials came from — a variable name, stored login key, or an AWS source, never the credential. `/status` reads this launch report directly. `line()` renders the one-line form a session opens with. Installed by the binary from [`ReadyProvider::report`](crate::providers::ReadyProvider::report); a host that builds its own server installs none. Global because one provider serves every session in the process. |
+
 # Safety
 
 | Resource | Scope | What it exposes |
 |----------|-------|-----------------|
+| [`McpRegistry`](crate::tools::mcp::McpRegistry) | Global | Configured MCP servers, typed [`McpStatus`](crate::tools::mcp::McpStatus) connection health, namespaced tools, project servers waiting for trust, and sanitized startup failures. Provided by `McpClientPlugin`; `/mcp` reads the same projection. |
 | [`SecretRedactor`](crate::agents::code_agent::SecretRedactor) | Global | The rule set that withholds recognisable credentials from tool output before it reaches the model, the transcript, the log or the session graph. `scan(text)` returns the rewritten text plus which shapes fired; `execute_tools` and `execute_read_only_batch` apply it where a result becomes a string, which every consumer of a tool result is downstream of. Global because the rule set is process configuration chosen once at the composition root, not per-session state. Provided by [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin) and gated by `POLARIS_CODE_REDACT`. **Not a permission boundary** — see [`docs/secret-redaction.md`](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/secret-redaction.md). |
 
 # Terminal presentation
@@ -76,9 +83,49 @@ travels this way rather than as a factory parameter.
 | [`CodingTask`](crate::cosmos::task::CodingTask) | Local | The accepted task read by `code.classify-request` and `code.request-clarification`. A caller composing either block directly must insert the same task used to make its [`CodingWorkspace`](crate::cosmos::payload::CodingWorkspace), so classification and the bounded clarification question refer to the same request. |
 
 Per-turn agent state (`AgentConfig`, `AgentLlm`, `PolicySnapshot`,
-`ProjectContext`, `ContextManager`, `LoopState`) is internal plumbing read only
+`ProjectContext`, `ContextManager`, `LoopState`, `AttemptLedger`) is internal plumbing read only
 by the agent's own systems and is intentionally excluded — see the
 `INTERNAL_RESOURCES` allowlist in `tests/resource_catalog.rs`.
 
+`ContextManager` persists both canonical messages and structured summary
+checkpoints. Its graph node reads the existing session `TokenMeter` for cost
+reservation and billing; compaction adds no separate resource. Summary focus
+requests and token calibration remain runtime state.
+
 The embedded multi-language index adds no resource. Parser state is private and
 constructed on demand inside the existing background indexing task.
+
+# Permission authorization
+
+| Resource | Scope | What it exposes |
+|----------|-------|-----------------|
+| [`PermissionRules`](crate::agents::permission_rules::PermissionRules) | Global | Immutable parsed user/project rules, source paths, fail-closed errors and explicit project trust (this process, optionally remembered per project). Provided by `PermissionRulesPlugin`; read by `PolicySnapshot::load` and the argument-aware permission gate. |
+| [`SessionGrants`](crate::agents::permission_rules::SessionGrants) | Global handle, session lifetime | Exact command/directory and decomposed prefix scopes explicitly selected by a human. Every access checks `SessionSettings::approval_generation`; session reset invalidates all prior scopes. Shared with `/permissions` for inspection and revocation. |
+| [`ShellApproval`](crate::agents::permission_rules::ShellApproval) | Global | Agent-policy shell restriction resolution and registered-tool dispatch. Issues tool-layer receipts bound to the current rule revision and session generation; the registered shell tool consumes them, preserving hard denies and the foreground/background wait lifecycle. |
+| [`RunToolGrants`](crate::agents::permission_rules::RunToolGrants) | Global | Immutable explicit launch-time `--allow-tool` names/prefixes, applied only to unattended policy. MCP requires an exact tool name. |
+| [`ToolPolicyRegistry`](crate::tools::ToolPolicyRegistry) | Global | The facts each capability states about its tools: read-only or mutating, and whether every attended call needs a person. Provided by `ToolPolicyPlugin`; capability plugins declare their tools while they build, and agent policy reads the facts when it authorizes a call. |
+
+## Automatic permission review
+
+| Resource | Scope | Purpose |
+|---|---|---|
+| [`ReviewPolicy`](crate::agents::auto_review::ReviewPolicy) | Global | Reviewer model selection, timeout, output cap and repeated-denial limit, provided by `AutoReviewPlugin`. |
+
+`AutoReviewPlugin` also keeps two crate-private local resources: the bounded
+real user input captured at ingress (never reconstructed from model or tool
+history) and the equivalent-denial counts that reset at each user turn. Nothing
+outside the crate reads them, so they are not part of this catalog's surface.
+
+[`ReviewResult`](crate::agents::auto_review::ReviewResult) is typed graph output,
+not shared mutable session state. It carries per-call verdicts bound to exact
+arguments, canonical directory, policy revision and settings generation, with
+pending single-use receipts kept internal to the authorization path.
+
+Startup configuration and `/status` add no resource. Diagnostics read the
+existing [`SessionSettings`](crate::terminal::SessionSettings) and
+[`SessionNavigation`](crate::terminal::SessionNavigation); loaded file paths and
+credential source names remain immutable launch inputs owned by the binary.
+
+[`ApprovalReceipt`](crate::tools::approval::ApprovalReceipt) is per-invocation
+`ToolContext`, rather than an ECS resource. The host supplies policy validation;
+foreground and background tools consume the same lower-layer contract.

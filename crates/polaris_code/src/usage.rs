@@ -269,6 +269,41 @@ impl Drop for CostPermit {
     }
 }
 
+/// A [`CostPermit`] for a request that is already on its way to the provider.
+///
+/// A bare permit releases its reservation when dropped, which is right for a
+/// request that was never sent. Once the request has been sent, dropping the
+/// future that awaits it (a cancelled turn, an interrupt) does not stop the
+/// provider billing for it, so the reservation has to be charged rather than
+/// released. This guard charges the permit's estimate on drop unless
+/// [`settle`](Self::settle) already replaced it with the billed usage.
+#[derive(Debug)]
+pub struct ChargeOnDrop(Option<CostPermit>);
+
+impl ChargeOnDrop {
+    /// Guard `permit`; `None`, as `reserve_request` returns when no cost cap
+    /// is set, guards nothing.
+    #[must_use]
+    pub fn new(permit: Option<CostPermit>) -> Self {
+        Self(permit)
+    }
+
+    /// Replace the reservation with the provider's billed usage. Usage the
+    /// provider did not report is charged at the reservation's estimate. Only
+    /// the first call has an effect.
+    pub fn settle(&mut self, usage: &polaris::models::llm::Usage) {
+        if let Some(permit) = self.0.take() {
+            permit.settle(usage);
+        }
+    }
+}
+
+impl Drop for ChargeOnDrop {
+    fn drop(&mut self) {
+        self.settle(&Default::default());
+    }
+}
+
 impl TokenMeter {
     /// Create an empty meter.
     ///
@@ -1608,5 +1643,47 @@ mod tests {
         assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_err());
         drop(permit);
         assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_ok());
+    }
+
+    #[test]
+    fn a_dropped_sent_call_keeps_its_reservation_charged() {
+        let meter = test_meter();
+        meter.set_task_cost_cap(0.01).unwrap();
+        let sent = ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_err());
+        // The turn was cancelled with the request in flight: the estimate is
+        // spent, not handed back, so a second call of the same size still
+        // does not fit under the cap.
+        drop(sent);
+        assert!(
+            meter.reserve_model_call("claude-sonnet-5", 1, 800).is_err(),
+            "the cancelled call's estimate was released instead of charged"
+        );
+    }
+
+    #[test]
+    fn a_settled_sent_call_is_charged_its_billed_usage_once() {
+        let meter = test_meter();
+        meter.set_task_cost_cap(0.01).unwrap();
+        let mut sent =
+            ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        sent.settle(&polaris::models::llm::Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            ..Default::default()
+        });
+        // The call billed almost nothing, and dropping the guard afterwards
+        // must not charge the estimate on top of it.
+        drop(sent);
+        assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_ok());
+    }
+
+    #[test]
+    fn guarding_no_permit_is_harmless() {
+        let meter = test_meter();
+        let mut sent =
+            ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        assert!(sent.0.is_none(), "no cost cap means no permit");
+        sent.settle(&Default::default());
     }
 }

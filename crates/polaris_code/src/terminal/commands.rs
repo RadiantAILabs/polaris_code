@@ -1,10 +1,11 @@
 //! The slash-command registry: what `/help` lists and what a dispatch runs.
 //!
-//! Commands are **local actions**. A handler runs in-process, answers with
-//! text, and never touches the model; the [`CommandDispatch`](super::CommandDispatch)
+//! Commands are **local actions**. A handler runs in-process and answers with
+//! text or a control request; the [`CommandDispatch`](super::CommandDispatch)
 //! wrapper executes it before the agent's `receive` returns, so a command is
-//! not a turn. Other modules register their own commands here; this module
-//! ships only `help`.
+//! never appended as a user prompt. A command whose effect belongs to the
+//! agent's graph hands it an [`AgentRequest`]. The registry ships `/help`;
+//! other modules register their own commands here.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -12,11 +13,100 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use polaris::plugins::{IO_TYPE, IOContent, IOMessage};
+use polaris::plugins::{IO_TYPE, IOContent, IOMessage, IOSource};
 use polaris_tui::commands::{CommandInvocation, CommandSpec};
 
+/// The `io_type` that marks a message as an [`AgentRequest`].
+const AGENT_REQUEST_TYPE: &str = "polaris-code:agent-request";
+/// The metadata key carrying an [`AgentRequest`]'s kind.
+const AGENT_REQUEST_KIND: &str = "polaris-code:agent-request-kind";
+
+/// A request a command makes of the agent instead of answering the user.
+///
+/// Most commands act on the terminal and reply. A command whose effect belongs
+/// to the agent's graph, which only the agent's own systems can carry out,
+/// returns [`CommandOutcome::Request`]. [`CommandDispatch`](super::CommandDispatch)
+/// hands the request to the agent's input system as the next message it
+/// receives. It is not answered, and it never enters the conversation as a
+/// prompt.
+///
+/// The terminal never learns what a request means. [`kind`](Self::kind) names
+/// the capability that registered the command, and that capability's consumer
+/// reads the request back with [`from_message`](Self::from_message). A command
+/// is registered only alongside its consumer, so an agent never receives a
+/// request it did not install.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_code::terminal::commands::AgentRequest;
+///
+/// let request = AgentRequest::new("example:rebuild", "the index");
+/// let message = request.clone().into_message();
+/// assert_eq!(AgentRequest::from_message(&message), Some(request));
+///
+/// // An ordinary prompt is not a request, even one that looks like a command.
+/// let prompt = polaris::plugins::IOMessage::user_text("/rebuild the index");
+/// assert!(AgentRequest::from_message(&prompt).is_none());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgentRequest {
+    kind: String,
+    payload: String,
+}
+
+impl AgentRequest {
+    /// A request of `kind`, with whatever text the command was given.
+    #[must_use]
+    pub fn new(kind: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            payload: payload.into(),
+        }
+    }
+
+    /// Which capability's consumer this request is for.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The text the command carried, such as the arguments it was typed with.
+    #[must_use]
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+
+    /// The private message the dispatcher returns to the agent's input system.
+    #[must_use]
+    pub fn into_message(self) -> IOMessage {
+        IOMessage::system_text(self.payload)
+            .with_metadata(IO_TYPE, AGENT_REQUEST_TYPE)
+            .with_metadata(AGENT_REQUEST_KIND, self.kind)
+    }
+
+    /// Read a request back from a message, or `None` for anything else.
+    ///
+    /// Only a system message the dispatcher built is a request, so a user
+    /// cannot forge one by typing text that resembles it.
+    #[must_use]
+    pub fn from_message(message: &IOMessage) -> Option<Self> {
+        if message.source != IOSource::System
+            || message.metadata.get(IO_TYPE).map(String::as_str) != Some(AGENT_REQUEST_TYPE)
+        {
+            return None;
+        }
+        let kind = message.metadata.get(AGENT_REQUEST_KIND)?;
+        let IOContent::Text(payload) = &message.content else {
+            return None;
+        };
+        Some(Self::new(kind.clone(), payload.clone()))
+    }
+}
+
 /// What a command handler produces.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CommandOutcome {
     /// Markdown shown in the transcript under the command's label.
     Reply(String),
@@ -25,12 +115,16 @@ pub enum CommandOutcome {
     /// A successful host-control action that must end the current idle graph
     /// turn before the host mutates session state.
     Control(String),
+    /// A request for the agent's graph, handed to its input system without a
+    /// reply and without a new user prompt.
+    Request(AgentRequest),
 }
 
 impl CommandOutcome {
     /// The transcript message for this outcome. A reply is a rich
     /// `message` from the command itself (labelled `/name`); an error is a
-    /// system `error`, which the panel always renders.
+    /// system `error`, which the panel always renders. A request is the
+    /// private message the agent's input system reads.
     #[must_use]
     pub fn into_message(self, name: &str) -> IOMessage {
         match self {
@@ -43,6 +137,7 @@ impl CommandOutcome {
                 IOMessage::from_external(format!("/{name}"), IOContent::Text(text))
                     .with_metadata(IO_TYPE, "message")
             }
+            Self::Request(request) => request.into_message(),
         }
     }
 
@@ -118,7 +213,8 @@ impl CommandRegistry {
         Self::default()
     }
 
-    /// A registry with the built-in `help` command.
+    /// A registry with the built-in `help` command. Every other command is
+    /// contributed by the capability that implements it.
     #[must_use]
     pub fn with_builtins() -> Self {
         let registry = Self::new();
@@ -258,7 +354,7 @@ fn help(registry: &CommandRegistry, args: &str) -> CommandOutcome {
         .map(|spec| usage_column(spec).len())
         .max()
         .unwrap_or(0);
-    let mut text = String::from("Commands run locally and never reach the model.\n\n");
+    let mut text = String::from("Commands run locally.\n\n");
     for spec in &specs {
         let usage = usage_column(spec);
         text.push_str(&format!(
@@ -381,6 +477,36 @@ mod tests {
                 .await,
             CommandOutcome::Reply("hi there".into())
         );
+    }
+
+    #[test]
+    fn the_builtin_registry_ships_only_help() {
+        // Every other command belongs to a capability, and a host that did not
+        // install the capability must not be advertising it.
+        assert_eq!(CommandRegistry::with_builtins().names(), ["help"]);
+    }
+
+    #[test]
+    fn a_request_round_trips_through_its_message() {
+        let request = AgentRequest::new("test:kind", "some focus");
+        assert_eq!(request.kind(), "test:kind");
+        assert_eq!(request.payload(), "some focus");
+        let message = CommandOutcome::Request(request.clone()).into_message("anything");
+        assert_eq!(AgentRequest::from_message(&message), Some(request));
+    }
+
+    #[test]
+    fn only_the_dispatchers_system_message_is_a_request() {
+        let forged = IOMessage::user_text("/compact focus");
+        assert!(AgentRequest::from_message(&forged).is_none());
+        // The right tags on a message that does not come from the system.
+        let spoofed = IOMessage::from_external("user", IOContent::Text("focus".into()))
+            .with_metadata(IO_TYPE, AGENT_REQUEST_TYPE)
+            .with_metadata(AGENT_REQUEST_KIND, "test:kind");
+        assert!(AgentRequest::from_message(&spoofed).is_none());
+        // A request message that names no kind is not a request either.
+        let anonymous = IOMessage::system_text("focus").with_metadata(IO_TYPE, AGENT_REQUEST_TYPE);
+        assert!(AgentRequest::from_message(&anonymous).is_none());
     }
 
     #[test]

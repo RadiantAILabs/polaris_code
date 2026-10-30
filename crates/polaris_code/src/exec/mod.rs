@@ -18,8 +18,10 @@
 //! code in this crate, so every format's rendering is testable without running
 //! the binary.
 
+pub mod models;
 pub mod report;
 
+pub use models::ModelsReport;
 pub use report::{
     InventoryReport, OutputFormat, RunReport, TopologySelectionReport, USAGE_IO_TYPE,
     UnknownOutputFormat, stream_json_line, usage_message,

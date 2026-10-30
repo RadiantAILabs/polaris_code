@@ -310,6 +310,16 @@ pub struct ToolRun {
 }
 
 impl ToolRun {
+    /// Keep a host-adapted tool future alive through foreground/background handoff.
+    #[must_use]
+    pub fn spawn_future(
+        future: impl Future<Output = Result<serde_json::Value, ToolError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            handle: tokio::spawn(future.instrument(tracing::Span::current())),
+        }
+    }
+
     /// Start `name` from `registry` with `args` and `context` in its own task.
     ///
     /// An unknown tool fails inside the task, exactly as

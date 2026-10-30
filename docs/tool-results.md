@@ -123,6 +123,45 @@ Only the model's copy is rendered. The host activity block and the reified
 `ToolCall` in the Session `ABox` keep the raw JSON, so the trajectory stays
 structured and machine-queryable.
 
+## Web pages
+
+`web_fetch` ([`tools/web.rs`](../crates/polaris_code/src/tools/web.rs), described
+in [`web-access.md`](web-access.md)) puts the answer to "what am I looking at"
+in a short header, because a page has an origin the model cannot see:
+
+```
+URL: https://example.com/guide
+Redirected from: https://example.com/old-guide
+Type: text/html (converted to markdown)
+Title: The guide
+
+# The guide
+…
+… showed bytes 0 to 31870 of 84012 bytes of page text. Next: web_fetch(url="https://example.com/guide", offset=31870)
+```
+
+The `URL:` line is the final address after redirects, so relative links in the
+text and the `Next:` call both use the address that actually answered. The
+footer follows the same rule as `read_file`: it names the tool's own `offset`,
+the totals are absolute, and the last piece has no footer. The unit is bytes of
+the converted text, not lines, because a page has no line numbers the model
+could cite.
+
+A download cut at the byte cap adds one line before the text, so a page that
+ends abruptly is not mistaken for a complete one:
+
+```
+Note: the download stopped at 2097152 of 6291456 bytes, so the end of the page is missing.
+```
+
+Failures name the URL and end with what to try, as above:
+
+```
+web_fetch 'https://example.com/x' failed: the server answered 404 Not Found; check that the URL is right
+web_fetch 'https://example.com/x' failed: no complete answer within 30s; try again, or fetch a smaller page
+web_fetch 'http://10.0.0.5/' refused: 10.0.0.5 is a private-network address. web_fetch reaches public internet hosts only; for a service on this machine or network use run_command (for example curl), which asks first
+```
+
 ## Adding a tool
 
 Reuse `line_view` / `resume_footer` / `cap_footer` for anything that shows part

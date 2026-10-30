@@ -170,5 +170,5 @@ async fn empty_commands_report_active_values_and_advertise_only_approved_modes()
         .into_iter()
         .find(|spec| spec.name == "permission")
         .unwrap();
-    assert_eq!(permission.choices, ["confirm", "auto-edit", "plan"]);
+    assert_eq!(permission.choices, ["confirm", "auto-edit", "auto", "plan"]);
 }

@@ -23,8 +23,8 @@
 </p>
 
 Polaris Code is a terminal coding agent written in Rust. It reads your
-project, edits code, and runs approved commands through Anthropic or AWS
-Bedrock. Model providers, tools, memory, and agent workflows compose as
+project, edits code, and runs approved commands through Anthropic, OpenAI,
+any OpenAI-compatible server, or AWS Bedrock. Model providers, tools, memory, and agent workflows compose as
 plugins, and every decision and tool call is recorded in the session graph.
 
 In a comparison on 150 SWE-bench Verified tasks, Polaris Code solved
@@ -52,11 +52,22 @@ cargo install polaris_code --locked
 
 ### Start a session
 
-Set your Anthropic API key, then launch Polaris in your project:
+Save a key once, then launch Polaris in your project. `polaris login` asks
+which provider you use, reads its key with the input hidden, stores it where
+only you can read it, and makes that provider your default:
+
+```bash
+polaris login            # Anthropic, OpenAI or AWS Bedrock
+polaris login status     # which providers have credentials, and from where
+cd your-project
+polaris .
+```
+
+Or export a key instead. An environment variable, or a `.env` file in the
+folder you launch from, wins over a saved key:
 
 ```bash
 export ANTHROPIC_API_KEY="your-key"
-cd your-project
 polaris .
 ```
 
@@ -72,10 +83,12 @@ Interactive sessions ask before edits and commands. Unattended runs require
 explicit per-run grants to write files or execute commands. See
 [permission modes](docs/permission-modes.md) for the available settings.
 
-### Use AWS Bedrock
+### Choose a provider
 
-Bedrock uses the AWS SDK credential chain. Select it with `--provider bedrock`
-or the `POLARIS_CODE_PROVIDER` environment variable:
+Select a provider with `--provider anthropic|openai|bedrock` or the
+`POLARIS_CODE_PROVIDER` environment variable. OpenAI uses `OPENAI_API_KEY`, and
+`OPENAI_BASE_URL` points it at an OpenAI-compatible server (Ollama, LM Studio,
+vLLM, a gateway). Bedrock uses the AWS SDK credential chain:
 
 ```bash
 export AWS_REGION=us-east-1
@@ -83,8 +96,51 @@ polaris --provider bedrock .
 ```
 
 The SDK also accepts `AWS_PROFILE` or
-`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Use `--model` to select an
-available model. Run `polaris --help` for all command-line options.
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. Before the terminal opens, Polaris
+checks the provider's credentials and, if something is missing, says what to
+do.
+
+`polaris --list-models` shows the models each provider offers, their prices,
+and whether the credentials are present; `--model sonnet` picks the newest
+Sonnet. Run `polaris --help` for all command-line options, and see
+[providers](docs/providers.md) for OpenAI-compatible servers, where credentials
+are stored, and the startup check.
+
+### Keep separate setups
+
+Set `POLARIS_CONFIG_DIR` to keep independent user setups:
+
+```bash
+POLARIS_CONFIG_DIR=~/.polaris-work polaris
+```
+
+This directory holds `config.toml` and its profiles, `credentials.toml`,
+`permissions.toml`, and `mcp.json`. When unset or empty, it falls back to
+`$XDG_CONFIG_HOME/polaris`, then `~/.config/polaris`. Project configuration and
+session state stay in the workspace. `/status` shows the resolved directory and
+whether `POLARIS_CONFIG_DIR` selected it. See
+[startup configuration](docs/configuration.md).
+
+### Set defaults
+
+Put defaults in `config.toml` (yours) or `polaris.toml` (the project's). The
+accepted keys are `provider`, `model`, `models`, `region`, `permission_mode`
+(`confirm`, `auto-edit`, `auto`, or `plan`), `permission_ceiling`,
+`max_cost_usd`, `max_tokens`, `max_turns`, and `max_output_tokens`. Flags and
+environment variables win over both files.
+
+Two options are flags or environment variables only: `--notify` /
+`POLARIS_CODE_NOTIFY` (`off`, `approval`, or `all`; when the terminal bell and
+window title ask for attention, `approval` by default) and `--review-model` /
+`POLARIS_CODE_REVIEW_MODEL` (the model for automatic review).
+
+A repository cannot loosen your permissions or start its own programs until you
+trust it. Polaris ignores a `polaris.toml` permission setting that is more
+permissive than yours, and does not start servers from a project `.mcp.json`.
+Review them, then use `/permissions trust-project` or `/mcp trust`. Trust is
+saved per project and ends when the reviewed file changes. See
+[startup configuration](docs/configuration.md#project-files-and-trust) and
+[MCP servers](docs/mcp.md#project-servers-and-trust).
 
 ## Why Polaris Code
 
@@ -97,7 +153,8 @@ available model. Run `polaris --help` for all command-line options.
   outcomes. Review changes and rewind a session.
 - **Explicit permissions.** Interactive edits and commands ask first;
   unattended execution uses explicit grants.
-- **Your provider.** Connect through the Anthropic API or AWS Bedrock.
+- **Your provider.** Connect through the Anthropic API, the OpenAI API, any
+  OpenAI-compatible server, or AWS Bedrock.
 
 ## Benchmark
 
@@ -133,7 +190,12 @@ explains the architecture.
 
 | Guide | Covers |
 | --- | --- |
-| [Permission modes](docs/permission-modes.md) | Approvals and unattended execution grants. |
+| [Permission modes](docs/permission-modes.md) | Approvals, rules, automatic review, and unattended execution grants. |
+| [Providers](docs/providers.md) | Provider selection, `polaris login`, and OpenAI-compatible servers. |
+| [Configuration](docs/configuration.md) | Config files, profiles, `POLARIS_CONFIG_DIR`, and `/status`. |
+| [MCP servers](docs/mcp.md) | Connecting tools from Model Context Protocol servers. |
+| [Web access](docs/web-access.md) | The `web_fetch` tool and its address limits. |
+| [Context compaction](docs/context-compaction.md) | Summaries, `/compact`, and what is kept. |
 | [Project instructions](docs/project-instructions.md) | How project guidance is discovered and applied. |
 | [Plugin integration](docs/reference/guide.md) | Composing and extending the existing capabilities. |
 | [Embedding](crates/polaris_code/src/docs/embedding.md) | Using the coding agent in a Rust application. |

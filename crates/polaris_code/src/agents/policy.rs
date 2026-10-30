@@ -2,15 +2,16 @@
 //!
 //! The snapshot uses [`PolicySnapshot::defaults`], and every decision point
 //! routes through it. [`PolicySnapshot::load`] is the policy-as-data seam and
-//! currently delegates to `defaults()`.
+//! loads the installed permission-rule capability.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use polaris::system::resource::LocalResource;
 use polaris::tools::ToolPermission;
 use polaris_ontrace::oxigraph::OxigraphStore;
 
-use crate::tools::FILE_WRITE_TOOLS;
+use crate::tools::{AttendedApproval, FILE_WRITE_TOOLS, ToolEffect, ToolPolicyRegistry};
 
 /// Default cap on messages retained in the projected live window.
 pub const DEFAULT_MAX_MESSAGES: usize = 50;
@@ -26,10 +27,14 @@ pub const DEFAULT_COMPACT_AFTER_TOKENS: usize = 60_000;
 pub const DEFAULT_COMPACT_BATCH: usize = 8;
 /// Default number of most-recent messages compaction never touches.
 pub const DEFAULT_COMPACT_KEEP_RECENT: usize = 12;
+/// Second-stage summary threshold after cheap tool-result elision.
+pub const DEFAULT_SUMMARIZE_AFTER_TOKENS: usize = 90_000;
+/// Maximum output allowance for a summary checkpoint.
+pub const DEFAULT_SUMMARY_OUTPUT_TOKENS: NonZeroU32 = NonZeroU32::new(2_048).unwrap();
 
 /// How `prepare_context` assembles the window. (Active in v1 — see
 /// [`PolicySnapshot::defaults`].)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalPolicy {
     /// Optional cap on messages retained in the live window.
     pub max_messages: Option<usize>,
@@ -43,6 +48,28 @@ pub struct RetrievalPolicy {
     /// Most-recent messages compaction leaves intact, so fresh observations stay
     /// readable.
     pub compact_keep_recent: usize,
+    /// Token threshold after elision for graph-based summary checkpoints.
+    /// `None` disables automatic summaries.
+    pub summarize_after_tokens: Option<usize>,
+    /// Maximum output tokens reserved and requested for a summary call.
+    pub summary_output_tokens: NonZeroU32,
+}
+
+impl Default for RetrievalPolicy {
+    /// No caps, no compaction and no automatic summaries, with a summary
+    /// output allowance of [`DEFAULT_SUMMARY_OUTPUT_TOKENS`]. A summary needs
+    /// some allowance to be requested at all, so zero is not representable.
+    fn default() -> Self {
+        Self {
+            max_messages: None,
+            max_tokens: None,
+            compact_after_tokens: None,
+            compact_batch: 0,
+            compact_keep_recent: 0,
+            summarize_after_tokens: None,
+            summary_output_tokens: DEFAULT_SUMMARY_OUTPUT_TOKENS,
+        }
+    }
 }
 
 /// How a turn's tool palette is selected from the registry's exposed tools.
@@ -137,45 +164,208 @@ impl ToolPalettePolicy {
     }
 }
 
+/// Who answers a call that deterministic policy leaves at
+/// [`Confirm`](ToolPermission::Confirm).
+///
+/// This is the whole difference between an attended, an automatically reviewed
+/// and an unattended session, so it is one value rather than a pair of flags
+/// that could disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Approver {
+    /// A person, asked by the host. `confirm`, `auto-edit` and `plan`.
+    #[default]
+    Human,
+    /// The graph's automatic reviewer first, then a person whenever it asks,
+    /// cannot decide or is not allowed to see the call. `auto`.
+    Reviewer,
+    /// Nobody: a would-be confirmation is a refusal. Unattended runs.
+    Nobody,
+}
+
 /// Context-sensitive permission overrides resolved before execution.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy {
+    /// Who answers a confirmation that policy leaves open.
+    pub approver: Approver,
     /// Per-tool overrides; absent → fall back to the registry's permission.
     pub overrides: HashMap<String, ToolPermission>,
-    /// Whether an ambiguous shell verdict must be refused instead of returned
-    /// as a confirmation request. Set only for unattended runs.
-    pub fail_closed_on_ambiguous_shell_permission: bool,
+    /// Immutable permission files installed by the permission-rules capability.
+    pub rules: Option<super::permission_rules::PermissionRules>,
+    /// Policy facts the tool capabilities published about their tools.
+    pub tools: ToolPolicyRegistry,
 }
 
 impl PermissionPolicy {
+    /// Whether nobody can answer a confirmation, so it must be refused.
+    #[must_use]
+    pub fn is_unattended(&self) -> bool {
+        self.approver == Approver::Nobody
+    }
+
+    /// Whether the automatic reviewer sees confirmations before a person does.
+    #[must_use]
+    pub fn uses_reviewer(&self) -> bool {
+        self.approver == Approver::Reviewer
+    }
+
+    /// The `plan` posture: nothing that writes files or runs commands.
+    fn is_plan(&self) -> bool {
+        matches!(
+            (
+                self.overrides.get("edit_file"),
+                self.overrides.get("run_command"),
+            ),
+            (Some(ToolPermission::Deny), Some(ToolPermission::Deny))
+        )
+    }
+
     /// Resolve the effective permission for `tool`, falling back to
     /// `registry_default` when no override applies.
+    ///
+    /// A tool whose capability declared [`AttendedApproval::Human`] is resolved
+    /// from those facts instead: refused when the registry or an override
+    /// refuses it, asked in every attended mode however it was overridden, and
+    /// run unattended only on an explicit `Allow` override. `plan` is the one
+    /// exception to the asking: it runs a tool declared
+    /// [`ToolEffect::ReadOnly`] and refuses one declared
+    /// [`ToolEffect::Mutating`].
     #[must_use]
     pub fn resolve(&self, tool: &str, registry_default: ToolPermission) -> ToolPermission {
-        let resolved = self
-            .overrides
-            .get(tool)
-            .copied()
-            .unwrap_or(registry_default);
-        if self.fail_closed_on_ambiguous_shell_permission && resolved == ToolPermission::Confirm {
+        let overridden = self.overrides.get(tool).copied();
+        let declared = self.tools.get(tool);
+        if declared.attended() == AttendedApproval::Human {
+            if registry_default == ToolPermission::Deny || overridden == Some(ToolPermission::Deny)
+            {
+                return ToolPermission::Deny;
+            }
+            if self.is_unattended() {
+                return if overridden == Some(ToolPermission::Allow) {
+                    ToolPermission::Allow
+                } else {
+                    ToolPermission::Deny
+                };
+            }
+            return match (self.is_plan(), declared.effect()) {
+                (true, Some(ToolEffect::ReadOnly)) => ToolPermission::Allow,
+                (true, Some(ToolEffect::Mutating)) => ToolPermission::Deny,
+                _ => ToolPermission::Confirm,
+            };
+        }
+        let resolved = overridden.unwrap_or(registry_default);
+        if self.is_unattended() && resolved == ToolPermission::Confirm {
             ToolPermission::Deny
         } else {
             resolved
         }
     }
 
+    /// Argument-aware first pass before an optional reviewer and human approval.
+    /// Hard mode denials and ceilings precede rules; deny > ask > allow, with
+    /// session grants considered only when no restrictive rule matched.
+    ///
+    /// The decision also records whether the automatic reviewer may settle it
+    /// ([`AuthorizationDecision::review`](super::permission_rules::AuthorizationDecision::review)). It may not when a rule asks (an
+    /// explicit `ask` rule, or a project `allow` rule that is not yet trusted)
+    /// or when the tool's capability declared [`AttendedApproval::Human`]; those
+    /// calls reach a person, and neither allow rules nor session grants apply
+    /// to the latter.
+    #[must_use]
+    pub fn resolve_call(
+        &self,
+        call: &super::permission_rules::PermissionCall<'_>,
+        grants: &super::permission_rules::SessionGrants,
+    ) -> super::permission_rules::AuthorizationDecision {
+        use super::permission_rules::{
+            AuthorizationDecision, ReviewEligibility, RuleDecision, ceiling_permission,
+        };
+        let base = self.resolve(call.tool, call.registry_default);
+        let human_only_tool = self.tools.get(call.tool).attended() == AttendedApproval::Human;
+        let matched = self
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.resolve(call.tool, call.args));
+        let ceiling = call.ceiling.map(|ceiling| {
+            let mut held = ceiling.mode().permission_policy();
+            held.tools = self.tools.clone();
+            held.resolve(call.tool, call.registry_default)
+        });
+        let mut result = AuthorizationDecision {
+            permission: base,
+            source: format!("permission mode: {}", self.mode_label()),
+            remember: !self.is_unattended(),
+            session_grant: false,
+            review: if human_only_tool {
+                ReviewEligibility::HumanOnly
+            } else {
+                ReviewEligibility::Eligible
+            },
+        };
+        if base == ToolPermission::Deny {
+            result.remember = false;
+            return result;
+        }
+        match matched {
+            Some((RuleDecision::Deny, source)) => {
+                result.permission = ToolPermission::Deny;
+                result.source = source;
+                result.remember = false;
+            }
+            Some((RuleDecision::Ask, source)) => {
+                result.permission = if self.is_unattended() {
+                    ToolPermission::Deny
+                } else {
+                    ToolPermission::Confirm
+                };
+                result.source = source;
+                result.remember = false;
+                result.review = ReviewEligibility::HumanOnly;
+            }
+            Some((RuleDecision::Allow, source)) if !self.is_unattended() && !human_only_tool => {
+                result.permission = ToolPermission::Allow;
+                result.source = source;
+                result.session_grant =
+                    grants.allows(call.generation, call.tool, call.args, call.root);
+            }
+            _ if !self.is_unattended()
+                && !human_only_tool
+                && grants.allows(call.generation, call.tool, call.args, call.root) =>
+            {
+                result.permission = ToolPermission::Allow;
+                result.source = "human session command grant".into();
+                result.session_grant = true;
+            }
+            _ => {}
+        }
+        let bounded = ceiling_permission(result.permission, ceiling);
+        if bounded != result.permission
+            && let Some(held) = call.ceiling
+        {
+            result.source = format!("{} permission ceiling", held.label());
+        }
+        result.permission = bounded;
+        if matches!(
+            ceiling,
+            Some(ToolPermission::Confirm | ToolPermission::Deny)
+        ) {
+            result.remember = false;
+        }
+        result
+    }
+
     /// Stable label for trajectory provenance.
     #[must_use]
     pub fn mode_label(&self) -> &'static str {
-        if self.fail_closed_on_ambiguous_shell_permission {
-            return "unattended";
+        match self.approver {
+            Approver::Nobody => return "unattended",
+            Approver::Reviewer => return "auto",
+            Approver::Human => {}
         }
         match (
             self.overrides.get("edit_file"),
             self.overrides.get("run_command"),
         ) {
             (Some(ToolPermission::Allow), Some(ToolPermission::Confirm)) => "auto-edit",
-            (Some(ToolPermission::Deny), Some(ToolPermission::Deny)) => "plan",
+            _ if self.is_plan() => "plan",
             _ => "confirm",
         }
     }
@@ -189,6 +379,8 @@ pub enum PermissionMode {
     Confirm,
     /// Allow file edits without asking while shell commands still require approval.
     AutoEdit,
+    /// Apply edits and review remaining confirmations with a model before dispatch.
+    Auto,
     /// Refuse mutating tools while leaving read-only tools available.
     Plan,
     /// Apply immutable construction-time grants without ever asking a human.
@@ -213,6 +405,7 @@ impl PermissionMode {
         match self {
             Self::Confirm => "confirm",
             Self::AutoEdit => "auto-edit",
+            Self::Auto => "auto",
             Self::Plan => "plan",
             Self::Unattended(_) => "unattended",
         }
@@ -238,9 +431,11 @@ impl PermissionMode {
     /// strictly below the mode that simply does it.
     ///
     /// [`Unattended`](Self::Unattended) has **no rung**, which is why this
-    /// returns an `Option`. It is not "above auto-edit": an unattended policy
+    /// returns an `Option`. `Auto` also has no rung: its reviewer capability
+    /// is admitted explicitly by `PermissionCeiling`, never inferred from
+    /// these deterministic tool gates. Unattended is not "above auto-edit": an unattended policy
     /// turns every would-be confirmation into a refusal
-    /// ([`PermissionPolicy::fail_closed_on_ambiguous_shell_permission`]), so
+    /// ([`Approver::Nobody`]), so
     /// against `confirm` it is *stricter* on every tool it holds no grant for
     /// and *more permissive* on the ones it does — `--allow-command 'cargo *'`
     /// runs `cargo` with nobody asked, which `auto-edit` would still confirm.
@@ -252,7 +447,7 @@ impl PermissionMode {
             Self::Plan => Some(0),
             Self::Confirm => Some(1),
             Self::AutoEdit => Some(2),
-            Self::Unattended(_) => None,
+            Self::Auto | Self::Unattended(_) => None,
         }
     }
 
@@ -264,21 +459,22 @@ impl PermissionMode {
 
     /// Produce the existing permission-policy seam for this mode.
     ///
-    /// The overrides and unattended fail-closed signal come from the same
-    /// match arm so a future mode cannot configure one without the other.
+    /// The overrides and the approver come from the same match arm so a future
+    /// mode cannot configure one without the other.
     #[must_use]
     pub fn permission_policy(&self) -> PermissionPolicy {
-        let (overrides, fail_closed_on_ambiguous_shell_permission) = self.permission_parts();
+        let (overrides, approver) = self.permission_parts();
         PermissionPolicy {
             overrides,
-            fail_closed_on_ambiguous_shell_permission,
+            approver,
+            ..PermissionPolicy::default()
         }
     }
 
-    fn permission_parts(&self) -> (HashMap<String, ToolPermission>, bool) {
+    fn permission_parts(&self) -> (HashMap<String, ToolPermission>, Approver) {
         let (edit, shell) = match self {
             Self::Confirm => (None, ToolPermission::Confirm),
-            Self::AutoEdit => (Some(ToolPermission::Allow), ToolPermission::Confirm),
+            Self::AutoEdit | Self::Auto => (Some(ToolPermission::Allow), ToolPermission::Confirm),
             Self::Plan => (Some(ToolPermission::Deny), ToolPermission::Deny),
             Self::Unattended(grants) => (
                 Some(if grants.edit_file {
@@ -312,7 +508,12 @@ impl PermissionMode {
                     .map(|name| ((*name).to_string(), edit)),
             );
         }
-        (overrides, matches!(self, Self::Unattended(_)))
+        let approver = match self {
+            Self::Auto => Approver::Reviewer,
+            Self::Unattended(_) => Approver::Nobody,
+            Self::Confirm | Self::AutoEdit | Self::Plan => Approver::Human,
+        };
+        (overrides, approver)
     }
 }
 
@@ -335,6 +536,9 @@ pub const SHELL_EXECUTION_TOOLS: [&str; 3] = ["run_command", "run_in_background"
 /// whether a posture may be entered therefore has to handle "cannot be
 /// ordered", and [`PermissionCeiling::admits`] answers it with a refusal.
 ///
+/// `Auto` is also incomparable with the human-approval ladder. Its reviewer
+/// capability is admitted explicitly by `PermissionCeiling::admits`.
+///
 /// `Some(Ordering::Equal)` is returned exactly when the two modes are equal, so
 /// this stays consistent with the derived [`PartialEq`].
 impl PartialOrd for PermissionMode {
@@ -352,7 +556,8 @@ impl PartialOrd for PermissionMode {
 /// The operator names one at launch and nothing reachable from inside the
 /// session — a command, a setting, a prompt, a tool — may exceed it. A ceiling
 /// holds a rung of the attended ladder
-/// ([`PermissionMode::attended_rung`]); [`PermissionMode::Unattended`] cannot be
+/// ([`PermissionMode::attended_rung`]) or the explicit `Auto` capability.
+/// [`PermissionMode::Unattended`] cannot be
 /// one, because a ceiling has to order every posture against itself and an
 /// unattended posture orders against nothing.
 ///
@@ -364,8 +569,8 @@ impl PartialOrd for PermissionMode {
 pub struct PermissionCeiling(PermissionMode);
 
 impl PermissionCeiling {
-    /// Build a ceiling at `mode`, or `None` when `mode` has no rung on the
-    /// attended ladder — today exactly [`PermissionMode::Unattended`].
+    /// Build a ceiling at a human-approval rung or the explicit `Auto`
+    /// capability. Unattended modes cannot be ceilings.
     ///
     /// # Examples
     ///
@@ -382,7 +587,7 @@ impl PermissionCeiling {
     /// ```
     #[must_use]
     pub fn new(mode: PermissionMode) -> Option<Self> {
-        mode.attended_rung().is_some().then_some(Self(mode))
+        (mode.attended_rung().is_some() || mode == PermissionMode::Auto).then_some(Self(mode))
     }
 
     /// The posture at the ceiling.
@@ -400,11 +605,19 @@ impl PermissionCeiling {
 
     /// Whether a session may run in `mode` under this ceiling.
     ///
-    /// A mode the ceiling cannot order — an unattended one — is refused rather
-    /// than guessed at, per the ordering documented on
-    /// [`PermissionMode::attended_rung`].
+    /// `Auto` requires an `Auto` ceiling; that ceiling also admits the three
+    /// human-approval modes. Other ceilings use the original ladder.
+    /// Unattended modes are always refused.
     #[must_use]
     pub fn admits(&self, mode: &PermissionMode) -> bool {
+        // Automated command approval requires its own explicit capability.
+        // AutoEdit still promises that a human approves commands.
+        if matches!(mode, PermissionMode::Auto) {
+            return self.0 == PermissionMode::Auto;
+        }
+        if self.0 == PermissionMode::Auto {
+            return mode.attended_rung().is_some();
+        }
         matches!(
             mode.partial_cmp(&self.0),
             Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
@@ -443,16 +656,54 @@ impl PermissionCeiling {
     }
 }
 
-/// How failures are retried within a system.
-#[derive(Debug, Clone)]
+/// How transient model-call failures are retried.
+///
+/// Only a failure the provider is likely to recover from is retried (see
+/// [`FailureKind::is_transient`](super::failure::FailureKind::is_transient));
+/// the deciding logic is [`RetryPolicy::next_step`], which the agent graph's
+/// retry stage consults after every failed attempt.
+///
+/// # Defaults
+///
+/// | Field | Default | Meaning |
+/// |-------|---------|---------|
+/// | [`max_attempts`](Self::max_attempts) | 5 | The first call plus four retries. |
+/// | [`base_delay`](Self::base_delay) | 1 s | The wait before the first retry; it doubles for each later one. |
+/// | [`max_delay`](Self::max_delay) | 60 s | The longest single wait, computed or requested by the provider. |
+/// | [`attempt_timeout`](Self::attempt_timeout) | 300 s | The longest an attempt may go without a provider event. |
+///
+/// With these numbers the computed waits are about 1, 2, 4 and 8 s, each
+/// scaled by a random factor between 0.75 and 1.25. The worst case is a
+/// provider that goes silent on every attempt and asks for the longest wait
+/// in between: five silent attempts of 300 s and four waits of 60 s, which is
+/// [`RetryPolicy::worst_case_wait`], 1,740 s (29 minutes). Lower
+/// `attempt_timeout` or `max_attempts` to bound an unattended run more
+/// tightly.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Maximum attempts for a transient LLM failure (>= 1).
+    /// Maximum attempts for a transient LLM failure, the first included
+    /// (>= 1). `1` turns retrying off.
     pub max_attempts: u32,
+    /// The wait before the first retry. Each later retry waits twice as long as
+    /// the one before, with jitter.
+    pub base_delay: std::time::Duration,
+    /// The longest a single wait may be, whether computed or requested by the
+    /// provider. A provider that asks for longer ends the retrying instead.
+    pub max_delay: std::time::Duration,
+    /// How long one attempt may go without the provider sending anything — to
+    /// the first event, and between events after that — before it is abandoned
+    /// as a timeout.
+    pub attempt_timeout: std::time::Duration,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_attempts: 2 }
+        Self {
+            max_attempts: 5,
+            base_delay: std::time::Duration::from_secs(1),
+            max_delay: std::time::Duration::from_secs(60),
+            attempt_timeout: std::time::Duration::from_secs(300),
+        }
     }
 }
 
@@ -483,16 +734,24 @@ impl PolicySnapshot {
                 compact_after_tokens: Some(DEFAULT_COMPACT_AFTER_TOKENS),
                 compact_batch: DEFAULT_COMPACT_BATCH,
                 compact_keep_recent: DEFAULT_COMPACT_KEEP_RECENT,
+                summarize_after_tokens: Some(DEFAULT_SUMMARIZE_AFTER_TOKENS),
+                summary_output_tokens: DEFAULT_SUMMARY_OUTPUT_TOKENS,
             },
             ..Default::default()
         }
     }
 
-    /// Policy-as-data seam: load policy from the `TBox` keyed by the current intent. v1
-    /// delegates to [`Self::defaults`].
-    pub async fn load(store: &OxigraphStore, intent: Option<&str>) -> Self {
+    /// Load permission data from the installed capability. Store and intent
+    /// remain available for future intent-specific policy selection.
+    pub async fn load(
+        store: &OxigraphStore,
+        intent: Option<&str>,
+        rules: &super::permission_rules::PermissionRules,
+    ) -> Self {
         let _ = (store, intent);
-        Self::defaults()
+        let mut snapshot = Self::defaults();
+        snapshot.permission.rules = Some(rules.clone());
+        snapshot
     }
 }
 
