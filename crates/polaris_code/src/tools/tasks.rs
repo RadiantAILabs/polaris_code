@@ -72,6 +72,8 @@ use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
 use polaris::tools::{ToolError, ToolPermission, ToolRegistry, ToolsPlugin, toolset};
 
+use super::approval::ApprovalReceipt;
+
 use crate::terminal::background::{
     BACKGROUND_DEFAULT_TIMEOUT_SECS, BackgroundTasks, FINISHED_RETAINED, FinishedTask, TaskView,
     collect_result, deadline_clause, lossiness,
@@ -133,6 +135,9 @@ impl TaskTools {
         /// Host destination for incremental process events.
         #[context]
         sink: Option<ShellSinkHandle>,
+        /// Single-use host authorization for these exact arguments.
+        #[context]
+        approval: Option<ApprovalReceipt>,
     ) -> Result<serde_json::Value, ToolError> {
         let seconds = timeout_secs.unwrap_or(BACKGROUND_DEFAULT_TIMEOUT_SECS);
         let mut request = ShellRequest::new(&command).with_timeout(seconds);
@@ -142,7 +147,20 @@ impl TaskTools {
         // No `ShellCancel`. The turn's token is wired into a foreground
         // `run_command` so Ctrl-C can stop it; a task that outlives its turn by
         // construction must not be taken down by the turn ending.
-        let started = match self.executor.start(request).await {
+        let response = if let Some(approval) = approval {
+            let Some(directory) = approval.consume_background(&command, timeout_secs) else {
+                return Err(ToolError::permission_denied(
+                    "Approval does not match this background invocation",
+                ));
+            };
+            self.executor
+                .start_confirmed(request.with_working_dir(directory))
+                .await
+                .map(ShellStartResponse::Started)
+        } else {
+            self.executor.start(request).await
+        };
+        let started = match response {
             Ok(ShellStartResponse::Started(process)) => process.detach(),
             Ok(ShellStartResponse::ConfirmationRequired(request)) => {
                 return Ok(serde_json::json!({
@@ -536,5 +554,77 @@ impl Plugin for TaskToolsPlugin {
                 .set_permission(name, permission)
                 .expect("TaskTools registers every name it gates");
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use polaris::shell::{ShellConfig, ShellSinkHandle};
+    use polaris::tools::ToolContext;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn host_approval_starts_background_work_without_agent_policy_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let executor = ShellExecutor::new(
+            ShellConfig::new()
+                .with_working_dir(directory.path())
+                .with_allowed_dirs(vec![directory.path().into()]),
+        );
+        let tasks = BackgroundTasks::detached(Duration::from_secs(5));
+        let mut registry = ToolRegistry::new();
+        registry.register_toolset(TaskTools::new(executor.clone(), tasks.clone()));
+        let invocation = tasks.enter("host-background", RUN_IN_BACKGROUND, None);
+        let sink = invocation.sink(
+            &polaris::sessions::SessionId::from_string("test"),
+            0,
+            Duration::from_secs(5),
+        );
+        let args = json!({"command":"printf x >> marker; echo \"$(pwd)\"", "timeout_secs":5});
+        let context = ToolContext::new().with(ShellSinkHandle::new(sink));
+        assert_eq!(
+            registry
+                .execute_with(RUN_IN_BACKGROUND, &args, &context)
+                .await
+                .unwrap()["status"],
+            "confirmation_required"
+        );
+        assert!(!directory.path().join("marker").exists());
+        let receipt = ApprovalReceipt::issue(
+            RUN_IN_BACKGROUND,
+            args.clone(),
+            directory.path(),
+            &directory.path().canonicalize().unwrap(),
+            || true,
+        );
+        let context = context.with(receipt);
+        assert!(
+            registry
+                .execute_with(RUN_IN_BACKGROUND, &args, &context)
+                .await
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("Started task")
+        );
+        assert!(
+            registry
+                .execute_with(RUN_IN_BACKGROUND, &args, &context)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tasks.finished().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join("marker")).unwrap(),
+            b"x"
+        );
+        executor.stop_all().await;
     }
 }

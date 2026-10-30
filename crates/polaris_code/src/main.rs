@@ -30,9 +30,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use polaris::graph::GraphExecutor;
+use polaris::models::ModelsPlugin;
 use polaris::models::anthropic::DEFAULT_MAX_TOKENS;
 use polaris::models::pricing::PriceStore;
-use polaris::models::{AnthropicPlugin, BedrockPlugin, ModelsPlugin};
 use polaris::plugins::{IOContent, IOMessage, IOProvider, PersistenceAPI, PersistencePlugin};
 use polaris::sessions::checkpoint::CheckpointOrigin;
 use polaris::sessions::{
@@ -42,11 +42,11 @@ use polaris::shell::{ShellConfig, ShellPlugin};
 use polaris::system::param::SystemContext;
 use polaris::system::server::Server;
 use polaris::tools::{ToolPermission, ToolsPlugin};
+use polaris_code::accounts::{self, Account};
 use polaris_code::agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS, PermissionCeiling, PermissionMode,
     PolicySnapshot, UnattendedGrants, load_seed_ontologies,
 };
-use polaris_code::config::{DEFAULT_BEDROCK_MODEL, ModelCatalog};
 use polaris_code::cosmos::composition::CompositionPolicy;
 use polaris_code::cosmos::default_loop::DefaultLoopTopologyPackPlugin;
 use polaris_code::cosmos::domains::DomainSelection;
@@ -57,13 +57,16 @@ use polaris_code::cosmos::inventory;
 use polaris_code::cosmos::planner::GatePlannerMode;
 use polaris_code::cosmos::policy as coding_policy;
 use polaris_code::cosmos::topology::{CodingTopologyPackPlugin, HostCapabilities};
+use polaris_code::credentials::CredentialStore;
 use polaris_code::exec::{
-    ExecIOPlugin, ExecIOProvider, InventoryReport, OutputFormat, RunReport, stream_json_line,
-    usage_message,
+    ExecIOPlugin, ExecIOProvider, InventoryReport, ModelsReport, OutputFormat, RunReport,
+    stream_json_line, usage_message,
 };
 use polaris_code::progress::ProgressMiddlewarePlugin;
+use polaris_code::providers::{self, ModelListing, Provider};
 use polaris_code::run;
 use polaris_code::state;
+use polaris_code::terminal::notify::NotifyMode;
 use polaris_code::terminal::{
     self, AttachmentStore, BackgroundCommands, BackgroundReporter, BackgroundTasks,
     CommandRegistry, EditJournal, RewindApplication, RewindControl, SessionAction,
@@ -71,7 +74,7 @@ use polaris_code::terminal::{
 };
 use polaris_code::tools::{
     CodeGraphPlugin, CodeToolsConfig, CodeToolsPlugin, GraphSearchMode, MemoryToolsPlugin,
-    TaskToolsPlugin,
+    TaskToolsPlugin, WebToolsPlugin,
 };
 use polaris_code::usage::{RunCeiling, TaskCostLimit, TokenMeter};
 use polaris_cosmos::evidence::TopologyEvidencePlugin;
@@ -82,22 +85,36 @@ use polaris_tui::panels::{ConversationPanelPlugin, HelpPanelPlugin, LogBuffer, L
 use polaris_tui::{TuiConfig, TuiHandle, TuiPlugin};
 use tokio::sync::mpsc;
 
+mod settings_file;
+
 /// The tail of `--help`: every environment knob and every key binding in one
 /// place, so the configuration surface is discoverable without reading the
 /// source. Clap renders the flags above it; these two sections are the part it
 /// cannot derive from the `Cli` struct.
 const HELP: &str = "\
 ENVIRONMENT:
+    POLARIS_CONFIG_DIR         Directory for user configuration, credentials,
+                               permission rules, and MCP definitions. Fallback:
+                               $XDG_CONFIG_HOME/polaris, then ~/.config/polaris.
     ANTHROPIC_API_KEY          Required for --provider anthropic (the
                                default). Anthropic API key. Not read for
                                --provider bedrock, which uses the AWS SDK's
                                own default credential chain instead (an
                                EC2/ECS instance role, AWS_PROFILE, or
                                AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY).
-    POLARIS_CODE_MODEL         Model id to start on. Default:
-                               anthropic/claude-sonnet-5. `--model` wins.
+    OPENAI_API_KEY             Required for --provider openai. Any non-empty
+                               value works for a server that checks no key.
+    OPENAI_BASE_URL            Address of an OpenAI-compatible server (Ollama,
+                               LM Studio, vLLM, a gateway) for --provider
+                               openai. Default: api.openai.com.
+    POLARIS_CODE_MODEL         Model id to start on. Default: the provider's
+                               newest Sonnet-class or flagship model, shown
+                               by --list-models. `--model` wins; a bare name
+                               such as `sonnet` picks the newest match.
     POLARIS_CODE_MODELS        Comma-separated set of models this run can
                                reach and `/model` can switch between.
+                               Declare a local server's models here as
+                               openai/<id>.
     POLARIS_CODE_GRAPH_SEARCH  Graph-search surface: curated | freeform | both.
                                Default: both.
     POLARIS_CODE_TOPOLOGY_PIN  Pins this run to one registered topology id (see
@@ -136,6 +153,34 @@ ENVIRONMENT:
                                startup.
     POLARIS_CODE_TESTENV       Keep the activated project runtime (PATH,
                                conda/venv vars) in shell tools (0/1, default 0).
+    POLARIS_CODE_MAX_COST_USD  Per coding task estimated USD ceiling. Lean
+                               defaults to 1.50; 0 disables it. Other arms
+                               default off.
+    POLARIS_CODE_PROMPT_CACHE  0/false/off disables cache-aware context and
+                               provider prompt caching. Default: on.
+    POLARIS_CODE_REDACT       0/false/off turns off secret redaction of tool
+                               output. Default: on.
+    POLARIS_CODE_NOTIFY       When the terminal bell and window title ask for
+                               attention: off, approval (a pending approval,
+                               default), or all (also when a turn ends).
+    POLARIS_CODE_ONTOLOGY_DIR  Ontology-pack directory seeded into the TBox at
+                               boot. Default: unset (seeding is skipped).
+
+    POLARIS_CODE_PROVIDER      Provider to start on; `--provider` wins.
+    POLARIS_CODE_REGION        AWS region; `--region` wins. The AWS SDK's
+                               own region chain is the fallback.
+    POLARIS_CODE_PERMISSION_MODE
+                               Interactive posture; `--permission-mode` wins.
+    POLARIS_CODE_PERMISSION_CEILING
+                               Interactive ceiling; `--permission-ceiling` wins.
+    POLARIS_CODE_MAX_TOKENS    Whole-run billed-token ceiling; `--max-tokens` wins.
+    POLARIS_CODE_MAX_OUTPUT_TOKENS
+                               Positive per-request output-token limit;
+                               `--max-output-tokens` wins.
+    POLARIS_CODE_MAX_TURNS     Positive agent iteration limit per turn;
+                               `--max-turns` wins.
+
+EXPERIMENT SWITCHES (not configuration-file keys):
     POLARIS_CODE_EXP_SUBMIT_GUARD  Refuse submit_answer while nothing is edited or
                                the last run_python check failed (0/1, default 0).
     POLARIS_CODE_EXP_REPO_LAYOUT  Put a short workspace listing in the first
@@ -159,24 +204,37 @@ ENVIRONMENT:
                                entry (0/1, default 0).
     POLARIS_CODE_LEAN_TWM_CODEMAP  Free, no-model-call code map in the
                                unchanging first block (0/1, default 0).
-    POLARIS_CODE_MAX_COST_USD  Per coding task estimated USD ceiling. Lean
-                               defaults to 1.50; 0 disables it. Other arms
-                               default off.
-    POLARIS_CODE_PROMPT_CACHE  0/false/off disables cache-aware context and
-                               provider prompt caching. Default: on.
-    POLARIS_CODE_REDACT       0/false/off turns off secret redaction of tool
-                               output. Default: on.
-    POLARIS_CODE_ONTOLOGY_DIR  Ontology-pack directory seeded into the TBox at
-                               boot. Default: unset (seeding is skipped).
 
-A .env file in the working directory is loaded automatically.
+CONFIGURATION FILES:
+    User: <POLARIS_CONFIG_DIR>/config.toml (or the fallback directory above).
+    Project: <working directory>/polaris.toml. Select an overlay with --profile.
+    Flags > environment > project file > user file > defaults.
+    POLARIS_CODE_MAX_COST_USD is a separate per-task limit; the file key
+    max_cost_usd sets the whole-run --max-cost-usd limit.
+
+Only .env in the launch folder is loaded automatically; parent folders and
+an explicit working directory are not searched. A loaded file is reported
+on stderr. Existing environment values take precedence.
+
+CREDENTIALS:
+    A provider's key is read from its environment variable (a .env file in
+    the launch folder counts), and otherwise from the key `polaris login`
+    stored in credentials.toml in the user configuration directory. Select that
+    directory with POLARIS_CONFIG_DIR. `polaris login status` shows which
+    providers have credentials and where each comes from.
 
 KEYS (in the TUI):
-    Tab / Shift-Tab   cycle panels (Conversation, Logs, Help)
+    Tab               cycle panels (Conversation, Logs, Help)
+    Shift-Tab         step to the next permission mode (see /permission)
     Alt-1 … Alt-9     jump to panel N
+    Esc               interrupt a running turn (a popup, search or pending
+                      approval takes Esc first); never quits
+    Ctrl-G            edit the draft in $VISUAL / $EDITOR
+    Ctrl-N            browse and search the transcript
     Ctrl-O            expand the per-turn node timeline (Conversation)
     Ctrl-L            toggle single / tiled layout
-    Ctrl-C / Ctrl-Q   quit
+    Ctrl-C / Ctrl-Q   quit (Ctrl-C first clears the draft or interrupts a
+                      running turn)
 ";
 
 /// Destructive command patterns refused outright by the shell, regardless of
@@ -185,9 +243,6 @@ const DENIED_COMMANDS: &[&str] = &["rm -rf *", "rm -rf /", "sudo *", ":(){ :|:& 
 
 /// Output-channel capacity for the non-interactive front end's `UserIO`.
 const EXEC_OUTPUT_BUFFER: usize = 64;
-
-/// The environment variable `AnthropicPlugin` reads the model key from.
-const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
 /// How long a signalled stop waits for the TUI runtime to leave the alternate
 /// screen before giving up and printing over it.
@@ -414,9 +469,11 @@ async fn finish_host(server: &mut Server, exit_code: i32) -> i32 {
 }
 
 /// A terminal coding agent built on Polaris. Mirrors Claude Code's CLI shape:
-/// no positional subcommand, `-p`/`--print` for one non-interactive turn.
+/// `-p`/`--print` for one non-interactive turn, and `login`/`logout` to manage
+/// provider credentials. A working directory named `login` or `logout` is
+/// reached as `./login`.
 #[derive(Parser)]
-#[command(name = "polaris", version)]
+#[command(name = "polaris", version, args_conflicts_with_subcommands = true)]
 // `--print` and `--topology-task` are the two non-interactive entry points and
 // they are exclusive: one drives a conversational turn, the other a topology
 // turn, and a single run is one turn. The group also gives `--allow-edit` and
@@ -426,6 +483,11 @@ async fn finish_host(server: &mut Server, exit_code: i32) -> i32 {
 // environment knob and the TUI keys — so one `--help` shows the whole surface.
 #[command(after_help = HELP)]
 struct Cli {
+    /// Credential commands. `main` runs them before it loads any configuration
+    /// (see `accounts::is_account_command`); the field is what lists them in
+    /// `--help` and keeps `polaris login` from being read as a directory.
+    #[command(subcommand)]
+    account: Option<Account>,
     /// Working directory (defaults to the current directory).
     working_dir: Option<PathBuf>,
     /// Run one turn non-interactively with this prompt, then exit, instead of
@@ -452,11 +514,16 @@ struct Cli {
     /// refused at startup, naming what was available.
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
-    /// Model provider to run on. `bedrock` uses the AWS Bedrock Converse API
+    /// Model provider to run on. `anthropic` (the default) needs
+    /// `ANTHROPIC_API_KEY`. `openai` needs `OPENAI_API_KEY` and also reaches
+    /// any server that speaks the same API (Ollama, LM Studio, vLLM, a
+    /// gateway) when `OPENAI_BASE_URL` names it; declare that server's models
+    /// with `POLARIS_CODE_MODELS`. `bedrock` uses the AWS Bedrock Converse API
     /// through the default AWS credential chain (an EC2/ECS instance role,
-    /// `AWS_PROFILE`, or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) instead
-    /// of `ANTHROPIC_API_KEY`. With no `--model`/`POLARIS_CODE_MODEL`, a
-    /// `bedrock` run starts on `DEFAULT_BEDROCK_MODEL`.
+    /// `AWS_PROFILE`, or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) and
+    /// needs a region. A run checks its provider's credentials before
+    /// starting and says what is missing. `--list-models` shows what each
+    /// provider offers.
     #[arg(
         long,
         env = "POLARIS_CODE_PROVIDER",
@@ -467,8 +534,9 @@ struct Cli {
     provider: Provider,
     /// AWS region for `--provider bedrock`. Unset leaves region resolution to
     /// the AWS SDK's own default chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or
-    /// the local AWS config profile). Ignored for `--provider anthropic`.
-    #[arg(long, value_name = "REGION")]
+    /// the local AWS config profile); a run with no region from either place
+    /// stops at startup. Ignored for the other providers.
+    #[arg(long, env = "POLARIS_CODE_REGION", value_name = "REGION")]
     region: Option<String>,
     /// Plan arm, overriding `POLARIS_CODE_ARM` (including loop and lean).
     #[arg(long, value_name = "ARM")]
@@ -481,11 +549,25 @@ struct Cli {
     /// immutable unattended grant instead.
     #[arg(long, value_enum, value_name = "MODE")]
     permission_mode: Option<InteractivePermissionMode>,
+    /// Reviewer model in provider/model form; defaults to the session model.
+    #[arg(long, env = "POLARIS_CODE_REVIEW_MODEL", value_name = "MODEL")]
+    review_model: Option<String>,
     /// Highest permission posture this process may ever reach. Nothing inside
     /// the session — a command, a setting, a prompt — can exceed it.
     /// Interactive-only, like `--permission-mode`.
     #[arg(long, value_enum, value_name = "MODE")]
     permission_ceiling: Option<InteractivePermissionMode>,
+    /// When the terminal bell and window title ask for attention: `off`,
+    /// `approval` (an approval is waiting), or `all` (also when a turn ends).
+    /// Ignored by non-interactive runs.
+    #[arg(
+        long,
+        env = "POLARIS_CODE_NOTIFY",
+        value_enum,
+        default_value = "approval",
+        value_name = "MODE"
+    )]
+    notify: NotifyMode,
     /// Allow `edit_file` during this unattended run.
     #[arg(long, requires = "unattended")]
     allow_edit: bool,
@@ -493,10 +575,19 @@ struct Cli {
     /// this unattended run. May be repeated.
     #[arg(long, requires = "unattended", value_name = "GLOB")]
     allow_command: Vec<String>,
+    /// Grant an additional tool by exact name or trailing-star prefix during
+    /// this unattended run. MCP tools require exact names. May be repeated.
+    #[arg(long, requires = "unattended", value_name = "NAME|PATTERN")]
+    allow_tool: Vec<String>,
     /// List the topologies this build registered, and whether each can run
     /// here, then exit. Honours `--output-format`; starts no agent turn.
     #[arg(long, conflicts_with = "print")]
     list_topologies: bool,
+    /// List the models each provider offers, which have a price, and whether
+    /// its credentials are present, then exit. Honours `--output-format`;
+    /// needs no key and starts no agent turn.
+    #[arg(long, conflicts_with_all = ["print", "list_topologies"])]
+    list_models: bool,
     /// Stop the run once its estimated spend reaches this many US dollars.
     /// Refused at startup if the model in use has no price, because an
     /// unpriced model must not become an unlimited one.
@@ -506,6 +597,22 @@ struct Cli {
     /// Enforceable for any model, priced or not.
     #[arg(long, value_name = "TOKENS")]
     max_tokens: Option<u64>,
+    /// Maximum agent iterations per turn; must be positive.
+    #[arg(
+        long,
+        env = "POLARIS_CODE_MAX_TURNS",
+        value_name = "TURNS",
+        value_parser = |raw: &str| resolve_max_turns(Some(raw))
+    )]
+    max_turns: Option<usize>,
+    /// Maximum output tokens per model request; must be positive.
+    #[arg(
+        long,
+        env = "POLARIS_CODE_MAX_OUTPUT_TOKENS",
+        value_name = "TOKENS",
+        value_parser = |raw: &str| resolve_max_output_tokens(Some(raw))
+    )]
+    max_output_tokens: Option<NonZeroU32>,
 }
 
 /// Permission modes a human may choose when starting an interactive session.
@@ -513,6 +620,7 @@ struct Cli {
 enum InteractivePermissionMode {
     Confirm,
     AutoEdit,
+    Auto,
     Plan,
 }
 
@@ -521,20 +629,10 @@ impl From<InteractivePermissionMode> for PermissionMode {
         match mode {
             InteractivePermissionMode::Confirm => Self::Confirm,
             InteractivePermissionMode::AutoEdit => Self::AutoEdit,
+            InteractivePermissionMode::Auto => Self::Auto,
             InteractivePermissionMode::Plan => Self::Plan,
         }
     }
-}
-
-/// Model provider a run can select, via `--provider`.
-///
-/// Mirrors `AnthropicPlugin` / `BedrockPlugin` registration one-for-one — see
-/// the `match` in `main()` that builds the server. Adding a third provider
-/// means adding a variant here and one more arm there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Provider {
-    Anthropic,
-    Bedrock,
 }
 
 /// Resolve the posture this process starts in, and the ceiling it may never
@@ -562,6 +660,7 @@ fn startup_permissions(
     headless: bool,
 ) -> Result<(PermissionMode, Option<PermissionCeiling>), String> {
     if headless {
+        polaris_code::agents::permission_rules::RunToolGrants::new(cli.allow_tool.clone())?;
         if cli.permission_mode.is_some() {
             return Err(
                 "--permission-mode is interactive-only; a non-interactive run uses unattended \
@@ -628,7 +727,10 @@ fn ceiling_notice(ceiling: &PermissionCeiling, active: &PermissionMode) -> Strin
 fn shell_config(working_dir: &std::path::Path, mode: &PermissionMode) -> ShellConfig {
     let allowed_commands = match mode {
         PermissionMode::Unattended(grants) => grants.run_command_patterns.clone(),
-        PermissionMode::Confirm | PermissionMode::AutoEdit | PermissionMode::Plan => {
+        PermissionMode::Confirm
+        | PermissionMode::AutoEdit
+        | PermissionMode::Auto
+        | PermissionMode::Plan => {
             vec!["*".to_string()]
         }
     };
@@ -741,8 +843,22 @@ async fn list_topologies(working_dir: &std::path::Path, format: OutputFormat) ->
         Err(err) => fatal(true, &format!("failed to read the topology catalog: {err}")),
     };
     let report = InventoryReport::new(listed);
-    // The third and last print site in this file, and like the other two every
-    // byte of it is rendered inside `exec::report`.
+    // The third print site in this file, and like the other two every byte of
+    // it is rendered inside `exec`.
+    println!("{}", report.stdout_payload(format));
+    std::process::exit(report.exit_code());
+}
+
+/// Lists what each provider offers from the environment and the built-in
+/// price table alone: no key, no network, no server.
+fn list_models(format: OutputFormat) -> ! {
+    let listing = ModelListing::observe(
+        &providers::process_env,
+        &CredentialStore::user(),
+        &PriceStore::builtin(),
+    );
+    // The fourth print site: rendered inside `exec`, like the other three.
+    let report = ModelsReport::new(listing);
     println!("{}", report.stdout_payload(format));
     std::process::exit(report.exit_code());
 }
@@ -796,53 +912,20 @@ async fn resume_or_create_session(
     }
 }
 
-/// Builds the `BedrockPlugin` for `--provider bedrock`.
-///
-/// With no `--region`, defers entirely to `BedrockPlugin::from_env()`, which
-/// resolves both credentials and region through the AWS SDK's own default
-/// chain. With `--region`, loads that chain once here — the same credential
-/// resolution, with the region pinned — since `BedrockPlugin::from_env()`
-/// has no parameter to override it.
-async fn bedrock_plugin(
-    region: Option<String>,
-    max_output_tokens: NonZeroU32,
-    pricing_store: PriceStore,
-) -> BedrockPlugin {
-    let plugin = match region {
-        Some(region) => {
-            let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(aws_config::Region::new(region))
-                .load()
-                .await;
-            BedrockPlugin::from_sdk_config(sdk_config)
-        }
-        None => BedrockPlugin::from_env(),
-    };
-    let plugin = plugin
-        .with_max_tokens(max_output_tokens)
-        .with_pricing_store(pricing_store);
-    match reasoning_effort_fields(std::env::var(REASONING_EFFORT_VAR).ok().as_deref()) {
-        Some(fields) => plugin.with_additional_model_request_fields(fields),
-        None => plugin,
-    }
-}
-
-/// `POLARIS_CODE_EXP_REASONING_EFFORT`: the reasoning effort (`low`,
-/// `medium`, `high`) a Bedrock `OpenAI` model is asked for on every request.
-const REASONING_EFFORT_VAR: &str = "POLARIS_CODE_EXP_REASONING_EFFORT";
-
-/// The Converse request fields for a reasoning effort, or `None` when unset,
-/// blank, or not one of `low`/`medium`/`high` (the model's default applies).
-fn reasoning_effort_fields(value: Option<&str>) -> Option<serde_json::Value> {
-    let effort = value?.trim();
-    matches!(effort, "low" | "medium" | "high")
-        .then(|| serde_json::json!({"reasoning": {"effort": effort}}))
-}
-
 #[tokio::main]
 async fn main() {
-    let _ = dotenvy::dotenv();
-    let cli = Cli::parse();
+    // Credential commands run before any configuration is read, so a settings
+    // file that fails to load cannot stand in the way of fixing credentials.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if accounts::is_account_command(&argv) {
+        let save =
+            |key: &str, value: &str| settings_file::set_user_value(key, value).map_err(Into::into);
+        std::process::exit(accounts::run_from_args(argv, &save).await);
+    }
+    let (cli, startup) = settings_file::load();
+    if cli.account.is_some() {
+        fatal(false, "`login` and `logout` take no other options");
+    }
     let headless = cli.print.is_some() || cli.topology_task.is_some();
     let (permission_mode, permission_ceiling) =
         startup_permissions(&cli, headless).unwrap_or_else(|message| fatal(headless, &message));
@@ -853,13 +936,26 @@ async fn main() {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let working_dir = match working_dir.canonicalize() {
         Ok(dir) => dir,
-        Err(err) => fatal(headless, &format!("invalid working directory: {err}")),
+        Err(err) => {
+            let hint = if working_dir == std::path::Path::new("login")
+                || working_dir == std::path::Path::new("logout")
+            {
+                "; credential commands are `polaris login` and `polaris logout`, with no \
+                 option before them"
+            } else {
+                ""
+            };
+            fatal(headless, &format!("invalid working directory: {err}{hint}"))
+        }
     };
 
     // Listing is not a run: it seals the same packs, reads the sealed catalog
     // and exits before anything else is assembled.
     if cli.list_topologies {
         list_topologies(&working_dir, cli.output_format).await;
+    }
+    if cli.list_models {
+        list_models(cli.output_format);
     }
 
     // Which models this run can reach, and which one it starts on. Resolved
@@ -868,13 +964,16 @@ async fn main() {
     // with the set that would have worked, not with a provider error at the
     // first token. The set is narrowed to the registered providers once the
     // registry exists, further down.
-    let declared_models = match cli.provider {
-        Provider::Anthropic => ModelCatalog::from_env(),
-        Provider::Bedrock => ModelCatalog::from_env_with_default(DEFAULT_BEDROCK_MODEL, &[]),
-    };
-    let model_id = declared_models
-        .select(cli.model.as_deref())
+    let declared_models = startup.catalog(cli.provider.catalog(&providers::process_env));
+    let selected_model = declared_models
+        .select_noting(cli.model.as_deref())
         .unwrap_or_else(|err| fatal(headless, &err.to_string()));
+    let model_id = selected_model.id.clone();
+    // What startup has to tell the person running it, said once the front end
+    // that shows it exists: stderr for a `--print` run, the transcript for a
+    // session.
+    let mut startup_notes: Vec<String> = selected_model.note().into_iter().collect();
+    startup_notes.extend(startup.notices().iter().cloned());
 
     // Config gate: `POLARIS_CODE_GRAPH_SEARCH` selects which
     // graph-search surface the agent sees — `curated`, `freeform`, or `both`
@@ -987,11 +1086,8 @@ async fn main() {
     // carries. Resolved once here and handed to two places that must agree:
     // `AnthropicPlugin`, which sends it, and the non-interactive report, which
     // states it. One local, so they cannot drift.
-    let configured_max_output_tokens = std::env::var(MAX_OUTPUT_TOKENS_VAR).ok();
-    let max_output_tokens = resolve_max_output_tokens(configured_max_output_tokens.as_deref())
-        .unwrap_or_else(|message| fatal(headless, &message));
-    let max_turns = resolve_max_turns(std::env::var(MAX_TURNS_VAR).ok().as_deref())
-        .unwrap_or_else(|message| fatal(headless, &message));
+    let max_output_tokens = cli.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let max_turns = cli.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let agent_config = AgentConfig::new(model_id, working_dir.clone())
         .with_graph_search(graph_search)
         .with_prompt_cache(prompt_cache);
@@ -1095,33 +1191,26 @@ async fn main() {
         terminal::TurnSteering::enabled()
     };
 
-    // `AnthropicPlugin::from_env` panics when the key is missing, which exits
-    // `101` through a backtrace. Neither front end should meet that: the
-    // non-interactive contract owes its caller exit code `2` and one line of
-    // explanation for a configuration error, and an interactive
-    // run owes a person the same fact before the TUI takes the screen. A key
-    // set to whitespace is missing too — the provider would reject it on the
-    // first turn, long after the message would have helped. `--provider
-    // bedrock` has no equivalent gate: `BedrockPlugin::from_env` resolves
-    // credentials through the AWS SDK's own default chain (instance role,
-    // profile, or explicit keys), which has no single "is it set" env var to
-    // check up front — a missing/invalid credential surfaces from the SDK
-    // itself when the plugin builds.
-    if cli.provider == Provider::Anthropic && api_key_missing(std::env::var(API_KEY_VAR)) {
-        if headless {
-            fatal(
-                headless,
-                &format!("{API_KEY_VAR} is not set; a non-interactive run needs a model key"),
-            );
-        }
-        eprintln!(
-            "polaris: {API_KEY_VAR} is not set.\n\
-             Set it in your environment or a .env file in the working directory, e.g.:\n\
-             \n    export {API_KEY_VAR}=sk-ant-...\n\n\
-             Run `polaris --help` for all options."
-        );
-        std::process::exit(1);
-    }
+    // The provider's plugins panic when their key is missing, which exits `101`
+    // through a backtrace, and a Bedrock run with no region or credentials only
+    // fails at the first request. Neither front end should meet that: the
+    // non-interactive contract owes its caller exit code `2` and an explanation
+    // for a configuration error, and an interactive run owes a person the same
+    // fact before the TUI takes the screen. One check serves both, and what it
+    // finds out — which region, which credential source — is reported, never
+    // the credential itself.
+    let ready_provider = match providers::prepare(
+        cli.provider,
+        cli.region.as_deref(),
+        &providers::process_env,
+        &CredentialStore::user(),
+    )
+    .await
+    {
+        Ok(ready) => ready,
+        Err(err) => fatal(headless, &err.to_string()),
+    };
+    startup_notes.push(ready_provider.report().line());
 
     // Built once and shared: the session plugin persists through it, and
     // `/sessions` reads the saved records back through the same store so a
@@ -1130,25 +1219,22 @@ async fn main() {
     let session_store: Arc<dyn polaris::sessions::SessionStore> =
         Arc::new(FileStore::new(state_dir.join("sessions")));
 
+    // Servers a project declares start only once the user has trusted them.
+    let mcp = polaris_code::tools::mcp::McpClientPlugin::from_working_dir(
+        &working_dir,
+        commands.clone(),
+        startup.trust().clone(),
+    )
+    .await;
+    startup_notes.extend(mcp.startup_notes());
+
     let mut server = Server::new();
     server.add_plugins(ModelsPlugin);
-    match cli.provider {
-        Provider::Anthropic => {
-            server.add_plugins(
-                AnthropicPlugin::from_env(API_KEY_VAR)
-                    .with_max_tokens(max_output_tokens)
-                    .with_pricing_store(pricing_store.clone()),
-            );
-        }
-        Provider::Bedrock => {
-            server.add_plugins(
-                bedrock_plugin(cli.region.clone(), max_output_tokens, pricing_store.clone()).await,
-            );
-        }
-    }
+    ready_provider.install(&mut server, max_output_tokens, pricing_store.clone());
     server
         // Tools: file primitives, the SPARQL store + tools, the code graph, shell.
         .add_plugins(ToolsPlugin)
+        .add_plugins(mcp)
         .add_plugins(CodeToolsPlugin::new(
             CodeToolsConfig::new(&working_dir).with_edit_journal(edit_journal.clone()),
         ))
@@ -1158,10 +1244,30 @@ async fn main() {
         // content-hash-invalidated against the cited spans.
         .add_plugins(MemoryToolsPlugin::new(&working_dir))
         .add_plugins(ShellPlugin::new(shell_config))
+        .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin)
         // The model's own way to push a command out of a turn and read it
         // back. Over the executor `ShellPlugin` just published and the table
         // above — no second process registry.
         .add_plugins(TaskToolsPlugin::new(background_tasks.clone()))
+        .add_plugins(
+            polaris_code::agents::permission_rules::PermissionRulesPlugin::new(&working_dir)
+                .with_project_trust(startup.trust().clone())
+                .with_commands(commands.clone(), attachment_settings.clone())
+                .with_tool_grants(
+                    polaris_code::agents::permission_rules::RunToolGrants::new(
+                        cli.allow_tool.clone(),
+                    )
+                    .unwrap_or_else(|error| fatal(headless, &error.to_string())),
+                ),
+        )
+        .add_plugins(polaris_code::agents::auto_review::AutoReviewPlugin::new(
+            polaris_code::agents::auto_review::ReviewPolicy {
+                model: cli.review_model.clone(),
+                ..Default::default()
+            },
+        ))
+        // Reading a public web page; registered `Confirm`, so it asks first.
+        .add_plugins(WebToolsPlugin::default())
         // Sessions + persistence.
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(session_store.clone()))
@@ -1172,6 +1278,10 @@ async fn main() {
                 .with_prompt_cache(prompt_cache)
                 .with_redaction(redaction),
         )
+        // `/compact`, offered because the agent above reads it.
+        .add_plugins(polaris_code::agents::context::CompactionPlugin::new(
+            commands.clone(),
+        ))
         // Live per-step progress → whichever UserIO the front end installs.
         .add_plugins(ProgressMiddlewarePlugin)
         // Topology selection. One process-wide catalog provider, the coding
@@ -1236,6 +1346,7 @@ async fn main() {
                     .with_settings(attachment_settings.clone()),
                 ))
                 .with_turn_input_handle(Arc::new(turn_steering.clone()))
+                .with_notifications(cli.notify.config())
                 .with_interrupt_handle(move || {
                     let Some(sessions) = callback_api.get().cloned() else {
                         return;
@@ -1267,6 +1378,7 @@ async fn main() {
     // Register the token meter as a global so the agent's `act` system can read
     // it via `Res<TokenMeter>`. Must precede any `create_context()` call.
     server.insert_global(token_meter.clone());
+    server.insert_global(ready_provider.report().clone());
     if let Some(limit) = task_cost_limit {
         server.insert_global(limit);
     }
@@ -1358,6 +1470,9 @@ async fn main() {
             headless,
             &format!("failed to register settings commands: {err}"),
         );
+    }
+    if !headless && let Err(err) = accounts::register_login_command(&commands) {
+        fatal(headless, &format!("failed to register /login: {err}"));
     }
 
     // The sealed catalog this server just built, read back once,
@@ -1500,6 +1615,17 @@ async fn main() {
     let navigation = SessionNavigation::new(sessions.clone(), session_id.clone())
         .with_store(session_store.clone());
     let _ = interrupt_navigation.set(navigation.clone());
+    if !headless
+        && let Err(err) = startup.register_status(
+            &commands,
+            &settings,
+            &navigation,
+            &working_dir,
+            ready_provider.report().clone(),
+        )
+    {
+        fatal(headless, &format!("failed to register /status: {err}"));
+    }
     if !headless && let Err(err) = navigation.register(&commands) {
         fatal(
             headless,
@@ -1606,6 +1732,9 @@ async fn main() {
     }
 
     if let Some(exec_io) = exec_io {
+        for note in &startup_notes {
+            eprintln!("polaris: {note}");
+        }
         // Accept before the turn starts, so the selection point the turn
         // already runs finds the work. A refusal here is a configuration
         // error — exit `2`, nothing queued, no model call, no turn.
@@ -1654,7 +1783,12 @@ async fn main() {
     let driver_history = history.clone();
     let driver_navigation = navigation.clone();
     let driver_output = terminal_output.expect("interactive mode has terminal output");
-    // Open with the ceiling, before the first prompt: a user who cannot raise
+    // Open with what startup found out — which provider and credentials the
+    // session is on, and any model name it had to choose between.
+    for note in startup_notes {
+        let _ = driver_output.send(IOMessage::system_text(note)).await;
+    }
+    // Then the ceiling, before the first prompt: a user who cannot raise
     // their permissions should read why from the ordinary session surface
     // rather than discover it by being refused.
     if let Some(ceiling) = settings.permission_ceiling() {
@@ -1834,9 +1968,11 @@ async fn main() {
                 }
                 // Modes are deliberately not persisted. Every session entered
                 // through `/new` or `/resume` starts in fail-closed Confirm,
-                // regardless of the posture of the session being left.
+                // regardless of the posture of the session being left. The model
+                // is a preference rather than a posture, so it stays on whatever
+                // `/model` last chose.
                 let fresh_policy = policy_snapshot(&PermissionMode::Confirm, graph_search);
-                driver_settings.reset(driver_config.model_id.clone());
+                driver_settings.reset_keeping_model();
                 if let Err(err) = driver_sessions
                     .with_context(&target, move |ctx| {
                         ctx.insert(fresh_policy);
@@ -2151,12 +2287,6 @@ fn ontology_dir() -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// Whether `ANTHROPIC_API_KEY` is effectively absent: unset, or set but blank.
-/// Takes the `env::var` result so the predicate is pure and unit-testable.
-fn api_key_missing(var: Result<String, std::env::VarError>) -> bool {
-    var.map(|v| v.trim().is_empty()).unwrap_or(true)
-}
-
 /// Resolve an on-by-default boolean env gate: `0`/`false`/`off` (case- and
 /// whitespace-insensitive) disable it; unset or anything else leaves it on.
 /// Takes the `env::var` result so the predicate is pure and unit-testable.
@@ -2276,6 +2406,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn notify_defaults_to_approvals_and_takes_a_word() {
+        assert_eq!(cli(&[]).notify, NotifyMode::Approval);
+        for (word, mode) in [
+            ("off", NotifyMode::Off),
+            ("approval", NotifyMode::Approval),
+            ("all", NotifyMode::All),
+        ] {
+            assert_eq!(cli(&["--notify", word]).notify, mode, "{word}");
+        }
+    }
+
+    #[test]
+    fn notify_reads_its_variable_and_refuses_an_unknown_word() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let notify = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "notify")
+            .expect("--notify exists");
+        assert_eq!(
+            notify.get_env().and_then(|name| name.to_str()),
+            Some("POLARIS_CODE_NOTIFY")
+        );
+        let Err(refusal) = Cli::try_parse_from(["polaris", "--notify", "sometimes"]) else {
+            panic!("an unknown word must be refused");
+        };
+        let refusal = refusal.to_string();
+        for word in ["off", "approval", "all"] {
+            assert!(refusal.contains(word), "{refusal}");
+        }
+    }
+
     /// The default posture is `confirm`, which a stricter ceiling lowers rather
     /// than being bypassed by.
     #[test]
@@ -2304,6 +2467,42 @@ mod tests {
             resolve(&["--permission-mode", "auto-edit"]).expect("an explicit interactive posture");
         assert_eq!(mode, PermissionMode::AutoEdit);
         assert!(ceiling.is_none());
+    }
+
+    #[test]
+    fn auto_permission_mode_is_attended_and_requires_explicit_ceiling_admission() {
+        let (mode, ceiling) = resolve(&["--permission-mode", "auto"]).unwrap();
+        assert_eq!(mode, PermissionMode::Auto);
+        assert!(ceiling.is_none());
+        for ceiling in ["plan", "confirm", "auto-edit"] {
+            assert!(
+                resolve(&["--permission-mode", "auto", "--permission-ceiling", ceiling]).is_err()
+            );
+        }
+        assert!(resolve(&["--permission-mode", "auto", "--permission-ceiling", "auto"]).is_ok());
+        assert!(resolve(&["--print", "hello", "--permission-mode", "auto"]).is_err());
+        let parsed = cli(&["--review-model", "scripted/reviewer"]);
+        assert_eq!(parsed.review_model.as_deref(), Some("scripted/reviewer"));
+    }
+
+    #[test]
+    fn unattended_additional_tool_grants_validate_at_startup() {
+        assert!(Cli::try_parse_from(["polaris", "--allow-tool", "web_fetch"]).is_err());
+        let parsed = cli(&[
+            "--print",
+            "hello",
+            "--allow-tool",
+            "web_fetch",
+            "--allow-tool",
+            "mcp__repo__search",
+        ]);
+        assert!(startup_permissions(&parsed, true).is_ok());
+        let parsed = cli(&["--print", "hello", "--allow-tool", "mcp__repo__*"]);
+        assert!(
+            startup_permissions(&parsed, true)
+                .unwrap_err()
+                .contains("exact MCP")
+        );
     }
 
     /// `--print` stays fail-closed unattended and takes neither flag: its
@@ -2723,17 +2922,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_accepts_only_known_levels() {
-        assert_eq!(
-            reasoning_effort_fields(Some(" high ")),
-            Some(serde_json::json!({"reasoning": {"effort": "high"}}))
-        );
-        for value in [None, Some(""), Some("max"), Some("HIGH")] {
-            assert_eq!(reasoning_effort_fields(value), None);
-        }
-    }
-
-    #[test]
     fn help_is_reachable_and_lists_every_flag_and_env_knob() {
         // Clap owns `-h`/`--help`; `HELP` is the tail it cannot derive. This
         // asserts the two halves are actually joined, so a flag added without
@@ -2750,19 +2938,11 @@ mod tests {
             "POLARIS_CODE_GRAPH_SEARCH",
             "POLARIS_CODE_PROMPT_CACHE",
             "POLARIS_CODE_REDACT",
+            "POLARIS_CODE_NOTIFY",
             "POLARIS_CODE_ONTOLOGY_DIR",
         ] {
             assert!(rendered.contains(knob), "--help omits {knob}");
         }
-    }
-
-    #[test]
-    fn api_key_missing_treats_unset_and_blank_as_missing() {
-        use std::env::VarError;
-        assert!(api_key_missing(Err(VarError::NotPresent)));
-        assert!(api_key_missing(Ok(String::new())));
-        assert!(api_key_missing(Ok("   ".into())));
-        assert!(!api_key_missing(Ok("sk-ant-123".into())));
     }
 
     #[test]
@@ -2777,6 +2957,122 @@ mod tests {
         // Anything else → on.
         for on in ["1", "true", "on", "yes", "anything"] {
             assert!(env_flag_enabled(Ok(on.into())), "{on:?} should enable");
+        }
+    }
+
+    #[test]
+    fn every_provider_is_selectable_by_its_flag_spelling() {
+        for provider in Provider::ALL {
+            assert_eq!(cli(&["--provider", provider.flag()]).provider, provider);
+        }
+        assert_eq!(cli(&[]).provider, Provider::Anthropic);
+        assert!(Cli::try_parse_from(["polaris", "--provider", "gemini"]).is_err());
+    }
+
+    #[test]
+    fn a_region_may_be_given_by_flag() {
+        assert_eq!(
+            cli(&["--provider", "bedrock", "--region", "eu-west-1"])
+                .region
+                .as_deref(),
+            Some("eu-west-1")
+        );
+    }
+
+    /// `polaris login` is a command, `polaris ./login` is a directory, and a
+    /// run's own options never combine with one.
+    #[test]
+    fn login_is_a_command_and_a_directory_named_login_is_reached_by_path() {
+        assert!(matches!(
+            cli(&["login"]).account,
+            Some(Account::Login(accounts::Login {
+                provider: None,
+                with_api_key: false,
+                action: None
+            }))
+        ));
+        assert!(matches!(
+            cli(&["login", "openai", "--with-api-key"]).account,
+            Some(Account::Login(accounts::Login {
+                provider: Some(Provider::OpenAi),
+                with_api_key: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            cli(&["logout", "bedrock"]).account,
+            Some(Account::Logout {
+                provider: Some(Provider::Bedrock)
+            })
+        ));
+        assert!(matches!(
+            cli(&["login", "status"]).account,
+            Some(Account::Login(accounts::Login {
+                action: Some(accounts::LoginAction::Status),
+                ..
+            }))
+        ));
+
+        let directory = cli(&["./login"]);
+        assert!(directory.account.is_none());
+        assert_eq!(directory.working_dir, Some(PathBuf::from("./login")));
+        let plain = cli(&["."]);
+        assert!(plain.account.is_none());
+        assert_eq!(plain.working_dir, Some(PathBuf::from(".")));
+
+        // After an option, `login` is no longer in command position: it is the
+        // working directory, and `main` says how to reach the command instead.
+        let after_option = cli(&["--provider", "openai", "login"]);
+        assert!(after_option.account.is_none());
+        assert_eq!(after_option.working_dir, Some(PathBuf::from("login")));
+
+        for conflicting in [vec!["login", "--model", "sonnet"], vec![".", "login"]] {
+            let mut argv = vec!["polaris"];
+            argv.extend(&conflicting);
+            assert!(Cli::try_parse_from(argv).is_err(), "{conflicting:?}");
+        }
+    }
+
+    #[test]
+    fn help_lists_the_credential_commands() {
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_long_help().to_string();
+        for needle in ["login", "logout", "POLARIS_CONFIG_DIR", "credentials.toml"] {
+            assert!(rendered.contains(needle), "--help omits {needle}");
+        }
+    }
+
+    #[test]
+    fn listing_models_is_a_listing_not_a_turn() {
+        assert!(cli(&["--list-models"]).list_models);
+        assert!(!cli(&[]).list_models);
+        for conflicting in [
+            ["--list-models", "--print"],
+            ["--list-models", "--list-topologies"],
+        ] {
+            let mut argv = vec!["polaris"];
+            argv.extend(conflicting);
+            // `--print` takes a value, so give it one.
+            if conflicting.contains(&"--print") {
+                argv.push("hi");
+            }
+            assert!(Cli::try_parse_from(argv).is_err(), "{conflicting:?}");
+        }
+    }
+
+    #[test]
+    fn help_tells_the_operator_how_to_reach_each_provider() {
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_long_help().to_string();
+        for needle in [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "POLARIS_CODE_REGION",
+            "--list-models",
+            "openai",
+            "bedrock",
+        ] {
+            assert!(rendered.contains(needle), "--help omits {needle}");
         }
     }
 

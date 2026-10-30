@@ -19,3 +19,9 @@ Both APIs are provided by [`TuiPlugin`](crate::TuiPlugin).
 |-----|-----------------|
 | [`TuiRegistry`](crate::TuiRegistry) | The cross-plugin panel contribution surface. Panels call `add_panel` in their `build()`; `TuiPlugin` drains it once in `ready()`. **Open extension** — any number of panels. |
 | [`TuiHandle`](crate::TuiHandle) | Runtime handle to the running shell. `run_in_terminal()` serializes interactive child handoffs and restores terminal modes; `shutdown()` requests cooperative exit; `wait()` joins once. Panels receive a clone before initialization. |
+
+Approval rendering uses the ordinary typed [`ApprovalChoice`](crate::ApprovalChoice)
+protocol, not another framework API. Hosts encode choices using
+[`APPROVAL_CHOICES`](crate::APPROVAL_CHOICES); replies identify the selected scope
+with [`APPROVAL_CHOICE`](crate::APPROVAL_CHOICE). Prompt IDs correlate cancellation
+and responses so a resolved approval cannot answer a later receive.

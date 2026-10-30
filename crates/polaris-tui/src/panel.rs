@@ -9,6 +9,7 @@
 //! panel owns its own state.
 
 use crate::event::TuiEvent;
+use crate::notify::Notification;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
@@ -52,7 +53,10 @@ pub enum EventOutcome {
 ///    `Tick`, `Resize`, and focus transitions are broadcast to every panel
 ///    regardless of layout. Panels therefore do not need their own
 ///    "am-I-focused" gate around keystroke handling.
-/// 5. [`render`](Self::render) runs every paint pass — keep it pure.
+/// 5. [`take_notification`](Self::take_notification) is polled after every
+///    event and tick; a panel that needs the user's attention returns a
+///    [`Notification`] there.
+/// 6. [`render`](Self::render) runs every paint pass — keep it pure.
 pub trait TuiPanel: Send + 'static {
     /// Stable identifier — also the tab label by default.
     fn id(&self) -> &str;
@@ -78,6 +82,17 @@ pub trait TuiPanel: Send + 'static {
     /// Handle an input event. Default: ignore.
     fn handle_event(&mut self, _event: &TuiEvent) -> EventOutcome {
         EventOutcome::Continue
+    }
+
+    /// Take the pending request for the user's attention, if any.
+    ///
+    /// The runtime calls this after every event and tick and writes the
+    /// result to the terminal: a bell and/or a window title (see
+    /// [`Notification`]). Return each request once; the panel decides when
+    /// something is worth interrupting for, the runtime decides how it
+    /// reaches the terminal. Default: never notifies.
+    fn take_notification(&mut self) -> Option<Notification> {
+        None
     }
 
     /// Render this panel into `area` of the current frame.

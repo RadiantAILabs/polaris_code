@@ -160,7 +160,7 @@ async fn evicted_history_is_recovered_without_merging_or_executing_it() {
     }
     let live = screen(&mut panel).await;
     assert!(!live.contains("canonical 0000"));
-    key(&mut panel, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    key(&mut panel, KeyCode::Char('n'), KeyModifiers::CONTROL);
     key(&mut panel, KeyCode::Char('h'), KeyModifiers::NONE);
     screen(&mut panel).await;
     key(&mut panel, KeyCode::Char('h'), KeyModifiers::NONE);

@@ -9,8 +9,11 @@
 //! the agent resolves. Its `receive` loops: a command message is executed
 //! against the [`CommandRegistry`] and answered through the inner `send`,
 //! then it keeps waiting; an ordinary prompt has its `@` mentions checked
-//! and is returned. The agent's `receive` therefore only ever returns real
-//! prompts, and the model is only ever called for one.
+//! and is returned. A command that answers with an
+//! [`AgentRequest`](super::commands::AgentRequest) instead
+//! returns it to the agent as private control data, without a reply and
+//! without entering canonical history as a user prompt; the dispatcher does not
+//! know what any request means.
 //!
 //! The wrapper also advertises the command set to the panel on the first
 //! `receive` — the earliest moment the panel is listening — so the `/`
@@ -23,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use polaris::plugins::{IO_TYPE, IOError, IOMessage, IOProvider, IOSource, IOStream};
 use polaris_tui::commands::{CommandInvocation, advertise_commands};
 
-use super::commands::CommandRegistry;
+use super::commands::{CommandOutcome, CommandRegistry};
 use super::mentions;
 
 const HOST_CONTROL_TYPE: &str = "polaris-code:host-control";
@@ -93,6 +96,9 @@ impl<P: IOProvider> IOProvider for CommandDispatch<P> {
             let message = self.inner.receive().await?;
             if let Some(invocation) = CommandInvocation::from_message(&message) {
                 let outcome = self.registry.dispatch(&invocation).await;
+                if let CommandOutcome::Request(request) = outcome {
+                    return Ok(request.into_message());
+                }
                 let ends_turn = outcome.ends_turn();
                 self.inner
                     .send(outcome.into_message(&invocation.name))

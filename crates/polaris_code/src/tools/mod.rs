@@ -14,12 +14,16 @@
 //! upstream `polaris_shell`. Presenting a result is the consumer's job, so it
 //! lives here rather than in the framework.
 
+pub mod approval;
 pub mod code;
 pub mod code_graph;
 pub mod fileset;
+pub mod mcp;
 pub mod memory;
+pub mod policy;
 pub(crate) mod shell_render;
 pub mod tasks;
+pub mod web;
 
 pub use code::{CodeTools, CodeToolsConfig, CodeToolsPlugin, FILE_WRITE_TOOLS};
 pub use code_graph::{
@@ -28,7 +32,9 @@ pub use code_graph::{
 };
 pub use fileset::{PathGlob, Selection, WalkLimits, select_files};
 pub use memory::{MEMORY_GRAPH_IRI, MemoryTools, MemoryToolsPlugin};
+pub use policy::{AttendedApproval, ToolEffect, ToolPolicy, ToolPolicyPlugin, ToolPolicyRegistry};
 pub use tasks::{RUN_IN_BACKGROUND, STOP_TASK, TASK_OUTPUT, TaskTools, TaskToolsPlugin};
+pub use web::{WEB_FETCH, WebTools, WebToolsConfig, WebToolsPlugin};
 
 /// Whether a tool only reads state (vs. mutating files or the store).
 ///
@@ -39,7 +45,9 @@ pub use tasks::{RUN_IN_BACKGROUND, STOP_TASK, TASK_OUTPUT, TaskTools, TaskToolsP
 /// Read-only: `read_file`, `read_span`, `search`, `glob`, `list_files`, the `outline` /
 /// `read_symbol` / `find_*`/`callers_of`/`callees_of`/`impls_of_trait`
 /// navigation tools, the `concepts`/`find_by_role`/`resources`/`accessors_of`
-/// concept queries, `recall_memory`, `task_output`, and `sparql_query`.
+/// concept queries, `recall_memory`, `task_output`, and `sparql_query`, and
+/// `web_fetch` (it changes nothing on this machine; the permission policy, not
+/// this list, decides whether the network may be used).
 /// Mutating: `edit_file`, `create_file`, `run_command`, `run_in_background`,
 /// `stop_task`, `memoize`, `sparql_update`, `load_ontology_turtle`.
 #[must_use]
@@ -66,6 +74,7 @@ pub fn tool_is_read_only(name: &str) -> bool {
             | "task_output"
             | "sparql_query"
             | "describe_resource"
+            | "web_fetch"
     )
 }
 
@@ -83,6 +92,7 @@ mod tests {
         assert!(!tool_is_read_only("edit_file"));
         assert!(!tool_is_read_only("create_file"));
         assert!(tool_is_read_only("task_output"));
+        assert!(tool_is_read_only("web_fetch"));
         assert!(!tool_is_read_only("run_command"));
         assert!(!tool_is_read_only("run_in_background"));
         assert!(!tool_is_read_only("stop_task"));

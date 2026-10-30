@@ -3,14 +3,16 @@
 use crate::app::{AppShell, ShellOutcome};
 use crate::config::TuiConfig;
 use crate::event::TuiEvent;
+use crate::notify::{Notification, RESTORE_TITLE};
 use crate::panel::TuiPanel;
 use crossterm::ExecutableCommand;
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CtEvent, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    Event as CtEvent, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use crossterm::style::Print;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
@@ -104,12 +106,18 @@ async fn event_loop(
                 let size = terminal.size()?;
                 shell.handle_event(TuiEvent::Resize { cols: size.width, rows: size.height });
                 shell.tick();
+                deliver_notifications(modes, &mut shell);
                 terminal.draw(|frame| shell.render(frame))?;
             }
             event = next_terminal_event() => {
                 match event {
                     Ok(ct) => {
                         if let Some(event) = translate_event(ct) {
+                            // The user is at the keyboard again, so a title
+                            // that asked for them has done its job.
+                            if is_user_input(&event) {
+                                modes.restore_title();
+                            }
                             match shell.handle_event(event) {
                                 ShellOutcome::Quit => break,
                                 ShellOutcome::ToggleMouse => {
@@ -122,11 +130,13 @@ async fn event_loop(
                     }
                     Err(err) => return Err(err),
                 }
+                deliver_notifications(modes, &mut shell);
                 terminal.draw(|frame| shell.render(frame))?;
             }
             _ = tick.tick() => {
                 shell.tick();
                 if matches!(shell.handle_event(TuiEvent::Tick), ShellOutcome::Quit) { break; }
+                deliver_notifications(modes, &mut shell);
                 terminal.draw(|frame| shell.render(frame))?;
             }
         }
@@ -142,6 +152,26 @@ async fn next_terminal_event() -> io::Result<CtEvent> {
             return crossterm::event::read();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Whether `event` shows a person at the keyboard. Pointer movement alone
+/// does not: with mouse tracking on, a terminal reports every movement.
+fn is_user_input(event: &TuiEvent) -> bool {
+    match event {
+        TuiEvent::Key(_) | TuiEvent::Paste(_) => true,
+        TuiEvent::Mouse(mouse) => mouse.kind != MouseEventKind::Moved,
+        _ => false,
+    }
+}
+
+/// Write every attention request the panels raised. Best effort: failing to
+/// ring a bell is not a reason to stop the shell.
+fn deliver_notifications(modes: &mut TerminalModes, shell: &mut AppShell) {
+    for notification in shell.take_notifications() {
+        if let Err(error) = modes.notify(&notification) {
+            tracing::debug!(%error, "could not deliver a terminal notification");
+        }
     }
 }
 
@@ -179,8 +209,34 @@ struct TerminalModes {
     enhanced: bool,
     keyboard_active: bool,
     mouse: bool,
+    /// Whether the terminal was asked to save its window title, so a
+    /// notification title can be undone.
+    title_saved: bool,
     #[cfg(unix)]
     child_settings: Option<TtySettings>,
+}
+
+impl TerminalModes {
+    /// Write a notification's bell and title.
+    fn notify(&mut self, notification: &Notification) -> io::Result<()> {
+        let bytes = notification.encode(self.title_saved);
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // Mark before writing: even a partial write gets a defensive restore.
+        self.title_saved |= notification.sets_title();
+        io::stdout().execute(Print(bytes)).map(|_| ())
+    }
+
+    /// Put back the window title saved before the first notification.
+    fn restore_title(&mut self) {
+        if !self.title_saved {
+            return;
+        }
+        if io::stdout().execute(Print(RESTORE_TITLE)).is_ok() {
+            self.title_saved = false;
+        }
+    }
 }
 
 impl TerminalHandoff for TerminalModes {
@@ -231,6 +287,13 @@ impl TerminalHandoff for TerminalModes {
         // Attempt every restoration step even when one fails. The first error
         // is reported, and Drop retries any incomplete restoration.
         let mut result = Ok(());
+        if self.title_saved {
+            let restored = out.execute(Print(RESTORE_TITLE)).map(|_| ());
+            if restored.is_ok() {
+                self.title_saved = false;
+            }
+            result = result.and(restored);
+        }
         result = result.and(out.execute(DisableMouseCapture).map(|_| ()));
         if self.keyboard_active {
             let popped = out.execute(PopKeyboardEnhancementFlags).map(|_| ());
@@ -438,6 +501,28 @@ mod tests {
             translate_event(CtEvent::Resize(80, 24)),
             Some(TuiEvent::Resize { cols: 80, rows: 24 })
         ));
+    }
+
+    #[test]
+    fn typing_and_clicking_count_as_presence_but_moving_the_pointer_does_not() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let mouse = |kind| {
+            TuiEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(is_user_input(&TuiEvent::Key(key)));
+        assert!(is_user_input(&TuiEvent::Paste("text".into())));
+        assert!(is_user_input(&mouse(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
+        assert!(is_user_input(&mouse(MouseEventKind::ScrollUp)));
+        assert!(!is_user_input(&mouse(MouseEventKind::Moved)));
+        assert!(!is_user_input(&TuiEvent::Tick));
+        assert!(!is_user_input(&TuiEvent::Resize { cols: 80, rows: 24 }));
     }
 
     #[test]

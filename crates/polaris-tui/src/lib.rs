@@ -77,6 +77,7 @@ mod composer;
 mod config;
 mod event;
 mod layout;
+mod notify;
 mod panel;
 mod plugin;
 mod registry;
@@ -116,6 +117,7 @@ pub use composer::history::{PromptHistoryConfig, PromptHistoryNamespace, PromptH
 pub use config::{LayoutMode, TuiConfig};
 pub use event::TuiEvent;
 pub use nav::{KeyMap, NavIntent};
+pub use notify::{Notification, NotifyConfig};
 pub use panel::{EventOutcome, TuiPanel};
 pub use plugin::{TuiHandle, TuiPlugin};
 pub use registry::TuiRegistry;
@@ -133,3 +135,9 @@ pub use ratatui::crossterm;
 
 #[cfg(feature = "panels")]
 mod transcript;
+
+#[cfg(feature = "panels")]
+pub use panels::conversation::{
+    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_REQUEST_ID, ApprovalChoice,
+    IO_TYPE_APPROVAL_RESOLVED,
+};

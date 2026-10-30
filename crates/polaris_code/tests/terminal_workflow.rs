@@ -421,6 +421,7 @@ impl Host {
             .add_plugins(CodeGraphPlugin::new(&working_dir))
             .add_plugins(MemoryToolsPlugin::new(&working_dir))
             .add_plugins(ShellPlugin::new(shell_config(&working_dir)))
+            .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin)
             .add_plugins(PersistencePlugin)
             .add_plugins(SessionsPlugin::new(session_store.clone()))
             .add_plugins(CodeAgentPlugin::new())
@@ -1248,6 +1249,9 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
 async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
     let workspace = workspace();
     let mut host = Host::boot(workspace.path(), "default").await;
+    // The open dialog lists its answer choices under the diff, so it needs more
+    // rows than the default screen to keep the finished edit block in view.
+    host.resize(160, 40);
     host.spawn_driver();
 
     host.script.push(edit_reply(
