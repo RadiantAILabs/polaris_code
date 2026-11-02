@@ -105,12 +105,24 @@
 //! A second Ctrl-C within 1500 ms falls through to the shell; Ctrl-Q quits.
 //! Without a handle, the existing approval/draft/quit behaviour is unchanged.
 //!
+//! `Esc` requests the same interruption while a turn runs, after it has closed
+//! a popup, left history browsing or denied an open approval. It leaves the
+//! draft alone and never quits, so it is the safe key to reach for mid-turn.
+//!
 //! The callback requests work; it does not prove the signal was raised. The
 //! host sends `interrupting` when raised and `cancelled` when stopped, through
 //! ordinary [`UserIO`] messages. Only those messages produce the corresponding
 //! transcript rows. No timer infers completion, and this crate kills no process.
 //! The host must send statuses in turn order, ending with `cancelled` or an
 //! empty `status`, before sending the next turn's work status.
+//!
+//! # Asking for attention
+//!
+//! [`ConversationPanelPlugin::with_notifications`] lets the panel ring the
+//! terminal bell and/or set the window title when it needs the user: when an
+//! approval opens, and optionally when a turn the user did not interrupt ends.
+//! The panel only decides *when*; the runtime that owns the terminal decides
+//! *how* (see [`Notification`]). Without the call the panel never notifies.
 //!
 //! # Backgrounding the live work
 //!
@@ -157,6 +169,12 @@
 //! - a plain "yes" typed with no dialog open is just a message, and an answer
 //!   that cannot be delivered leaves the dialog open. Only a stamped, delivered
 //!   approval runs the tool.
+//!
+//! Hosts may attach `approval_choices` JSON: a list of objects with `id`,
+//! `label`, `keys` (answer aliases) and `confirmed` (boolean). The banner renders
+//! those labels and a selected key returns `approval_choice` alongside the
+//! standard `confirmed` metadata. `deny: reason` returns a denial with the
+//! original text. The panel keeps no command, path or persistence semantics.
 //!
 //! The panel decides nothing about *which* actions need approval — that is the
 //! tool's permission, set by the consumer. This is presentation and the answer
@@ -278,7 +296,8 @@ use crate::composer::Composer;
 use crate::composer::editor::edit_draft;
 use crate::composer::history::{History, replace};
 use crate::event::TuiEvent;
-use crate::nav::{KeyMap, NavIntent};
+use crate::nav::{Key, KeyMap, NavIntent};
+use crate::notify::{Notification, NotifyConfig};
 use crate::panel::{EventOutcome, TuiPanel};
 use crate::panels::LogBuffer;
 use crate::panels::logs::FRAMEWORK_TARGET_PREFIX;
@@ -483,6 +502,8 @@ pub struct TuiIOProvider {
     /// request, then take the next message", so without this latch the next
     /// message — whatever it is — becomes the answer.
     awaiting_confirm: AtomicBool,
+    /// Correlates scoped responses with the currently awaited approval.
+    confirm_id: Mutex<Option<String>>,
     /// Ordinary prompts pulled off the channel while `awaiting_confirm` was
     /// set. They arrived before the answer but are not the answer, so they wait
     /// here, in order, for the next ordinary [`receive`](IOProvider::receive)
@@ -525,6 +546,7 @@ impl TuiIOProvider {
             in_rx: tokio::sync::Mutex::new(in_rx),
             out_notify: out_notify.clone(),
             awaiting_confirm: AtomicBool::new(false),
+            confirm_id: Mutex::new(None),
             deferred: Mutex::new(VecDeque::new()),
             consumed: consumed.clone(),
         };
@@ -556,8 +578,19 @@ impl IOProvider for TuiIOProvider {
         // Latch the dialog on the way out. `confirm` gives the provider no
         // other signal that the receive which follows is an answer and not the
         // next thing the user happened to type.
-        if message.metadata.get(IO_TYPE).map(String::as_str) == Some(IO_TYPE_CONFIRM) {
-            self.awaiting_confirm.store(true, Ordering::SeqCst);
+        match message.metadata.get(IO_TYPE).map(String::as_str) {
+            Some(IO_TYPE_CONFIRM) => {
+                *self.confirm_id.lock() = message.metadata.get(APPROVAL_REQUEST_ID).cloned();
+                self.awaiting_confirm.store(true, Ordering::SeqCst);
+            }
+            Some(IO_TYPE_APPROVAL_RESOLVED) => {
+                let mut id = self.confirm_id.lock();
+                if id.is_some() && id.as_ref() == message.metadata.get(APPROVAL_REQUEST_ID) {
+                    self.awaiting_confirm.store(false, Ordering::SeqCst);
+                    *id = None;
+                }
+            }
+            _ => {}
         }
         self.out_tx
             .send(message)
@@ -585,6 +618,13 @@ impl IOProvider for TuiIOProvider {
                 return Err(IOError::Closed);
             };
             if !self.awaiting_confirm.load(Ordering::SeqCst) {
+                // A scoped answer queued before cancellation belongs to the
+                // resolved dialog, never to the next ordinary input receive.
+                if message.metadata.contains_key(CONFIRMED)
+                    && message.metadata.contains_key(APPROVAL_REQUEST_ID)
+                {
+                    continue;
+                }
                 self.note_consumed(&message);
                 return Ok(message);
             }
@@ -592,7 +632,12 @@ impl IOProvider for TuiIOProvider {
             // else is an ordinary prompt: handing it to `confirm` would both
             // deny the tool (no `confirmed` metadata) and swallow the prompt.
             if message.metadata.contains_key(CONFIRMED) {
+                let mut id = self.confirm_id.lock();
+                if message.metadata.get(APPROVAL_REQUEST_ID) != id.as_ref() {
+                    continue;
+                }
                 self.awaiting_confirm.store(false, Ordering::SeqCst);
+                *id = None;
                 return Ok(message);
             }
             self.deferred.lock().push_back(message);
@@ -663,6 +708,72 @@ struct TimelineNode {
     label: String,
 }
 
+/// Metadata key for the JSON array of host-provided [`ApprovalChoice`]s.
+pub const APPROVAL_CHOICES: &str = "approval_choices";
+/// Metadata key for the selected [`ApprovalChoice::id`] on a response.
+pub const APPROVAL_CHOICE: &str = "approval_choice";
+/// Metadata key correlating an approval prompt, its response and its resolution.
+pub const APPROVAL_REQUEST_ID: &str = "approval_request_id";
+/// [`IO_TYPE`] value closing a resolved approval without soliciting another answer.
+pub const IO_TYPE_APPROVAL_RESOLVED: &str = "approval_resolved";
+
+/// A host-provided approval scope. The UI interprets keys, never tool policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalChoice {
+    /// Stable response identifier chosen by the host.
+    pub id: String,
+    /// Human-readable description of the scope being authorized.
+    pub label: String,
+    /// Accepted answers, matched without regard to ASCII case.
+    pub keys: Vec<String>,
+    /// Whether this choice authorizes execution.
+    pub confirmed: bool,
+}
+
+impl ApprovalChoice {
+    /// Construct a choice for the shared approval metadata protocol.
+    #[must_use]
+    pub fn new(id: &str, label: impl Into<String>, keys: &[&str], confirmed: bool) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            keys: keys.iter().map(|key| (*key).into()).collect(),
+            confirmed,
+        }
+    }
+
+    /// Encode choices into [`APPROVAL_CHOICES`] metadata.
+    #[must_use]
+    pub fn encode(choices: &[Self]) -> String {
+        serde_json::Value::Array(choices.iter().map(|choice| serde_json::json!({
+            "id": choice.id, "label": choice.label, "keys": choice.keys, "confirmed": choice.confirmed,
+        })).collect()).to_string()
+    }
+
+    /// Decode the shared metadata, rejecting malformed choices as a whole.
+    #[must_use]
+    pub fn decode(text: &str) -> Option<Vec<Self>> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        value
+            .as_array()?
+            .iter()
+            .map(|choice| {
+                Some(Self {
+                    id: choice.get("id")?.as_str()?.into(),
+                    label: choice.get("label")?.as_str()?.into(),
+                    keys: choice
+                        .get("keys")?
+                        .as_array()?
+                        .iter()
+                        .map(|key| key.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()?,
+                    confirmed: choice.get("confirmed")?.as_bool()?,
+                })
+            })
+            .collect()
+    }
+}
+
 /// An approval request the agent is parked on, awaiting the user's answer.
 ///
 /// Its presence is the whole difference between a `y` that approves and a `y`
@@ -670,10 +781,35 @@ struct TimelineNode {
 /// metadata and treats its absence as denial, so the panel stamps a response
 /// only while a dialog is actually open.
 struct PendingConfirm {
+    /// Correlates answers and cancellation with this exact prompt.
+    id: Option<String>,
     /// First line of the agent's prompt — the command or edit being approved —
     /// echoed in the banner above the input so what `y` accepts stays on screen
     /// even after the transcript has scrolled past the full preview.
     summary: String,
+    /// Generic host-provided answer keys and labels; the panel interprets no tool rules.
+    choices: Vec<ApprovalChoice>,
+}
+
+impl PendingConfirm {
+    fn choice(&self, text: &str) -> Option<&ApprovalChoice> {
+        let text = text.trim();
+        self.choices
+            .iter()
+            .find(|choice| choice.keys.iter().any(|key| key.eq_ignore_ascii_case(text)))
+    }
+
+    fn answer(&self, text: &str) -> Option<bool> {
+        if let Some(choice) = self.choice(text) {
+            return Some(choice.confirmed);
+        }
+        if text.trim().split_once(':').is_some_and(|(key, _)| {
+            key.eq_ignore_ascii_case("deny") || key.eq_ignore_ascii_case("no")
+        }) {
+            return Some(false);
+        }
+        parse_confirmation(text)
+    }
 }
 
 /// Why the last submission did not reach the agent, and whether retrying helps.
@@ -741,6 +877,9 @@ pub struct ConversationPanel {
     composer_width: usize,
     view: ScrollableTranscript,
     nav: KeyMap,
+    /// Host-chosen keys that dispatch a fixed command line; see
+    /// [`ConversationPanelPlugin::with_key_command`].
+    key_commands: Vec<(Key, String)>,
     focused: bool,
     /// Per-turn timeline of graph nodes that ran, oldest first. Reset at the
     /// start of each turn (see `reset_pending`).
@@ -770,6 +909,10 @@ pub struct ConversationPanel {
     interrupt_handle: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Host-owned backgrounding request; the same shape, a different verb.
     background_handle: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Which moments ask for the user's attention. `None` never does.
+    notifications: Option<NotifyConfig>,
+    /// The request raised since the runtime last asked, handed over once.
+    pending_notification: Option<Notification>,
     /// Optional host-owned queue/steering contract. Without it, submissions use
     /// the original `UserIO` channel unchanged.
     turn_input: Option<Arc<dyn TurnInputHandle>>,
@@ -932,6 +1075,7 @@ impl ConversationPanel {
             composer_width: DEFAULT_COMPOSER_WIDTH,
             view: ScrollableTranscript::new(),
             nav: transcript_nav(),
+            key_commands: Vec::new(),
             focused: true,
             timeline: Vec::new(),
             expanded: false,
@@ -943,6 +1087,8 @@ impl ConversationPanel {
             last_interrupt: None,
             interrupt_handle: None,
             background_handle: None,
+            notifications: None,
+            pending_notification: None,
             turn_input: None,
             pending_turn_inputs: VecDeque::new(),
             interrupt_requested: false,
@@ -1148,6 +1294,7 @@ impl ConversationPanel {
         self.browse = navigation::BrowseState::default();
         self.view = ScrollableTranscript::new();
         self.pending_confirm = None;
+        self.pending_notification = None;
         self.confirm_notice = None;
         self.status = None;
         self.spinner = 0;
@@ -1175,6 +1322,26 @@ impl ConversationPanel {
         // Carrying them into another session would stamp a prompt with
         // references its host never minted.
         self.clear_attachments();
+    }
+
+    /// Raise a notification for a newly opened approval, if the host asked
+    /// for those. An approval blocks the agent until answered, so it replaces
+    /// any turn-end request still waiting to be delivered.
+    fn notify_approval(&mut self) {
+        if let Some(config) = self.notifications.as_ref().filter(|c| c.approval()) {
+            self.pending_notification = Some(config.notification("approval needed"));
+        }
+    }
+
+    /// Raise a notification for a turn that ended without the user's help,
+    /// if the host asked for those. It never displaces an approval request.
+    fn notify_turn_end(&mut self, what: &str) {
+        if self.pending_notification.is_some() {
+            return;
+        }
+        if let Some(config) = self.notifications.as_ref().filter(|c| c.turn_end()) {
+            self.pending_notification = Some(config.notification(what));
+        }
     }
 
     fn drain_inbox(&mut self) {
@@ -1219,8 +1386,16 @@ impl ConversationPanel {
                         continue;
                     }
                     if text.is_none() {
+                        // Work stopping on its own is news; work the user
+                        // just stopped is not.
+                        let finished = self.status.is_some()
+                            && !self.interrupt_requested
+                            && !self.interrupting;
                         self.interrupt_requested = false;
                         self.interrupting = false;
+                        if finished {
+                            self.notify_turn_end("turn finished");
+                        }
                     }
                     if !self.interrupting {
                         self.status = text.clone();
@@ -1295,6 +1470,9 @@ impl ConversationPanel {
                 }
                 Some(TYPE_ERROR) => {
                     if message.source == IOSource::System {
+                        if self.status.is_some() && !self.interrupt_requested {
+                            self.notify_turn_end("turn failed");
+                        }
                         self.last_error = match &message.content {
                             IOContent::Text(text) => split_lines(text)
                                 .find(|line| !line.trim().is_empty())
@@ -1303,6 +1481,16 @@ impl ConversationPanel {
                         };
                         self.status = None;
                         self.meta_active = true;
+                    }
+                    self.push_transcript(message);
+                }
+                Some(IO_TYPE_APPROVAL_RESOLVED) => {
+                    if self.pending_confirm.as_ref().is_some_and(|pending| {
+                        pending.id.is_some()
+                            && pending.id.as_ref() == message.metadata.get(APPROVAL_REQUEST_ID)
+                    }) {
+                        self.pending_confirm = None;
+                        self.confirm_notice = None;
                     }
                     self.push_transcript(message);
                 }
@@ -1317,7 +1505,19 @@ impl ConversationPanel {
                         }
                         _ => String::new(),
                     };
-                    self.pending_confirm = Some(PendingConfirm { summary });
+                    let choices = message
+                        .metadata
+                        .get(APPROVAL_CHOICES)
+                        .and_then(|text| ApprovalChoice::decode(text))
+                        .unwrap_or_default();
+                    if self.pending_confirm.is_none() {
+                        self.notify_approval();
+                    }
+                    self.pending_confirm = Some(PendingConfirm {
+                        id: message.metadata.get(APPROVAL_REQUEST_ID).cloned(),
+                        summary,
+                        choices,
+                    });
                     self.confirm_notice = None;
                     self.push_transcript(message);
                 }
@@ -1502,6 +1702,14 @@ impl ConversationPanel {
                             },
                             dim,
                         ),
+                        Span::styled(
+                            if show_tokens && self.esc_interrupts() {
+                                "  · esc to interrupt"
+                            } else {
+                                ""
+                            },
+                            dim,
+                        ),
                     ]
                 }
                 None => vec![Span::styled(
@@ -1601,7 +1809,25 @@ impl ConversationPanel {
             .add_modifier(Modifier::BOLD);
         let mut spans = vec![
             Span::styled("approve? ", accent),
-            Span::styled("y/yes runs it · n/no or Esc denies", accent),
+            Span::styled(
+                if pending.choices.is_empty() {
+                    "y/yes runs it · n/no or Esc denies".to_string()
+                } else {
+                    pending
+                        .choices
+                        .iter()
+                        .map(|choice| {
+                            format!(
+                                "{}: {}",
+                                choice.keys.first().map_or("", String::as_str),
+                                safe_text(&choice.label)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                },
+                accent,
+            ),
         ];
         if !pending.summary.is_empty() {
             spans.push(Span::styled(
@@ -1698,19 +1924,37 @@ impl ConversationPanel {
             if let Some(history) = &mut self.history {
                 history.reset();
             }
-        } else if self.status.is_some()
-            && let Some(handle) = &self.interrupt_handle
-        {
-            if !self.interrupt_requested {
-                self.interrupt_requested = true;
-                handle();
-            }
+        } else if self.can_interrupt() {
+            self.request_interrupt();
         } else {
             // Nothing to interrupt or clear: the shell owns this press.
             return EventOutcome::Continue;
         }
         self.last_interrupt = Some(now);
         EventOutcome::Consumed
+    }
+
+    /// Whether the host reports work in flight and gave the panel a way to
+    /// ask for it to stop.
+    fn can_interrupt(&self) -> bool {
+        self.status.is_some() && self.interrupt_handle.is_some()
+    }
+
+    /// Whether `Esc` would interrupt right now, which is what the meta row's
+    /// hint promises. An open approval takes `Esc` first, and a request
+    /// already sent leaves nothing more to ask.
+    fn esc_interrupts(&self) -> bool {
+        self.can_interrupt() && !self.interrupt_requested && self.pending_confirm.is_none()
+    }
+
+    /// Ask the host to interrupt, once until it reports idle or cancelled.
+    fn request_interrupt(&mut self) {
+        if let Some(handle) = &self.interrupt_handle
+            && !self.interrupt_requested
+        {
+            self.interrupt_requested = true;
+            handle();
+        }
     }
 
     /// Handle `Ctrl-T`: ask the host to background the live work.
@@ -1771,7 +2015,11 @@ impl ConversationPanel {
             .and_then(|_| CommandInvocation::parse(&text));
         // An open dialog claims this line only when it actually reads as an
         // answer. Everything else stays an ordinary prompt.
-        let accepted = match (invocation, parse_confirmation(&text)) {
+        let answer = self
+            .pending_confirm
+            .as_ref()
+            .and_then(|pending| pending.answer(&text));
+        let accepted = match (invocation, answer) {
             (Some(invocation), _) => self.submit_command(invocation, &text),
             (None, Some(confirmed)) if self.pending_confirm.is_some() => {
                 self.answer_confirmation(&text, confirmed)
@@ -1830,7 +2078,8 @@ impl ConversationPanel {
             text: text.to_string(),
         });
         if self.pending_confirm.is_some() {
-            self.confirm_notice = Some("queued for the next run — still waiting on y/n".into());
+            self.confirm_notice =
+                Some("queued for the next run — still waiting on an approval answer".into());
         }
         if let Some(history) = &mut self.history {
             history.record(text);
@@ -1907,7 +2156,22 @@ impl ConversationPanel {
         } else {
             CONFIRMED_FALSE
         };
-        let response = IOMessage::user_text(text.to_string()).with_metadata(CONFIRMED, value);
+        let mut response = IOMessage::user_text(text.to_string()).with_metadata(CONFIRMED, value);
+        if let Some(id) = self
+            .pending_confirm
+            .as_ref()
+            .and_then(|pending| pending.id.as_ref())
+        {
+            response = response.with_metadata(APPROVAL_REQUEST_ID, id);
+        }
+        if let Some(id) = self
+            .pending_confirm
+            .as_ref()
+            .and_then(|pending| pending.choice(text))
+            .map(|choice| choice.id.as_str())
+        {
+            response = response.with_metadata(APPROVAL_CHOICE, id);
+        }
         if !self.offer(response) {
             return false;
         }
@@ -1945,7 +2209,8 @@ impl ConversationPanel {
             history.record(text);
         }
         if self.pending_confirm.is_some() {
-            self.confirm_notice = Some("queued for the next turn — still waiting on y/n".into());
+            self.confirm_notice =
+                Some("queued for the next turn — still waiting on an approval answer".into());
         }
         true
     }
@@ -2544,6 +2809,7 @@ fn unknown_message(message: &IOMessage) -> bool {
                 | "tokens"
                 | TYPE_INTERRUPTING
                 | TYPE_CANCELLED
+                | IO_TYPE_APPROVAL_RESOLVED
         )
     })
 }
@@ -2585,6 +2851,9 @@ fn build_message_layout(
         let (label, color) = match &message.source {
             _ if kind == Some(TYPE_INTERRUPTING) => ("Interrupting".to_string(), Color::Yellow),
             _ if kind == Some(TYPE_CANCELLED) => ("Cancelled".to_string(), Color::DarkGray),
+            _ if kind == Some(IO_TYPE_APPROVAL_RESOLVED) => {
+                ("approval".to_string(), Color::DarkGray)
+            }
             _ if kind == Some("error") => ("error".to_string(), Color::Red),
             // A tool block reads as one activity line: what ran, how it ended,
             // and how long it took. The phase glyph carries the state so the
@@ -2783,6 +3052,10 @@ impl TuiPanel for ConversationPanel {
     }
     fn title(&self) -> &str {
         "Conversation"
+    }
+
+    fn take_notification(&mut self) -> Option<Notification> {
+        self.pending_notification.take()
     }
 
     fn tick(&mut self) {
@@ -2997,7 +3270,7 @@ impl TuiPanel for ConversationPanel {
         // the fold once the draft outgrows the frame.
         let title = match (self.focused, self.composer.is_multiline()) {
             (true, true) => format!(" › {} lines ", self.composer.text().split('\n').count()),
-            (true, false) => " › · Ctrl-G browse ".to_string(),
+            (true, false) => " › · Ctrl-N browse ".to_string(),
             (false, _) => " input ".to_string(),
         };
         let input_block = Block::default()
@@ -3140,6 +3413,14 @@ impl ConversationPanel {
                 EventOutcome::Consumed
             }
 
+            // Esc interrupts a running turn once nothing nearer has claimed it
+            // (popup, history, approval). It keeps the draft and, unlike
+            // Ctrl-C, never counts towards quitting.
+            (KeyCode::Esc, false, false) if self.can_interrupt() => {
+                self.request_interrupt();
+                EventOutcome::Consumed
+            }
+
             // Ctrl-C is a shell fallback chord: the panel claims it only when
             // it has something to act on, and declines otherwise so the shell
             // quits.
@@ -3278,15 +3559,40 @@ impl ConversationPanel {
                 EventOutcome::Consumed
             }
             // Editing keys are handled above; anything left falls through to
-            // the transcript navigation map.
+            // the transcript navigation map, then to the host's key bindings.
             _ => match self.nav.resolve(key) {
                 Some(intent) => {
                     self.view.apply(intent);
                     EventOutcome::Consumed
                 }
-                None => EventOutcome::Continue,
+                None => self.key_command(key),
             },
         }
+    }
+
+    /// Submit the host command bound to `key`, if there is one the host has
+    /// announced. Returns `Continue` otherwise so the shell's own handling of
+    /// the key (such as moving focus) still applies.
+    fn key_command(&mut self, key: KeyEvent) -> EventOutcome {
+        let Some(commands) = self.commands.as_deref() else {
+            return EventOutcome::Continue;
+        };
+        let Some((invocation, line)) = self
+            .key_commands
+            .iter()
+            .filter(|(bound, _)| bound.matches(key))
+            .find_map(|(_, line)| {
+                let invocation = CommandInvocation::parse(line)?;
+                commands
+                    .iter()
+                    .any(|spec| spec.name == invocation.name)
+                    .then(|| (invocation, line.clone()))
+            })
+        else {
+            return EventOutcome::Continue;
+        };
+        self.submit_command(invocation, &line);
+        EventOutcome::Consumed
     }
 }
 
@@ -3307,6 +3613,8 @@ pub struct ConversationPanelPlugin {
     history_source: Option<Arc<dyn TranscriptHistory>>,
     interrupt_handle: Option<Arc<dyn Fn() + Send + Sync>>,
     background_handle: Option<Arc<dyn Fn() + Send + Sync>>,
+    notifications: Option<NotifyConfig>,
+    key_commands: Vec<(Key, String)>,
     turn_input: Option<Arc<dyn TurnInputHandle>>,
     attachment_source: Option<Arc<dyn AttachmentSource>>,
 }
@@ -3327,6 +3635,8 @@ impl Default for ConversationPanelPlugin {
             history_source: None,
             interrupt_handle: None,
             background_handle: None,
+            notifications: None,
+            key_commands: Vec::new(),
             turn_input: None,
             attachment_source: None,
         }
@@ -3349,7 +3659,7 @@ impl ConversationPanelPlugin {
         self
     }
 
-    /// Supply the host's read-only canonical history. Ctrl-G, H requests a
+    /// Supply the host's read-only canonical history. Ctrl-N, H requests a
     /// bounded page; it never feeds replay into the agent's input channel.
     #[must_use]
     pub fn with_history_source(mut self, source: Arc<dyn TranscriptHistory>) -> Self {
@@ -3411,6 +3721,9 @@ impl ConversationPanelPlugin {
     /// After approval/draft precedence, Ctrl-C calls this once while the host's
     /// `io_type = "status"` is non-empty. A second press within 1500 ms falls
     /// through to the shell. Without a handle, Ctrl-C behaviour is unchanged.
+    /// `Esc` calls it under the same conditions once a popup, history browsing
+    /// and an open approval have had their turn at the key; it keeps the draft
+    /// and never falls through to the shell.
     /// The callback runs on the UI task: signal or enqueue work and return;
     /// never block waiting for the turn to stop.
     ///
@@ -3470,6 +3783,48 @@ impl ConversationPanelPlugin {
         self
     }
 
+    /// Ask for the user's attention through the terminal bell and/or window
+    /// title; see [`NotifyConfig`] for which moments and channels.
+    ///
+    /// Without this call the panel never notifies. The default
+    /// [`NotifyConfig`] notifies when an approval opens and stays quiet when a
+    /// turn ends, so a host passes `NotifyConfig::default()` to turn the
+    /// capability on and tunes it from its own settings. A turn the user
+    /// interrupted never notifies: they were there.
+    #[must_use]
+    pub fn with_notifications(mut self, config: NotifyConfig) -> Self {
+        self.notifications = Some(config);
+        self
+    }
+
+    /// Bind `key` to a host command: pressing it submits `line` (for example
+    /// `/permission cycle`) exactly as if the user had typed it and pressed
+    /// Enter, without touching the draft.
+    ///
+    /// The panel knows nothing about what the command does. The binding is
+    /// live only while the host advertises a command with that name, so a
+    /// host that does not execute commands, or has not announced this one,
+    /// leaves the key to the shell (Shift-Tab then moves panel focus
+    /// backward). Built-in chords and an open popup keep their keys; a
+    /// binding only claims a key the panel would otherwise ignore. While an
+    /// approval is open the command is queued until it is answered, like a
+    /// typed command. `line` is sent as one line, so keep it to a command
+    /// name and its arguments.
+    ///
+    /// ```
+    /// use polaris_tui::nav::Key;
+    /// use polaris_tui::panels::ConversationPanelPlugin;
+    /// use polaris_tui::ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    ///
+    /// let plugin = ConversationPanelPlugin::default()
+    ///     .with_key_command(Key::new(KeyCode::BackTab, KeyModifiers::SHIFT), "/mode next");
+    /// ```
+    #[must_use]
+    pub fn with_key_command(mut self, key: Key, line: impl Into<String>) -> Self {
+        self.key_commands.push((key, line.into()));
+        self
+    }
+
     /// Supply a host-owned queue and safe-boundary steering contract.
     ///
     /// With this handle, Enter queues for the next run and Ctrl-Enter steers
@@ -3507,6 +3862,8 @@ impl Plugin for ConversationPanelPlugin {
         }
         panel.interrupt_handle = self.interrupt_handle.clone();
         panel.background_handle = self.background_handle.clone();
+        panel.notifications = self.notifications.clone();
+        panel.key_commands = self.key_commands.clone();
         panel.turn_input = self.turn_input.clone();
         if let Some(source) = &self.attachment_source {
             panel.set_attachment_source(source.clone());
@@ -4528,6 +4885,297 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A panel with an interrupt handle and a counter of how often it is called.
+    fn interruptible_panel() -> (TuiIOProvider, ConversationPanel, Arc<AtomicUsize>) {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        panel.interrupt_handle = Some(Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        (provider, panel, calls)
+    }
+
+    #[tokio::test]
+    async fn esc_interrupts_a_running_turn_without_touching_the_draft_or_quitting() {
+        let (_provider, mut panel, calls) = interruptible_panel();
+        panel.inbox.lock().push_back(status_msg("Working"));
+        panel.tick();
+        type_str(&mut panel, "queued follow-up");
+        let cursor = panel.composer.cursor();
+
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.composer.text(), "queued follow-up");
+        assert_eq!(panel.composer.cursor(), cursor);
+        assert!(
+            panel.transcript.is_empty(),
+            "a callback is not host acknowledgement"
+        );
+
+        // The request goes out once per turn, and Esc never counts towards the
+        // Ctrl-C double press that quits.
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.last_interrupt, None);
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Consumed,
+            "the first Ctrl-C after Esc still only clears the draft"
+        );
+        assert!(panel.composer.is_empty());
+
+        // Once the host reports the turn over, the next turn can be interrupted.
+        panel
+            .inbox
+            .lock()
+            .push_back(IOMessage::system_text("Stopped").with_metadata(IO_TYPE, "cancelled"));
+        panel.inbox.lock().push_back(status_msg("Next turn"));
+        panel.tick();
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn esc_is_left_to_the_host_when_there_is_nothing_to_interrupt() {
+        let (_provider, mut panel, calls) = interruptible_panel();
+        assert_eq!(
+            panel.handle_key(key(KeyCode::Esc)),
+            EventOutcome::Continue,
+            "an idle panel does not claim Esc"
+        );
+
+        let (_provider, mut unhooked) = TuiIOProvider::new_with_panel(8);
+        unhooked.inbox.lock().push_back(status_msg("Working"));
+        unhooked.tick();
+        assert_eq!(
+            unhooked.handle_key(key(KeyCode::Esc)),
+            EventOutcome::Continue,
+            "a host that gave no handle keeps the old behaviour"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn esc_denies_an_approval_before_it_interrupts() {
+        let (provider, mut panel, calls) = interruptible_panel();
+        panel.inbox.lock().extend([
+            status_msg("Working"),
+            IOMessage::system_text("Run command?").with_metadata(IO_TYPE, TYPE_CONFIRM),
+        ]);
+        panel.tick();
+
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert_eq!(
+            provider.receive().await.unwrap().metadata[CONFIRMED],
+            CONFIRMED_FALSE
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the approval took the key");
+
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn notifying_panel(config: Option<NotifyConfig>) -> ConversationPanel {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.notifications = config;
+        panel
+    }
+
+    fn approval_msg() -> IOMessage {
+        IOMessage::system_text("Run command?").with_metadata(IO_TYPE, TYPE_CONFIRM)
+    }
+
+    #[tokio::test]
+    async fn a_panel_the_host_did_not_equip_never_notifies() {
+        let mut panel = notifying_panel(None);
+        panel
+            .inbox
+            .lock()
+            .extend([status_msg("Working"), approval_msg(), status_msg("")]);
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_opening_approval_notifies_once_by_default() {
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_label("polaris")));
+        panel.inbox.lock().push_back(approval_msg());
+        panel.tick();
+
+        let ping = panel.take_notification().expect("the approval notifies");
+        assert_eq!(ping.message(), "polaris: approval needed");
+        assert!(ping.bell() && ping.title());
+        assert!(panel.take_notification().is_none(), "handed over once");
+
+        // A second request while the dialog is still open is not a new wait.
+        panel.inbox.lock().push_back(approval_msg());
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn approval_notifications_follow_the_configured_channels_and_can_be_off() {
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_bell(false)));
+        panel.inbox.lock().push_back(approval_msg());
+        panel.tick();
+        let ping = panel.take_notification().unwrap();
+        assert!(!ping.bell() && ping.title());
+
+        let mut panel = notifying_panel(Some(NotifyConfig::off().with_turn_end(true)));
+        panel.inbox.lock().push_back(approval_msg());
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_is_quiet_unless_the_host_asked() {
+        let mut panel = notifying_panel(Some(NotifyConfig::default()));
+        panel
+            .inbox
+            .lock()
+            .extend([status_msg("Working"), status_msg("")]);
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_turn_end(true)));
+        panel
+            .inbox
+            .lock()
+            .extend([status_msg("Working"), status_msg("")]);
+        panel.tick();
+        assert_eq!(
+            panel.take_notification().unwrap().message(),
+            "polaris-tui: turn finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_turn_that_was_running_can_finish() {
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_turn_end(true)));
+        // The idle marker a host sends at startup and between prompts.
+        panel.inbox.lock().extend([status_msg(""), status_msg("")]);
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_notifies_as_failed() {
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_turn_end(true)));
+        panel.inbox.lock().extend([
+            status_msg("Working"),
+            IOMessage::system_text("provider exploded").with_metadata(IO_TYPE, TYPE_ERROR),
+            status_msg(""),
+        ]);
+        panel.tick();
+        assert_eq!(
+            panel.take_notification().unwrap().message(),
+            "polaris-tui: turn failed"
+        );
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_turn_the_user_interrupted_does_not_notify() {
+        let (_provider, mut panel, calls) = interruptible_panel();
+        panel.notifications = Some(NotifyConfig::default().with_turn_end(true));
+        panel.inbox.lock().push_back(status_msg("Working"));
+        panel.tick();
+        panel.handle_key(key(KeyCode::Esc));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        panel.inbox.lock().push_back(status_msg(""));
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_approval_outranks_a_turn_end_waiting_to_be_delivered() {
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_turn_end(true)));
+        panel
+            .inbox
+            .lock()
+            .extend([status_msg("Working"), status_msg(""), approval_msg()]);
+        panel.tick();
+        assert_eq!(
+            panel.take_notification().unwrap().message(),
+            "polaris-tui: approval needed"
+        );
+
+        let mut panel = notifying_panel(Some(NotifyConfig::default().with_turn_end(true)));
+        panel
+            .inbox
+            .lock()
+            .extend([approval_msg(), status_msg("Working"), status_msg("")]);
+        panel.tick();
+        assert_eq!(
+            panel.take_notification().unwrap().message(),
+            "polaris-tui: approval needed"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_another_session_drops_a_stale_notification() {
+        use crate::commands::session_replay_start;
+
+        let mut panel = notifying_panel(Some(NotifyConfig::default()));
+        panel.inbox.lock().push_back(approval_msg());
+        panel.tick();
+        panel.inbox.lock().push_back(session_replay_start("other"));
+        panel.tick();
+        assert!(panel.take_notification().is_none());
+    }
+
+    #[tokio::test]
+    async fn esc_closes_a_popup_before_it_interrupts() {
+        let (provider, mut panel, calls) = interruptible_panel();
+        advertise(&provider, &mut panel).await;
+        panel.inbox.lock().push_back(status_msg("Working"));
+        panel.tick();
+        type_str(&mut panel, "/");
+        assert!(panel.popup.is_some());
+
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert!(panel.popup.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the popup took the key");
+
+        assert_eq!(panel.handle_key(key(KeyCode::Esc)), EventOutcome::Consumed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.composer.text(), "/");
+    }
+
+    #[tokio::test]
+    async fn the_meta_row_offers_esc_only_while_it_would_interrupt() {
+        let hint = "esc to interrupt";
+        let text = |panel: &ConversationPanel| {
+            panel
+                .meta_line()
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let (_provider, mut panel, _calls) = interruptible_panel();
+        assert!(!text(&panel).contains(hint), "idle");
+
+        panel.inbox.lock().push_back(status_msg("Working"));
+        panel.tick();
+        assert!(text(&panel).contains(hint), "running");
+
+        panel.inbox.lock().push_back(confirm_msg("Run command?"));
+        panel.tick();
+        assert!(!text(&panel).contains(hint), "Esc denies the approval");
+        panel.handle_key(key(KeyCode::Esc));
+
+        panel.handle_key(key(KeyCode::Esc));
+        assert!(!text(&panel).contains(hint), "already requested");
+
+        let (_provider, mut unhooked) = TuiIOProvider::new_with_panel(8);
+        unhooked.inbox.lock().push_back(status_msg("Working"));
+        unhooked.tick();
+        assert!(!text(&unhooked).contains(hint), "no handle, no promise");
+    }
+
     #[tokio::test]
     async fn external_interrupt_statuses_render_without_a_local_handle() {
         let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
@@ -5072,6 +5720,228 @@ mod tests {
         assert!(
             banner.contains("apply edit to src/main.rs"),
             "banner keeps the preview in view: {banner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_choices_are_host_supplied_and_scoped_to_the_pending_dialog() {
+        use polaris::plugins::IOProvider;
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        let choices = serde_json::json!([
+            {"id":"once", "label":"allow once", "keys":["y"], "confirmed":true},
+            {"id":"prefix", "label":"allow prefix cargo test for this session", "keys":["p"], "confirmed":true},
+            {"id":"deny", "label":"deny", "keys":["n"], "confirmed":false}
+        ]);
+        provider
+            .send(
+                confirm_msg("Run command?").with_metadata("approval_choices", choices.to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(tick_until_confirm(&mut panel, 32).await);
+        let banner = line_text(&panel.confirm_line().unwrap());
+        assert!(banner.contains("prefix cargo test"));
+        type_str(&mut panel, "p");
+        panel.handle_key(key(KeyCode::Enter));
+        let response = provider.receive().await.unwrap();
+        assert_eq!(
+            response.metadata.get(CONFIRMED).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            response.metadata.get("approval_choice").map(String::as_str),
+            Some("prefix")
+        );
+        assert!(panel.pending_confirm.is_none());
+        type_str(&mut panel, "p");
+        panel.handle_key(key(KeyCode::Enter));
+        let response = provider.receive().await.unwrap();
+        assert!(!response.metadata.contains_key(CONFIRMED));
+        assert!(!response.metadata.contains_key("approval_choice"));
+    }
+
+    #[test]
+    fn approval_choice_protocol_round_trips_and_rejects_malformed_fields() {
+        let choices = vec![ApprovalChoice::new(
+            "once",
+            "allow once",
+            &["y", "yes"],
+            true,
+        )];
+        assert_eq!(
+            ApprovalChoice::decode(&ApprovalChoice::encode(&choices)),
+            Some(choices)
+        );
+        for invalid in [
+            r#"[{"id":"once","keys":["y"],"confirmed":true}]"#,
+            r#"[{"id":"once","label":"allow","keys":[42],"confirmed":true}]"#,
+        ] {
+            assert!(ApprovalChoice::decode(invalid).is_none());
+        }
+    }
+
+    async fn wait_for_approval_state(panel: &mut ConversationPanel, pending: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                panel.tick();
+                if panel.pending_confirm.is_some() == pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval state should change");
+    }
+
+    fn resolve_approval(id: &str) -> IOMessage {
+        IOMessage::system_text("Approval interrupted by user")
+            .with_metadata(IO_TYPE, IO_TYPE_APPROVAL_RESOLVED)
+            .with_metadata(APPROVAL_REQUEST_ID, id)
+    }
+
+    #[tokio::test]
+    async fn resolved_approval_closes_the_dialog_and_discards_late_answers() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        provider
+            .send(confirm_msg("Run?").with_metadata(APPROVAL_REQUEST_ID, "old"))
+            .await
+            .unwrap();
+        wait_for_approval_state(&mut panel, true).await;
+        // The cancelled agent receive is already waiting when cancellation resolves it.
+        {
+            let mut receive = std::pin::pin!(provider.receive());
+            tokio::select! {
+                biased;
+                _ = &mut receive => panic!("the user has not answered"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        provider.send(resolve_approval("old")).await.unwrap();
+        wait_for_approval_state(&mut panel, false).await;
+        let (rows, _) = draw(&mut panel, 80, 20);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Approval interrupted by user"))
+        );
+        assert!(
+            panel.offer(
+                IOMessage::user_text("yes")
+                    .with_metadata(CONFIRMED, CONFIRMED_TRUE)
+                    .with_metadata(APPROVAL_REQUEST_ID, "old")
+            )
+        );
+        assert!(panel.offer(IOMessage::user_text("next request")));
+        let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(response.content, IOContent::Text(text) if text == "next request"));
+        assert!(!response.metadata.contains_key(CONFIRMED));
+    }
+
+    #[tokio::test]
+    async fn resolved_approval_answers_cannot_authorize_a_new_prompt() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        provider
+            .send(confirm_msg("Old?").with_metadata(APPROVAL_REQUEST_ID, "old"))
+            .await
+            .unwrap();
+        wait_for_approval_state(&mut panel, true).await;
+        // An answer can race cancellation and already be queued when the wait is dropped.
+        assert!(panel.answer_confirmation("yes", true));
+        provider.send(resolve_approval("old")).await.unwrap();
+        provider
+            .send(confirm_msg("New?").with_metadata(APPROVAL_REQUEST_ID, "new"))
+            .await
+            .unwrap();
+        wait_for_approval_state(&mut panel, true).await;
+        assert_eq!(
+            panel.pending_confirm.as_ref().unwrap().id.as_deref(),
+            Some("new")
+        );
+        // A repeated old resolution must not clear the new provider latch or dialog.
+        provider.send(resolve_approval("old")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                panel.tick();
+                let resolutions = panel
+                    .transcript
+                    .iter()
+                    .filter(|message| {
+                        message.metadata.get(IO_TYPE).map(String::as_str)
+                            == Some(IO_TYPE_APPROVAL_RESOLVED)
+                    })
+                    .count();
+                if resolutions >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            panel.pending_confirm.as_ref().unwrap().id.as_deref(),
+            Some("new")
+        );
+        assert!(panel.answer_confirmation("yes", true));
+        let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response
+                .metadata
+                .get(APPROVAL_REQUEST_ID)
+                .map(String::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            response.metadata.get(CONFIRMED).map(String::as_str),
+            Some(CONFIRMED_TRUE)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_scoped_answer_cannot_answer_a_legacy_confirmation() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        provider
+            .send(confirm_msg("Old?").with_metadata(APPROVAL_REQUEST_ID, "old"))
+            .await
+            .unwrap();
+        wait_for_approval_state(&mut panel, true).await;
+        assert!(panel.answer_confirmation("yes", true));
+        provider.send(resolve_approval("old")).await.unwrap();
+        provider.send(confirm_msg("Legacy?")).await.unwrap();
+        wait_for_approval_state(&mut panel, true).await;
+        assert!(panel.answer_confirmation("no", false));
+        let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.metadata.get(CONFIRMED).map(String::as_str),
+            Some(CONFIRMED_FALSE)
+        );
+        assert!(!response.metadata.contains_key(APPROVAL_REQUEST_ID));
+    }
+
+    #[tokio::test]
+    async fn confirmation_denial_preserves_the_optional_reason() {
+        use polaris::plugins::IOProvider;
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        provider.send(confirm_msg("Run command?")).await.unwrap();
+        assert!(tick_until_confirm(&mut panel, 32).await);
+        type_str(&mut panel, "deny: inspect the script first");
+        panel.handle_key(key(KeyCode::Enter));
+        let response = provider.receive().await.unwrap();
+        assert_eq!(
+            response.metadata.get(CONFIRMED).map(String::as_str),
+            Some("false")
+        );
+        assert!(
+            matches!(response.content, IOContent::Text(text) if text == "deny: inspect the script first")
         );
     }
 
@@ -6361,6 +7231,125 @@ mod tests {
         );
     }
 
+    fn shift_tab() -> KeyEvent {
+        modified(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    fn bind_shift_tab(panel: &mut ConversationPanel, line: &str) {
+        panel.key_commands = vec![(
+            Key::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            line.to_string(),
+        )];
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_submits_its_command_and_leaves_the_draft_alone() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        advertise(&provider, &mut panel).await;
+        bind_shift_tab(&mut panel, "/model next");
+        type_str(&mut panel, "half a thought");
+
+        assert_eq!(panel.handle_key(shift_tab()), EventOutcome::Consumed);
+
+        let received = provider.receive().await.unwrap();
+        assert_eq!(
+            CommandInvocation::from_message(&received),
+            Some(CommandInvocation::new("model", "next"))
+        );
+        assert_eq!(panel.composer.text(), "half a thought");
+        // Echoed like a typed command, so the user sees what was sent.
+        let echoed = &panel.transcript[0];
+        assert!(matches!(&echoed.content, IOContent::Text(t) if t == "/model next"));
+        assert!(echoed.metadata.contains_key(META_SUBMISSION));
+
+        // Terminals that report Shift-Tab without the SHIFT flag work too.
+        assert_eq!(
+            panel.handle_key(key(KeyCode::BackTab)),
+            EventOutcome::Consumed
+        );
+        provider.receive().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_waits_for_the_host_to_announce_the_command() {
+        // A host that advertised nothing runs no commands.
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        bind_shift_tab(&mut panel, "/model next");
+        assert_eq!(panel.handle_key(shift_tab()), EventOutcome::Continue);
+        assert!(nothing_submitted(&panel));
+
+        // A host that advertised commands, but not this one.
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        advertise(&provider, &mut panel).await;
+        bind_shift_tab(&mut panel, "/mode next");
+        assert_eq!(panel.handle_key(shift_tab()), EventOutcome::Continue);
+        assert!(nothing_submitted(&panel));
+
+        // A line that is not a command at all.
+        bind_shift_tab(&mut panel, "model next");
+        assert_eq!(panel.handle_key(shift_tab()), EventOutcome::Continue);
+        assert!(nothing_submitted(&panel));
+    }
+
+    #[tokio::test]
+    async fn a_bound_key_claims_only_its_own_chord() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        advertise(&provider, &mut panel).await;
+        bind_shift_tab(&mut panel, "/model next");
+
+        assert_eq!(panel.handle_key(key(KeyCode::Tab)), EventOutcome::Continue);
+        assert_eq!(
+            panel.handle_key(modified(KeyCode::BackTab, KeyModifiers::ALT)),
+            EventOutcome::Continue
+        );
+        assert!(nothing_submitted(&panel));
+    }
+
+    #[tokio::test]
+    async fn a_binding_never_takes_a_typing_key_or_an_open_popup() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        advertise(&provider, &mut panel).await;
+        panel.key_commands = vec![
+            (
+                Key::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                "/model a".into(),
+            ),
+            (
+                Key::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                "/model next".into(),
+            ),
+        ];
+
+        // A bound plain letter is still text.
+        type_str(&mut panel, "a");
+        assert_eq!(panel.composer.text(), "a");
+        assert!(nothing_submitted(&panel));
+
+        // While the popup is open, Shift-Tab moves its selection instead.
+        panel.composer.clear();
+        panel.refresh_popup();
+        type_str(&mut panel, "/");
+        assert!(panel.popup.is_some());
+        assert_eq!(panel.handle_key(shift_tab()), EventOutcome::Consumed);
+        assert!(nothing_submitted(&panel));
+    }
+
+    #[tokio::test]
+    async fn a_bound_command_waits_behind_an_open_approval() {
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        advertise(&provider, &mut panel).await;
+        bind_shift_tab(&mut panel, "/model next");
+        panel.inbox.lock().push_back(approval_msg());
+        panel.tick();
+
+        assert_eq!(panel.handle_key(shift_tab()), EventOutcome::Consumed);
+        assert_eq!(
+            panel.confirm_notice.as_deref(),
+            Some("command queued until the approval is answered")
+        );
+        assert!(panel.pending_confirm.is_some(), "the dialog stays open");
+    }
+
     #[tokio::test]
     async fn a_refused_command_keeps_the_draft() {
         let (_provider, mut panel) = TuiIOProvider::new_with_panel(1);
@@ -6697,6 +7686,34 @@ mod tests {
         assert!(nothing_submitted(&panel));
         panel.handle_key(key(KeyCode::Char('x')));
         assert_eq!(panel.composer.text(), "edited 世界\n\nx");
+    }
+
+    #[tokio::test]
+    async fn ctrl_g_opens_the_editor_and_ctrl_n_browses_the_transcript() {
+        let (_provider, mut panel) = TuiIOProvider::new();
+        type_str(&mut panel, "draft");
+
+        // A panel with no runtime cannot launch an editor, which is the only
+        // observable difference between "opened the editor" and "ignored".
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('g'))),
+            EventOutcome::Consumed
+        );
+        assert!(
+            panel
+                .editor_notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Editor unavailable"))
+        );
+        assert!(!panel.browse.active);
+        assert_eq!(panel.composer.text(), "draft");
+
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('n'))),
+            EventOutcome::Consumed
+        );
+        assert!(panel.browse.active);
+        assert_eq!(panel.composer.text(), "draft");
     }
 
     #[tokio::test]

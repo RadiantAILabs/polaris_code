@@ -120,6 +120,7 @@ pub trait TuiPanel: Send + 'static {
     fn init(&mut self) {}
     fn tick(&mut self) {}
     fn handle_event(&mut self, event: &TuiEvent) -> EventOutcome { EventOutcome::Continue }
+    fn take_notification(&mut self) -> Option<Notification> { None }
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect);
 }
 ```
@@ -228,12 +229,13 @@ it works whether or not your terminal maps Option to Meta.
 | `Ctrl-O`                          | Reveal hidden messages, expand diff previews, and show the agent-graph timeline. |
 | `Ctrl-R`                          | Search prompt history; repeat to find an older match. |
 | `Ctrl-G`                          | Open the draft in VISUAL/EDITOR; cancel when searching. |
+| `Ctrl-N`                          | Browse the transcript (see [search, navigation, and export](#transcript-search-navigation-and-export)). |
 | `Ctrl-V`                          | Attach the clipboard image, when the host supplies an `AttachmentSource` (see [attachments](#attachments)). |
 | `Ctrl-X`                          | Remove the last attachment chip, and its `@` mention with it. |
 | `/` at the start, `@` after a space | Open the command / file-mention popup (see [commands and mentions](#commands-and-file-mentions)). |
 | `Tab`, `↑` / `↓`, `Esc` (popup open) | Accept the highlighted entry, move the highlight, close the popup. |
-| `Esc`                             | Cancel history browsing/search; otherwise deny a pending approval. |
-| `Ctrl-C`                          | Deny a pending approval, or clear the draft; press again to quit. |
+| `Esc`                             | Cancel history browsing/search; otherwise deny a pending approval; otherwise interrupt a running turn (when the host supplies an interrupt handle). Never quits. |
+| `Ctrl-C`                          | Deny a pending approval, interrupt a running turn, or clear the draft; press again to quit. |
 
 ### Multi-line prompts
 
@@ -339,6 +341,54 @@ cannot be delivered leaves the dialog open. Only a stamped, delivered approval
 runs the tool. Which actions need approval is the tool's permission — set by
 the consumer, not by this panel.
 
+### Notifications
+
+A terminal in another window or tab cannot show that the agent is waiting. The
+conversation panel can ask for attention through the terminal itself, with no
+desktop notification service, so it also works over SSH and inside `tmux`:
+
+- the **bell** (`BEL`), which most terminals turn into a tab badge, a dock
+  bounce or a sound; and
+- the **window title** (`OSC 0`), set to `<label>: approval needed` (or
+  `turn finished`, `turn failed`). The runtime asks the terminal to save the
+  current title first and restores it on the next key press, click or paste,
+  and again on exit or when an editor takes the terminal. A terminal without a
+  title stack keeps the notification title until the application exits.
+
+It is off until the host opts in with
+`ConversationPanelPlugin::with_notifications(NotifyConfig)`:
+
+```rust
+use polaris_tui::NotifyConfig;
+use polaris_tui::panels::ConversationPanelPlugin;
+
+// Default: bell and title when an approval opens; nothing when a turn ends.
+let plugin = ConversationPanelPlugin::default()
+    .with_notifications(NotifyConfig::default().with_label("myapp"));
+
+// Also tell me when a turn finishes, but keep the bell quiet.
+let plugin = ConversationPanelPlugin::default().with_notifications(
+    NotifyConfig::default().with_turn_end(true).with_bell(false),
+);
+```
+
+| Setting | Default | Meaning |
+| ------- | ------- | ------- |
+| `with_approval` | on | An approval dialog opened and the agent is waiting. |
+| `with_turn_end` | off | A running turn ended on its own (`turn finished`) or with an error (`turn failed`). A turn you interrupted never notifies. |
+| `with_bell` | on | Ring the terminal bell. |
+| `with_title` | on | Show the message in the window title. |
+| `with_label` | `polaris-tui` | The application name that starts every title. |
+| `NotifyConfig::off()` | — | Neither moment notifies; a host setting can map "off" to this. |
+
+The panel decides *when*; the runtime, which owns stdout, decides *how*. A
+custom panel raises its own request by returning a `Notification` from
+`TuiPanel::take_notification`, which the runtime polls after every event and
+tick. Titles are limited to 80 printable characters; control characters are
+removed before anything is written, so a message can never end the title early
+or start another escape sequence. The terminal's own focus is not tracked, so
+a notification also fires while you are watching the screen.
+
 ### Commands and file mentions
 
 The panel ships **no commands of its own**. A host advertises the slash
@@ -375,6 +425,30 @@ carrying a `commands` list) and read dispatches with
 agent sees them, wrap the panel's provider via
 `ConversationPanelPlugin::with_io_decorator`; supply mention candidates via
 `with_completion_source`.
+
+A host can also put one of its commands on a key with
+`ConversationPanelPlugin::with_key_command(Key, "/name args")`. Pressing the key
+sends that line exactly as if it had been typed and submitted — echoed to the
+transcript, the draft left alone — and the panel never learns what the command
+means. For example, a host that owns permission modes can bind `Shift-Tab` to a
+command of its own that moves to the next mode:
+
+```rust
+use polaris_tui::nav::Key;
+use polaris_tui::panels::ConversationPanelPlugin;
+use polaris_tui::ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+let plugin = ConversationPanelPlugin::default()
+    .with_key_command(Key::new(KeyCode::BackTab, KeyModifiers::SHIFT), "/mode next");
+```
+
+A binding is live only while the host advertises a command with that name, and
+it only claims a key the panel would otherwise leave alone: typing, the other
+chords above and an open popup keep theirs, and a key that is unbound, or bound
+to a command the host has not announced, falls through to the shell (`Shift-Tab`
+then cycles panel focus backward). While an approval is open the command waits
+until it is answered, like a typed command. `Shift` is not compared for
+`Shift-Tab`, since terminals disagree on whether they report it.
 
 A host may replace the visible conversation after a session switch by sending
 `commands::session_replay_start`, canonical `IOMessage`s, then
@@ -460,8 +534,9 @@ only if the panel returns `EventOutcome::Continue`:
 
 | Keys | Panel may claim it for | Shell does otherwise |
 | ---- | ---------------------- | -------------------- |
-| `Tab` / `Shift-Tab` | Accepting or cycling a completion | Cycle panel focus |
+| `Tab` / `Shift-Tab` | Accepting or cycling a completion; a host-bound command (`with_key_command`) | Cycle panel focus |
 | `Ctrl-C` | Denying an approval, clearing a draft, or requesting interruption through a host-supplied handle | Quit |
+| `Esc` | Closing a popup or search, denying an approval, or requesting interruption through a host-supplied handle | Nothing — `Esc` never quits |
 
 A panel that claims nothing leaves the shell's own behaviour in place. A panel that
 claims everything still cannot trap you: `Ctrl-Q` and `Alt+N` are inviolable,
@@ -476,7 +551,7 @@ which subset to wire in.
 
 | Plugin                       | What it contributes                                                                                               |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approval dialogs. Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-G` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `Ctrl-O` reveals hidden messages, expands diff previews, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. |
+| `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approval dialogs. Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-N` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `with_notifications` opts in to a terminal bell and/or window-title change when an approval opens or a turn ends (see [notifications](#notifications)). `Ctrl-O` reveals hidden messages, expands diff previews, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. |
 | `LogPanelPlugin`             | Tail of `tracing` events fed by an installed `tracing-subscriber` layer.                                          |
 | `SessionsPanelPlugin`        | Live list of active sessions read from `SessionsAPI`. Depends on `SessionsPlugin`.                                |
 | `HelpPanelPlugin`            | Static keymap + plugin help. The simplest possible example.                                                       |
@@ -612,7 +687,7 @@ any tool does.
 
 ### Transcript search, navigation, and export
 
-`Ctrl-G` opens transcript browsing over the current view (the retained live
+`Ctrl-N` opens transcript browsing over the current view (the retained live
 window, or a loaded history page). Browsing highlights one message at a time
 and freezes your place against new output — the tail keeps growing
 underneath; it just doesn't steal the scroll position or the selection.
@@ -640,7 +715,7 @@ emulator's own copy shortcut work directly on rendered rows, and many
 emulators keep their own scrollback reachable from inside the alternate
 screen (a plain mouse-wheel scroll, or the emulator/multiplexer's dedicated
 scrollback or copy-mode key). That route is terminal-dependent and only
-reaches what your screen has recently shown; `Ctrl-G` browsing is the
+reaches what your screen has recently shown; `Ctrl-N` browsing is the
 app-native route, and the only one that can reach content evicted from the
 retained window.
 

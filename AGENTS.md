@@ -92,6 +92,12 @@ the workspace checkout.
 Within `crates/polaris_code/src/`:
 
 - `main.rs` assembles the server, providers, front end, tools, and agent.
+- `providers.rs` owns the provider choice, its startup check (credentials,
+  region, endpoint), its model catalog, and `--list-models`. Adding a provider is
+  one variant and one arm in each `match` there.
+- `credentials.rs` and `accounts.rs` own the credentials file and the
+  `login`, `logout` and `login status` commands; `config_dir.rs` locates the
+  user configuration directory.
 - `run.rs` is the shared interactive and headless turn driver.
 - `agents/` owns the ReAct loop, policy snapshots, context projection, project
   grounding, and trajectory recording.
@@ -127,10 +133,12 @@ so new registrations should not need hand-maintained listing entries.
 - Build custom TUI widgets against the `polaris_tui::ratatui` re-export to keep
   the UI stack on one version.
 
-The composition root has three intentional stdout surfaces: the headless result
-emitter, the post-TUI usage summary, and `--list-topologies`. Their bytes are
-rendered by `exec::report`. Startup diagnostics may use stderr before the TUI
-installs its tracing subscriber.
+The composition root has four intentional stdout surfaces: the headless result
+emitter, the post-TUI usage summary, `--list-topologies` and `--list-models`.
+Their bytes are rendered inside `exec` (`exec::report`, `exec::models`). The
+credential commands (`login`, `logout`) are dialogue and write to stderr.
+Startup diagnostics may use stderr before the TUI installs its tracing
+subscriber.
 
 ## Permissions and safety
 

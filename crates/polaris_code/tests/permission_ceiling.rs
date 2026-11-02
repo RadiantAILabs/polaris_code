@@ -6,7 +6,7 @@
 //! and the `/new`/`/resume` reset — rather than asserting on the comparison
 //! helper the unit tests in `agents::policy` already cover.
 
-use polaris_code::agents::{PermissionCeiling, PermissionMode};
+use polaris_code::agents::{PermissionCeiling, PermissionMode, UnattendedGrants};
 use polaris_code::config::ModelCatalog;
 use polaris_code::terminal::{CommandOutcome, CommandRegistry, SessionSettings};
 use polaris_tui::commands::CommandInvocation;
@@ -190,7 +190,7 @@ async fn an_unconstrained_session_is_unchanged() {
 
     assert_eq!(
         permission_spec_choices(&commands),
-        ["confirm", "auto-edit", "plan"]
+        ["confirm", "auto-edit", "auto", "plan"]
     );
     assert!(!permission_spec_description(&commands).contains("ceiling"));
     assert!(
@@ -206,4 +206,101 @@ async fn an_unconstrained_session_is_unchanged() {
         settings.snapshot().permission_mode,
         PermissionMode::AutoEdit
     );
+}
+
+/// `/permission cycle` is what a key press sends. Run it and require the
+/// ordinary reply, so a refusal fails the test where it happens.
+async fn cycle(commands: &CommandRegistry) -> String {
+    let outcome = commands
+        .dispatch(&CommandInvocation::new("permission", "cycle"))
+        .await;
+    let CommandOutcome::Reply(reply) = outcome else {
+        panic!("`/permission cycle` was refused: {outcome:?}");
+    };
+    reply
+}
+
+/// Cycling visits every posture in the picker's order and wraps, and the reply
+/// names the posture it landed on.
+#[tokio::test]
+async fn cycle_steps_through_every_posture_and_wraps() {
+    let (commands, settings) = session(PermissionMode::Confirm, None);
+
+    for expected in [
+        PermissionMode::AutoEdit,
+        PermissionMode::Auto,
+        PermissionMode::Plan,
+        PermissionMode::Confirm,
+        PermissionMode::AutoEdit,
+    ] {
+        let reply = cycle(&commands).await;
+        assert_eq!(settings.snapshot().permission_mode, expected);
+        assert!(reply.contains(expected.label()), "{reply}");
+    }
+}
+
+/// Cycling goes through the same admission as a typed posture, so it only ever
+/// visits what the ceiling lets the session enter.
+#[tokio::test]
+async fn cycle_only_visits_postures_the_ceiling_admits() {
+    // A `confirm` ceiling offers `confirm` and `plan`, never `auto-edit`.
+    let (commands, settings) = session(
+        PermissionMode::Confirm,
+        Some(ceiling(PermissionMode::Confirm)),
+    );
+    for expected in [
+        PermissionMode::Plan,
+        PermissionMode::Confirm,
+        PermissionMode::Plan,
+    ] {
+        cycle(&commands).await;
+        assert_eq!(settings.snapshot().permission_mode, expected);
+    }
+
+    // A `plan` ceiling offers one posture, so cycling stays on it.
+    let (commands, settings) =
+        session(PermissionMode::Confirm, Some(ceiling(PermissionMode::Plan)));
+    for _ in 0..2 {
+        cycle(&commands).await;
+        assert_eq!(settings.snapshot().permission_mode, PermissionMode::Plan);
+    }
+}
+
+/// A posture the picker does not offer (an unattended run's) has no place in
+/// the order, so cycling enters the first one on offer.
+#[tokio::test]
+async fn cycle_from_a_posture_that_is_not_on_offer_starts_at_the_first() {
+    let (commands, settings) = session(
+        PermissionMode::Unattended(UnattendedGrants::default()),
+        None,
+    );
+    cycle(&commands).await;
+    assert_eq!(settings.snapshot().permission_mode, PermissionMode::Confirm);
+}
+
+/// Only the bare word `cycle` is special: it is advertised as a usage hint,
+/// not as a mode choice, and anything after it is refused unchanged.
+#[tokio::test]
+async fn cycle_is_a_verb_not_a_mode_choice() {
+    let (commands, settings) = session(PermissionMode::Confirm, None);
+
+    let spec = commands
+        .specs()
+        .into_iter()
+        .find(|spec| spec.name == "permission")
+        .expect("`/permission` is registered");
+    assert!(
+        spec.usage
+            .as_deref()
+            .is_some_and(|usage| usage.contains("cycle")),
+        "the usage hint must mention `cycle`: {:?}",
+        spec.usage
+    );
+    assert!(!spec.choices.iter().any(|choice| choice == "cycle"));
+
+    let outcome = commands
+        .dispatch(&CommandInvocation::new("permission", "cycle now"))
+        .await;
+    assert!(matches!(outcome, CommandOutcome::Error(_)), "{outcome:?}");
+    assert_eq!(settings.snapshot().permission_mode, PermissionMode::Confirm);
 }

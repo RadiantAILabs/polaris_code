@@ -6,21 +6,26 @@ sync with any fix.
 
 ## Agent and context
 
-- **Recovery bypasses normal context projection.** The recovery system in
-  `agents/code_agent.rs` sends the canonical message list instead of applying
-  the active retrieval window. A retry after provider context overflow can
-  therefore be larger than the request that failed. Recovery should use the
-  same `RetrievalPolicy` projection as the normal action path.
+- **Model-call retries are fixed, silent, and stop at the first shown token.**
+  `RetryPolicy` (attempts, backoff, stall timeout) is read from the policy
+  snapshot, but no flag, environment variable or settings file sets it. The wait
+  before a retry is logged and recorded as a `retry` decision on the
+  trajectory, not shown in the transcript or status row. A
+  failure after the first output reached the screen is final, because the
+  panel's token tally cannot be rolled back. Failures are classified from the
+  HTTP status and the provider's error type because the Anthropic client maps
+  none of them to typed errors, and it reports no `Retry-After`, so its rate
+  limits are retried on the computed backoff; see `agents/failure.rs`.
+
+- **Compaction preserves recent messages and unfinished tool exchanges.**
+  Those protected observations can still exceed the provider's context limit.
+  Failed summaries retain cheap elision, which may
+  also leave an oversized request. See [context compaction](context-compaction.md).
 
 - **Agent setup assumes a multithreaded Tokio runtime.** Project-context
   discovery currently uses `block_in_place`, which panics on a current-thread
   runtime. Move discovery to an asynchronous lifecycle hook or document the
   runtime requirement on `CodeAgent`.
-
-- **Token-delta retry accounting needs focused tests.** The conversion from
-  cumulative to incremental usage and the rule that committed output cannot be
-  retried should be extracted into a pure helper and tested for zero,
-  decreasing, and repeated values.
 
 - **Git context is captured once per session.** Project instructions refresh at
   turn boundaries, but branch, status, and recent-commit context are captured

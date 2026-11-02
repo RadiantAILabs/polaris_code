@@ -78,6 +78,46 @@ total. `docs/reference/guide.md` and the rustdoc on
 The human-readable `Session usage` block that an *interactive* session prints
 on exit (`TokenMeter::summary`) is a rendering for a person. Never parse it.
 
+## When the run fails
+
+A turn whose model call fails says so once. The `json` object's `error` is one
+short sentence with no provider response body and no internal ids, and
+`error_kind` beside it is one of `auth`, `rate_limit`, `overloaded`, `timeout`, `network`,
+`invalid_request` or `other`:
+
+```json
+{ "session_id": "…", "status": "failed", "result": null,
+  "error": "Anthropic rejected the API key (HTTP 401, authentication_error). Check ANTHROPIC_API_KEY.",
+  "error_kind": "auth", "usage": { } }
+```
+
+`error_kind` is `null` exactly when `error` is. A failure that did not come
+from a model call, such as a busy session, is `other`. The same sentence is the
+stderr line `polaris: turn failed: …`, and in `stream-json` it is the message
+whose `io_type` is `error`; no made-up assistant answer follows it. (When a
+step other than the model call fails and the follow-up model call fails too,
+there are two `error` messages, one for each, and `error` carries both.)
+
+The agent retries a model call before it reports one that failed in a way that
+can pass: a rate limit (HTTP 429), an overloaded or unavailable provider (HTTP
+5xx, including 529), a connection failure, or a stall. A provider that sends
+nothing for 300 seconds, to the first event or between events, counts as a
+stall. Retries use exponential backoff with jitter, starting at 1 second and
+capped at 60, and wait as long as the provider asked when its client reports a
+wait (`GenerationError::RateLimited`'s `retry_after`; the Anthropic client does
+not report one today, so its retries use the backoff). A provider that asks for
+more than 60 seconds ends the retrying. A
+run makes at most 5 attempts, so a failure after retries says so ("Gave up
+after 4 retries over 38 s."). A call that goes silent on every attempt and
+whose provider asks for the longest wait in between takes at most 29 minutes:
+five 300-second silences and four 60-second waits. `auth`, `invalid_request`
+and `other` failures are never retried, and neither is one that fails after
+some of its answer was already shown. These limits are the fields of
+`RetryPolicy` in the agent's policy snapshot. Each retry is a step of the agent
+graph, not a loop inside one node: a failed attempt is followed by a decision,
+recorded on the trajectory, and then by either a wait and another attempt or
+the report.
+
 ## The limit the run ran under
 
 The `json` object also carries `max_output_tokens`, alongside `usage` rather

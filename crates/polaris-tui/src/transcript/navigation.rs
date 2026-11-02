@@ -58,7 +58,7 @@ impl Drop for BrowseState {
 }
 
 impl ConversationPanel {
-    /// Supply read-only canonical history for Ctrl-G, H browsing.
+    /// Supply read-only canonical history for Ctrl-N, H browsing.
     /// Plain consumers may omit this; the retained live view remains usable.
     #[must_use]
     pub fn with_history_source(mut self, source: Arc<dyn TranscriptHistory>) -> Self {
@@ -325,7 +325,7 @@ impl ConversationPanel {
             self.return_live();
             return Some(EventOutcome::Consumed);
         }
-        if key.code == KeyCode::Char('g') && ctrl {
+        if key.code == KeyCode::Char('n') && ctrl {
             self.browse.active = true;
             self.browse.notice = "Browse transcript".into();
             self.close_popup();
@@ -497,7 +497,7 @@ mod tests {
             .collect()
     }
     fn enter(panel: &mut ConversationPanel) {
-        key(panel, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        key(panel, KeyCode::Char('n'), KeyModifiers::CONTROL);
     }
 
     #[tokio::test]
@@ -646,7 +646,9 @@ mod tests {
         let mut panel = panel.with_history_source(Arc::new(BrokenHistory));
         panel.push_transcript(IOMessage::user_text("keep me"));
         panel.pending_confirm = Some(PendingConfirm {
+            id: None,
             summary: "run command?".into(),
+            choices: Vec::new(),
         });
         enter(&mut panel);
         panel.load_history(false);

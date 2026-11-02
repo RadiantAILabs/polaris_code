@@ -23,6 +23,7 @@ use polaris::sessions::{AgentTypeId, FileStore, SessionId, SessionsAPI, Sessions
 use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
 use polaris::tools::ToolsPlugin;
+use polaris_code::agents::policy::PolicySnapshot;
 use polaris_code::agents::{AgentConfig, CodeAgent, CodeAgentPlugin, ContextManager, LoopState};
 use polaris_code::exec::{ExecIOPlugin, ExecIOProvider, OutputFormat, RunReport, stream_json_line};
 use polaris_code::run::{self, TurnReason};
@@ -124,10 +125,9 @@ impl Plugin for ScriptedModelPlugin {
     }
 }
 
-/// An `LlmProvider` whose streaming step and its own recovery `generate` call
-/// both fail, so a turn takes the doubly-failed-recovery path: `act`'s
-/// retries exhaust, the graph's error edge routes into `recover`, and
-/// `recover`'s own model call errors too — leaving no assistant answer at all.
+/// An `LlmProvider` whose streaming step and non-streaming `generate` call
+/// both fail, so a turn gets no assistant answer at all: `act`'s retries
+/// exhaust and the graph's error edge routes into `recover`.
 struct FailingProvider;
 
 impl LlmProvider for FailingProvider {
@@ -589,11 +589,10 @@ async fn corrupt_resume_and_failed_save_are_explicit_errors() {
 #[tokio::test]
 async fn a_doubly_failed_recovery_reports_the_turn_as_failed_not_completed() {
     // `act`'s retries exhaust (every attempt errors), routing into `recover`
-    // through the graph's error edge — and `recover`'s own model call fails
-    // too, so there is no assistant answer for this turn. Before the fix, the
-    // graph still reached its terminal `is_complete` state cleanly here, so
-    // the turn reported `status: "completed"` with a null result instead of
-    // surfacing the failure.
+    // through the graph's error edge, and there is no assistant answer for this
+    // turn. Before the fix, the graph still reached its terminal `is_complete`
+    // state cleanly here, so the turn reported `status: "completed"` with a
+    // null result instead of surfacing the failure.
     let workspace = tempfile::tempdir().unwrap();
     let data_dir = tempfile::tempdir().unwrap();
     let (provider, input_tx, mut output_rx) = ExecIOProvider::new(64);
@@ -632,15 +631,24 @@ async fn a_doubly_failed_recovery_reports_the_turn_as_failed_not_completed() {
             },
         )
         .unwrap();
+    // A connection failure is retried with a backoff; shrink it so the test
+    // does not wait out the real one.
+    sessions
+        .with_context(&session_id, |ctx| {
+            let mut policy = ctx.get_resource_mut::<PolicySnapshot>().unwrap();
+            policy.retry.base_delay = std::time::Duration::from_millis(1);
+        })
+        .await
+        .unwrap();
 
     enqueue(input_tx, "say hi").await;
     let drain = tokio::spawn(async move { while output_rx.recv().await.is_some() {} });
     let outcome = run::drive_turn(sessions, &session_id).await;
 
-    // `recover` sets this on the `LoopState` *resource*, not just its own
-    // graph-output return value — `run_one_turn` reads the resource, which
-    // outlives this one run, to tell a doubly-failed recovery apart from an
-    // ordinary completion.
+    // The failure is recorded on the `LoopState` *resource*, not just returned
+    // as the error handler's own graph output — `run_one_turn` reads the
+    // resource, which outlives this one run, to tell a failed turn apart from
+    // an ordinary completion.
     let loop_state_failure = sessions
         .with_context(&session_id, |ctx| {
             ctx.get_resource::<LoopState>()
@@ -672,5 +680,6 @@ async fn a_doubly_failed_recovery_reports_the_turn_as_failed_not_completed() {
     let object: serde_json::Value = serde_json::from_str(&json).expect("the object parses");
     assert_eq!(object["status"], "failed");
     assert!(object["error"].is_string());
+    assert_eq!(object["error_kind"], "network");
     assert!(object["result"].is_null());
 }

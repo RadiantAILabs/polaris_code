@@ -34,7 +34,7 @@ use polaris::tools::{ToolRegistry, ToolsPlugin};
 use polaris_code::terminal::BackgroundTasks;
 use polaris_code::tools::{
     CodeGraphPlugin, CodeToolsConfig, CodeToolsPlugin, GraphSearchMode, MemoryToolsPlugin,
-    TaskToolsPlugin, tool_is_read_only,
+    TaskToolsPlugin, WebToolsPlugin, tool_is_read_only,
 };
 use polaris_ontrace::oxigraph::OxigraphPlugin;
 
@@ -74,6 +74,8 @@ const CLASSIFICATION: &[(&str, bool)] = &[
     ("run_in_background", false),
     ("task_output", true),
     ("stop_task", false),
+    // `WebTools` — reads a public page; changes nothing on this machine.
+    ("web_fetch", true),
     // ontrace's SPARQL toolset.
     ("sparql_query", true),
     ("describe_resource", true),
@@ -105,6 +107,7 @@ async fn registered_tool_names() -> Vec<String> {
         .add_plugins(TaskToolsPlugin::new(
             BackgroundTasks::new(std::time::Duration::from_secs(120)).0,
         ))
+        .add_plugins(WebToolsPlugin::default())
         .add_plugins(PersistencePlugin);
     server.finish().await.unwrap();
 

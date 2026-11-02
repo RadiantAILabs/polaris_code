@@ -47,6 +47,20 @@
 //! it sits next to the accounting rather than inside the versioned
 //! [`RunUsage`] record. `json` carries it; `text` and `stream-json` do not.
 //!
+//! # Where a consumer reads why a run failed
+//!
+//! A failed run says so once, in one short sentence: the `error` member of
+//! the `json` object and the [`RunReport::error_line`] on stderr carry the
+//! same text, with no provider response body and no internal node ids in it.
+//! `error_kind` beside it names the kind of failure — `auth`, `rate_limit`,
+//! `overloaded`, `timeout`, `network`, `invalid_request` or `other` — so a
+//! caller can choose between fixing a key, waiting, and retrying without
+//! parsing the sentence. It is present exactly when `error` is, and a failure
+//! that did not come from a model call is `other`. `rate_limit`,
+//! `overloaded`, `timeout` and `network` are transient: the agent has already
+//! retried them as far as its `RetryPolicy` allows by the time they are
+//! reported.
+//!
 //! # Where a consumer reads which topology ran, and why
 //!
 //! A turn whose accepted coding task started a topology carries the same
@@ -69,6 +83,7 @@ use polaris_cosmos::contracts::{
 };
 use serde::Serialize;
 
+use crate::agents::FailureKind;
 use crate::cosmos::host::TopologyTurn;
 use crate::cosmos::inventory::TopologyInventory;
 use crate::run::{TurnOutcome, TurnReason};
@@ -370,6 +385,13 @@ pub struct RunReport {
     pub result: Option<String>,
     /// The failure message, when the turn failed.
     pub error: Option<String>,
+    /// What kind of failure `error` describes — `auth`, `rate_limit`,
+    /// `overloaded`, `timeout`, `network`, `invalid_request` or `other` — so a
+    /// caller can decide what to do without reading the message. Present
+    /// exactly when `error` is; a failure that is not a model-call failure,
+    /// such as a busy session or a coding task that started no topology, is
+    /// `other`.
+    pub error_kind: Option<FailureKind>,
     /// The run's own token and cost accounting — the `usage` member of the
     /// `json` object, and the authoritative reading for any consumer that
     /// needs what the run cost. Taken from
@@ -442,7 +464,7 @@ impl RunReport {
     pub fn new(session_id: &SessionId, outcome: &TurnOutcome, max_output_tokens: u32) -> Self {
         let (status, error) = match &outcome.reason {
             TurnReason::Completed => ("completed", None),
-            TurnReason::Failed(message) => ("failed", Some(message.clone())),
+            TurnReason::Failed(failure) => ("failed", Some(failure.message.clone())),
             TurnReason::Interrupted => ("interrupted", None),
             // The answer *is* the explanation for this outcome, so `error`
             // carries the turn's own answer rather than a second rendering of
@@ -470,6 +492,10 @@ impl RunReport {
             run_id: outcome.run_id.as_ref().map(|id| id.as_str().to_string()),
             status,
             result: outcome.final_text.clone(),
+            error_kind: error.as_ref().map(|_| match &outcome.reason {
+                TurnReason::Failed(failure) => failure.kind,
+                _ => FailureKind::Other,
+            }),
             error,
             usage: outcome.usage.clone(),
             ceiling: outcome.ceiling.clone(),
@@ -729,6 +755,7 @@ pub fn stream_json_line(message: &IOMessage) -> Result<String, serde_json::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::TurnFailure;
     use crate::usage::TokenMeter;
     use polaris::graph::RunId;
     use polaris::models::anthropic::DEFAULT_MAX_TOKENS;
@@ -981,6 +1008,50 @@ mod tests {
         // `text` has nothing to print for a failed turn; the reason is the
         // stderr diagnostic and the exit code.
         assert_eq!(report.stdout_payload(OutputFormat::Text), None);
+    }
+
+    /// `error_kind` sits next to `error` and is present exactly when it is, so
+    /// a caller can branch on the kind of failure without reading the message.
+    #[test]
+    fn json_reports_the_kind_of_failure_beside_its_message() {
+        let session_id = SessionId::from_string("s-kind");
+        let parsed = |reason: TurnReason| -> serde_json::Value {
+            let report =
+                RunReport::new(&session_id, &outcome(reason, None, true), CONFIGURED_LIMIT);
+            let json = report
+                .stdout_payload(OutputFormat::Json)
+                .expect("json always prints an object");
+            serde_json::from_str(&json).expect("json is parseable")
+        };
+
+        for kind in [
+            FailureKind::Auth,
+            FailureKind::RateLimit,
+            FailureKind::Overloaded,
+            FailureKind::Timeout,
+            FailureKind::Network,
+            FailureKind::InvalidRequest,
+            FailureKind::Other,
+        ] {
+            let object = parsed(TurnReason::Failed(TurnFailure::new(kind, "it failed")));
+            assert_eq!(object["error"], "it failed");
+            assert_eq!(object["error_kind"], kind.label());
+        }
+
+        // A failure that is not a model-call failure is `other`.
+        let object = parsed(TurnReason::Failed("session busy".into()));
+        assert_eq!(object["error_kind"], "other");
+
+        // No error, no kind: a consumer keying off either sees the same thing.
+        for reason in [
+            TurnReason::Completed,
+            TurnReason::Interrupted,
+            TurnReason::CeilingReached,
+        ] {
+            let object = parsed(reason);
+            assert!(object["error"].is_null());
+            assert!(object["error_kind"].is_null());
+        }
     }
 
     /// The `json` object states the output token limit the turn ran under, so

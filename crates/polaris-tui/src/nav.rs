@@ -63,7 +63,8 @@ pub enum NavIntent {
 ///
 /// `SHIFT` is ignored when the code is a [`KeyCode::Char`], because the char
 /// itself already encodes case (`G` vs `g`) and terminals are inconsistent
-/// about whether they additionally report `SHIFT`.
+/// about whether they additionally report `SHIFT`. The same holds for
+/// [`KeyCode::BackTab`], which already means Shift-Tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key {
     /// The key code.
@@ -80,14 +81,15 @@ impl Key {
     }
 
     fn normalized_mods(code: KeyCode, mods: KeyModifiers) -> KeyModifiers {
-        if matches!(code, KeyCode::Char(_)) {
+        if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
             mods.difference(KeyModifiers::SHIFT)
         } else {
             mods
         }
     }
 
-    fn matches(self, event: KeyEvent) -> bool {
+    /// Whether `event` is this key, under the `SHIFT` rule above.
+    pub(crate) fn matches(self, event: KeyEvent) -> bool {
         self.code == event.code
             && Self::normalized_mods(self.code, self.mods)
                 == Self::normalized_mods(event.code, event.modifiers)
@@ -253,6 +255,16 @@ mod tests {
             map.resolve(key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             Some(NavIntent::Bottom)
         );
+    }
+
+    #[test]
+    fn shift_is_ignored_for_back_tab() {
+        // Terminals report Shift-Tab as `BackTab` with or without SHIFT.
+        let binding = Key::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(binding.matches(key(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert!(binding.matches(key(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert!(!binding.matches(key(KeyCode::BackTab, KeyModifiers::ALT)));
+        assert!(!binding.matches(key(KeyCode::Tab, KeyModifiers::NONE)));
     }
 
     #[test]

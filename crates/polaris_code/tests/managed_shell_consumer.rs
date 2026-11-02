@@ -444,6 +444,7 @@ impl CodingTurn {
                 &working_dir,
                 cache.path(),
             )))
+            .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin)
             .add_plugins(PersistencePlugin)
             .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new(
                 data.path().to_str().expect("a UTF-8 temp path"),
@@ -514,9 +515,8 @@ impl CodingTurn {
             .await
             .unwrap();
 
-        // The registry itself is untouched — its `run_command` entry is still
-        // the `#[tool]` default. The gate the agent honours is the policy
-        // override above, which is the whole reason it has to exist.
+        // Receipt support preserves the shell tool's default permission.
+        // The gate the agent honours is the policy override above.
         assert_eq!(
             self.server
                 .get_global::<ToolRegistry>()
@@ -752,9 +752,11 @@ async fn policy_denial_runs_no_process_and_never_asks() {
 }
 
 #[tokio::test]
-async fn denied_pattern_survives_user_approval() {
-    // The user approves at the one gate that asks; the shell's deny list is
-    // still authoritative, so the command never reaches spawn.
+async fn denied_pattern_is_refused_before_the_user_is_asked() {
+    // The shell's deny list is authoritative, so the user is not offered an
+    // approval (or a session grant) for a command that can never run. The
+    // scripted user would approve if asked, so an approval cannot be what
+    // stopped it.
     let turn = CodingTurn::build(
         "sudo tee '{marker}'",
         Answer::Approve,
@@ -764,15 +766,23 @@ async fn denied_pattern_survives_user_approval() {
     let outcome = turn.drive().await;
 
     assert_eq!(outcome.reason, TurnReason::Completed);
-    assert_eq!(turn.io.confirm_prompts().len(), 1, "the user approved");
+    assert!(
+        turn.io.confirm_prompts().is_empty(),
+        "a command on the deny list is refused before the user is asked"
+    );
     assert_eq!(turn.runs(), 0, "a denied pattern must never execute");
 
-    let errors = turn.io.tool_messages(PHASE_ERROR);
-    assert_eq!(errors.len(), 1, "one failed tool block: {errors:?}");
+    let denials = turn.io.tool_messages(PHASE_DENIED);
+    assert_eq!(denials.len(), 1, "one denied tool block: {denials:?}");
     assert!(
-        errors[0].contains("Permission denied") && errors[0].contains("denied by policy"),
-        "the refusal comes from the shell's deny list: {errors:?}"
+        denials[0].contains("Permission denied") && denials[0].contains("deny list"),
+        "the refusal comes from the shell's deny list: {denials:?}"
     );
+    assert!(
+        turn.io.tool_messages(PHASE_ERROR).is_empty(),
+        "refused up front, not started and failed"
+    );
+    assert!(turn.io.tool_messages(PHASE_OK).is_empty());
     assert_eq!(
         turn.next_process_id().await,
         1,

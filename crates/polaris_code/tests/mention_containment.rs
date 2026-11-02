@@ -659,7 +659,7 @@ async fn a_headless_prompt_naming_an_escape_never_reaches_the_model() {
         panic!("a refused prompt ends the turn rather than running it: {outcome:?}");
     };
     assert!(
-        reason.contains("outside the working directory"),
+        reason.message.contains("outside the working directory"),
         "and the caller is told why: {reason}"
     );
 }

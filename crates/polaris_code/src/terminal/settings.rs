@@ -12,7 +12,10 @@
 //!
 //! [`prepare_context`]: crate::agents::code_agent
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+
+static APPROVAL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 use polaris_tui::commands::CommandSpec;
 
@@ -26,10 +29,11 @@ use super::{CommandError, CommandOutcome, CommandRegistry};
 /// One list serves three purposes that must not drift apart: parsing the
 /// argument, advertising the choices, and wording the "must be one of" error.
 /// A ceiling filters this list once and all three follow.
-fn selectable_modes() -> [(&'static str, PermissionMode); 3] {
+fn selectable_modes() -> [(&'static str, PermissionMode); 4] {
     [
         ("confirm", PermissionMode::Confirm),
         ("auto-edit", PermissionMode::AutoEdit),
+        ("auto", PermissionMode::Auto),
         ("plan", PermissionMode::Plan),
     ]
 }
@@ -47,6 +51,7 @@ pub struct SettingsSnapshot {
 #[derive(Debug, Clone)]
 pub struct SessionSettings {
     inner: Arc<RwLock<SettingsSnapshot>>,
+    approval_generation: Arc<AtomicU64>,
     /// Shared with every clone and written at most once, so the gate cannot be
     /// escaped by holding a copy of these settings taken before the ceiling was
     /// installed, and cannot be raised by installing a second one.
@@ -74,6 +79,9 @@ impl SessionSettings {
                 model_id: model_id.into(),
                 permission_mode: mode,
             })),
+            approval_generation: Arc::new(AtomicU64::new(
+                APPROVAL_GENERATION.fetch_add(1, Ordering::SeqCst),
+            )),
             ceiling: Arc::new(OnceLock::new()),
             served: Arc::new(RwLock::new(None)),
             catalog: Arc::new(catalog.clone()),
@@ -135,6 +143,13 @@ impl SessionSettings {
         self.apply_at_turn_boundary.then(|| self.snapshot())
     }
 
+    /// Identity of the current session approval lifetime. Resetting settings
+    /// invalidates remembered grants, including when reopening the same session.
+    #[must_use]
+    pub fn approval_generation(&self) -> u64 {
+        self.approval_generation.load(Ordering::SeqCst)
+    }
+
     /// Current values, atomically cloned for a turn.
     #[must_use]
     pub fn snapshot(&self) -> SettingsSnapshot {
@@ -175,6 +190,10 @@ impl SessionSettings {
     /// bypassed by it: entering a session must never be a way to come out one
     /// rung higher than the operator allowed.
     pub fn reset(&self, model_id: impl Into<String>) {
+        self.approval_generation.store(
+            APPROVAL_GENERATION.fetch_add(1, Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         let permission_mode = match self.ceiling.get() {
             Some(ceiling) => ceiling.clamp(PermissionMode::Confirm),
             None => PermissionMode::Confirm,
@@ -186,6 +205,16 @@ impl SessionSettings {
         *self.served.write().unwrap_or_else(|err| err.into_inner()) = None;
     }
 
+    /// [`Self::reset`] for a session entered while the user is already on a
+    /// chosen model: it stays on that model, so a `/model` choice carries
+    /// across `/new` and `/resume` for the life of the process.
+    ///
+    /// Only the posture is a safety default to fall back to; the model is a
+    /// preference, and putting the launch model back would silently undo it.
+    pub fn reset_keeping_model(&self) {
+        self.reset(self.snapshot().model_id);
+    }
+
     /// The postures `/permission` offers here — every selectable mode, minus
     /// any the ceiling refuses.
     fn offered_modes(&self) -> Vec<&'static str> {
@@ -194,6 +223,21 @@ impl SessionSettings {
             .filter(|(_, mode)| self.admit(mode.clone()).is_ok())
             .map(|(name, _)| name)
             .collect()
+    }
+
+    /// The posture after the active one among those `/permission` offers,
+    /// wrapping around; the first offered when the active mode is not one of
+    /// them. Built from [`offered_modes`](Self::offered_modes), so it follows
+    /// the selectable list and the ceiling without a list of its own.
+    fn next_offered_mode(&self) -> &'static str {
+        let offered = self.offered_modes();
+        let active = self.snapshot().permission_mode;
+        let next = selectable_modes()
+            .iter()
+            .find(|(_, mode)| *mode == active)
+            .and_then(|(name, _)| offered.iter().position(|o| o == name))
+            .map_or(0, |at| (at + 1) % offered.len());
+        offered[next]
     }
 
     /// Register `/model` and `/permission` with finite picker choices.
@@ -226,7 +270,7 @@ impl SessionSettings {
         let permission_settings = self.clone();
         commands.register_sync(
             CommandSpec::new("permission", description)
-                .with_usage(format!("[{}]", offered.join("|")))
+                .with_usage(format!("[{}|cycle]", offered.join("|")))
                 .with_choices(offered),
             move |_, args| permission_settings.permission_command(args),
         )
@@ -254,7 +298,7 @@ impl SessionSettings {
         // Resolved against the catalog, so an unknown name is refused here with
         // the set that would have worked — never carried into a turn to fail as
         // a provider error at the first token.
-        let resolved = match self.catalog.resolve(requested) {
+        let resolved = match self.catalog.resolve_noting(requested) {
             Ok(resolved) => resolved,
             Err(err) => {
                 return CommandOutcome::Error(format!("{err}; the active model was not changed"));
@@ -263,8 +307,11 @@ impl SessionSettings {
         self.inner
             .write()
             .unwrap_or_else(|err| err.into_inner())
-            .model_id = resolved.clone();
-        CommandOutcome::Reply(format!("Model set to `{resolved}` for the next turn."))
+            .model_id = resolved.id.clone();
+        CommandOutcome::Reply(match resolved.note() {
+            Some(note) => format!("{note}. Model set for the next turn."),
+            None => format!("Model set to `{}` for the next turn.", resolved.id),
+        })
     }
 
     fn permission_command(&self, args: &str) -> CommandOutcome {
@@ -284,6 +331,14 @@ impl SessionSettings {
                 None => active,
             });
         }
+        // `cycle` stands for the next posture on offer. Resolving it to a mode
+        // word here sends it through the same lookup and ceiling check below,
+        // which is what a key bound to `/permission cycle` relies on.
+        let requested = if requested == "cycle" {
+            self.next_offered_mode().to_string()
+        } else {
+            requested
+        };
         let Some((_, mode)) = selectable_modes()
             .into_iter()
             .find(|(name, _)| *name == requested)

@@ -60,7 +60,7 @@ use polaris::models::llm::{AssistantBlock, Message};
 use polaris::plugins::{IO_TYPE, IOContent, IOMessage, IOProvider};
 use polaris::sessions::{SessionError, SessionId, SessionsAPI, TurnNumber};
 
-use crate::agents::{AgentConfig, ContextManager, LoopState};
+use crate::agents::{AgentConfig, ContextManager, LoopState, TurnFailure};
 use crate::cosmos::host::{self, TopologyTurn};
 use crate::terminal::{SessionSettings, TurnSteering, transcript};
 use crate::usage::{CeilingStatus, RunCeiling, RunUsage, TokenMeter};
@@ -227,8 +227,10 @@ pub async fn stop_signal() -> StopSignal {
 pub enum TurnReason {
     /// The turn ran to completion.
     Completed,
-    /// The turn failed; the message is the session error's rendering.
-    Failed(String),
+    /// The turn failed. The [`TurnFailure`] carries the one message to show and
+    /// the kind of failure it was; a session error that never reached a model
+    /// call is of kind [`FailureKind::Other`](crate::agents::FailureKind::Other).
+    Failed(TurnFailure),
     /// The turn was interrupted before completion.
     ///
     /// The upstream session cancellation signal stopped the turn cleanly.
@@ -504,7 +506,7 @@ async fn run_one_turn(
                 nodes_executed: 0,
                 duration: Duration::ZERO,
                 turn_number: pending_turn,
-                reason: TurnReason::Failed(message.clone()),
+                reason: TurnReason::Failed(message.clone().into()),
                 usage: run_usage(sessions, session_id).await,
                 topology: None,
                 ceiling: None,
@@ -648,7 +650,7 @@ async fn run_one_turn(
                     nodes_executed: 0,
                     duration: Duration::ZERO,
                     turn_number,
-                    reason: TurnReason::Failed(message),
+                    reason: TurnReason::Failed(message.into()),
                     usage,
                     topology: None,
                     ceiling: None,

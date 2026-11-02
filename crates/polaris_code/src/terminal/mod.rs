@@ -3,12 +3,13 @@
 //!
 //! `polaris-tui` owns the presentation — the popup, its keys, the wire
 //! protocol — and deliberately ships no command set and no file-system rules.
-//! This module supplies both for the coding agent, and keeps them out of the
-//! agent's graph:
+//! This module supplies both for the coding agent. Command handlers run locally;
+//! a command that needs the agent's graph hands it an [`AgentRequest`]:
 //!
 //! | Piece | Role |
 //! |-------|------|
 //! | [`CommandRegistry`] | The `/commands` the terminal runs locally. Ships `/help`; other features register theirs. |
+//! | [`AgentRequest`] | What a command hands the agent's input system when its effect belongs to the agent's graph. The terminal never learns what one means; the capability that registered the command reads it. |
 //! | [`CommandDispatch`] | An [`IOProvider`](polaris::plugins::IOProvider) decorator that executes dispatched commands and answers them **before** the agent's `receive` returns, advertises the set to the panel, and validates `@` mentions on ordinary prompts crossing the channel. |
 //! | [`WorkspaceFiles`] | The [`CompletionSource`](polaris_tui::commands::CompletionSource) for `@` mentions: a cancellable, `.gitignore`-aware walk of the working directory, ranked against the query. |
 //! | [`mentions`] | Resolves `@path` mentions against the working directory and refuses any that escape it. [`ContainedPrompt`] is the proof it hands out; [`user_message`] takes nothing else. |
@@ -26,10 +27,12 @@
 //!
 //! # What never happens
 //!
-//! A `/command` never becomes a model request. The panel dispatches it as a
+//! A `/command` never becomes a canonical user prompt. The panel dispatches it as a
 //! tagged message, [`CommandDispatch::receive`](CommandDispatch) consumes it
-//! and loops, and the agent's `receive_user_input` — which pushes whatever
-//! text it gets into the model's history — only ever sees real prompts. An
+//! and loops for local replies. A command that answers with an [`AgentRequest`]
+//! instead returns a private control message: for `/compact`,
+//! `receive_user_input` requests a summary without appending the command or its
+//! focus to history, and the graph skips the normal answer call. An
 //! unknown command is answered with an error naming `/help`, not forwarded.
 //! A prompt mentioning a path outside the working directory is refused, not
 //! forwarded either: the tools are sandboxed there and could not act on it.
@@ -52,6 +55,7 @@ pub mod files;
 pub mod history;
 pub mod ignore;
 pub mod mentions;
+pub mod notify;
 pub mod review;
 pub mod rewind;
 pub mod sessions;
@@ -66,7 +70,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use polaris::plugins::{IOProvider, UserIO};
+use polaris_tui::nav::Key;
 use polaris_tui::panels::{ConversationPanelPlugin, TuiIOProvider};
+use polaris_tui::ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::run::StatusEmitter;
 
@@ -79,7 +85,8 @@ pub use background::{
     FINISHED_RETAINED, FinishedTask, collect_result,
 };
 pub use commands::{
-    CommandContext, CommandError, CommandFuture, CommandHandler, CommandOutcome, CommandRegistry,
+    AgentRequest, CommandContext, CommandError, CommandFuture, CommandHandler, CommandOutcome,
+    CommandRegistry,
 };
 pub use dispatch::CommandDispatch;
 pub use files::WorkspaceFiles;
@@ -172,7 +179,8 @@ pub fn attach_with_status(
 }
 
 /// The one decorator behind `attach*`: command dispatch, `@` mention
-/// candidates, the replay output handle, and — when asked for — the status sink.
+/// candidates, the Shift-Tab permission-mode key, the replay output handle,
+/// and — when asked for — the status sink.
 fn decorate(
     panel: ConversationPanelPlugin,
     registry: Arc<CommandRegistry>,
@@ -185,6 +193,13 @@ fn decorate(
     let capture = output.clone();
     let panel = panel
         .with_completion_source(Arc::new(files))
+        // Shift-Tab steps the permission mode. The panel honours the key only
+        // while `/permission` is advertised, and otherwise leaves it to the
+        // shell (backward panel focus).
+        .with_key_command(
+            Key::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            "/permission cycle",
+        )
         .with_io_decorator(move |provider: Arc<TuiIOProvider>| {
             if let Ok(mut slot) = capture.provider.write() {
                 *slot = Some(provider.clone());

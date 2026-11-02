@@ -67,7 +67,7 @@ control flow.
 
 **Files:** `src/tools/code.rs` (`CodeToolsPlugin`), `src/tools/code_graph.rs`
 (`CodeGraphPlugin`), `src/tools/memory.rs` (`MemoryToolsPlugin`),
-`src/progress.rs` (`ProgressMiddlewarePlugin`), `src/terminal/`
+`src/tools/web.rs` (`WebToolsPlugin`), `src/progress.rs` (`ProgressMiddlewarePlugin`), `src/terminal/`
 (`CommandRegistry`, `CommandDispatch`, `WorkspaceFiles`, `LiveTranscript`),
 `src/exec/` (`ExecIOPlugin`).
 
@@ -78,7 +78,9 @@ The swappable capabilities this app contributes as Polaris plugins:
   reflective memory (`MemoryTools`), and the model's own route to a background
   shell run (`TaskTools`: `run_in_background`, `task_output`, `stop_task`),
   which composes the executor `ShellPlugin` publishes with the same
-  `src/terminal/background.rs` table the user's chord writes.
+  `src/terminal/background.rs` table the user's chord writes, and public web
+  pages as readable text (`WebTools`: `web_fetch`; see
+  [`web-access.md`](web-access.md)).
 - **Instrumentation.** `ProgressMiddlewarePlugin` bridges graph execution events
   to the conversation panel.
 - **Terminal policy.** `src/terminal/` supplies what `polaris-tui`'s

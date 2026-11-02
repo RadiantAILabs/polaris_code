@@ -12,7 +12,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use polaris::plugins::{IO_TYPE, IOContent, IOError, IOMessage, IOProvider, UserIO};
+use polaris::models::ModelsPlugin;
+use polaris::plugins::{
+    IO_TYPE, IOContent, IOError, IOMessage, IOProvider, PersistencePlugin, UserIO,
+};
+use polaris::system::server::Server;
+use polaris::tools::ToolsPlugin;
+use polaris_code::agents::CodeAgentPlugin;
+use polaris_code::agents::context::CompactionPlugin;
+use polaris_code::terminal::commands::AgentRequest;
 use polaris_code::terminal::{
     CommandDispatch, CommandOutcome, CommandRegistry, META_MENTIONS, attach,
 };
@@ -104,7 +112,8 @@ async fn a_command_is_answered_locally_and_never_reaches_receive() {
     let specs = parse_advertisement(&shown[0]).expect("first message advertises the commands");
     assert_eq!(
         specs,
-        vec![CommandSpec::new("help", "List the available commands").with_usage("[command]")]
+        vec![CommandSpec::new("help", "List the available commands").with_usage("[command]")],
+        "a registry that no capability contributed to advertises only its own command"
     );
     assert_eq!(kind(&shown[1]), Some("message"));
     assert!(text(&shown[1]).contains("/help"), "{}", text(&shown[1]));
@@ -150,6 +159,109 @@ async fn registered_commands_run_with_their_args() {
     let shown = inner.shown().await;
     assert_eq!(text(&shown[1]), "echo: one two");
     assert_eq!(shown[1].metadata.get("io_type").unwrap(), "message");
+}
+
+#[tokio::test]
+async fn a_command_that_requests_something_of_the_agent_hands_it_over_unanswered() {
+    let ws = workspace();
+    let registry = Arc::new(CommandRegistry::with_builtins());
+    registry
+        .register_sync(
+            CommandSpec::new("rebuild", "Ask for a rebuild"),
+            |_, args| CommandOutcome::Request(AgentRequest::new("test:rebuild", args)),
+        )
+        .unwrap();
+    let inner = Scripted::new(vec![
+        CommandInvocation::new("rebuild", "the index").into_message("/rebuild the index"),
+        IOMessage::user_text("a later prompt"),
+    ]);
+    let io = user_io(inner.clone(), registry, ws.path());
+
+    // The request is what `receive` returns, ahead of the later prompt, and
+    // it is not a command and not a user prompt.
+    let got = io.receive().await.unwrap();
+    assert_eq!(
+        AgentRequest::from_message(&got),
+        Some(AgentRequest::new("test:rebuild", "the index"))
+    );
+    assert!(CommandInvocation::from_message(&got).is_none());
+    // The terminal shows the user the advertisement and nothing else: the
+    // agent, not the dispatcher, decides what a request means.
+    let shown = inner.shown().await;
+    assert_eq!(shown.len(), 1, "{shown:#?}");
+    assert!(shown[0].metadata.contains_key(META_COMMANDS));
+
+    // The next receive is the prompt that followed it.
+    let next = io.receive().await.unwrap();
+    assert_eq!(text(&next), "a later prompt");
+}
+
+#[tokio::test]
+async fn a_host_without_the_compaction_capability_has_no_compact_command() {
+    let ws = workspace();
+    let registry = Arc::new(CommandRegistry::with_builtins());
+    assert!(!registry.contains("compact"));
+    let inner = Scripted::new(vec![
+        CommandInvocation::new("compact", "focus").into_message("/compact focus"),
+    ]);
+    let io = user_io(inner.clone(), registry, ws.path());
+
+    // It is answered as an unknown command; nothing reaches the agent.
+    assert!(matches!(io.receive().await, Err(IOError::Closed)));
+    let shown = inner.shown().await;
+    let reply = shown.last().unwrap();
+    assert_eq!(kind(reply), Some("error"));
+    assert!(
+        text(reply).contains("unknown command `/compact`"),
+        "{}",
+        text(reply)
+    );
+}
+
+/// What a server needs besides the agent for `CodeAgentPlugin` to assemble.
+fn agent_prerequisites(server: &mut Server) {
+    server
+        .add_plugins(ModelsPlugin)
+        .add_plugins(ToolsPlugin)
+        .add_plugins(PersistencePlugin);
+}
+
+#[tokio::test]
+async fn the_compaction_plugin_adds_compact_next_to_the_agent_that_reads_it() {
+    let registry = Arc::new(CommandRegistry::with_builtins());
+    let mut server = Server::new();
+    agent_prerequisites(&mut server);
+    server
+        .add_plugins(CodeAgentPlugin::new())
+        .add_plugins(CompactionPlugin::new(registry.clone()));
+    server
+        .finish()
+        .await
+        .expect("the agent and its command assemble");
+
+    assert!(registry.contains("compact"));
+    let ws = workspace();
+    let inner = Scripted::new(vec![
+        CommandInvocation::new("compact", "keep the failures").into_message("/compact"),
+    ]);
+    let io = user_io(inner, registry, ws.path());
+    let got = io.receive().await.unwrap();
+    let request = AgentRequest::from_message(&got).expect("`/compact` is a request");
+    assert_eq!(request.payload(), "keep the failures");
+}
+
+#[tokio::test]
+async fn the_compaction_plugin_cannot_be_assembled_without_the_agent() {
+    let registry = Arc::new(CommandRegistry::with_builtins());
+    let mut server = Server::new();
+    agent_prerequisites(&mut server);
+    server.add_plugins(CompactionPlugin::new(registry.clone()));
+
+    server
+        .finish()
+        .await
+        .expect_err("a command nothing reads is not offered");
+    assert!(!registry.contains("compact"));
 }
 
 #[tokio::test]

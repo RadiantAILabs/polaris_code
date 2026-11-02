@@ -8,20 +8,23 @@
 //!
 //! | Layer | Source | Meaning |
 //! |-------|--------|---------|
-//! | The set | [`BUILTIN_MODELS`], replaced wholesale by `POLARIS_CODE_MODELS` | every `provider/model` id this run may select |
-//! | The default | `POLARIS_CODE_MODEL`, else [`DEFAULT_MODEL`] | the id a run uses when it names none |
+//! | The set | the provider's built-in ids ([`BUILTIN_MODELS`], [`BUILTIN_OPENAI_MODELS`]), replaced wholesale by `POLARIS_CODE_MODELS` | every `provider/model` id this run may select |
+//! | The default | `POLARIS_CODE_MODEL`, else the provider's default ([`DEFAULT_MODEL`], [`DEFAULT_OPENAI_MODEL`], [`DEFAULT_BEDROCK_MODEL`]) | the id a run uses when it names none |
 //! | Reachability | the registered provider names | an id whose provider is not registered is dropped |
 //!
 //! Resolution happens once, at launch, before a session exists — so an id
 //! nothing can serve is a startup error naming what *was* available, rather
 //! than a provider error at the first token.
 //!
+//! A bare family name such as `sonnet` resolves to the newest model of that
+//! family in the set; [`ResolvedModel::note`] says which one it chose.
+//!
 //! [`LlmProvider`]: polaris::models::llm::LlmProvider
 
 use std::fmt;
 
 /// Default model when `POLARIS_CODE_MODEL` is unset.
-pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
+pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5-5";
 
 /// Environment variable naming the model a run defaults to.
 pub const MODEL_VAR: &str = "POLARIS_CODE_MODEL";
@@ -34,15 +37,39 @@ pub const MODEL_VAR: &str = "POLARIS_CODE_MODEL";
 /// a session to one model.
 pub const MODELS_VAR: &str = "POLARIS_CODE_MODELS";
 
-/// The models a build knows about with no configuration at all.
+/// The Anthropic models a build knows about with no configuration at all.
 ///
 /// Deliberately short. It is a convenience, not an inventory: `POLARIS_CODE_MODELS`
 /// is the supported way to name anything else, and the resolver's error says so.
+/// Newest first; every id is one the framework's built-in price table
+/// recognises except `claude-haiku-5-5`, which that table does not list yet,
+/// so `--max-cost-usd` on it needs the live price table.
 pub const BUILTIN_MODELS: &[&str] = &[
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-sonnet-5-5",
+    "anthropic/claude-haiku-5-5",
+    "anthropic/claude-fable-5-1",
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
     "anthropic/claude-sonnet-4-6",
     "anthropic/claude-haiku-4-5",
+];
+
+/// Default model when `--provider openai` is selected and neither `--model`
+/// nor `POLARIS_CODE_MODEL` names one.
+pub const DEFAULT_OPENAI_MODEL: &str = "openai/gpt-5.5";
+
+/// The `OpenAI` models a build knows about with no configuration at all: the
+/// ids the framework's built-in price table lists for the `OpenAI` provider.
+///
+/// A server that speaks the same API (Ollama, LM Studio, vLLM, a gateway)
+/// serves ids this list cannot know, so `POLARIS_CODE_MODELS` declares them as
+/// `openai/<id>`.
+pub const BUILTIN_OPENAI_MODELS: &[&str] = &[
+    "openai/gpt-5.5",
+    "openai/gpt-5.4",
+    "openai/gpt-5.4-mini",
+    "openai/gpt-6-luna",
 ];
 
 /// Default model when `--provider bedrock` is selected and neither `--model`
@@ -205,15 +232,23 @@ impl ModelCatalog {
     /// exactly like the Anthropic path.
     #[must_use]
     pub fn from_env_with_default(default_model: &str, builtin: &[&str]) -> Self {
-        let default_model = std::env::var(MODEL_VAR)
-            .ok()
+        Self::from_lookup(default_model, builtin, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::from_env_with_default`] over an explicit source of variables
+    /// instead of the process environment, so the same rules can be applied
+    /// to any other source — and checked without touching the real one.
+    #[must_use]
+    pub fn from_lookup(
+        default_model: &str,
+        builtin: &[&str],
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
+        let default_model = lookup(MODEL_VAR)
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| default_model.to_string());
-        match std::env::var(MODELS_VAR)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-        {
+        match lookup(MODELS_VAR).filter(|v| !v.trim().is_empty()) {
             Some(declared) => Self::new(default_model, parse_declared(&declared)),
             None => Self::new(default_model, builtin.iter().map(|id| (*id).to_string())),
         }
@@ -279,21 +314,37 @@ impl ModelCatalog {
     /// A name containing `/` must match an id exactly. A bare name matches on
     /// the model half: exactly first, then by substring, which is what makes
     /// `--model opus` and `/model haiku` work without spelling a full id.
+    /// When a bare name matches several versions of one model family, the
+    /// newest is taken; [`Self::resolve_noting`] also says so.
     ///
     /// # Errors
     ///
     /// [`ModelSelectionError`] when the name matches nothing, matches several
-    /// ids, or names an unregistered provider — always carrying the set that
-    /// *was* available.
+    /// unrelated ids, or names an unregistered provider — always carrying the
+    /// set that *was* available.
     pub fn resolve(&self, requested: &str) -> Result<String, ModelSelectionError> {
+        self.resolve_noting(requested).map(|resolved| resolved.id)
+    }
+
+    /// [`Self::resolve`], keeping what the resolver had to decide.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelSelectionError`], as [`Self::resolve`].
+    pub fn resolve_noting(&self, requested: &str) -> Result<ResolvedModel, ModelSelectionError> {
         let requested = requested.trim();
         if self.models.is_empty() {
             return Err(ModelSelectionError::Empty {
                 requested: requested.to_string(),
             });
         }
+        let chosen = |id: &str| ResolvedModel {
+            id: id.to_string(),
+            requested: requested.to_string(),
+            matched: Vec::new(),
+        };
         if let Some(exact) = self.models.iter().find(|id| *id == requested) {
-            return Ok(exact.clone());
+            return Ok(chosen(exact));
         }
         if let Some((provider, _)) = requested.split_once('/') {
             let providers = self.providers();
@@ -341,11 +392,18 @@ impl ModelCatalog {
                 requested: requested.to_string(),
                 available: self.models.clone(),
             }),
-            1 => Ok(matches[0].clone()),
-            _ => Err(ModelSelectionError::Ambiguous {
-                requested: requested.to_string(),
-                matches,
-            }),
+            1 => Ok(chosen(&matches[0])),
+            _ => match newest_of_one_family(&matches) {
+                Some(newest_first) => Ok(ResolvedModel {
+                    id: newest_first[0].clone(),
+                    requested: requested.to_string(),
+                    matched: newest_first,
+                }),
+                None => Err(ModelSelectionError::Ambiguous {
+                    requested: requested.to_string(),
+                    matches,
+                }),
+            },
         }
     }
 
@@ -360,8 +418,116 @@ impl ModelCatalog {
     ///
     /// [`ModelSelectionError`], as [`Self::resolve`].
     pub fn select(&self, requested: Option<&str>) -> Result<String, ModelSelectionError> {
-        self.resolve(requested.unwrap_or(&self.default_model))
+        self.select_noting(requested).map(|resolved| resolved.id)
     }
+
+    /// [`Self::select`], keeping what the resolver had to decide.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelSelectionError`], as [`Self::resolve`].
+    pub fn select_noting(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<ResolvedModel, ModelSelectionError> {
+        self.resolve_noting(requested.unwrap_or(&self.default_model))
+    }
+}
+
+/// A name resolved to a selectable id, and whether the resolver had to choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    /// The selectable `provider/model` id.
+    pub id: String,
+    /// What the operator typed.
+    pub requested: String,
+    /// Every id the name matched, newest first, when it matched several
+    /// versions of one family and the newest was taken; empty when the name
+    /// identified one id outright.
+    pub matched: Vec<String>,
+}
+
+impl ResolvedModel {
+    /// One sentence saying which model a family name chose, or `None` when
+    /// the name needed no choosing.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        (!self.matched.is_empty()).then(|| {
+            format!(
+                "`{}` matches {} models; using the newest, `{}`",
+                self.requested,
+                self.matched.len(),
+                self.id
+            )
+        })
+    }
+}
+
+/// `ids` ordered newest first, when they are versions of one model family.
+///
+/// `None` when they are not — a different provider, family or variant among
+/// them (`gpt-5.4` and `gpt-5.4-mini`), an id with no version in it, or two
+/// at the same newest version — because then nothing says which one was meant.
+fn newest_of_one_family(ids: &[String]) -> Option<Vec<String>> {
+    let mut releases = ids
+        .iter()
+        .map(|id| release(id).map(|release| (release, id)))
+        .collect::<Option<Vec<_>>>()?;
+    let ((provider, family, _), _) = releases.first()?;
+    if releases
+        .iter()
+        .any(|((other_provider, other_family, _), _)| {
+            other_provider != provider || other_family != family
+        })
+    {
+        return None;
+    }
+    releases.sort_by(|((_, _, a), _), ((_, _, b), _)| b.cmp(a));
+    if releases.len() > 1 && releases[0].0.2 == releases[1].0.2 {
+        return None;
+    }
+    Some(releases.into_iter().map(|(_, id)| id.clone()).collect())
+}
+
+/// Where an id sits in its model family: its provider, the family's name, and
+/// its version.
+///
+/// `anthropic/claude-sonnet-5-5` is provider `anthropic`, family
+/// `claude-sonnet`, version `[5, 5]`. A snapshot date (`-20250929`) belongs to
+/// neither the family nor the version, so a dated id sorts with its family; any
+/// other word (`-mini`) is part of the family, since `gpt-5.4-mini` is a
+/// different model rather than a newer `gpt-5.4`. `None` when the id carries
+/// no version at all.
+fn release(id: &str) -> Option<(&str, String, Vec<u64>)> {
+    let (provider, model) = id.split_once('/')?;
+    let mut family = Vec::new();
+    let mut version = Vec::new();
+    for segment in model.split('-') {
+        match version_parts(segment) {
+            Some(parts) => version.extend(parts),
+            None if is_snapshot_date(segment) => {}
+            None => family.push(segment),
+        }
+    }
+    (!version.is_empty()).then(|| (provider, family.join("-"), version))
+}
+
+/// The numbers in a version segment such as `5` or `5.4`; `None` for anything
+/// else. Each number has at most four digits, which is what keeps a snapshot
+/// date out of the version.
+fn version_parts(segment: &str) -> Option<Vec<u64>> {
+    segment
+        .split('.')
+        .map(|part| {
+            let digits = !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+            (digits && part.len() <= 4).then(|| part.parse().ok())?
+        })
+        .collect()
+}
+
+/// A snapshot date such as `20250929`: only digits, and too many to be a version.
+fn is_snapshot_date(segment: &str) -> bool {
+    segment.len() >= 6 && segment.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Split a `POLARIS_CODE_MODELS` value on commas and whitespace.
@@ -447,5 +613,162 @@ mod tests {
         let catalog = ModelCatalog::pinned("fake/only");
         assert_eq!(catalog.models(), ["fake/only"]);
         assert!(catalog.resolve("fake/other").is_err());
+    }
+
+    fn anthropic() -> ModelCatalog {
+        ModelCatalog::new(DEFAULT_MODEL, BUILTIN_MODELS.iter().copied())
+    }
+
+    fn openai() -> ModelCatalog {
+        ModelCatalog::new(DEFAULT_OPENAI_MODEL, BUILTIN_OPENAI_MODELS.iter().copied())
+    }
+
+    #[test]
+    fn a_family_name_resolves_to_the_newest_model_of_the_family() {
+        let catalog = anthropic();
+        for (name, expected) in [
+            ("sonnet", "anthropic/claude-sonnet-5-5"),
+            ("opus", "anthropic/claude-opus-5-5"),
+            ("haiku", "anthropic/claude-haiku-5-5"),
+            ("fable", "anthropic/claude-fable-5-1"),
+        ] {
+            assert_eq!(catalog.resolve(name).unwrap(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_family_name_says_which_model_it_chose() {
+        let resolved = anthropic().resolve_noting("sonnet").unwrap();
+        assert_eq!(resolved.id, "anthropic/claude-sonnet-5-5");
+        assert_eq!(
+            resolved.matched,
+            [
+                "anthropic/claude-sonnet-5-5",
+                "anthropic/claude-sonnet-5",
+                "anthropic/claude-sonnet-4-6"
+            ]
+        );
+        let note = resolved.note().expect("a choice is worth saying");
+        assert!(note.contains("`sonnet`"), "{note}");
+        assert!(note.contains("3 models"), "{note}");
+        assert!(note.contains("`anthropic/claude-sonnet-5-5`"), "{note}");
+    }
+
+    #[test]
+    fn a_name_that_needed_no_choosing_has_no_note() {
+        let catalog = anthropic();
+        for name in ["fable", "claude-sonnet-5", "anthropic/claude-sonnet-4-6"] {
+            let resolved = catalog.resolve_noting(name).unwrap();
+            assert_eq!(resolved.note(), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_exact_model_name_beats_the_newer_models_that_contain_it() {
+        assert_eq!(
+            anthropic().resolve("claude-sonnet-5").unwrap(),
+            "anthropic/claude-sonnet-5"
+        );
+        assert_eq!(
+            anthropic().resolve("claude-haiku-4-5").unwrap(),
+            "anthropic/claude-haiku-4-5"
+        );
+    }
+
+    #[test]
+    fn names_that_span_several_families_stay_ambiguous() {
+        for name in ["claude", "5"] {
+            let err = anthropic().resolve(name).unwrap_err();
+            assert!(
+                matches!(err, ModelSelectionError::Ambiguous { .. }),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// `gpt-5.4-mini` is a different model from `gpt-5.4`, not a newer one, so
+    /// a name that matches both must not be settled by version alone.
+    #[test]
+    fn a_variant_is_not_a_newer_version_of_its_base_model() {
+        let err = openai().resolve("gpt").unwrap_err();
+        assert!(
+            matches!(err, ModelSelectionError::Ambiguous { .. }),
+            "{err}"
+        );
+        assert_eq!(openai().resolve("mini").unwrap(), "openai/gpt-5.4-mini");
+        assert_eq!(openai().resolve("gpt-5.4").unwrap(), "openai/gpt-5.4");
+    }
+
+    #[test]
+    fn a_dated_snapshot_sorts_with_its_family() {
+        let catalog = ModelCatalog::new(
+            "p/claude-sonnet-4-5-20250929",
+            ["p/claude-sonnet-4-5-20250929", "p/claude-sonnet-5-5"],
+        );
+        assert_eq!(catalog.resolve("sonnet").unwrap(), "p/claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn a_version_written_before_the_family_word_still_orders() {
+        let catalog = ModelCatalog::new(
+            "p/claude-3-5-haiku",
+            ["p/claude-3-5-haiku", "p/claude-haiku-4-5"],
+        );
+        assert_eq!(catalog.resolve("haiku").unwrap(), "p/claude-haiku-4-5");
+    }
+
+    #[test]
+    fn two_newest_candidates_at_one_version_stay_ambiguous() {
+        let catalog = ModelCatalog::new(
+            "p/claude-sonnet-5-5",
+            ["p/claude-sonnet-5-5", "p/claude-sonnet-5-5-20260101"],
+        );
+        let err = catalog.resolve("sonnet").unwrap_err();
+        assert!(
+            matches!(err, ModelSelectionError::Ambiguous { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_same_family_at_two_providers_stays_ambiguous() {
+        let catalog = ModelCatalog::new(
+            "a/claude-sonnet-5-5",
+            ["a/claude-sonnet-5-5", "b/claude-sonnet-5-5"],
+        );
+        let err = catalog.resolve("sonnet").unwrap_err();
+        assert!(
+            matches!(err, ModelSelectionError::Ambiguous { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_defaults_are_members_of_their_own_sets() {
+        assert!(BUILTIN_MODELS.contains(&DEFAULT_MODEL));
+        assert!(BUILTIN_OPENAI_MODELS.contains(&DEFAULT_OPENAI_MODEL));
+        for id in BUILTIN_MODELS {
+            assert!(id.starts_with("anthropic/"), "{id}");
+        }
+        for id in BUILTIN_OPENAI_MODELS {
+            assert!(id.starts_with("openai/"), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_lookup_replaces_the_process_environment() {
+        let env = |name: &str| match name {
+            MODEL_VAR => Some(" openai/gpt-5.4 ".to_string()),
+            MODELS_VAR => Some("openai/gpt-5.4, openai/local-model".to_string()),
+            _ => None,
+        };
+        let catalog = ModelCatalog::from_lookup(DEFAULT_OPENAI_MODEL, BUILTIN_OPENAI_MODELS, &env);
+        assert_eq!(catalog.default_model(), "openai/gpt-5.4");
+        assert_eq!(catalog.models(), ["openai/gpt-5.4", "openai/local-model"]);
+
+        let none = |_: &str| -> Option<String> { None };
+        let catalog = ModelCatalog::from_lookup(DEFAULT_OPENAI_MODEL, BUILTIN_OPENAI_MODELS, &none);
+        assert_eq!(catalog.default_model(), DEFAULT_OPENAI_MODEL);
+        assert_eq!(catalog.models(), BUILTIN_OPENAI_MODELS);
     }
 }

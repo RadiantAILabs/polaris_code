@@ -5,10 +5,17 @@
 //!
 //! ```text
 //! receive_user_input → refresh_project_docs → init_loop → loop("agent_loop") {
-//!     prepare_context → act → has_tool_calls ? execute_tools : finalize
+//!     compact_context → manual ? finish_compaction :
+//!         prepare_context → begin_model_call → act → loop("model_retries") { … } →
+//!             model_answered ? (accept_response →
+//!                 has_tool_calls ? (review_tools → execute_tools) : finalize) :
+//!                 report_failure
 //!     on error → recover
 //! }
 //! ```
+//!
+//! The model call's retry stage is described in [`retry`]: `act` is one
+//! attempt, and a failed one is retried or given up on by graph edges.
 //!
 //! The object loop is the proven `ReAct` pattern (one LLM call per iteration; the
 //! model's own output structure drives control flow). The *reflective* layer
@@ -25,36 +32,50 @@ use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::auto_review::{
+    AutoReviewPlugin, ReviewDecision, ReviewHistory, ReviewIntent, ReviewResult, review_tools,
+};
 use super::config::AgentConfig;
-use super::context::{CacheAwareWindow, ContextManager};
-use super::policy::{PolicySnapshot, ToolPalettePolicy};
+use super::context::{
+    CacheAwareWindow, CompactionRun, ContextManager, LinearWindow, SummarizingWindow,
+    compact_context, compaction_focus, finish_compaction,
+};
+use super::failure::{self, Attempts, TurnFailure};
+use super::permission_rules::{
+    ApprovalRequest, ApprovalScope, PermissionCall, PermissionRules, PermissionRulesPlugin,
+    ReviewEligibility, RunToolGrants, SessionGrants, ShellApproval,
+};
+use super::policy::PolicySnapshot;
 use super::project_context::ProjectContext;
+use super::retry::{
+    self, AttemptLedger, AttemptOutcome, RetryStep, abandon, accept_response, act,
+    begin_model_call, decide_retry, report_failure, wait_to_retry,
+};
 use super::state::LoopState;
 use super::trajectory::{Decision, record_tool_call};
 use crate::terminal::attachments::{AttachmentStore, user_message};
 use crate::terminal::background::{
-    BackgroundTasks, COALESCE_TICK, ToolRun, background_body, background_receipt,
+    BackgroundTasks, COALESCE_TICK, background_body, background_receipt,
 };
 use crate::terminal::dispatch::is_session_switch_signal;
 use crate::terminal::status;
 use crate::terminal::transcript::{
     LiveTranscript, OUTCOME_COMPLETE, OUTCOME_ERROR, PHASE_BACKGROUND, PHASE_DENIED, PHASE_ERROR,
-    PHASE_OK, PHASE_PENDING, PHASE_RUNNING, PHASE_START, ToolActivity, forward, tool_detail,
+    PHASE_OK, PHASE_PENDING, PHASE_RUNNING, PHASE_START, ToolActivity, tool_detail,
 };
 use crate::terminal::{ContainedPrompt, SessionSettings, TurnPrompt, TurnSteering};
 use crate::tools::shell_render::render_run_command;
-use crate::tools::{CodeIndexer, RUN_IN_BACKGROUND, code_index_state, enrich, tool_is_read_only};
+use crate::tools::{
+    CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, code_index_state, enrich, tool_is_read_only,
+};
 use crate::usage::TokenMeter;
 
 use futures_util::StreamExt;
 use polaris::agent::{Agent, SetupError};
 use polaris::graph::{CaughtError, Graph, RunCancellation};
-use polaris::models::llm::{
-    Llm, LlmResponse, Message, StreamEvent, StreamEventExt, ToolCall, ToolResultContent, UserBlock,
-};
+use polaris::models::llm::{Llm, LlmResponse, Message, ToolCall, ToolResultContent, UserBlock};
 use polaris::models::{ModelRegistry, ModelsPlugin};
 use polaris::plugins::{
     IO_TYPE, IOContent, IOMessage, IOSource, PersistenceAPI, PersistencePlugin, UserIO,
@@ -72,9 +93,7 @@ use polaris::tools::{
     LlmRequestBuilderExt, ToolContext, ToolError, ToolPermission, ToolRegistry, ToolsPlugin,
 };
 use polaris_ontrace::oxigraph::OxigraphStore;
-use polaris_tui::commands::{
-    Availability, StatusReport, attachment_handles, report_status, report_unavailable,
-};
+use polaris_tui::commands::{Availability, StatusReport, attachment_handles, report_status};
 
 /// The current LLM instance, resolved in `setup` and injected as a local.
 #[derive(Clone)]
@@ -169,60 +188,6 @@ async fn send_error(user_io: &UserIO, text: impl Into<String>) {
     let _ = user_io.send(msg).await;
 }
 
-/// Report an *increment* of token usage as a `io_type=tokens` delta. The
-/// conversation panel adds each delta's `in`/`out` counts into a running session
-/// tally, so during a streaming call we forward the change since the last
-/// emission (not the cumulative total the stream reports) and the sum still
-/// matches cost.
-async fn send_token_delta(user_io: &UserIO, in_delta: u64, out_delta: u64) {
-    let msg = IOMessage::from_agent("code", IOContent::Text(String::new()))
-        .with_metadata(IO_TYPE, "tokens")
-        .with_metadata("in", in_delta.to_string())
-        .with_metadata("out", out_delta.to_string());
-    let _ = user_io.send(msg).await;
-}
-
-/// Fold a cumulative usage reading into the increment to emit this step.
-///
-/// Streams report *cumulative* `input`/`output` token totals, but the panel
-/// tally and the session [`TokenMeter`] are additive, so each step forwards only
-/// the increase since the previous reading. A repeated or decreasing reading
-/// (which would otherwise double-count or underflow) yields `(0, 0)`.
-fn token_increment(prev_in: u64, prev_out: u64, in_now: u64, out_now: u64) -> (u64, u64) {
-    (
-        in_now.saturating_sub(prev_in),
-        out_now.saturating_sub(prev_out),
-    )
-}
-
-/// Assemble the reified `tool_palette` [`Decision`] for a turn: the tools
-/// actually offered (`offered`, already intersected with exposure), how the
-/// palette was selected, and the policy values that drove it.
-///
-/// Split out of [`act`] so the provenance shape is unit-testable without
-/// standing up the full system. Consumes `offered` into the decision's options.
-fn tool_palette_decision(
-    palette: &ToolPalettePolicy,
-    offered: Vec<String>,
-    max_attempts: u32,
-    attempts_used: u32,
-) -> Decision {
-    let mode = palette.mode.label();
-    let count = offered.len();
-    Decision {
-        kind: "tool_palette",
-        intent: None,
-        chosen: format!("{mode}:{count}"),
-        options: offered,
-        policy_refs: vec![
-            format!("tool_palette.mode={mode}"),
-            format!("tool_palette.denied={}", palette.denied.len()),
-            format!("retry.max_attempts={max_attempts}"),
-            format!("attempts_used={attempts_used}"),
-        ],
-    }
-}
-
 /// The next item accepted by the agent's single input boundary.
 enum AgentInput {
     /// A proof-carrying prompt from the host's turn-input queue.
@@ -257,7 +222,12 @@ async fn receive_user_input(
     attachments: Res<AttachmentStore>,
     config: Res<AgentConfig>,
     cancel: Res<RunCancellation>,
+    settings: Res<SessionSettings>,
+    mut intent: ResMut<ReviewIntent>,
+    mut reviews: ResMut<ReviewHistory>,
 ) -> Result<(), SystemError> {
+    intent.begin_turn(settings.approval_generation());
+    reviews.clear();
     let next = if steering.is_enabled() {
         cancel
             .run_until_cancelled(async {
@@ -278,11 +248,16 @@ async fn receive_user_input(
 
     match next {
         AgentInput::Prompt(prompt) => {
+            intent.push(prompt.text.as_str());
             context.push(user_message(&attachments, prompt.text, &prompt.attachments));
         }
         AgentInput::Channel(received) => {
             match received {
                 Ok(message) => {
+                    if let Some(focus) = compaction_focus(&message) {
+                        context.request_compaction(focus);
+                        return Ok(());
+                    }
                     if is_session_switch_signal(&message) {
                         state.is_complete = true;
                         return Err(SystemError::ExecutionError(
@@ -312,6 +287,7 @@ async fn receive_user_input(
                                 return Err(SystemError::ExecutionError(reason));
                             }
                         };
+                        intent.push(prompt.as_str());
                         context.push(user_message(&attachments, prompt, &handles));
                     }
                 }
@@ -363,8 +339,10 @@ async fn apply_steering(
     steering: Res<TurnSteering>,
     attachments: Res<AttachmentStore>,
     mut context: ResMut<ContextManager>,
+    mut intent: ResMut<ReviewIntent>,
 ) {
     for prompt in steering.take_steering() {
+        intent.push(prompt.text.as_str());
         context.push(user_message(&attachments, prompt.text, &prompt.attachments));
     }
 }
@@ -425,7 +403,7 @@ async fn prepare_context(
         &user_io,
         &model_id,
         &config.working_dir,
-        session.session_id.as_str(),
+        &context.status_session(session.session_id.as_str()),
         u64::from(session.turn_number),
         &policy.permission,
         projected.estimated_tokens,
@@ -468,221 +446,6 @@ async fn prepare_context(
     }
 }
 
-/// Single LLM call with tools available, with in-system retry per policy.
-#[system]
-async fn act(
-    prepared: Out<PreparedContext>,
-    mut context: ResMut<ContextManager>,
-    llm: Res<AgentLlm>,
-    tool_registry: Res<ToolRegistry>,
-    user_io: Res<UserIO>,
-    policy: Res<PolicySnapshot>,
-    store: Res<OxigraphStore>,
-    meter: Res<TokenMeter>,
-    mut live: ResMut<LiveTranscript>,
-    cancel: Res<RunCancellation>,
-) -> Result<LlmResponse, SystemError> {
-    let messages = prepared.messages.clone();
-    let max_attempts = policy.retry.max_attempts.max(1);
-
-    // Per-turn tool selection (the agent narrowing its own palette). The predicate
-    // composes the policy's allow-list/denylist with the registry's static
-    // exposure inside `definitions_for`; we capture the resulting set for the
-    // reified `tool_palette` decision below.
-    let offered: Vec<String> = tool_registry
-        .definitions_for(|name| policy.tool_palette.includes(name))
-        .into_iter()
-        .map(|def| def.name)
-        .collect();
-    if offered.is_empty() {
-        // An empty palette is a legitimate pure-reasoning turn (the model is
-        // sent no tools), but it is always intentional — log it so it is never
-        // silent, and so an accidentally over-narrow policy is observable.
-        tracing::debug!(
-            mode = policy.tool_palette.mode.label(),
-            "act: tool palette is empty — offering the model no tools this turn"
-        );
-    }
-    // Cheap Arc clone of the session meter to fold usage into from the stream
-    // closure; the binary reads it on exit to print a cost summary.
-    let meter = TokenMeter::clone(&meter);
-
-    let mut attempt = 0;
-    // The loop yields the response plus the provider-native `input_tokens` for the
-    // window we actually sent, captured on the successful attempt to calibrate the
-    // context manager's token estimate.
-    let (response, prompt_tokens) = loop {
-        attempt += 1;
-
-        // Per-attempt live token accounting. Each `MessageDelta`/`MessageStop`
-        // carries *cumulative* usage; we forward the *increment* since the last
-        // emission, because the conversation panel adds deltas into its running
-        // tally. `committed` flips true once we've emitted anything this attempt;
-        // past that point the additive tally can't be rolled back, so a failed
-        // stream is terminal rather than retryable.
-        let last_in = Arc::new(AtomicU64::new(0));
-        let last_out = Arc::new(AtomicU64::new(0));
-        let last_cache_read = Arc::new(AtomicU64::new(0));
-        let last_cache_creation = Arc::new(AtomicU64::new(0));
-        let committed = Arc::new(AtomicBool::new(false));
-        // A fresh transcript block per attempt. A retry that has shown nothing
-        // reuses nothing; a retry after visible text cannot happen at all
-        // (emitting a delta marks the attempt committed, below), so one block
-        // never mixes two attempts' text.
-        // Close the previous iteration's block first: a ReAct turn emits one
-        // block per iteration (reasoning, then its tools), and an unclosed one
-        // would render as still being written.
-        live.close(&user_io, "", OUTCOME_COMPLETE).await;
-        let block = live.open();
-
-        let user_io_ref: &UserIO = &user_io;
-        let result = cancel
-            .run_until_cancelled(async {
-                // Cache-aware projection: the strategy decides whether to
-                // cache the stable prefix (system + tools) and where to place the
-                // rolling/stable conversation breakpoints; we forward those onto the
-                // request so the provider emits `cache_control`.
-                let mut builder = llm
-                    .builder()
-                    .with_registry_filtered(&tool_registry, |name| {
-                        policy.tool_palette.includes(name)
-                    })
-                    .system(prepared.system_prompt.clone())
-                    .messages(messages.clone());
-                if prepared.cache_prefix {
-                    builder = builder.cache_prefix();
-                }
-                builder = builder.cache_breakpoints(prepared.cache_breakpoints.clone());
-                meter.record_model_turn();
-                let stream = builder.stream().await?;
-
-                // Emit token increments as usage events arrive, then hand the
-                // (still complete) event stream to the collector for assembly.
-                stream
-                    .then(|event| {
-                        let block = block.clone();
-                        let last_in = last_in.clone();
-                        let last_out = last_out.clone();
-                        let last_cache_read = last_cache_read.clone();
-                        let last_cache_creation = last_cache_creation.clone();
-                        let committed = committed.clone();
-                        let meter = meter.clone();
-                        async move {
-                            // Forward the model's text as it arrives; anything
-                            // that reached the screen makes the attempt terminal.
-                            if forward(&block, user_io_ref, &event).await {
-                                committed.store(true, Ordering::Relaxed);
-                            }
-                            let usage = match &event {
-                                Ok(StreamEvent::MessageDelta { usage }) => Some(usage),
-                                Ok(StreamEvent::MessageStop { usage, .. }) => Some(usage),
-                                _ => None,
-                            };
-                            if let Some(usage) = usage {
-                                let in_now = usage.input_tokens.unwrap_or(0);
-                                let out_now = usage.output_tokens.unwrap_or(0);
-                                let (in_delta, out_delta) = token_increment(
-                                    last_in.swap(in_now, Ordering::Relaxed),
-                                    last_out.swap(out_now, Ordering::Relaxed),
-                                    in_now,
-                                    out_now,
-                                );
-                                // Cache tiers: bill cache read/write into
-                                // the meter at their discounted rates. Same cumulative
-                                // → increment fold as input/output.
-                                let cr_now = usage.cache_read_tokens.unwrap_or(0);
-                                let cc_now = usage.cache_creation_tokens.unwrap_or(0);
-                                let (cr_delta, cc_delta) = token_increment(
-                                    last_cache_read.swap(cr_now, Ordering::Relaxed),
-                                    last_cache_creation.swap(cc_now, Ordering::Relaxed),
-                                    cr_now,
-                                    cc_now,
-                                );
-                                // Anything billed to the meter makes this attempt
-                                // terminal — a retry would double-count.
-                                if cr_delta > 0 || cc_delta > 0 || in_delta > 0 || out_delta > 0 {
-                                    committed.store(true, Ordering::Relaxed);
-                                }
-                                if cr_delta > 0 || cc_delta > 0 {
-                                    meter.add_cache(cr_delta, cc_delta);
-                                }
-                                if in_delta > 0 || out_delta > 0 {
-                                    // Mirror the same increment into the session meter
-                                    // (binary-side, survives the TUI) and the panel.
-                                    meter.add(in_delta, out_delta);
-                                    send_token_delta(user_io_ref, in_delta, out_delta).await;
-                                }
-                            }
-                            event
-                        }
-                    })
-                    .collect_response()
-                    .await
-            })
-            .await;
-
-        let Some(result) = result else {
-            live.close(&user_io, "", OUTCOME_ERROR).await;
-            return Err(SystemError::ExecutionError("turn interrupted".into()));
-        };
-
-        match result {
-            Ok(response) => break (response, last_in.load(Ordering::Relaxed)),
-            // Only attempts that failed before emitting any token delta are safe
-            // to re-run; otherwise the panel tally would double-count.
-            Err(err) if attempt < max_attempts && !committed.load(Ordering::Relaxed) => {
-                tracing::warn!("act: llm attempt {attempt} failed: {err}; retrying");
-            }
-            Err(err) => {
-                // Keep whatever text reached the user and say plainly that it
-                // stops there, rather than leaving a block that looks like it
-                // is still being written.
-                live.close(&user_io, "", OUTCOME_ERROR).await;
-                let _ = user_io
-                    .send(report_unavailable(format!(
-                        "provider failed: {err}; recovery is required before more work can run"
-                    )))
-                    .await;
-                return Err(SystemError::ExecutionError(err.to_string()));
-            }
-        }
-    };
-
-    tool_palette_decision(&policy.tool_palette, offered, max_attempts, attempt)
-        .record(&store, prepared.turn);
-
-    // Feed the provider's real `input_tokens` + the sent window back so the next
-    // turn's projection can calibrate its tokens-per-char estimate. Success path
-    // only, so a failed/retried attempt never miscalibrates.
-    context.record_sent_window(prompt_tokens, &messages);
-    status::send_cost(&user_io, &prepared.model_id, &meter).await;
-
-    context.push(Message::Assistant {
-        id: None,
-        content: response.content.clone(),
-    });
-
-    // The model's reasoning and its chosen actions become node-scoped `tracing`
-    // events: they nest under this `act` node's span (opened by the progress
-    // middleware) and surface under the node in the panel's Ctrl-O timeline,
-    // rather than cluttering the transcript. On a terminal turn `finalize`
-    // still emits the answer to the transcript, so there's no double-print.
-    let reasoning = response.text();
-    let tool_calls = response.tool_calls();
-    if !reasoning.is_empty() {
-        tracing::info!("REASON: {reasoning}");
-    }
-    for call in tool_calls {
-        tracing::info!(
-            "Action: {}({})",
-            call.function.name,
-            call.function.arguments
-        );
-    }
-
-    Ok(response)
-}
-
 /// Execute the response's tool calls, gating by the policy-resolved permission,
 /// and reify each call into the trajectory graph.
 ///
@@ -713,8 +476,9 @@ async fn act(
 /// call, one confirmation, one denial — keeps the sequential loop below,
 /// unchanged. See [`batch_runs_concurrently`] for why the test is that coarse.
 #[system]
-async fn execute_tools(
+pub(crate) async fn execute_tools(
     decision: Out<LlmResponse>,
+    reviews: Out<ReviewResult>,
     mut context: ResMut<ContextManager>,
     tool_registry: Res<ToolRegistry>,
     user_io: Res<UserIO>,
@@ -726,6 +490,12 @@ async fn execute_tools(
     session: Res<SessionInfo>,
     tasks: Res<BackgroundTasks>,
     redactor: Res<SecretRedactor>,
+    rules: Res<PermissionRules>,
+    tool_policies: Res<ToolPolicyRegistry>,
+    grants: Res<SessionGrants>,
+    shell_approval: Res<ShellApproval>,
+    tool_grants: Res<RunToolGrants>,
+    settings: Res<SessionSettings>,
 ) -> Result<(), SystemError> {
     let redactor = *redactor;
     let turn = context.turn_marker();
@@ -736,22 +506,36 @@ async fn execute_tools(
     let mut edited: Vec<std::path::PathBuf> = Vec::new();
 
     let calls = decision.tool_calls();
-    // Resolved once, up front, because the lane decision needs the whole
-    // batch's permissions before the first call runs. Hoisting is
-    // behaviour-preserving: both inputs — the snapshot and the registry — are
-    // read-only for the turn, so resolving early cannot differ from resolving
-    // in the loop.
-    let permissions: Vec<ToolPermission> = calls
-        .iter()
-        .map(|call| {
-            let registry_default = tool_registry
-                .permission(&call.function.name)
-                .unwrap_or(ToolPermission::Deny);
-            policy
-                .permission
-                .resolve(&call.function.name, registry_default)
-        })
-        .collect();
+    // Only the permission part of the snapshot is read below, so only it is copied.
+    let mut effective = policy.permission.clone();
+    effective.rules = Some((*rules).clone());
+    effective.tools = (*tool_policies).clone();
+    tool_grants.apply(
+        &mut effective,
+        calls.iter().map(|call| call.function.name.as_str()),
+    );
+    let policy = &effective;
+    let generation = settings.approval_generation();
+    let resolve = |call: &ToolCall| {
+        shell_approval.resolve(
+            policy,
+            &PermissionCall {
+                tool: &call.function.name,
+                args: &call.function.arguments,
+                registry_default: tool_registry
+                    .permission(&call.function.name)
+                    .unwrap_or(ToolPermission::Deny),
+                root: &config.working_dir,
+                generation,
+                ceiling: settings.permission_ceiling(),
+            },
+            &grants,
+        )
+    };
+    // The concurrent lane needs every verdict before dispatch. The sequential
+    // lane re-resolves calls so a newly granted session scope applies at once.
+    let permissions: Vec<ToolPermission> =
+        calls.iter().map(|call| resolve(call).permission).collect();
 
     if batch_runs_concurrently(&calls, &permissions) {
         return execute_read_only_batch(
@@ -759,7 +543,7 @@ async fn execute_tools(
             &mut context,
             &tool_registry,
             &user_io,
-            &policy,
+            policy,
             &store,
             &live,
             &cancel,
@@ -770,8 +554,24 @@ async fn execute_tools(
         .await;
     }
 
-    for (tool_call, &permission) in calls.iter().zip(&permissions) {
+    for (call_index, tool_call) in calls.iter().enumerate() {
         let name = &tool_call.function.name;
+        // Re-read session grants: an earlier call in this batch may have just
+        // received an explicit session approval.
+        let authorization = resolve(tool_call);
+        let permission = authorization.permission;
+        let request = ApprovalRequest::new(
+            name,
+            &tool_call.function.arguments,
+            &config.working_dir,
+            generation,
+            authorization.remember,
+        );
+        // Bind the directory and policy revision before waiting. Only the
+        // allowed branch can attach this pending receipt to tool context.
+        let mut receipt = (!policy.is_unattended())
+            .then(|| shell_approval.receipt_for(&request, &rules, &settings))
+            .flatten();
 
         // One activity block per invocation, keyed by the provider's own call
         // id and nested under the message that asked for it. Every exit below
@@ -791,13 +591,69 @@ async fn execute_tools(
         // without each exit path below having to remember.
         let invocation = tasks.enter(&tool_call.id, name, live.current_id());
 
+        // The eligibility check lives inside `matching`, so a review recorded
+        // earlier cannot authorize a call that has since become human-only.
+        let review = policy
+            .uses_reviewer()
+            .then(|| {
+                reviews.matching(
+                    call_index,
+                    tool_call,
+                    &config.working_dir,
+                    &rules,
+                    &settings,
+                    &authorization,
+                )
+            })
+            .flatten();
+        if let Some(review) = review {
+            // Preserve the binding made before the model wait. Rebinding now
+            // could authorize a symlink target the reviewer never saw.
+            receipt = review.receipt.clone();
+        }
+        let reviewer_denial = review.filter(|r| r.decision == ReviewDecision::Deny);
+        let mut approval_scope = None;
         let (denied_reason, chosen) = match permission {
             ToolPermission::Deny => (
-                Some(format!("Permission denied: tool '{name}' is not allowed")),
+                Some(format!(
+                    "Permission denied: tool '{name}' is not allowed ({})",
+                    authorization.source
+                )),
+                "deny",
+            ),
+            ToolPermission::Confirm
+                if review.is_some_and(|r| r.decision == ReviewDecision::Allow) =>
+            {
+                (None, "allow")
+            }
+            ToolPermission::Confirm if reviewer_denial.is_some() => (
+                reviewer_denial.map(|r| format!("Permission denied: {}", r.notice())),
                 "deny",
             ),
             ToolPermission::Confirm => {
-                let prompt = build_confirm_prompt(name, &tool_call.function.arguments);
+                let mut prompt = format!(
+                    "{}\nDecision source: {}",
+                    build_confirm_prompt(name, &tool_call.function.arguments),
+                    authorization.source
+                );
+                // Only `auto` has a review to report; the other modes keep the
+                // prompt they always had.
+                if policy.uses_reviewer() {
+                    prompt.push('\n');
+                    prompt.push_str(&review.map_or_else(
+                        || match authorization.review {
+                            ReviewEligibility::HumanOnly => {
+                                "This call needs a person's approval; automatic review does not apply"
+                                    .into()
+                            }
+                            ReviewEligibility::Eligible => {
+                                "No matching review for the current call and policy; human approval required"
+                                    .into()
+                            }
+                        },
+                        |r| r.notice(),
+                    ));
+                }
                 // Waiting on the user is not the tool running: say so, so the
                 // elapsed time on the block isn't read as the tool being slow.
                 activity.phase(&user_io, PHASE_PENDING, &detail).await;
@@ -806,10 +662,24 @@ async fn execute_tools(
                 // `BackgroundTasks::request` refuses while it is.
                 invocation.awaiting_approval();
                 // Reify the permission decision (its outcome is the user's answer).
-                let answer = match user_io.confirm(prompt).await {
-                    Ok(response) if response.confirmed => None,
-                    Ok(_) => Some(format!("User denied execution of tool '{name}'")),
-                    Err(err) => Some(format!("Confirmation failed: {err}")),
+                let answer = match cancel
+                    .run_until_cancelled(request.ask(&user_io, prompt, &grants))
+                    .await
+                {
+                    Some(Ok(scope)) => {
+                        approval_scope = Some(scope);
+                        None
+                    }
+                    Some(Err(reason)) => Some(reason.to_string()),
+                    None => {
+                        let reason = match request.cancel(&user_io).await {
+                            Ok(()) => "Approval interrupted by user".into(),
+                            Err(error) => format!(
+                                "Approval interrupted by user; could not resolve prompt: {error}"
+                            ),
+                        };
+                        Some(reason)
+                    }
                 };
                 if answer.is_none() {
                     invocation.executing();
@@ -820,7 +690,41 @@ async fn execute_tools(
             }
             ToolPermission::Allow => (None, "allow"),
         };
-        permission_decision(&policy.permission, permission, chosen).record(&store, turn);
+        let mut recorded = permission_decision(policy, permission, chosen);
+        recorded
+            .policy_refs
+            .push(format!("authorization.source={}", authorization.source));
+        if let Some(review) = review {
+            let source = match review.decision {
+                ReviewDecision::Allow | ReviewDecision::Deny => "reviewer",
+                ReviewDecision::Ask => "human",
+            };
+            recorded
+                .policy_refs
+                .push(format!("authorization.decision_source={source}"));
+            recorded
+                .policy_refs
+                .push(format!("authorization.reviewer={}", review.model));
+            recorded
+                .policy_refs
+                .push(format!("authorization.review={}", review.notice()));
+        } else if policy.uses_reviewer()
+            && permission == ToolPermission::Confirm
+            && authorization.review == ReviewEligibility::HumanOnly
+        {
+            // The reviewer was never consulted, so the audit trail says whose
+            // decision this is rather than leaving the field out.
+            recorded
+                .policy_refs
+                .push("authorization.decision_source=human".into());
+        }
+        if let Some(scope) = approval_scope {
+            recorded.policy_refs.push(format!(
+                "authorization.scope={}",
+                approval_scope_label(scope)
+            ));
+        }
+        recorded.record(&store, turn);
 
         let block = if let Some(reason) = denied_reason {
             activity.finish(&user_io, PHASE_DENIED, &reason).await;
@@ -848,10 +752,13 @@ async fn execute_tools(
             // moment the user backgrounds it: a detached run is no longer part
             // of the turn, so Ctrl-C must not take it with the turn.
             let (detached_tx, detached_rx) = tokio::sync::watch::channel(false);
-            let tool_context = ToolContext::new()
+            let mut tool_context = ToolContext::new()
                 .with(ShellSinkHandle::new(sink))
                 .with(detachable_cancel(&cancel, detached_rx));
-            let mut run = ToolRun::spawn(
+            if let Some(receipt) = receipt {
+                tool_context = tool_context.with(receipt);
+            }
+            let mut run = shell_approval.spawn(
                 &tool_registry,
                 name,
                 tool_call.function.arguments.clone(),
@@ -972,8 +879,7 @@ async fn execute_tools(
             });
             match result {
                 Ok(value) => {
-                    if let Some(reason) = unattended_shell_refusal(name, &value, &policy.permission)
-                    {
+                    if let Some(reason) = unattended_shell_refusal(name, &value, policy) {
                         activity.finish(&user_io, PHASE_DENIED, &reason).await;
                         record_tool_call(
                             &store,
@@ -1151,7 +1057,7 @@ async fn execute_read_only_batch(
     context: &mut ContextManager,
     tool_registry: &ToolRegistry,
     user_io: &UserIO,
-    policy: &PolicySnapshot,
+    policy: &super::policy::PermissionPolicy,
     store: &OxigraphStore,
     live: &LiveTranscript,
     cancel: &RunCancellation,
@@ -1162,8 +1068,18 @@ async fn execute_read_only_batch(
     // Every call in this batch resolved to `Allow`; reify that in request order
     // before anything runs, so the trajectory reads identically whichever lane
     // executed the batch.
-    for _ in calls {
-        permission_decision(&policy.permission, ToolPermission::Allow, "allow").record(store, turn);
+    for call in calls {
+        let mut recorded = permission_decision(policy, ToolPermission::Allow, "allow");
+        if let Some((_, source)) = policy
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.resolve(&call.function.name, &call.function.arguments))
+        {
+            recorded
+                .policy_refs
+                .push(format!("authorization.source={source}"));
+        }
+        recorded.record(store, turn);
     }
 
     // Open every block up front, in request order: the panel should show the
@@ -1293,6 +1209,15 @@ fn permission_decision(
     }
 }
 
+/// The scope a person chose, as the word the trajectory records.
+fn approval_scope_label(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Exact => "exact",
+        ApprovalScope::Prefix => "prefix",
+    }
+}
+
 /// Turn the shell executor's ambiguous response into an actual refusal when
 /// the run has no human who could answer it.
 fn unattended_shell_refusal(
@@ -1304,7 +1229,7 @@ fn unattended_shell_refusal(
     // confirmation-required shape and an unattended run must not be able to
     // reach an unapproved command by asking for it in the background.
     (super::policy::SHELL_EXECUTION_TOOLS.contains(&tool_name)
-        && permission.fail_closed_on_ambiguous_shell_permission
+        && permission.is_unattended()
         && value.get("status").and_then(serde_json::Value::as_str) == Some("confirmation_required"))
     .then(|| "Permission denied: shell command is outside the unattended grant".to_string())
 }
@@ -2277,7 +2202,16 @@ async fn finalize(
     }
 }
 
-/// Recover from a caught error: surface it, add it to context, respond gracefully.
+/// Recover from a caught error: surface it once, and where a model reply can
+/// still help, ask for one.
+///
+/// A model call the retry stage already gave up on arrives here classified, in
+/// [`LoopState::failure`], with the provider having had its whole retry budget.
+/// Asking the same provider again would only repeat the failure — against a
+/// rejected API key it would be a request that cannot succeed — so that failure
+/// is reported as it stands. Any other failed system gets one model call to
+/// answer the user from what the conversation holds, on the same bounded window a
+/// normal turn sends.
 #[system]
 async fn recover(
     error: ErrOut<CaughtError>,
@@ -2287,32 +2221,56 @@ async fn recover(
     tool_registry: Res<ToolRegistry>,
     user_io: Res<UserIO>,
     project: Res<ProjectContext>,
+    policy: Res<PolicySnapshot>,
+    settings: Res<SessionSettings>,
+    config: Res<AgentConfig>,
     mut live: ResMut<LiveTranscript>,
     mut loop_state: ResMut<LoopState>,
 ) -> LoopState {
     // Whatever the failed system left open stops here. Its partial text stays
     // on screen, marked as ended in error rather than still arriving.
     live.close(&user_io, "", OUTCOME_ERROR).await;
-    let error_text = format!(
-        "System '{}' failed: {} (node {}, {:?}, kind {})",
-        error.system_name, error.message, error.node_id, error.duration, error.kind
+    tracing::error!(
+        system = error.system_name,
+        node = %error.node_id,
+        duration = ?error.duration,
+        kind = %error.kind,
+        "recover: {}",
+        error.message
     );
-    send_error(&user_io, format!("\n[System Error] {error_text}")).await;
+
+    if let Some(failure) = loop_state.failure.clone() {
+        send_error(&user_io, failure.message.clone()).await;
+        loop_state.is_complete = true;
+        return LoopState {
+            is_complete: true,
+            failure: Some(failure),
+        };
+    }
+
+    let error_text = format!("{} failed: {}", error.system_name, error.message);
+    send_error(&user_io, error_text.clone()).await;
     context.push(Message::user(format!("[System Error] {error_text}")));
 
     // Keep the same project grounding the loop's `prepare_context` injects, so a
     // recovery turn doesn't silently lose git/project context.
     let system_prompt = format!("{SYSTEM_PROMPT}\n\n{}", project.system_prompt());
-    let messages = context.messages.clone();
-    let builder = llm
+    // The window a normal turn would send, not the whole canonical history: a
+    // recovery after a context overflow must not be larger than the request
+    // that overflowed.
+    let window = context.project(&policy.retrieval);
+    let mut builder = llm
         .builder()
         .system(system_prompt)
-        .messages(messages)
-        .with_registry(&tool_registry)
-        .cache_prefix();
+        .messages(window.messages)
+        .with_registry(&tool_registry);
+    if window.cache_prefix {
+        builder = builder.cache_prefix();
+    }
+    builder = builder.cache_breakpoints(window.breakpoints);
 
     meter.record_model_turn();
-    let failure = match builder.generate().await {
+    let failure = match retry::within(policy.retry.attempt_timeout, builder.generate()).await {
         Ok(response) => {
             // The recovery reply is not streamed — it comes from a single
             // `generate` — so it is emitted as one already-closed block, which
@@ -2328,24 +2286,22 @@ async fn recover(
             None
         }
         Err(err) => {
-            send_error(&user_io, format!("\nLLM error: {err}")).await;
-            let _ = user_io
-                .send(report_unavailable(format!(
-                    "recovery provider failed: {err}; restart or resume the session"
-                )))
-                .await;
-            live.whole(
-                &user_io,
-                "I encountered an error processing your request.",
-                OUTCOME_ERROR,
-            )
-            .await;
             // The recovery call itself also failed, so there is no assistant
-            // answer for this turn. Carry the original failure forward so the
+            // answer for this turn, and none is invented. Carry the original
+            // failure forward with the reason the model could not help, so the
             // turn is reported as failed instead of completed — otherwise the
             // graph reaching its terminal `is_complete` state here reads as
             // success even though nothing answered the user.
-            Some(error_text.clone())
+            let served = settings
+                .served_model()
+                .unwrap_or_else(|| config.model_id.clone());
+            let cause = failure::describe(&err, &served, Attempts::default());
+            tracing::error!(kind = %cause.kind, "recover: recovery call failed: {err}");
+            send_error(&user_io, cause.message.clone()).await;
+            Some(TurnFailure::new(
+                cause.kind,
+                format!("{error_text}. {}", cause.message),
+            ))
         }
     };
 
@@ -2364,6 +2320,16 @@ async fn recover(
         failure,
     }
 }
+
+/// The iteration limit of the model-call retry loop.
+///
+/// Not the retry budget: [`RetryPolicy::max_attempts`] ends the loop long
+/// before this, and a graph cannot read policy when it is built. Every loop
+/// needs a limit, and the executor's default is the turn limit, which is about
+/// something else and must not cut a retry short.
+///
+/// [`RetryPolicy::max_attempts`]: super::policy::RetryPolicy::max_attempts
+const MODEL_RETRIES_BOUND: usize = u32::MAX as usize;
 
 /// How many times the agent loop may go round in one turn when
 /// `POLARIS_CODE_MAX_TURNS` is unset.
@@ -2406,6 +2372,7 @@ impl Agent for CodeAgent {
         ctx.insert(project);
         ctx.insert(PolicySnapshot::defaults());
         ctx.insert(LiveTranscript::default());
+        ctx.insert(AttemptLedger::default());
         // Bind the queue's containment root to the very directory this agent
         // is configured with, so the gate the composer submits through and the
         // sandbox the tools run in can never disagree about what is inside the
@@ -2454,16 +2421,66 @@ impl Agent for CodeAgent {
             |state| state.is_complete,
             |g| {
                 g.add_system(apply_steering);
-                g.add_system(prepare_context);
-                g.add_system(act);
-                g.add_conditional_branch::<LlmResponse, _, _, _>(
-                    "has_tool_calls",
-                    |response| response.has_tool_calls(),
-                    |tool_branch| {
-                        tool_branch.add_system(execute_tools);
+                g.add_system(compact_context);
+                g.add_conditional_branch::<CompactionRun, _, _, _>(
+                    "manual_compaction",
+                    |run| run.manual,
+                    |manual| {
+                        manual.add_system(finish_compaction);
                     },
-                    |done_branch| {
-                        done_branch.add_system(finalize);
+                    |normal| {
+                        normal.add_system(prepare_context);
+                        normal.add_system(begin_model_call);
+                        normal.add_system(act);
+                        // A failed attempt is retried here, not inside `act`:
+                        // the policy decides, a branch routes, and the edge
+                        // back into `act` is the retry. The loop's own bound is
+                        // `RetryPolicy::max_attempts`, which `decide_retry`
+                        // enforces; the iteration limit below only exists
+                        // because every loop needs one, and sits above any
+                        // policy so `--max-turns` never shortens a retry.
+                        normal.add_loop::<AttemptOutcome, _, _>(
+                            "model_retries",
+                            AttemptOutcome::is_settled,
+                            |retry| {
+                                retry.add_system(decide_retry);
+                                retry.add_conditional_branch::<RetryStep, _, _, _>(
+                                    "retry_or_give_up",
+                                    |step| matches!(step, RetryStep::Retry { .. }),
+                                    |again| {
+                                        again.add_system(wait_to_retry);
+                                        again.add_system(act);
+                                    },
+                                    |stop| {
+                                        stop.add_system(abandon);
+                                    },
+                                );
+                            },
+                        );
+                        if let Some(retries) = normal.last_node() {
+                            normal.set_loop_max_iterations(retries, MODEL_RETRIES_BOUND);
+                        }
+                        normal.add_conditional_branch::<AttemptOutcome, _, _, _>(
+                            "model_answered",
+                            AttemptOutcome::is_success,
+                            |answered| {
+                                answered.add_system(accept_response);
+                                answered.add_conditional_branch::<LlmResponse, _, _, _>(
+                                    "has_tool_calls",
+                                    |response| response.has_tool_calls(),
+                                    |tool_branch| {
+                                        tool_branch.add_system(review_tools);
+                                        tool_branch.add_system(execute_tools);
+                                    },
+                                    |done_branch| {
+                                        done_branch.add_system(finalize);
+                                    },
+                                );
+                            },
+                            |unanswered| {
+                                unanswered.add_system(report_failure);
+                            },
+                        );
                     },
                 );
                 g.add_error_handler(|h| {
@@ -2512,15 +2529,50 @@ where
 ///
 /// | Resource | Scope | Description |
 /// |----------|-------|-------------|
-/// | [`ContextManager`] | local | Conversation history (persisted). |
+/// | [`ContextManager`] | local | Full history and summary checkpoints (persisted). |
 /// | [`LoopState`] | local | Loop termination flag. |
 /// | [`PolicySnapshot`] | local | Per-turn decision policy (defaults in v1). |
 /// | [`SecretRedactor`] | global | Withholds recognisable credentials from every consumer of a tool result. |
 ///
 /// # Dependencies
 ///
-/// Expects `ModelsPlugin`, a tools plugin, and (for persistence) `PersistencePlugin`
-/// to be present on the server; resolves the model and project context in `setup`.
+/// Expects [`ModelsPlugin`], [`ToolsPlugin`] and (for persistence)
+/// [`PersistencePlugin`] to be present on the server; resolves the model and
+/// project context in `setup`.
+///
+/// Two more dependencies are installed with their defaults when omitted:
+///
+/// - [`PermissionRulesPlugin`] supplies authorization resources. Its default
+///   loads no rule files; add `PermissionRulesPlugin::new(root)` to load them.
+/// - [`AutoReviewPlugin`] supplies the reviewer's `ReviewPolicy` and the local
+///   state that attended `auto` mode reads. Its default is
+///   `ReviewPolicy::default()`; add it with your own policy to change the
+///   reviewer model, timeout, output cap or denial cutoff.
+///
+/// Both depend on [`ToolPolicyPlugin`](crate::tools::ToolPolicyPlugin), which is
+/// added by default as well, so tool capabilities can publish policy facts the
+/// agent reads.
+///
+/// # Example
+///
+/// ```no_run
+/// use polaris::models::ModelsPlugin;
+/// use polaris::plugins::PersistencePlugin;
+/// use polaris::system::server::Server;
+/// use polaris::tools::ToolsPlugin;
+/// use polaris_code::agents::CodeAgentPlugin;
+/// use polaris_code::agents::auto_review::{AutoReviewPlugin, ReviewPolicy};
+/// use polaris_code::agents::permission_rules::PermissionRulesPlugin;
+///
+/// let mut server = Server::new();
+/// server
+///     .add_plugins(ModelsPlugin)
+///     .add_plugins(ToolsPlugin)
+///     .add_plugins(PersistencePlugin)
+///     .add_plugins(PermissionRulesPlugin::new("."))
+///     .add_plugins(AutoReviewPlugin::new(ReviewPolicy::default()))
+///     .add_plugins(CodeAgentPlugin::new());
+/// ```
 pub struct CodeAgentPlugin {
     /// Whether to project with the cache-aware strategy ([`CacheAwareWindow`])
     /// and request provider prompt caching. The binary mirrors
@@ -2548,7 +2600,8 @@ impl CodeAgentPlugin {
     }
 
     /// Enable or disable the cache-aware context strategy + prompt caching
-    /// (config gate). Disabled falls back to the sliding [`LinearWindow`].
+    /// (config gate). Disabled uses the sliding [`LinearWindow`]. Both compose
+    /// [`SummarizingWindow`] for graph-owned checkpoints.
     ///
     /// [`LinearWindow`]: super::context::LinearWindow
     #[must_use]
@@ -2579,16 +2632,28 @@ impl Plugin for CodeAgentPlugin {
             PluginId::of::<ModelsPlugin>(),
             PluginId::of::<ToolsPlugin>(),
             PluginId::of::<PersistencePlugin>(),
+            PluginId::of::<PermissionRulesPlugin>(),
+            PluginId::of::<AutoReviewPlugin>(),
         ]
+    }
+
+    fn default_dependencies(&self) -> polaris::system::plugin::DefaultDependencies {
+        super::auto_review::default_dependencies()
     }
 
     fn build(&self, server: &mut Server) {
         if self.prompt_cache {
             server.register_local(|| {
-                ContextManager::with_strategy(std::sync::Arc::new(CacheAwareWindow))
+                ContextManager::with_strategy(Arc::new(SummarizingWindow::new(Arc::new(
+                    CacheAwareWindow,
+                ))))
             });
         } else {
-            server.register_local(ContextManager::default);
+            server.register_local(|| {
+                ContextManager::with_strategy(Arc::new(SummarizingWindow::new(Arc::new(
+                    LinearWindow,
+                ))))
+            });
         }
         server.register_local(LoopState::default);
         server.register_local(PolicySnapshot::defaults);
@@ -2741,61 +2806,6 @@ mod tests {
             .with_prompt_cache(false)
             .build(&mut server);
         assert!(server.has_local::<ContextManager>());
-    }
-
-    #[test]
-    fn token_increment_forwards_only_the_increase() {
-        // Cumulative readings produce the per-step increment.
-        assert_eq!(token_increment(0, 0, 10, 4), (10, 4));
-        assert_eq!(token_increment(10, 4, 25, 9), (15, 5));
-        // A repeated reading adds nothing.
-        assert_eq!(token_increment(25, 9, 25, 9), (0, 0));
-        // A decreasing/out-of-order reading saturates to zero rather than
-        // underflowing (which would corrupt the additive tally).
-        assert_eq!(token_increment(25, 9, 20, 9), (0, 0));
-    }
-
-    #[test]
-    fn tool_palette_decision_reifies_mode_and_offered() {
-        use crate::agents::PaletteMode;
-        let palette = ToolPalettePolicy {
-            mode: PaletteMode::Only(vec!["read_file".into()]),
-            denied: vec!["edit_file".into()],
-        };
-        let decision = tool_palette_decision(&palette, vec!["read_file".into()], 2, 1);
-        assert_eq!(decision.kind, "tool_palette");
-        // `<mode-label>:<offered-count>` — the reified summary the ABox stores.
-        assert_eq!(decision.chosen, "selected:1");
-        assert_eq!(decision.options, vec!["read_file".to_string()]);
-        assert!(
-            decision
-                .policy_refs
-                .contains(&"tool_palette.mode=selected".to_string())
-        );
-        assert!(
-            decision
-                .policy_refs
-                .contains(&"tool_palette.denied=1".to_string())
-        );
-    }
-
-    #[test]
-    fn tool_palette_decision_reports_empty_none_palette() {
-        use crate::agents::PaletteMode;
-        // The explicit no-tools turn reifies as `none:0` with no options — the
-        // empty palette is recorded, never silent.
-        let palette = ToolPalettePolicy {
-            mode: PaletteMode::None,
-            denied: Vec::new(),
-        };
-        let decision = tool_palette_decision(&palette, Vec::new(), 2, 1);
-        assert_eq!(decision.chosen, "none:0");
-        assert!(decision.options.is_empty());
-        assert!(
-            decision
-                .policy_refs
-                .contains(&"tool_palette.mode=none".to_string())
-        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -3031,5 +3041,305 @@ mod tests {
             redact_tool_output(SecretRedactor::new(true), "read_file", clean.to_string()),
             clean
         );
+    }
+
+    /// `recover` as the error handler of a system that fails, run through the
+    /// real session and executor — the one way to reach it that does not need
+    /// a wiring fault in the agent's own graph.
+    mod recovery {
+        use std::sync::Mutex;
+
+        use polaris::models::llm::{
+            AssistantBlock, GenerationError, LlmProvider, LlmRequest, LlmResponse, LlmStream,
+            StopReason, Usage,
+        };
+        use polaris::plugins::{IOProvider, PersistenceAPI, PersistencePlugin};
+        use polaris::sessions::{AgentTypeId, FileStore, SessionId, SessionsAPI, SessionsPlugin};
+
+        use super::*;
+        use crate::agents::failure::FailureKind;
+        use crate::agents::policy::DEFAULT_MAX_MESSAGES;
+        use crate::exec::{ExecIOPlugin, ExecIOProvider};
+
+        /// What the scripted provider saw, and what it does with the one
+        /// request recovery makes.
+        struct Recorder {
+            requests: Mutex<Vec<Vec<Message>>>,
+            fail_with: Option<fn() -> GenerationError>,
+        }
+
+        struct Handle(Arc<Recorder>);
+
+        impl LlmProvider for Handle {
+            fn name(&self) -> &'static str {
+                "anthropic"
+            }
+
+            async fn generate(
+                &self,
+                _model: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                self.0.requests.lock().unwrap().push(request.messages);
+                match self.0.fail_with {
+                    Some(fail) => Err(fail()),
+                    None => Ok(LlmResponse {
+                        content: vec![AssistantBlock::text("the model's answer")],
+                        usage: Usage::default(),
+                        stop_reason: StopReason::EndTurn,
+                        id: None,
+                        model: None,
+                    }),
+                }
+            }
+
+            async fn stream(
+                &self,
+                _model: &str,
+                _request: LlmRequest,
+            ) -> Result<LlmStream, GenerationError> {
+                Err(GenerationError::Http("recovery does not stream".into()))
+            }
+        }
+
+        struct HandlePlugin(Arc<Recorder>);
+
+        impl Plugin for HandlePlugin {
+            const ID: &'static str = "test::recovery_provider";
+            const VERSION: Version = Version::new(0, 1, 0);
+
+            fn dependencies(&self) -> Vec<PluginId> {
+                vec![PluginId::of::<ModelsPlugin>()]
+            }
+
+            fn build(&self, server: &mut Server) {
+                server
+                    .get_resource_mut::<ModelRegistry>()
+                    .expect("ModelsPlugin builds first")
+                    .register_llm_provider(Handle(self.0.clone()));
+            }
+        }
+
+        #[system]
+        async fn broken() -> Result<(), SystemError> {
+            Err(SystemError::ExecutionError("the step broke".into()))
+        }
+
+        /// The coding agent's own session setup, around a graph whose only
+        /// step fails and is handled by `recover`.
+        struct BrokenStep;
+
+        impl Agent for BrokenStep {
+            fn setup(&self, ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
+                CodeAgent.setup(ctx)
+            }
+
+            fn build(&self, graph: &mut Graph) {
+                graph.add_system(broken).add_error_handler(|handler| {
+                    handler.add_system(recover);
+                });
+            }
+
+            fn name(&self) -> &'static str {
+                "BrokenStep"
+            }
+        }
+
+        /// What one recovery left behind.
+        struct Outcome {
+            requests: Vec<Vec<Message>>,
+            failure: Option<TurnFailure>,
+            shown: Vec<IOMessage>,
+        }
+
+        async fn run_recovery(
+            fail_with: Option<fn() -> GenerationError>,
+            history: usize,
+        ) -> Outcome {
+            let recorder = Arc::new(Recorder {
+                requests: Mutex::new(Vec::new()),
+                fail_with,
+            });
+            let workspace = tempfile::tempdir().unwrap();
+            let data_dir = tempfile::tempdir().unwrap();
+            let (front_end, _input, mut output) = ExecIOProvider::new(64);
+            let front_end = Arc::new(front_end);
+
+            let mut server = Server::new();
+            server.insert_global(TokenMeter::new());
+            server
+                .add_plugins(ModelsPlugin)
+                .add_plugins(HandlePlugin(recorder.clone()))
+                .add_plugins(ToolsPlugin)
+                .add_plugins(PersistencePlugin)
+                .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new(
+                    data_dir.path().to_str().unwrap(),
+                ))))
+                .add_plugins(CodeAgentPlugin::new())
+                .add_plugins(ExecIOPlugin::new(front_end.clone()));
+            server.finish().await.unwrap();
+
+            let persistence = server.api::<PersistenceAPI>().unwrap();
+            let sessions = server.api::<SessionsAPI>().unwrap();
+            sessions.set_serializers(persistence.serializers());
+            sessions.register_agent(BrokenStep).unwrap();
+
+            let id = SessionId::new();
+            let config = AgentConfig::new("anthropic/test-model", workspace.path().to_path_buf());
+            sessions
+                .create_session_with_executor(
+                    server.create_context(),
+                    &id,
+                    &AgentTypeId::from_name("BrokenStep"),
+                    polaris::graph::GraphExecutor::new(),
+                    move |ctx| {
+                        ctx.insert(config.clone());
+                    },
+                )
+                .unwrap();
+            sessions
+                .with_context(&id, |ctx| {
+                    let mut context = ctx.get_resource_mut::<ContextManager>().unwrap();
+                    for turn in 0..history / 2 {
+                        context
+                            .messages
+                            .push(Message::user(format!("question {turn}")));
+                        context
+                            .messages
+                            .push(Message::assistant(format!("answer {turn}")));
+                    }
+                })
+                .await
+                .unwrap();
+
+            let drain = tokio::spawn(async move {
+                let mut shown = Vec::new();
+                while let Some(message) = output.recv().await {
+                    shown.push(message);
+                }
+                shown
+            });
+            sessions.process_turn(&id).await.unwrap();
+            let failure = sessions
+                .with_context(&id, |ctx| {
+                    ctx.get_resource::<LoopState>()
+                        .ok()
+                        .and_then(|state| state.failure.clone())
+                })
+                .await
+                .unwrap();
+            front_end.close().await;
+            let shown = drain.await.unwrap();
+            let requests = recorder.requests.lock().unwrap().clone();
+            Outcome {
+                requests,
+                failure,
+                shown,
+            }
+        }
+
+        fn shown_text(outcome: &Outcome) -> Vec<(bool, String)> {
+            outcome
+                .shown
+                .iter()
+                .filter_map(|message| match &message.content {
+                    IOContent::Text(text) => Some((
+                        message.metadata.get(IO_TYPE).map(String::as_str) == Some("error"),
+                        text.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn text_of(message: &Message) -> String {
+            match message {
+                Message::User { content } => content
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                Message::Assistant { .. } => String::new(),
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_sends_the_bounded_window_not_the_whole_history() {
+            let history = 4 * DEFAULT_MAX_MESSAGES;
+            let outcome = run_recovery(None, history).await;
+
+            assert_eq!(outcome.requests.len(), 1, "one recovery request");
+            let sent = &outcome.requests[0];
+            assert!(
+                sent.len() <= DEFAULT_MAX_MESSAGES,
+                "recovery sent {} messages; a normal turn sends at most {DEFAULT_MAX_MESSAGES}",
+                sent.len()
+            );
+            assert!(sent.len() < history, "far fewer than the {history} held");
+            let note = text_of(sent.last().expect("a non-empty window"));
+            assert!(
+                note.starts_with("[System Error] broken failed: ")
+                    && note.ends_with("the step broke"),
+                "the window still ends with the failure the model is to answer: {note}"
+            );
+            assert!(
+                outcome.failure.is_none(),
+                "the model answered, so the turn did"
+            );
+            let shown = shown_text(&outcome);
+            assert!(
+                shown.iter().any(|(_, text)| text == "the model's answer"),
+                "{shown:?}"
+            );
+            assert_eq!(
+                shown.iter().filter(|(error, _)| *error).count(),
+                1,
+                "the failed step is reported once: {shown:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_recovery_reports_one_typed_failure_and_invents_no_reply() {
+            let outcome = run_recovery(Some(|| GenerationError::Auth("denied".into())), 0).await;
+
+            assert_eq!(
+                outcome.requests.len(),
+                1,
+                "recovery is one request, not retried"
+            );
+            let failure = outcome
+                .failure
+                .clone()
+                .expect("the turn is reported failed");
+            assert_eq!(failure.kind, FailureKind::Auth);
+            assert!(
+                failure.message.contains("broken failed: ")
+                    && failure.message.contains("the step broke. "),
+                "the original failure is kept: {}",
+                failure.message
+            );
+            assert!(
+                failure
+                    .message
+                    .ends_with("Anthropic rejected the API key. Check the key saved by `polaris login anthropic` or supplied through ANTHROPIC_API_KEY."),
+                "{}",
+                failure.message
+            );
+
+            let shown = shown_text(&outcome);
+            assert_eq!(
+                shown.iter().filter(|(error, _)| *error).count(),
+                2,
+                "what failed, and why nothing could help: {shown:?}"
+            );
+            for stale in ["[System Error]", "LLM error", "I encountered an error"] {
+                assert!(
+                    shown.iter().all(|(_, text)| !text.contains(stale)),
+                    "{stale:?} was shown: {shown:?}"
+                );
+            }
+        }
     }
 }

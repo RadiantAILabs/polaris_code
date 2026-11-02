@@ -21,7 +21,7 @@ rust-version = "1.97.0"
 # `UserIO`, …) unify across crates. Each crate adds the features it needs.
 [workspace.dependencies]
 # The agent runtime. `package = "polaris-ai"` keeps `use polaris::…` short.
-polaris = { package = "polaris-ai", version = "0.7.0", default-features = false }
+polaris = { package = "polaris-ai", version = "0.7.1", default-features = false }
 # Domain-neutral cognition: the topology catalog and admission boundary, the
 # selection policy points, the evidence provider contract, and the shared value
 # vocabulary. `polaris_code` supplies the *coding* embodiment of those

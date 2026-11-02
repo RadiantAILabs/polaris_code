@@ -96,7 +96,7 @@ async fn long_transcript_browse_search_selects_unicode_without_submitting() {
     );
 
     assert_eq!(
-        key(&mut panel, KeyCode::Char('g'), KeyModifiers::CONTROL),
+        key(&mut panel, KeyCode::Char('n'), KeyModifiers::CONTROL),
         EventOutcome::Consumed
     );
     assert_eq!(

@@ -34,11 +34,18 @@ use crate::usage::TokenMeter;
 /// what a mode is named after: `unattended` promises no confirmation at all,
 /// because an unattended policy turns every would-be confirmation into a
 /// refusal rather than into a question.
-const POSTURES: [(&str, &str); 4] = [
-    ("confirm", "confirm · edits and commands ask first"),
+const POSTURES: [(&str, &str); 5] = [
+    (
+        "confirm",
+        "confirm · edits and commands ask first unless a rule allows them",
+    ),
     (
         "auto-edit",
-        "auto-edit · edits apply unasked, commands ask first",
+        "auto-edit · edits apply unasked, commands ask first unless a rule allows them",
+    ),
+    (
+        "auto",
+        "auto · edits apply unasked, a reviewer model decides commands no rule covers",
     ),
     ("plan", "plan · edits and commands refused"),
     (
@@ -90,7 +97,10 @@ fn indexing(workspace: &Path, index: IndexPhase) -> String {
 const POSTURE_UNSTATED: &str = "permission posture unstated";
 
 /// The host's own words for the posture `permission` puts a turn in.
-fn posture(permission: &PermissionPolicy) -> &'static str {
+///
+/// Shared by the session status row and local configuration diagnostics.
+#[must_use]
+pub fn permission_posture(permission: &PermissionPolicy) -> &'static str {
     let label = permission.mode_label();
     POSTURES
         .iter()
@@ -154,7 +164,7 @@ fn build(
         .with_model(model)
         .with_workspace(indexing(workspace, index))
         .with_session(format!("{session} · turn {turn}"))
-        .with_permissions(posture(permission))
+        .with_permissions(permission_posture(permission))
         .with_context(window)
         .with_availability(Availability::Available)
 }
@@ -176,10 +186,11 @@ mod tests {
 
     /// Every mode a host can put a turn in, including both shapes of unattended
     /// run: one that was granted something, and one that was granted nothing.
-    fn every_mode() -> [PermissionMode; 5] {
+    fn every_mode() -> [PermissionMode; 6] {
         [
             PermissionMode::Confirm,
             PermissionMode::AutoEdit,
+            PermissionMode::Auto,
             PermissionMode::Plan,
             PermissionMode::Unattended(UnattendedGrants::default()),
             PermissionMode::Unattended(UnattendedGrants {
@@ -195,7 +206,7 @@ mod tests {
     #[test]
     fn every_mode_states_its_own_posture() {
         for mode in every_mode() {
-            let stated = posture(&mode.permission_policy());
+            let stated = permission_posture(&mode.permission_policy());
             assert_ne!(
                 stated,
                 POSTURE_UNSTATED,
@@ -218,11 +229,12 @@ mod tests {
         let stated: Vec<&str> = [
             PermissionMode::Confirm,
             PermissionMode::AutoEdit,
+            PermissionMode::Auto,
             PermissionMode::Plan,
             PermissionMode::Unattended(UnattendedGrants::default()),
         ]
         .iter()
-        .map(|mode| posture(&mode.permission_policy()))
+        .map(|mode| permission_posture(&mode.permission_policy()))
         .collect();
 
         let mut unique = stated.clone();
@@ -245,7 +257,7 @@ mod tests {
             .into_iter()
             .filter(|mode| matches!(mode, PermissionMode::Unattended(_)))
         {
-            let stated = posture(&mode.permission_policy());
+            let stated = permission_posture(&mode.permission_policy());
             assert!(
                 !stated.contains("confirm"),
                 "an unattended run asks no one anything: {stated:?}"
@@ -363,7 +375,9 @@ mod tests {
         assert_eq!(report.session.as_deref(), Some("session-a · turn 3"));
         assert_eq!(
             report.permissions.as_deref(),
-            Some(posture(&PermissionMode::Confirm.permission_policy()))
+            Some(permission_posture(
+                &PermissionMode::Confirm.permission_policy()
+            ))
         );
 
         let meter = TokenMeter::new();

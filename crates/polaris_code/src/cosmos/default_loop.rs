@@ -82,7 +82,13 @@ use polaris_cosmos::topology::{
 };
 use polaris_ontrace::oxigraph::OxigraphStore;
 
+use crate::agents::auto_review::{ReviewHistory, ReviewIntent, ReviewPolicy, ReviewResult};
 use crate::agents::code_agent::{PreparedContext, SecretRedactor};
+use crate::agents::context::CompactionRun;
+use crate::agents::permission_rules::{
+    PermissionRules, RunToolGrants, SessionGrants, ShellApproval,
+};
+use crate::agents::retry::{AttemptLedger, AttemptOutcome, RetryStep};
 use crate::agents::{
     AgentConfig, AgentLlm, CodeAgent, ContextManager, LoopState, PolicySnapshot, ProjectContext,
 };
@@ -90,6 +96,7 @@ use crate::terminal::attachments::AttachmentStore;
 use crate::terminal::background::BackgroundTasks;
 use crate::terminal::transcript::LiveTranscript;
 use crate::terminal::{SessionSettings, TurnSteering};
+use crate::tools::ToolPolicyRegistry;
 use crate::usage::TokenMeter;
 
 use super::topology::{CatalogError, MODEL_PROVIDER, MODEL_REGISTRY_TYPE, RUN_METER_TYPE};
@@ -278,12 +285,27 @@ pub fn type_explanations() -> Result<TypeExplanationRegistry, CatalogError> {
     registry.bind_resource::<RunCancellation>(type_key("polaris-code.run-cancellation"))?;
     registry.bind_resource::<ToolRegistry>(type_key("polaris-code.tool-registry"))?;
     registry.bind_resource::<SecretRedactor>(type_key("polaris-code.secret-redactor"))?;
+    registry.bind_resource::<AttemptLedger>(type_key("polaris-code.attempt-ledger"))?;
+
+    registry.bind_resource::<PermissionRules>(type_key("polaris-code.permission-rules"))?;
+    registry.bind_resource::<SessionGrants>(type_key("polaris-code.session-grants"))?;
+    registry.bind_resource::<ShellApproval>(type_key("polaris-code.shell-approval"))?;
+    registry.bind_resource::<RunToolGrants>(type_key("polaris-code.run-tool-grants"))?;
+    registry.bind_resource::<ToolPolicyRegistry>(type_key("polaris-code.tool-policy-registry"))?;
+
+    registry.bind_resource::<ReviewPolicy>(type_key("polaris-code.review-policy"))?;
+    registry.bind_resource::<ReviewIntent>(type_key("polaris-code.review-intent"))?;
+    registry.bind_resource::<ReviewHistory>(type_key("polaris-code.review-history"))?;
+    registry.bind_output::<ReviewResult>(type_key("polaris-code.review-result"))?;
 
     // Outputs the loop produces, plus the one free output its error handler
     // reads.
     registry.bind_output::<LlmResponse>(type_key("polaris-code.llm-response"))?;
     registry.bind_output::<LoopState>(type_key("polaris-code.agent-loop-state"))?;
     registry.bind_output::<PreparedContext>(type_key("polaris-code.prepared-context"))?;
+    registry.bind_output::<CompactionRun>(type_key("polaris-code.compaction-run"))?;
+    registry.bind_output::<AttemptOutcome>(type_key("polaris-code.attempt-outcome"))?;
+    registry.bind_output::<RetryStep>(type_key("polaris-code.retry-step"))?;
     registry.bind_output::<CaughtError>(type_key("polaris-code.caught-error"))?;
 
     Ok(registry)
@@ -363,9 +385,13 @@ impl ConversationalHost {
 /// session state. It is still reported from [`ConversationalHost`] with the
 /// rest: a plugin has to install it before the loop can read it, which is the
 /// same claim the other entries make.
-const LOOP_RESOURCES: [(&str, ResourceAccess); 19] = [
+const LOOP_RESOURCES: [(&str, ResourceAccess); 28] = [
+    ("polaris-code.review-policy", ResourceAccess::Read),
+    ("polaris-code.review-intent", ResourceAccess::Write),
+    ("polaris-code.review-history", ResourceAccess::Write),
     ("polaris-code.agent-config", ResourceAccess::Read),
     ("polaris-code.agent-llm", ResourceAccess::Write),
+    ("polaris-code.attempt-ledger", ResourceAccess::Write),
     ("polaris-code.agent-loop-state", ResourceAccess::Write),
     ("polaris-code.attachment-store", ResourceAccess::Read),
     ("polaris-code.background-tasks", ResourceAccess::Read),
@@ -380,6 +406,11 @@ const LOOP_RESOURCES: [(&str, ResourceAccess); 19] = [
     ("polaris-code.run-cancellation", ResourceAccess::Read),
     ("polaris-code.run-token-meter", ResourceAccess::Read),
     ("polaris-code.secret-redactor", ResourceAccess::Read),
+    ("polaris-code.permission-rules", ResourceAccess::Read),
+    ("polaris-code.session-grants", ResourceAccess::Read),
+    ("polaris-code.shell-approval", ResourceAccess::Read),
+    ("polaris-code.run-tool-grants", ResourceAccess::Read),
+    ("polaris-code.tool-policy-registry", ResourceAccess::Read),
     ("polaris-code.session-info", ResourceAccess::Read),
     ("polaris-code.session-settings", ResourceAccess::Read),
     ("polaris-code.tool-registry", ResourceAccess::Read),

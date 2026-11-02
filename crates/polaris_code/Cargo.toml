@@ -19,7 +19,7 @@ missing_docs = "warn"
 doc_markdown = "warn"
 
 [dependencies]
-polaris = { workspace = true, features = ["anthropic", "bedrock", "tiktoken", "file-store"] }
+polaris = { workspace = true, features = ["anthropic", "openai", "bedrock", "tiktoken", "file-store"] }
 # Domain-neutral cognition contracts; the coding embodiment lives in `src/cosmos/`.
 polaris_cosmos.workspace = true
 polaris-tui.workspace = true
@@ -27,6 +27,12 @@ polaris_ontrace.workspace = true
 tokio.workspace = true
 # `.then` stream combinator for live token accounting in the agent loop.
 futures-util = "0.3"
+# Official MCP client and its stdio / Streamable HTTP transports.
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+# SSE types for the bounded MCP HTTP backend (same parser as rmcp).
+sse-stream = "0.2.4"
+# Reuse the SDK's process wrapper so stdio shutdown includes descendants.
+process-wrap = { version = "10", features = ["tokio1"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -41,6 +47,8 @@ walkdir = "2"
 # it needs are already in-tree (`walkdir` + `terminal::IgnoreRules`); a regex
 # engine is the one part of that job worth a dependency.
 regex = "1"
+# Shared permission-file parser and wildcard dialect.
+glob = "0.3"
 percent-encoding = "2"
 # Direct handle on the RDF store + SPARQL types for the code graph. We only ever
 # use the in-memory store (`OxigraphStore::in_memory`), so disable the default
@@ -50,12 +58,20 @@ percent-encoding = "2"
 oxigraph = { version = "0.4", default-features = false }
 # Loads ANTHROPIC_API_KEY from a .env at startup (binary only).
 dotenvy = "0.15"
+# Parse user and project startup configuration.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 # CLI parsing for the binary's interactive/non-interactive front-end flags.
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 # Builds the `SdkConfig` for `--provider bedrock --region <region>`; without an
 # explicit region, `BedrockPlugin::from_env()` alone covers it (the AWS SDK's
 # own default chain reads `AWS_REGION`/`AWS_DEFAULT_REGION`/the local profile).
 aws-config = { version = "1", features = ["behavior-version-latest"] }
+# The startup check asks the loaded SDK config's credential provider for one
+# credential, and reads which source it came from (`ProvideCredentials`,
+# `AwsCredentialFeature`); `aws-config` does not re-export either.
+aws-credential-types = "1"
+# Typed source errors retained by the framework Bedrock provider.
+aws-sdk-bedrockruntime = { version = "1", default-features = false }
 # Embedded syntax parsers for the approved zero-setup non-Rust index. Keep the
 # runtime and grammars pinned as one tested ABI-compatible set.
 tree-sitter = "=0.25.10"
@@ -66,6 +82,19 @@ tree-sitter-typescript = "=0.23.2"
 # workspace (`cosmos::compare`), so this moved out of dev-dependencies: the
 # isolation it provides is load-bearing at runtime, not only in tests.
 tempfile = "3"
+# The `web_fetch` tool's HTTP client, shared with the direct provider clients.
+# The transitive async-openai client currently uses reqwest 0.12 separately.
+reqwest = "0.13"
+# Decodes a fetched page from the charset it declares (already in-tree through
+# `reqwest`'s `charset` feature).
+encoding_rs = "0.8"
+# Turns a fetched HTML page into markdown for `web_fetch`. `htmd` converts;
+# html5ever parses and `markup5ever_rcdom` is the tree it builds. Both are named
+# here, at the versions `htmd` uses, so a page can be parsed in pieces and
+# checked for hostile shapes before it is converted.
+htmd = "0.5"
+html5ever = "0.38"
+markup5ever_rcdom = "0.38"
 
 [[bin]]
 name = "polaris"

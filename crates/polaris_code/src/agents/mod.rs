@@ -13,11 +13,15 @@
 //! The reflective coding agent: a `ReAct` loop whose every control decision reads
 //! a [`PolicySnapshot`] and is reified into the Session `ABox` knowledge graph.
 
+pub mod auto_review;
 pub mod code_agent;
 pub mod config;
 pub mod context;
+pub mod failure;
+pub mod permission_rules;
 pub mod policy;
 pub mod project_context;
+pub mod retry;
 pub mod state;
 pub mod trajectory;
 
@@ -26,8 +30,9 @@ pub use polaris::agent::{Agent, SetupError};
 pub use code_agent::{AgentLlm, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS};
 pub use config::AgentConfig;
 pub use context::{ContextManager, ContextStrategy, LinearWindow};
+pub use failure::{FailureKind, TurnFailure};
 pub use policy::{
-    PaletteMode, PermissionCeiling, PermissionMode, PermissionPolicy, PolicySnapshot,
+    Approver, PaletteMode, PermissionCeiling, PermissionMode, PermissionPolicy, PolicySnapshot,
     ToolPalettePolicy, UnattendedGrants,
 };
 pub use project_context::{ProjectContext, load_seed_ontologies};
