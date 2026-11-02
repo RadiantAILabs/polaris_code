@@ -126,8 +126,8 @@ from the specs in [`docs/figures/swebench-500/`](docs/figures/swebench-500/).
 brew install radiantailabs/tap/polaris-code
 ```
 
-Prebuilt Homebrew bottles are available for Apple Silicon on macOS Sequoia
-and newer, and Linux x86-64. Other configurations build from source.
+Homebrew installs a prebuilt binary for Apple Silicon on macOS Sequoia and
+newer, and Linux x86-64. On other platforms, use Cargo.
 The formula is named `polaris-code`; the installed command is `polaris`.
 
 Or install with Cargo using Rust 1.97.0 or newer:
