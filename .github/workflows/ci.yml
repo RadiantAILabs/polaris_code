@@ -266,6 +266,7 @@ jobs:
           formula="polaris/ci-artifacts/polaris-code"
           brew tap-new --no-git polaris/ci-artifacts
           cp dist/polaris-code.rb "$(brew --repository polaris/ci-artifacts)/Formula/polaris-code.rb"
+          brew style "$formula"
           brew trust --formula "$formula"
           # Cache the exact archive so PRs can test release URLs before publication.
           archive_cache="$(brew --cache --build-from-source "$formula")"

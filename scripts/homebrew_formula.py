@@ -38,8 +38,8 @@ class PolarisCode < Formula
   license "Apache-2.0"
 
   on_macos do
-    depends_on macos: :sequoia
     depends_on arch: :arm64
+    depends_on macos: :sequoia
 
     on_arm do
       url "{release_url}/polaris-code-{version}-aarch64-apple-darwin.tar.gz"
@@ -48,9 +48,9 @@ class PolarisCode < Formula
   end
 
   on_linux do
+    depends_on "patchelf" => :build
     depends_on arch: :x86_64
     depends_on "gcc"
-    depends_on "patchelf" => :build
 
     on_intel do
       url "{release_url}/polaris-code-{version}-x86_64-unknown-linux-gnu.tar.gz"
@@ -64,16 +64,16 @@ class PolarisCode < Formula
     bin.install "polaris"
     if OS.linux?
       # Use Homebrew's GCC runtime and, when present, its glibc loader.
-      rpath = "#{{Formula["gcc"].opt_lib}}/gcc/current:#{{HOMEBREW_PREFIX}}/lib"
+      rpath = "#{{formula_opt_lib("gcc")}}/gcc/current:#{{HOMEBREW_PREFIX}}/lib"
       args = ["--set-rpath", rpath]
-      patcher = [Formula["patchelf"].opt_bin/"patchelf"]
+      patcher = [formula_opt_bin("patchelf")/"patchelf"]
       loader = HOMEBREW_PREFIX/"lib/ld.so"
       if loader.exist?
         args += ["--set-interpreter", loader.to_s]
         # The patchelf bottle can also require Homebrew's newer glibc.
         patcher.prepend(loader.to_s, "--library-path", rpath)
       end
-      system *patcher, *args, bin/"polaris"
+      system(*patcher, *args, bin/"polaris")
     end
   end
 
