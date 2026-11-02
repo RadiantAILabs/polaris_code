@@ -48,8 +48,8 @@ class PolarisCode < Formula
   end
 
   on_linux do
-    depends_on arch: :x86_64
     depends_on "patchelf" => :build
+    depends_on arch: :x86_64
     depends_on "gcc"
 
     on_intel do
