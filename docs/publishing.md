@@ -205,23 +205,22 @@ it; prereleases are excluded. If another workflow creates the GitHub Release,
 use a GitHub App or personal access token, since releases created with the
 repository's `GITHUB_TOKEN` do not trigger another workflow.
 
-The tap checks that the source archive declares the matching `polaris_code`
-version and `polaris` executable, computes SHA-256 from the downloaded bytes,
-and stages the new formula on its runners. The live formula keeps its previous
-bottles until both new builds pass. The formula fetches the locked Cargo
-dependencies and then installs offline. Its functional test checks the installed
-command's version, help, and a real JSON topology inventory without a model key.
+The tap's **Homebrew formula** workflow publishes the generated
+`polaris-code.rb` from that release. It:
 
-The tap's GitHub Actions workflow builds and tests bottles on Apple Silicon
-macOS Sequoia and Linux x86-64. It validates the archive checksums, publishes
-them as immutable GitHub release assets, and merges Homebrew's bottle metadata
-into the formula. Separate fresh runners then install with `--force-bottle`,
-verify the installation receipt, and run the functional tests. The macOS job
-also checks that Golden Gate selects the compatible Apple Silicon bottle.
+1. downloads the formula from the release;
+2. checks that every URL points at that release, and that each archive
+   matches the formula's SHA-256 and the release's `.sha256` file;
+3. installs and tests the formula on fresh macOS and Linux runners;
+4. commits it to the tap.
 
-Each batch uses its own download URL so previous bottle assets are preserved.
-Bottles skip Rust and CMake build dependencies during installation; platforms
-without a compatible bottle use the formula's existing source-build path.
+A release reaches the tap in a few minutes. The formula installs the prebuilt
+archive for Apple Silicon on macOS Sequoia and newer, or Linux x86-64, with no
+Rust toolchain or build step. Its functional test checks the installed
+command's version, help, and a real JSON topology inventory without a model
+key. Only the two platforms in the build matrix are supported; elsewhere,
+install with `cargo install polaris_code --locked`, or extend the build matrix
+and the generator.
 
 ### One-time automation setup
 
@@ -232,7 +231,7 @@ Store it as the `HOMEBREW_TAP_TOKEN` repository Actions secret in
 [`RadiantAILabs/polaris_code` settings](https://github.com/RadiantAILabs/polaris_code/settings/secrets/actions).
 Do not commit it or reuse a broad development credential. The source repository's
 `GITHUB_TOKEN` cannot dispatch workflows in the separate tap. The tap uses its
-own job-scoped token to publish assets and push its formula; its repository
+own job-scoped token to push its formula; its repository
 settings must allow Actions to write contents and push to `main`.
 
 See GitHub's [workflow dispatch API permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
@@ -241,37 +240,14 @@ and [workflow event authentication rules](https://docs.github.com/en/actions/how
 ### Retry and verify
 
 Run the public repository's **Homebrew release** workflow manually with the
-published `release_tag` to replay a notification. An already bottled version
-is skipped; an older version cannot replace a newer formula. Enable
-`force_rebuild` to rebuild the current version. After the workflows are installed,
-a manual replay of the current release verifies authentication and release
-validation without rebuilding it.
+published `release_tag` to replay a notification. A formula that is already
+current is not committed again, and an older version cannot replace a newer
+formula. Enable `force_rebuild` to re-check and install-test the current
+version; this also verifies authentication and release validation.
 
-The tap's **Homebrew bottles** workflow also accepts `release_tag` and
-`force_rebuild`, or `verify_only` to test existing bottles on fresh runners.
-Use **Re-run all jobs** after a build or publication failure so both artifacts
-share the new run attempt's immutable download URL. Builds are pinned to the
-latest tap commit selected when preparation starts; if `main` changes while
-building, restart from the latest commit. Check both repositories' Actions runs:
-a successful source notification means the tap accepted the request, while the
-tap run reports build, publication, and fresh-install results.
-
-### Switching the tap to CI binaries
-
-The generated `polaris-code.rb` is an alternative to the tap's current
-source-and-bottle formula. A release archive is not a Homebrew bottle: bottles
-also contain Homebrew's installation metadata. To reuse the application's CI
-builds, copy the generated formula to the tap's `Formula/polaris-code.rb`
-after publishing the GitHub release, and replace the tap's source-staging and
-bottle-publication workflow with binary installation and `brew test` checks
-on macOS and Linux. The existing workflow expects a source archive and cannot
-consume this formula unchanged.
-
-This handoff requires a separate tap change. The test and build workflow
-generates the formula without writing to the tap or requiring a
-cross-repository token. The existing Homebrew release notifier continues to
-trigger the source-and-bottle workflow until the tap is migrated.
-The generated formula supports only the two platforms in the build matrix
-and has no source-build fallback. Keep the current tap formula if that
-fallback is required, or extend the build matrix and generator before
-migrating other platforms.
+The tap's **Homebrew formula** workflow accepts the same `release_tag` and
+`force_rebuild` inputs; with no tag, it checks and installs the current
+formula. If the tap's `main` changes during a run, start a new run from the
+latest commit. Check both repositories' Actions runs: a successful source
+notification means the tap accepted the request, while the tap run reports
+verification, installation, and publication results.
