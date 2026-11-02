@@ -40,17 +40,38 @@ cost**, and finishing tasks **2.4x faster**. See the
 
 ## Why Polaris Code
 
-- **Composable by design.** Replace model providers, tools, memory, or graph
-  steps through declared plugin contracts.
-- **Token efficient.** Plan the task and project the context needed for each
-  step. The [benchmark](#benchmark) records a comparison you can reproduce.
-- **Native Rust.** One executable, with no Node runtime, daemon, or telemetry.
-- **Inspectable sessions.** Trace decisions, tool calls, evidence, and
-  outcomes. Review changes and rewind a session.
-- **Explicit permissions.** Interactive edits and commands ask first;
-  unattended execution uses explicit grants.
-- **Your provider.** Connect through the Anthropic API, the OpenAI API, any
-  OpenAI-compatible server, or AWS Bedrock.
+- **Change the agent, not just its tools.** The agent loop is a graph; plugins
+  add, replace, or rewire its steps.
+- **A workflow for each task.** Coding tasks are matched to a catalog of task
+  graphs, and the result records why one was chosen.
+- **Fewer tokens.** Short planned steps with their own limits, ranged reads
+  instead of whole files, and cached prompts.
+- **See the agent run.** The Graph tab shows the step running now, live.
+- **One knowledge graph.** Code index, session history, and memories share one
+  queryable store; a memory goes stale when its code changes.
+- **Inspectable and safe.** Review and rewind changes; edits and commands ask
+  first.
+- **Your provider.** Anthropic, OpenAI, any OpenAI-compatible server, or AWS
+  Bedrock, in one Rust executable with no telemetry.
+
+## How it compares
+
+| | Polaris Code | Claude Code | Codex CLI | OpenCode | goose |
+| --- | --- | --- | --- | --- | --- |
+| Source | Apache-2.0 | Closed | Apache-2.0 | MIT | Apache-2.0 |
+| Written in | Rust | TypeScript | Rust | TypeScript | Rust |
+| Plugins can replace steps of the agent loop | Yes | No | No | No | No |
+| Picks a workflow for each task and records why | Yes | No | No | No | No |
+| Live view of the running agent graph | Yes | No | No | No | No |
+| Head-to-head SWE-bench Verified result in the repository | Yes, all 500 tasks | — | No | No | No |
+
+Because the workflow is a graph you can extend, there is no fixed limit on
+how far Polaris Code can improve: add a workflow graph for a domain, such as
+data migrations, security fixes, or a framework your team uses, and it is
+admitted, ranked, and chosen alongside the built-in ones.
+
+The other columns describe each project's public documentation as of
+November 2026. Corrections are welcome as issues.
 
 ## Benchmark
 
@@ -212,8 +233,9 @@ saved per project and ends when the reviewed file changes. See
 The interactive terminal and headless command drive the same Polaris session
 and reflective ReAct loop. Tools read and edit files, run approved commands,
 search the workspace, query a multi-language code index, and store memories.
-The topology catalog selects and composes bounded task graphs; the session
-graph records their decisions and outcomes.
+For a coding task, the topology catalog picks or assembles a task graph,
+and the session graph records the choice, its alternatives, and the outcome.
+Ordinary conversation turns use the default loop.
 
 Agent behavior is a graph of typed Rust systems. Replace a step or rewire a
 workflow to try another approach. The [design philosophy](docs/philosophy.md)
@@ -239,6 +261,7 @@ in [`docs/figures/agent-graph/`](docs/figures/agent-graph/).
 | [Plugin integration](docs/reference/guide.md) | Composing and extending the existing capabilities. |
 | [Embedding](crates/polaris_code/src/docs/embedding.md) | Using the coding agent in a Rust application. |
 | [Topology selection](docs/topology-selection.md) | Graph admission, selection, and recorded explanations. |
+| [Graph tab](docs/graph-tab.md) | The live view of the running graph and what its markers mean. |
 | [Publishing](docs/publishing.md) | Registry packages, release archives, and Homebrew. |
 | [Benchmark reproduction](evals/reproduce/swebench-opus/README.md) | Pinned inputs and commands for the comparison above. |
 
