@@ -3,8 +3,7 @@
 //! Scans `src/` for `impl GlobalResource for X` and `impl LocalResource for X`
 //! declarations and asserts each consumer-facing resource name appears in the
 //! catalog. Adding a new resource without listing it in the catalog will fail
-//! this test. (This crate currently ships no consumer-facing resources, so the
-//! guard passes trivially — it exists to catch the first one that is added.)
+//! this test. `GraphFeed`, provided by `GraphPanelPlugin`, is one such resource.
 //!
 //! Internal resources (per-panel plumbing that no downstream system reads as
 //! `Res<T>`) are exempt; add them to [`INTERNAL_RESOURCES`] with a brief

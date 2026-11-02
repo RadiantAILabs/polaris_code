@@ -43,6 +43,8 @@ impl TuiPanel for HelpPanel {
             Line::from("    Home/End, ^A/^E   jump to line start / end"),
             Line::from("    Opt+Bksp, ^W      delete word back  (Opt+Del / Alt-d: forward)"),
             Line::from("    Ctrl-U / Ctrl-K   kill to line start / end"),
+            Line::from("  Graph               The running graph; the executing node is lit."),
+            Line::from("    ↑/↓, PgUp/PgDn    scroll    Home/End  top/bottom    f  follow"),
             Line::from("  Logs                Tail of tracing events."),
             Line::from("  Sessions            Live list of active sessions."),
             Line::from(""),

@@ -6,9 +6,18 @@
 
 use crate::nav::NavIntent;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget, Wrap};
+use unicode_width::UnicodeWidthStr;
+
+/// Largest `width × rows` a single line may span and still have its wrapped
+/// rows cached. Building them renders the line into a cell grid of about 40
+/// bytes per cell, so this bounds that transient grid to roughly 40 MiB. A
+/// longer line is drawn by [`Paragraph`] each frame instead.
+const WRAP_CACHE_CELL_BUDGET: usize = 1 << 20;
 
 /// A virtualized, word-wrapped, scrollable transcript backed by [`Paragraph`].
 ///
@@ -29,9 +38,12 @@ use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarStat
 /// tail" flag, and **virtualizes** rendering: the content is wrapped only when
 /// it (or the viewport size) actually changes — keyed by a caller-supplied
 /// `revision` — into a per-logical-line row-height prefix sum. Each frame it
-/// binary-searches that prefix to the first visible line and hands `Paragraph`
-/// only the ~viewport-worth of lines that can show, so steady-state scrolling is
-/// O(viewport), not O(history).
+/// binary-searches that prefix to the first visible line. Multi-row logical
+/// lines are materialized into styled rows on a cache miss as well, so drawing
+/// deep inside a long line does not wrap its off-screen rows again. A line too
+/// large to materialize within a fixed memory budget is wrapped by
+/// [`Paragraph`] on each frame instead. Each frame draws only the rows that can
+/// show.
 ///
 /// The widget owns the cached content; the panel supplies a `build` closure that
 /// is invoked **only on a cache miss**, so an unchanged transcript costs nothing
@@ -70,6 +82,11 @@ struct TranscriptCache {
     lines: Vec<Line<'static>>,
     /// Cumulative wrapped-row counts; `len() == lines.len() + 1`, `prefix[0] == 0`.
     prefix: Vec<u32>,
+    /// Materialized rows for multi-row lines. Short lines already cost only
+    /// O(width) to draw and need no second copy. None also covers lines beyond
+    /// Paragraph's 16-bit single-line scroll range and lines over
+    /// [`WRAP_CACHE_CELL_BUDGET`], which retain its fallback.
+    wrapped: Vec<Option<Vec<Line<'static>>>>,
     search_text: Vec<String>,
 }
 
@@ -104,6 +121,12 @@ impl ScrollableTranscript {
     #[must_use]
     pub fn is_following(&self) -> bool {
         self.follow_tail
+    }
+
+    /// Whether the viewport is above the live bottom. An upward navigation
+    /// attempt on content that fits can disable following without moving it.
+    pub(crate) fn is_scrolled_up(&self) -> bool {
+        self.scroll < self.max_scroll()
     }
 
     /// The largest valid scroll offset given the geometry of the last render.
@@ -286,12 +309,13 @@ impl ScrollableTranscript {
                 self.follow_tail = false;
             }
             NavIntent::Bottom => {
+                self.scroll = self.max_scroll();
                 self.follow_tail = true;
             }
         }
         self.scroll = self.scroll.min(self.max_scroll());
         // A downward move (or Bottom) that reaches the end re-pins the tail.
-        if self.scroll == self.max_scroll()
+        if !self.is_scrolled_up()
             && matches!(
                 intent,
                 NavIntent::LineDown | NavIntent::PageDown | NavIntent::Bottom
@@ -353,26 +377,55 @@ impl ScrollableTranscript {
                 .min(max_scroll)
         };
 
-        // Window: only the logical lines that can appear in the viewport are
-        // handed to `Paragraph`, so it wraps O(viewport) rows rather than the
-        // whole transcript. `intra` is the offset *within* the first such line.
+        // Locate the visible logical lines, then slice their cached rows.
+        // `intra` is the offset within the first such line. Rendering already
+        // wrapped rows directly also preserves Paragraph's edge glyphs and
+        // alignment without a second truncation or wrap pass.
         if !cache.lines.is_empty() {
             let scroll_rows = scroll;
             let first = cache
                 .prefix
                 .partition_point(|&p| p <= scroll_rows)
                 .saturating_sub(1);
-            let intra =
-                u16::try_from(scroll.saturating_sub(cache.prefix[first])).unwrap_or(u16::MAX);
             let end_row = scroll_rows + u32::from(text_area.height);
             let mut last = cache.prefix.partition_point(|&p| p < end_row);
             last = last.clamp(first + 1, cache.lines.len());
 
-            let window: Vec<Line<'static>> = cache.lines[first..last].to_vec();
-            let paragraph = Paragraph::new(window)
-                .wrap(Wrap { trim: false })
-                .scroll((intra, 0));
-            frame.render_widget(paragraph, text_area);
+            for line in first..last {
+                let intra = scroll.saturating_sub(cache.prefix[line]);
+                let y = cache.prefix[line].saturating_sub(scroll);
+                let height = (cache.prefix[line + 1] - cache.prefix[line] - intra)
+                    .min(u32::from(text_area.height) - y) as u16;
+                let area = Rect {
+                    y: text_area.y + y as u16,
+                    height,
+                    ..text_area
+                };
+                if let Some(rows) = &cache.wrapped[line] {
+                    let window = &rows[intra as usize..intra as usize + usize::from(height)];
+                    for (y, row) in window.iter().enumerate() {
+                        let mut x = 0;
+                        for grapheme in row.styled_graphemes(Style::default()) {
+                            if x >= area.width {
+                                break;
+                            }
+                            frame.buffer_mut()[(area.x + x, area.y + y as u16)]
+                                .set_symbol(grapheme.symbol)
+                                .set_style(grapheme.style);
+                            x = x.saturating_add(
+                                u16::try_from(grapheme.symbol.width().max(1)).unwrap_or(1),
+                            );
+                        }
+                    }
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(cache.lines[line].clone())
+                            .wrap(Wrap { trim: false })
+                            .scroll((u16::try_from(intra).unwrap_or(u16::MAX), 0)),
+                        area,
+                    );
+                }
+            }
         }
         // `cache` borrow ends here — `self` is free to mutate again.
 
@@ -465,15 +518,61 @@ impl ScrollableTranscript {
                 .iter()
                 .map(|line| line.to_string().to_lowercase())
                 .collect();
+            let width = area.width - gutter;
+            let wrapped = lines
+                .iter()
+                .zip(prefix.windows(2))
+                .map(|(line, offsets)| {
+                    let height = offsets[1] - offsets[0];
+                    (height > 1)
+                        .then(|| u16::try_from(height).ok())
+                        .flatten()
+                        .filter(|&height| {
+                            usize::from(width) * usize::from(height) <= WRAP_CACHE_CELL_BUDGET
+                        })
+                        .map(|height| wrapped_rows(line, width, height))
+                })
+                .collect();
             TranscriptCache {
                 search_text,
                 key,
                 gutter,
                 lines,
                 prefix,
+                wrapped,
             }
         })
     }
+}
+
+/// Ask Paragraph to wrap once, then retain compact styled rows rather than a
+/// cell grid. This uses the renderer's word/whitespace/alignment rules without
+/// copying its private wrapping algorithm or retaining O(width * rows) cells.
+/// The cell grid exists while this runs, so callers stay within
+/// [`WRAP_CACHE_CELL_BUDGET`].
+fn wrapped_rows(line: &Line<'static>, width: u16, height: u16) -> Vec<Line<'static>> {
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buffer);
+    (0..height)
+        .map(|y| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut x = 0;
+            while x < width {
+                let cell = &buffer[(x, y)];
+                let style = cell.style();
+                if let Some(span) = spans.last_mut().filter(|span| span.style == style) {
+                    span.content.to_mut().push_str(cell.symbol());
+                } else {
+                    spans.push(Span::styled(cell.symbol().to_owned(), style));
+                }
+                x = x.saturating_add(u16::try_from(cell.symbol().width().max(1)).unwrap_or(1));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Build the cumulative wrapped-row prefix sum for `lines` at `width`.
@@ -509,6 +608,38 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    #[ignore = "manual scrolling performance measurement"]
+    fn measure_cached_scrolling() {
+        for (name, lines) in [
+            (
+                "10000 short lines",
+                (0..10_000).map(|i| Line::raw(format!("row {i}"))).collect(),
+            ),
+            (
+                "100000 character line",
+                vec![Line::raw("word ".repeat(20_000))],
+            ),
+        ] {
+            let mut view = ScrollableTranscript::new();
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|f| view.render(f, f.area(), 1, || lines))
+                .unwrap();
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                view.apply(NavIntent::LineUp);
+                terminal
+                    .draw(|f| view.render(f, f.area(), 1, || panic!("cache miss")))
+                    .unwrap();
+            }
+            eprintln!(
+                "{name}: 100 cached scroll frames in {:?}",
+                started.elapsed()
+            );
+        }
+    }
 
     /// Render `lines` into a `width x height` terminal and return the
     /// transcript's resulting scroll offset. Each call uses a fresh revision so
@@ -595,6 +726,132 @@ mod tests {
         t.apply(NavIntent::LineUp);
         assert!(!t.is_following());
         assert_eq!(t.offset(), 5);
+    }
+
+    #[test]
+    fn bottom_then_up_before_a_frame_starts_from_the_tail() {
+        let mut t = ScrollableTranscript::new();
+        render_at(&mut t, 20, 4, &["row"; 20]);
+        t.apply(NavIntent::Top);
+        t.apply(NavIntent::Bottom);
+        t.apply(NavIntent::LineUp);
+        assert_eq!(t.row_offset(), 15);
+        assert!(!t.is_following());
+    }
+
+    #[test]
+    fn cached_wrapped_rows_match_paragraph_at_every_offset() {
+        use ratatui::layout::Alignment;
+        use ratatui::style::{Color, Modifier, Style};
+
+        let lines = vec![
+            Line::raw("  leading spaces and words  ".repeat(20)),
+            Line::from(vec![
+                Span::styled("wide 世界 👩‍💻 ", Style::default().fg(Color::Red)),
+                Span::styled(
+                    "e\u{301} text ".repeat(20),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::raw("long_word_".repeat(20)).alignment(Alignment::Right),
+            Line::raw("centered words ".repeat(10)).alignment(Alignment::Center),
+            Line::default(),
+        ];
+        for width in [4, 13, 40] {
+            let mut view = ScrollableTranscript::new();
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+            terminal
+                .draw(|f| view.render(f, f.area(), 1, || lines.clone()))
+                .unwrap();
+            assert!(view.cache.as_ref().unwrap().wrapped[0].is_some());
+            for scroll in 0..=view.max_scroll() {
+                view.scroll = scroll;
+                view.follow_tail = false;
+                let actual = terminal
+                    .draw(|f| view.render(f, f.area(), 1, || panic!("cache miss")))
+                    .unwrap()
+                    .buffer
+                    .clone();
+                let area = Rect::new(0, 0, width - 1, 4);
+                let mut expected = Buffer::empty(area);
+                Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll as u16, 0))
+                    .render(area, &mut expected);
+                for y in 0..4 {
+                    for x in 0..width - 1 {
+                        assert_eq!(
+                            actual[(x, y)].symbol(),
+                            expected[(x, y)].symbol(),
+                            "width={width}, scroll={scroll}, x={x}, y={y}"
+                        );
+                        assert_eq!(
+                            actual[(x, y)].style(),
+                            expected[(x, y)].style(),
+                            "width={width}, scroll={scroll}, x={x}, y={y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_over_the_cell_budget_is_not_cached_and_renders_as_paragraph_does() {
+        // About 11,000 rows at 99 columns: under Paragraph's 16-bit scroll range,
+        // over the cell budget.
+        let lines = vec![
+            Line::raw("medium words ".repeat(30)),
+            Line::raw("word ".repeat(220_000)),
+            Line::raw("tail"),
+        ];
+        let (width, height) = (100, 6);
+        let mut view = ScrollableTranscript::new();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| view.render(f, f.area(), 1, || lines.clone()))
+            .unwrap();
+        let cache = view.cache.as_ref().unwrap();
+        let (gutter, prefix) = (cache.gutter, cache.prefix.clone());
+        let huge_rows = (prefix[2] - prefix[1]) as usize;
+        assert_eq!(gutter, 1);
+        assert!(u16::try_from(huge_rows).is_ok());
+        assert!(usize::from(width - gutter) * huge_rows > WRAP_CACHE_CELL_BUDGET);
+        assert!(
+            cache.wrapped[0].is_some(),
+            "a line within the budget stays cached"
+        );
+        assert!(
+            cache.wrapped[1].is_none(),
+            "a line over the budget must not be materialized"
+        );
+
+        let max_scroll = view.max_scroll();
+        for scroll in [prefix[1] - 2, prefix[1] + 5_000, max_scroll] {
+            view.scroll = scroll;
+            view.follow_tail = false;
+            let actual = terminal
+                .draw(|f| view.render(f, f.area(), 1, || panic!("cache miss")))
+                .unwrap()
+                .buffer
+                .clone();
+            let area = Rect::new(0, 0, width - gutter, height);
+            let mut expected = Buffer::empty(area);
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((scroll as u16, 0))
+                .render(area, &mut expected);
+            for y in 0..height {
+                for x in 0..width - gutter {
+                    assert_eq!(
+                        actual[(x, y)],
+                        expected[(x, y)],
+                        "scroll={scroll}, x={x}, y={y}"
+                    );
+                }
+            }
+        }
+        assert!(view.cache.as_ref().unwrap().wrapped[1].is_none());
     }
 
     #[test]

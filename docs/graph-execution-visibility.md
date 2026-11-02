@@ -4,6 +4,9 @@ Proof: `crates/polaris_code/tests/graph_execution_visibility.rs`.
 Code: `crates/polaris_code/src/progress.rs`,
 `crates/polaris_code/src/cosmos/host.rs`.
 
+The same instrumentation also feeds the Graph tab, which draws whichever graph
+is running; see [`graph-tab.md`](graph-tab.md).
+
 `polaris_code` runs graphs other than the agent's `ReAct` loop — the six coding
 topologies in `cosmos/graphs.rs`, and whatever a topology pack adds later. The
 progress bridge that makes work visible was written against the agent loop, so

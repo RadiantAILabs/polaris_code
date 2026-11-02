@@ -1,0 +1,492 @@
+[
+  {
+    "match": [
+      "image inspect",
+      "swebench/sweb.eval.x86_64.astral-sh_1776_ruff-15309:latest"
+    ],
+    "stdout": "swebench/sweb.eval.x86_64.example@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+  },
+  {
+    "match": [
+      "create --name",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "start",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309",
+      "mkdir"
+    ]
+  },
+  {
+    "match": [
+      "cp ",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309",
+      "chmod"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309",
+      "rev-parse"
+    ],
+    "stdout": "75a24bbc67aa31b825b6326cfb6e6afdf3ca90d5\n"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309",
+      "status --porcelain"
+    ]
+  },
+  {
+    "match": [
+      "sbml-rust-plumbing-demo-curated-1-astral-sh__ruff-15309",
+      "--output-format"
+    ],
+    "stdout": "{\"session_id\": \"sbml-rust-plumbing-demo-curated-1-astral-sh__ruff-15309\", \"turn_number\": 1, \"run_id\": \"run-astral-sh__ruff-15309-curated-1\", \"status\": \"completed\", \"result\": \"done\", \"error\": null, \"usage\": {\"schema\": \"polaris-code-run-usage/v1\", \"model_id\": \"anthropic/claude-sonnet-4-6\", \"input_tokens\": 100, \"output_tokens\": 10, \"cache_read_tokens\": 5, \"cache_creation_tokens\": 2, \"total_tokens\": 117, \"estimated_cost_usd\": 0.0, \"pricing_basis\": \"anthropic-list-2026-09\", \"pricing\": {\"family\": \"sonnet\", \"input_per_mtok\": 3.0, \"output_per_mtok\": 15.0, \"cache_read_per_mtok\": 0.3, \"cache_write_per_mtok\": 3.75}}}"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309",
+      "add -A"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309",
+      "diff --cached"
+    ]
+  },
+  {
+    "match": [
+      "rm -f",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "image inspect",
+      "swebench/sweb.eval.x86_64.astral-sh_1776_ruff-15309:latest"
+    ],
+    "stdout": "swebench/sweb.eval.x86_64.example@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+  },
+  {
+    "match": [
+      "create --name",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "start",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309",
+      "mkdir"
+    ]
+  },
+  {
+    "match": [
+      "cp ",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309",
+      "chmod"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309",
+      "rev-parse"
+    ],
+    "stdout": "75a24bbc67aa31b825b6326cfb6e6afdf3ca90d5\n"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309",
+      "status --porcelain"
+    ]
+  },
+  {
+    "match": [
+      "sbml-rust-plumbing-demo-freeform-1-astral-sh__ruff-15309",
+      "--output-format"
+    ],
+    "stdout": "{\"session_id\": \"sbml-rust-plumbing-demo-freeform-1-astral-sh__ruff-15309\", \"turn_number\": 1, \"run_id\": \"run-astral-sh__ruff-15309-freeform-1\", \"status\": \"completed\", \"result\": \"done\", \"error\": null, \"usage\": {\"schema\": \"polaris-code-run-usage/v1\", \"model_id\": \"anthropic/claude-sonnet-4-6\", \"input_tokens\": 100, \"output_tokens\": 10, \"cache_read_tokens\": 5, \"cache_creation_tokens\": 2, \"total_tokens\": 117, \"estimated_cost_usd\": 0.0, \"pricing_basis\": \"anthropic-list-2026-09\", \"pricing\": {\"family\": \"sonnet\", \"input_per_mtok\": 3.0, \"output_per_mtok\": 15.0, \"cache_read_per_mtok\": 0.3, \"cache_write_per_mtok\": 3.75}}}"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309",
+      "add -A"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309",
+      "diff --cached"
+    ]
+  },
+  {
+    "match": [
+      "rm -f",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "image inspect",
+      "swebench/sweb.eval.x86_64.astral-sh_1776_ruff-15309:latest"
+    ],
+    "stdout": "swebench/sweb.eval.x86_64.example@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+  },
+  {
+    "match": [
+      "create --name",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "start",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309",
+      "mkdir"
+    ]
+  },
+  {
+    "match": [
+      "cp ",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309",
+      "chmod"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309",
+      "rev-parse"
+    ],
+    "stdout": "75a24bbc67aa31b825b6326cfb6e6afdf3ca90d5\n"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309",
+      "status --porcelain"
+    ]
+  },
+  {
+    "match": [
+      "sbml-rust-plumbing-demo-both-1-astral-sh__ruff-15309",
+      "--output-format"
+    ],
+    "stdout": "{\"session_id\": \"sbml-rust-plumbing-demo-both-1-astral-sh__ruff-15309\", \"turn_number\": 1, \"run_id\": \"run-astral-sh__ruff-15309-both-1\", \"status\": \"completed\", \"result\": \"done\", \"error\": null, \"usage\": {\"schema\": \"polaris-code-run-usage/v1\", \"model_id\": \"anthropic/claude-sonnet-4-6\", \"input_tokens\": 100, \"output_tokens\": 10, \"cache_read_tokens\": 5, \"cache_creation_tokens\": 2, \"total_tokens\": 117, \"estimated_cost_usd\": 0.0, \"pricing_basis\": \"anthropic-list-2026-09\", \"pricing\": {\"family\": \"sonnet\", \"input_per_mtok\": 3.0, \"output_per_mtok\": 15.0, \"cache_read_per_mtok\": 0.3, \"cache_write_per_mtok\": 3.75}}}"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309",
+      "add -A"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309",
+      "diff --cached"
+    ]
+  },
+  {
+    "match": [
+      "rm -f",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-astral-sh__ruff-15309"
+    ]
+  },
+  {
+    "match": [
+      "image inspect",
+      "swebench/sweb.eval.x86_64.burntsushi_1776_ripgrep-2209:latest"
+    ],
+    "stdout": "swebench/sweb.eval.x86_64.example@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+  },
+  {
+    "match": [
+      "create --name",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "start",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209",
+      "mkdir"
+    ]
+  },
+  {
+    "match": [
+      "cp ",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209",
+      "chmod"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209",
+      "rev-parse"
+    ],
+    "stdout": "4dc6c73c5a9203c5a8a89ce2161feca542329812\n"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209",
+      "status --porcelain"
+    ]
+  },
+  {
+    "match": [
+      "sbml-rust-plumbing-demo-curated-1-burntsushi__ripgrep-2209",
+      "--output-format"
+    ],
+    "stdout": "{\"session_id\": \"sbml-rust-plumbing-demo-curated-1-burntsushi__ripgrep-2209\", \"turn_number\": 1, \"run_id\": \"run-burntsushi__ripgrep-2209-curated-1\", \"status\": \"completed\", \"result\": \"done\", \"error\": null, \"usage\": {\"schema\": \"polaris-code-run-usage/v1\", \"model_id\": \"anthropic/claude-sonnet-4-6\", \"input_tokens\": 101, \"output_tokens\": 10, \"cache_read_tokens\": 5, \"cache_creation_tokens\": 2, \"total_tokens\": 118, \"estimated_cost_usd\": 0.0, \"pricing_basis\": \"anthropic-list-2026-09\", \"pricing\": {\"family\": \"sonnet\", \"input_per_mtok\": 3.0, \"output_per_mtok\": 15.0, \"cache_read_per_mtok\": 0.3, \"cache_write_per_mtok\": 3.75}}}"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209",
+      "add -A"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209",
+      "diff --cached"
+    ]
+  },
+  {
+    "match": [
+      "rm -f",
+      "polaris-eval-sbml-rust-plumbing-demo-curated-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "image inspect",
+      "swebench/sweb.eval.x86_64.burntsushi_1776_ripgrep-2209:latest"
+    ],
+    "stdout": "swebench/sweb.eval.x86_64.example@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+  },
+  {
+    "match": [
+      "create --name",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "start",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209",
+      "mkdir"
+    ]
+  },
+  {
+    "match": [
+      "cp ",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209",
+      "chmod"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209",
+      "rev-parse"
+    ],
+    "stdout": "4dc6c73c5a9203c5a8a89ce2161feca542329812\n"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209",
+      "status --porcelain"
+    ]
+  },
+  {
+    "match": [
+      "sbml-rust-plumbing-demo-freeform-1-burntsushi__ripgrep-2209",
+      "--output-format"
+    ],
+    "stdout": "{\"session_id\": \"sbml-rust-plumbing-demo-freeform-1-burntsushi__ripgrep-2209\", \"turn_number\": 1, \"run_id\": \"run-burntsushi__ripgrep-2209-freeform-1\", \"status\": \"completed\", \"result\": \"done\", \"error\": null, \"usage\": {\"schema\": \"polaris-code-run-usage/v1\", \"model_id\": \"anthropic/claude-sonnet-4-6\", \"input_tokens\": 101, \"output_tokens\": 10, \"cache_read_tokens\": 5, \"cache_creation_tokens\": 2, \"total_tokens\": 118, \"estimated_cost_usd\": 0.0, \"pricing_basis\": \"anthropic-list-2026-09\", \"pricing\": {\"family\": \"sonnet\", \"input_per_mtok\": 3.0, \"output_per_mtok\": 15.0, \"cache_read_per_mtok\": 0.3, \"cache_write_per_mtok\": 3.75}}}"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209",
+      "add -A"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209",
+      "diff --cached"
+    ]
+  },
+  {
+    "match": [
+      "rm -f",
+      "polaris-eval-sbml-rust-plumbing-demo-freeform-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "image inspect",
+      "swebench/sweb.eval.x86_64.burntsushi_1776_ripgrep-2209:latest"
+    ],
+    "stdout": "swebench/sweb.eval.x86_64.example@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+  },
+  {
+    "match": [
+      "create --name",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "start",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209",
+      "mkdir"
+    ]
+  },
+  {
+    "match": [
+      "cp ",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209",
+      "chmod"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209",
+      "rev-parse"
+    ],
+    "stdout": "4dc6c73c5a9203c5a8a89ce2161feca542329812\n"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209",
+      "status --porcelain"
+    ]
+  },
+  {
+    "match": [
+      "sbml-rust-plumbing-demo-both-1-burntsushi__ripgrep-2209",
+      "--output-format"
+    ],
+    "stdout": "{\"session_id\": \"sbml-rust-plumbing-demo-both-1-burntsushi__ripgrep-2209\", \"turn_number\": 1, \"run_id\": \"run-burntsushi__ripgrep-2209-both-1\", \"status\": \"completed\", \"result\": \"done\", \"error\": null, \"usage\": {\"schema\": \"polaris-code-run-usage/v1\", \"model_id\": \"anthropic/claude-sonnet-4-6\", \"input_tokens\": 101, \"output_tokens\": 10, \"cache_read_tokens\": 5, \"cache_creation_tokens\": 2, \"total_tokens\": 118, \"estimated_cost_usd\": 0.0, \"pricing_basis\": \"anthropic-list-2026-09\", \"pricing\": {\"family\": \"sonnet\", \"input_per_mtok\": 3.0, \"output_per_mtok\": 15.0, \"cache_read_per_mtok\": 0.3, \"cache_write_per_mtok\": 3.75}}}"
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209",
+      "add -A"
+    ]
+  },
+  {
+    "match": [
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209",
+      "diff --cached"
+    ]
+  },
+  {
+    "match": [
+      "rm -f",
+      "polaris-eval-sbml-rust-plumbing-demo-both-r1-burntsushi__ripgrep-2209"
+    ]
+  },
+  {
+    "match": [
+      "run_evaluation",
+      "sbml-rust-plumbing-demo-both-r1"
+    ],
+    "stdout": "grading complete for sbml-rust-plumbing-demo-both-r1\n",
+    "writes": [
+      [
+        "polaris-code+both+r1.sbml-rust-plumbing-demo-both-r1.json",
+        "{\n  \"empty_patch_instances_ids\": [\n    \"astral-sh__ruff-15309\",\n    \"burntsushi__ripgrep-2209\"\n  ],\n  \"error_ids\": [],\n  \"resolved_ids\": [],\n  \"unresolved_ids\": []\n}"
+      ]
+    ]
+  },
+  {
+    "match": [
+      "run_evaluation",
+      "sbml-rust-plumbing-demo-curated-r1"
+    ],
+    "stdout": "grading complete for sbml-rust-plumbing-demo-curated-r1\n",
+    "writes": [
+      [
+        "polaris-code+curated+r1.sbml-rust-plumbing-demo-curated-r1.json",
+        "{\n  \"empty_patch_instances_ids\": [\n    \"astral-sh__ruff-15309\",\n    \"burntsushi__ripgrep-2209\"\n  ],\n  \"error_ids\": [],\n  \"resolved_ids\": [],\n  \"unresolved_ids\": []\n}"
+      ]
+    ]
+  },
+  {
+    "match": [
+      "run_evaluation",
+      "sbml-rust-plumbing-demo-freeform-r1"
+    ],
+    "stdout": "grading complete for sbml-rust-plumbing-demo-freeform-r1\n",
+    "writes": [
+      [
+        "polaris-code+freeform+r1.sbml-rust-plumbing-demo-freeform-r1.json",
+        "{\n  \"empty_patch_instances_ids\": [\n    \"astral-sh__ruff-15309\",\n    \"burntsushi__ripgrep-2209\"\n  ],\n  \"error_ids\": [],\n  \"resolved_ids\": [],\n  \"unresolved_ids\": []\n}"
+      ]
+    ]
+  }
+]
+

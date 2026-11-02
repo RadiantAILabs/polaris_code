@@ -99,11 +99,16 @@
 //! # Interrupting a turn
 //!
 //! [`ConversationPanelPlugin::with_interrupt_handle`] accepts a non-blocking
-//! host callback. Ctrl-C denies an open approval first, clears a draft next,
-//! then requests interruption when a non-empty host `status` indicates work.
+//! host callback. While scrolled up or browsing, Ctrl-C first returns to the
+//! live bottom, keeping the draft and any open approval; this does not count
+//! toward quit. At the live bottom, Ctrl-C denies an open approval, clears a
+//! draft next, then requests interruption when a non-empty host `status`
+//! indicates work.
 //! It invokes the handle at most once until the host reports idle or cancelled.
-//! A second Ctrl-C within 1500 ms falls through to the shell; Ctrl-Q quits.
-//! Without a handle, the existing approval/draft/quit behaviour is unchanged.
+//! After an approval, draft or interrupt action, a second Ctrl-C within 1500 ms
+//! falls through to the shell unless navigation takes precedence again.
+//! Ctrl-Q always quits immediately.
+//! Without a handle, the navigation/approval/draft/quit behaviour is unchanged.
 //!
 //! `Esc` requests the same interruption while a turn runs, after it has closed
 //! a popup, left history browsing or denied an open approval. It leaves the
@@ -1897,11 +1902,12 @@ impl ConversationPanel {
 
     /// Handle `Ctrl-C`.
     ///
-    /// Claimed only where there is something to act on — an open approval to
-    /// deny, or a draft to clear — and declined otherwise, so an idle panel
-    /// leaves the shell's quit behaviour untouched. A second press inside
-    /// [`INTERRUPT_ESCALATION`] is always declined, so quitting is never more
-    /// than two presses away regardless of panel state.
+    /// Called after scrollback/browsing navigation: that first press returns
+    /// to the live bottom, keeps the draft and approval, and resets escalation.
+    /// At the live bottom, claimed for an open approval, a draft or a running
+    /// turn with an interrupt handle; otherwise the shell quits. A second
+    /// press inside [`INTERRUPT_ESCALATION`] is declined unless navigation
+    /// takes precedence again. Ctrl-Q always quits immediately.
     ///
     /// After approval and draft handling, an active host status plus a handle
     /// lets this panel request interruption once. Only host IO acknowledges the
@@ -2980,7 +2986,8 @@ fn build_message_layout(
 /// Render the per-turn node timeline (shown when expanded). Each node is a
 /// header line followed by the `tracing` events captured within its span —
 /// correlated from the shared [`LogBuffer`] by `(node_name, seq)`, restricted to
-/// framework targets (`polaris*`). Multi-line messages break into one row each.
+/// framework targets (`polaris*`). Each message uses the same 64 KiB rendering
+/// limit as transcript bodies; multi-line messages break into one row each.
 /// Without a log buffer, only the headers show.
 ///
 /// A free function (rather than a `&self` method) so the scroll view's build
@@ -3021,7 +3028,10 @@ fn build_timeline_lines(
             // Multi-line log messages (e.g. an error with context) break into one
             // row each; the level badge leads the first, the rest indent under the
             // message column.
-            for (i, segment) in split_lines(&entry.message).enumerate() {
+            for (i, mut line) in body_lines(&entry.message, false, true)
+                .into_iter()
+                .enumerate()
+            {
                 let badge = if i == 0 {
                     Span::styled(
                         entry.level.label(),
@@ -3030,12 +3040,10 @@ fn build_timeline_lines(
                 } else {
                     Span::raw("     ")
                 };
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    badge,
-                    Span::raw(" "),
-                    Span::raw(segment.to_string()),
-                ]));
+                let mut spans = vec![Span::raw("    "), badge, Span::raw(" ")];
+                spans.append(&mut line.spans);
+                line.spans = spans;
+                lines.push(line);
             }
         }
     }
@@ -3323,6 +3331,16 @@ impl ConversationPanel {
     fn handle_key(&mut self, key: KeyEvent) -> EventOutcome {
         self.poll_composer_services();
         if self.editor_result.is_some() {
+            return EventOutcome::Consumed;
+        }
+        // Leaving scrollback is a navigation action. It preserves the draft
+        // and approval and never arms the interrupt/quit escalation window.
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (self.view.is_scrolled_up() || self.browse.active || self.browse.page.is_some())
+        {
+            self.return_live();
+            self.last_interrupt = None;
             return EventOutcome::Consumed;
         }
         // Prompt-history search is checked before transcript browsing so that
@@ -3718,9 +3736,13 @@ impl ConversationPanelPlugin {
 
     /// Supply the host's non-blocking operation for requesting an interrupt.
     ///
-    /// After approval/draft precedence, Ctrl-C calls this once while the host's
-    /// `io_type = "status"` is non-empty. A second press within 1500 ms falls
-    /// through to the shell. Without a handle, Ctrl-C behaviour is unchanged.
+    /// While scrolled up or browsing, Ctrl-C first returns to the live bottom,
+    /// keeping the draft and approval without counting toward quit. After
+    /// navigation, approval and draft precedence, Ctrl-C calls this once while
+    /// the host's `io_type = "status"` is non-empty. A second press within
+    /// 1500 ms falls through to the shell unless navigation takes precedence
+    /// again. Ctrl-Q always quits immediately. Without a handle, Ctrl-C
+    /// behaviour is unchanged.
     /// `Esc` calls it under the same conditions once a popup, history browsing
     /// and an open approval have had their turn at the key; it keeps the draft
     /// and never falls through to the shell.
@@ -4594,6 +4616,124 @@ mod tests {
     // ── Ctrl-C claiming ─────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn wheel_burst_preserves_distance_without_intermediate_frames() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        for i in 0..100 {
+            panel.push_transcript(IOMessage::user_text(format!("message {i}")));
+        }
+        draw(&mut panel, 80, 24);
+        let tail = panel.view.row_offset();
+        for i in 0..13 {
+            panel.handle_event(&TuiEvent::Mouse(crossterm::event::MouseEvent {
+                kind: if i < 10 {
+                    MouseEventKind::ScrollUp
+                } else {
+                    MouseEventKind::ScrollDown
+                },
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        draw(&mut panel, 80, 24);
+        assert_eq!(panel.view.row_offset(), tail - 7 * WHEEL_LINES as u32);
+        assert!(!panel.view.is_following());
+        panel.handle_key(ctrl(KeyCode::Char('c')));
+        assert!(panel.view.is_following());
+        assert_eq!(panel.view.row_offset(), tail);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_returns_scrollback_to_live_before_clearing_or_quitting() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        for i in 0..100 {
+            panel.push_transcript(IOMessage::user_text(format!("message {i}")));
+        }
+        draw(&mut panel, 80, 24);
+        panel.handle_key(key(KeyCode::PageUp));
+        assert!(!panel.view.is_following());
+        type_str(&mut panel, "keep this draft");
+        panel.pending_confirm = Some(PendingConfirm {
+            id: None,
+            summary: "approve?".into(),
+            choices: Vec::new(),
+        });
+        // Even a previously armed escalation must not override navigation.
+        panel.last_interrupt = Some(Instant::now());
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Consumed
+        );
+        assert!(panel.view.is_following());
+        assert!(panel.last_interrupt.is_none());
+        assert_eq!(panel.composer.text(), "keep this draft");
+        assert!(panel.pending_confirm.is_some());
+        let (screen, _) = draw(&mut panel, 80, 24);
+        assert!(screen.iter().any(|row| row.contains("message 99")));
+
+        panel.pending_confirm = None;
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Consumed
+        );
+        assert!(
+            panel.composer.is_empty(),
+            "the first live press clears the draft"
+        );
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_leaves_transcript_search_and_canonical_history() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.push_transcript(IOMessage::user_text("live message"));
+        panel.browse.active = true;
+        panel.browse.editing_search = true;
+        panel.browse.page = Some(HistoryPage {
+            start: 0,
+            total: 1,
+            messages: vec![IOMessage::user_text("old message")].into(),
+        });
+        draw(&mut panel, 80, 24);
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Consumed
+        );
+        assert!(!panel.browse.active);
+        assert!(!panel.browse.editing_search);
+        assert!(panel.browse.page.is_none());
+        let (screen, _) = draw(&mut panel, 80, 24);
+        assert!(screen.iter().any(|row| row.contains("live message")));
+        assert!(!screen.iter().any(|row| row.contains("old message")));
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_q_still_quits_immediately_while_scrolled_up() {
+        use crate::app::{AppShell, ShellOutcome};
+        use crate::config::TuiConfig;
+
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        for i in 0..100 {
+            panel.push_transcript(IOMessage::user_text(format!("message {i}")));
+        }
+        draw(&mut panel, 80, 24);
+        panel.view.apply(NavIntent::PageUp);
+        assert!(!panel.view.is_following());
+        let mut shell = AppShell::new(vec![Box::new(panel)], &TuiConfig::default());
+        assert!(matches!(
+            shell.handle_event(TuiEvent::Key(ctrl(KeyCode::Char('q')))),
+            ShellOutcome::Quit
+        ));
+    }
+
+    #[tokio::test]
     async fn ctrl_c_is_declined_when_there_is_nothing_to_act_on() {
         // Idle with an empty draft: the shell owns the press and quits.
         let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
@@ -4601,6 +4741,22 @@ mod tests {
             panel.handle_key(ctrl(KeyCode::Char('c'))),
             EventOutcome::Continue
         );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_at_the_bottom_still_clears_a_draft_after_an_upward_scroll_attempt() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.push_transcript(IOMessage::user_text("short transcript"));
+        draw(&mut panel, 80, 24);
+        panel.handle_key(key(KeyCode::PageUp));
+        assert!(!panel.view.is_following());
+        type_str(&mut panel, "draft");
+        assert_eq!(
+            panel.handle_key(ctrl(KeyCode::Char('c'))),
+            EventOutcome::Consumed
+        );
+        assert!(panel.composer.is_empty());
+        assert!(panel.last_interrupt.is_some());
     }
 
     #[tokio::test]
@@ -6489,6 +6645,43 @@ mod tests {
         assert!(!text.contains("from another node"));
         // A non-`polaris*` target under this node is filtered out.
         assert!(!text.contains("hyper connection"));
+    }
+
+    #[test]
+    fn timeline_limits_each_log_body_and_retains_the_original() {
+        use crate::panels::{LogEntry, LogLevel};
+
+        let buffer = LogBuffer::with_capacity(2);
+        // The byte limit falls inside a multibyte character after a newline.
+        let message = format!("first line\n{}hidden tail", "世".repeat(64 * 1024));
+        for message in [&message, "next event"] {
+            buffer.push(LogEntry {
+                level: LogLevel::Info,
+                target: "polaris_graph::executor".into(),
+                message: message.into(),
+                node: Some("act".into()),
+                seq: Some(1),
+            });
+        }
+        let lines = build_timeline_lines(
+            &[TimelineNode {
+                node_name: "act".into(),
+                seq: 1,
+                label: "Thinking".into(),
+            }],
+            Some(&buffer),
+        );
+        assert_eq!(lines[1].to_string(), "    INFO  first line");
+        let prefix = "first line\n";
+        let kept = (64 * 1024 - prefix.len()) / '世'.len_utf8();
+        assert_eq!(
+            lines[2].to_string(),
+            format!("          {}", "世".repeat(kept))
+        );
+        assert!(lines[3].to_string().contains("rendering limited to 64 KiB"));
+        assert_eq!(lines[4].to_string(), "    INFO  next event");
+        assert_eq!(lines.len(), 5);
+        assert_eq!(buffer.snapshot()[0].message, message);
     }
     // ── Live agent transcript: streamed message blocks and tool activity ────
 

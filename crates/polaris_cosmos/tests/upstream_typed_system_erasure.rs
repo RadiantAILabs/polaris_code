@@ -362,15 +362,31 @@ impl Drop for TemporaryCrate {
 
 /// Renders the workspace's `polaris` dependency as a `polaris-ai` dependency line,
 /// so the scratch crate builds against the same Polaris source and version.
-fn workspace_polaris_dependency(workspace_manifest: &str) -> String {
+/// Relative path dependencies are resolved from the workspace before rendering.
+fn workspace_polaris_dependency(workspace_root: &Path, workspace_manifest: &str) -> String {
     let entry = workspace_manifest
         .lines()
         .find_map(|line| line.trim().strip_prefix("polaris = "))
         .expect("workspace manifest should declare a `polaris` dependency");
-    format!(
-        "polaris-ai = {}",
-        entry.replacen("package = \"polaris-ai\", ", "", 1)
-    )
+    let entry = entry.replacen("package = \"polaris-ai\", ", "", 1);
+    let entry = if let Some((prefix, path_entry)) = entry.split_once("path = \"") {
+        let (relative_path, suffix) = path_entry
+            .split_once('"')
+            .expect("workspace Polaris path should have a closing quote");
+        let absolute_path = workspace_root
+            .join(relative_path)
+            .canonicalize()
+            .expect("workspace Polaris path should resolve");
+        let absolute_path = absolute_path
+            .to_str()
+            .expect("workspace Polaris path should be UTF-8")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        format!("{prefix}path = \"{absolute_path}\"{suffix}")
+    } else {
+        entry
+    };
+    format!("polaris-ai = {entry}")
 }
 
 #[test]
@@ -382,7 +398,7 @@ fn mismatched_stage_output_is_rejected_at_compile_time() {
         .expect("crate should live at <workspace>/crates/<name>");
     let workspace_manifest = fs::read_to_string(workspace_root.join("Cargo.toml"))
         .expect("workspace manifest should be readable");
-    let polaris_dependency = workspace_polaris_dependency(&workspace_manifest);
+    let polaris_dependency = workspace_polaris_dependency(workspace_root, &workspace_manifest);
 
     let manifest = format!(
         "[package]\nname = \"typed-erasure-compile-fail\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n{polaris_dependency}\n",

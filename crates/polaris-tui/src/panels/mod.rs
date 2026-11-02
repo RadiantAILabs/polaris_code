@@ -8,16 +8,22 @@
 //! | Module           | Plugin                       | Use                                              |
 //! |------------------|------------------------------|--------------------------------------------------|
 //! | [`conversation`] | [`ConversationPanelPlugin`]  | Chat-style transcript driven by [`UserIO`](polaris::plugins::UserIO). |
+//! | [`graph`]        | [`GraphPanelPlugin`]         | The graph a host is running, with the executing node highlighted, fed by a [`GraphFeed`]. |
 //! | [`logs`]         | [`LogPanelPlugin`]           | Tail of `tracing` events fed by a subscriber layer. |
 //! | [`sessions`]     | [`SessionsPanelPlugin`]      | Live list of active sessions from [`SessionsAPI`](polaris::sessions::SessionsAPI). |
 //! | [`help`]         | [`HelpPanelPlugin`]          | Static keymap reference. Smallest possible example. |
 
 pub mod conversation;
+pub mod graph;
 pub mod help;
 pub mod logs;
 pub mod sessions;
 
 pub use conversation::{ConversationPanel, ConversationPanelPlugin, TuiIOProvider};
+pub use graph::{
+    Announcement, GraphBranch, GraphFeed, GraphModel, GraphNode, GraphNodeKind, GraphPanel,
+    GraphPanelPlugin, GraphSnapshot, NodeRun, NodeSpan, RunSpan, RunningNode,
+};
 pub use help::{HelpPanel, HelpPanelPlugin};
 pub use logs::{LogBuffer, LogEntry, LogLevel, LogPanel, LogPanelPlugin};
 pub use sessions::{SessionsPanel, SessionsPanelPlugin};

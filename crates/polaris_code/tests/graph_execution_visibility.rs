@@ -476,6 +476,90 @@ async fn a_topology_turn_calls_no_model_and_leaves_the_session_untouched() {
     assert_eq!(meter.cache_creation_tokens(), 0);
 }
 
+#[tokio::test]
+async fn a_topology_run_replaces_the_agents_graph_in_the_graph_tab() {
+    use polaris::agent::Agent as _;
+    use polaris_code::graph_view::graph_model;
+    use polaris_tui::TuiPanel as _;
+    use polaris_tui::panels::{GraphFeed, GraphPanel};
+    use polaris_tui::ratatui::{Terminal, backend::TestBackend};
+
+    let feed = GraphFeed::new();
+    feed.publish(graph_model(CodeAgent::NAME, &CodeAgent.to_graph()));
+    let (project_dir, task) = project();
+    let data_dir = tempfile::tempdir().expect("temp data dir");
+    let wiring = Wiring {
+        user_io: true,
+        progress: true,
+    };
+    let installed = feed.clone();
+    let (server, queue, _provider, _output_rx) =
+        selecting_server_with(data_dir.path(), wiring, move |server| {
+            server.insert_global(installed);
+        })
+        .await;
+    let sessions = server.api::<SessionsAPI>().expect("SessionsAPI");
+    let session_id = open_session(&server, project_dir.path());
+    assert_eq!(
+        feed.snapshot()
+            .model()
+            .map(|model| model.name().to_string()),
+        Some(CodeAgent::NAME.to_string()),
+        "before any turn the tab shows the agent's graph"
+    );
+
+    queue.accept(AcceptedCodingTask::new(task));
+    let outcome = run::drive_turn(sessions, &session_id).await;
+    let Some(TopologyTurn::Executed(executed)) = outcome.topology.as_ref() else {
+        panic!("expected an executed topology, got {:?}", outcome.topology);
+    };
+
+    let snapshot = feed.snapshot();
+    let model = snapshot.model().expect("the tab has a graph");
+    assert_eq!(
+        model.name(),
+        executed.registration_id,
+        "the tab names the topology that ran, not the agent"
+    );
+    assert_eq!(snapshot.run(), 1);
+    assert!(snapshot.running().is_empty(), "the run is over");
+    assert_eq!(
+        snapshot.finished_count(),
+        outcome.nodes_executed,
+        "every node that ran is marked as having run: the model is the executed graph, \
+         so the ids matched exactly"
+    );
+    assert!(
+        model.node_count() >= snapshot.finished_count(),
+        "a node on a path this run did not take stays unmarked"
+    );
+
+    // What the user sees: the topology's nodes, each marked as run.
+    let mut panel = GraphPanel::new(feed.clone());
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| panel.render(frame, frame.area()))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let screen: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let row = screen
+        .iter()
+        .find(|row| row.contains("predict_edit"))
+        .unwrap_or_else(|| panic!("the topology's nodes are drawn:\n{}", screen.join("\n")));
+    assert!(row.starts_with('✓'), "{row:?}");
+    assert!(
+        !screen.iter().any(|row| row.contains("agent_loop")),
+        "the agent's own graph is gone:\n{}",
+        screen.join("\n")
+    );
+}
+
 /// Everything one topology turn is judged by, other than what was narrated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnOutcome {

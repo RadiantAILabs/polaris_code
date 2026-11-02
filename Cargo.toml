@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris_code"
@@ -28,7 +28,7 @@ polaris = { package = "polaris-ai", version = "0.7.1", default-features = false 
 # contracts (see `crates/polaris_code/src/cosmos/`).
 polaris_cosmos = { path = "crates/polaris_cosmos", version = "0.1.0" }
 # Composable ratatui TUI: panels contributed via a shared registry.
-polaris-tui = { path = "crates/polaris-tui", version = "0.1.0" }
+polaris-tui = { path = "crates/polaris-tui", version = "0.1.1" }
 # Ontology-driven tools/resources/agents: oxigraph RDF store + SPARQL toolset.
 polaris_ontrace = { path = "crates/polaris_ontrace", version = "0.1.0", default-features = false, features = [
     "oxigraph",

@@ -107,6 +107,9 @@ Within `crates/polaris_code/src/`:
 - `terminal/` owns TUI commands, transcript projection, session navigation,
   attachments, rewind, and change review.
 - `exec/` owns the non-interactive provider and output formats.
+- `graph_view.rs` converts a framework graph into the model `polaris-tui`'s
+  Graph tab draws and reports which node is running; `tabs.rs` lists the tabs
+  the default shell shows around the conversation.
 
 Add tools as self-contained modules under `tools/` and register them through a
 plugin. Add agent decision seams under `agents/`. Add coding topology graphs

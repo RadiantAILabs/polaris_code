@@ -65,10 +65,22 @@
 //!
 //! | Chord            | Action                                  |
 //! |------------------|-----------------------------------------|
-//! | `Ctrl-C` / `Ctrl-Q` | Quit the TUI.                        |
+//! | `Ctrl-Q` | Quit the TUI immediately, from any state.       |
+//! | `Ctrl-C` while browsing or scrolled up | Return the conversation to its live bottom; preserve the draft and approval, without counting toward quit. |
+//! | `Ctrl-C` at the live bottom | Deny an approval, clear a draft, then request interruption if available; otherwise quit. A second press within 1.5 s quits unless navigation takes precedence again. |
 //! | `Tab` / `Shift-Tab` | Cycle panel focus (a panel with an open completion popup claims them first). |
 //! | `Alt-1` … `Alt-9` | Jump directly to panel N.              |
 //! | `Ctrl-L`         | Toggle Single ↔ Tiled layout.          |
+//!
+//! A panel binds further keys while it is focused. The Graph panel
+//! (`panels::GraphPanel`, feature `panels`) uses:
+//!
+//! | Chord            | Action                                  |
+//! |------------------|-----------------------------------------|
+//! | `↑` / `k`, `↓` / `j` | Scroll the graph one row.           |
+//! | `PgUp` / `PgDn`  | Scroll one page.                        |
+//! | `Home` / `g`, `End` / `G` | Jump to the top / bottom.      |
+//! | `f`              | Follow the running node again.          |
 
 #![warn(missing_docs)]
 

@@ -191,7 +191,7 @@ impl ConversationPanel {
         }));
     }
 
-    fn return_live(&mut self) {
+    pub(super) fn return_live(&mut self) {
         if let Some(job) = self.browse.history_job.take() {
             job.abort();
         }

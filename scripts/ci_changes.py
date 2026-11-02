@@ -16,10 +16,11 @@ def affects_build(path: str) -> bool:
         return True
     if path.startswith("scripts/") and path.endswith((".py", ".sh")):
         return True
-    # Workspace integration tests execute the external evaluation adapters.
+    # Workspace integration tests execute the external evaluation adapters. The
+    # reproduction kits are run by hand and no test reads them.
     if path.startswith("evals/"):
         return not (
-            path.startswith(("evals/docs/", "evals/results/"))
+            path.startswith(("evals/docs/", "evals/results/", "evals/reproduce/"))
             or PurePosixPath(path).name in {"README.md", "AGENTS.md", "CLAUDE.md"}
         )
     if PurePosixPath(path).name.startswith("rust-toolchain"):

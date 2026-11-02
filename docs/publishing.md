@@ -175,7 +175,7 @@ To regenerate it locally after downloading both archives and their checksum
 files:
 
 ```bash
-python3 scripts/homebrew_formula.py 0.1.1 RadiantAILabs/polaris_code dist
+python3 scripts/homebrew_formula.py 0.2.0 RadiantAILabs/polaris_code dist
 ```
 
 The generator requires Python 3.11 or newer and rejects missing platforms and

@@ -2836,6 +2836,11 @@ async fn execute_permitted(
     )?;
 
     let started = Instant::now();
+    // The Graph tab draws this graph, not the agent's, for the run below. The
+    // guard stays open until this function returns; one the run did not take up
+    // is withdrawn then.
+    let _announced =
+        crate::graph_view::announce(context, registration.as_str(), composition.graph());
     // The same middleware chain the session's own turn runs under, so a node
     // of this graph is as watchable as a node of the agent loop. `None` is an
     // empty chain: identical execution, nobody informed.
