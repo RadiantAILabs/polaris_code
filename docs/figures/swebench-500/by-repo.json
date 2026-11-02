@@ -1,0 +1,73 @@
+{
+ "kind": "barChart",
+ "title": "Polaris Code tokens as a share of Claude Code's (100%), by repository",
+ "intent": "The saving holds on every repository, not just on average.",
+ "source": "SWE-bench Verified, all 500 tasks, Claude Opus 5.5 on AWS Bedrock, 2026-10-29",
+ "data": [
+  {
+   "label": "flask (1)",
+   "value": 2.6,
+   "text": "3%"
+  },
+  {
+   "label": "requests (8)",
+   "value": 11.5,
+   "text": "12%"
+  },
+  {
+   "label": "xarray (22)",
+   "value": 12.2,
+   "text": "12%"
+  },
+  {
+   "label": "django (231)",
+   "value": 13.6,
+   "text": "14%"
+  },
+  {
+   "label": "scikit-learn (32)",
+   "value": 15.6,
+   "text": "16%"
+  },
+  {
+   "label": "matplotlib (34)",
+   "value": 16.3,
+   "text": "16%"
+  },
+  {
+   "label": "sympy (75)",
+   "value": 16.4,
+   "text": "16%"
+  },
+  {
+   "label": "pylint (10)",
+   "value": 16.7,
+   "text": "17%"
+  },
+  {
+   "label": "seaborn (2)",
+   "value": 18.4,
+   "text": "18%"
+  },
+  {
+   "label": "sphinx (44)",
+   "value": 18.7,
+   "text": "19%"
+  },
+  {
+   "label": "astropy (22)",
+   "value": 21.5,
+   "text": "21%"
+  },
+  {
+   "label": "pytest (19)",
+   "value": 23.7,
+   "text": "24%"
+  }
+ ],
+ "options": {
+  "width": 30,
+  "max": 100,
+  "empty": "\u2591"
+ }
+}

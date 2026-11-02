@@ -488,8 +488,12 @@ impl TuiPanel for LogPanel {
 ///
 /// `build()` installs the layer as the global tracing default. If a global
 /// default is already set, the install attempt logs a `tracing::warn!` (not
-/// stderr, which would corrupt the alternate screen) and the panel will
-/// simply stay empty.
+/// stderr, which would corrupt the alternate screen) and this plugin captures
+/// no new events in its buffer.
+///
+/// The buffer and the subscriber are useful without the tab: another panel can
+/// read the same [`LogBuffer`] (the conversation panel's node timeline does).
+/// [`without_panel`](Self::without_panel) keeps both and leaves the tab out.
 pub struct LogPanelPlugin {
     capacity: usize,
     /// An externally supplied buffer to install the layer over and feed the
@@ -499,6 +503,8 @@ pub struct LogPanelPlugin {
     buffer: Option<LogBuffer>,
     /// Target prefixes the installed layer keeps; empty buffers everything.
     target_prefixes: Vec<String>,
+    /// Whether `build()` adds the [`LogPanel`] tab to the registry.
+    show_panel: bool,
 }
 
 impl Default for LogPanelPlugin {
@@ -507,6 +513,7 @@ impl Default for LogPanelPlugin {
             capacity: DEFAULT_CAPACITY,
             buffer: None,
             target_prefixes: Vec::new(),
+            show_panel: true,
         }
     }
 }
@@ -517,8 +524,7 @@ impl LogPanelPlugin {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity,
-            buffer: None,
-            target_prefixes: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -532,8 +538,29 @@ impl LogPanelPlugin {
         Self {
             capacity: buffer.capacity(),
             buffer: Some(buffer),
-            target_prefixes: Vec::new(),
+            ..Self::default()
         }
+    }
+
+    /// Install the layer and fill the buffer, but contribute no tab.
+    ///
+    /// For a host that reads the buffer elsewhere and has nothing to show in a
+    /// log tab. The subscriber is installed exactly as it would be with the
+    /// tab. No TUI registry is required in this mode.
+    ///
+    /// ```no_run
+    /// use polaris::system::server::Server;
+    /// use polaris_tui::panels::{LogBuffer, LogPanelPlugin};
+    ///
+    /// let buffer = LogBuffer::with_capacity(256);
+    /// let mut server = Server::new();
+    /// server.add_plugins(LogPanelPlugin::with_buffer(buffer.clone()).without_panel());
+    /// // Keep `buffer` to read captured events after the server is built.
+    /// ```
+    #[must_use]
+    pub fn without_panel(mut self) -> Self {
+        self.show_panel = false;
+        self
     }
 
     /// Restrict the installed layer to events whose `target` starts with one of
@@ -585,18 +612,24 @@ impl Plugin for LogPanelPlugin {
             tracing::warn!(
                 error = %err,
                 "polaris-tui: LogPanelPlugin could not install its tracing subscriber \
-                 (another global default is already set); the Logs panel will stay empty"
+                 (another global default is already set); this plugin will capture no new log events"
             );
         }
-        server
-            .api::<TuiRegistry>()
-            .expect("TuiPlugin must be added before LogPanelPlugin")
-            .add_panel(panel);
+        if self.show_panel {
+            server
+                .api::<TuiRegistry>()
+                .expect("TuiPlugin must be added before LogPanelPlugin")
+                .add_panel(panel);
+        }
     }
 
     fn access(&self) -> PluginAccess {
-        PluginAccess::new()
-            .requires::<TuiRegistry>(VersionReq::caret(TuiRegistry::CONTRACT_VERSION))
+        let access = PluginAccess::new();
+        if self.show_panel {
+            access.requires::<TuiRegistry>(VersionReq::caret(TuiRegistry::CONTRACT_VERSION))
+        } else {
+            access
+        }
     }
 }
 

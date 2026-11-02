@@ -81,7 +81,7 @@ use polaris_cosmos::evidence::TopologyEvidencePlugin;
 use polaris_cosmos::topology::{TopologyCatalog, TopologyCatalogPlugin};
 use polaris_ontrace::oxigraph::OxigraphPlugin;
 use polaris_ontrace::oxigraph::OxigraphStore;
-use polaris_tui::panels::{ConversationPanelPlugin, HelpPanelPlugin, LogBuffer, LogPanelPlugin};
+use polaris_tui::panels::{ConversationPanelPlugin, LogBuffer};
 use polaris_tui::{TuiConfig, TuiHandle, TuiPlugin};
 use tokio::sync::mpsc;
 
@@ -224,7 +224,7 @@ CREDENTIALS:
     providers have credentials and where each comes from.
 
 KEYS (in the TUI):
-    Tab               cycle panels (Conversation, Logs, Help)
+    Tab               cycle panels (Conversation, Graph, Help)
     Shift-Tab         step to the next permission mode (see /permission)
     Alt-1 … Alt-9     jump to panel N
     Esc               interrupt a running turn (a popup, search or pending
@@ -233,8 +233,17 @@ KEYS (in the TUI):
     Ctrl-N            browse and search the transcript
     Ctrl-O            expand the per-turn node timeline (Conversation)
     Ctrl-L            toggle single / tiled layout
-    Ctrl-C / Ctrl-Q   quit (Ctrl-C first clears the draft or interrupts a
+    Ctrl-C / Ctrl-Q   quit (Ctrl-C first returns a scrolled-up transcript to
+                      the live bottom, then clears the draft or interrupts a
                       running turn)
+
+KEYS (Graph panel):
+    Up / k, Down / j  scroll one row
+    PageUp / PageDown scroll one page
+    Home / g, End / G jump to the top or bottom
+    f                 follow the running node again (scrolling stops
+                      following)
+    Mouse wheel       scroll three rows
 ";
 
 /// Destructive command patterns refused outright by the shell, regardless of
@@ -1306,28 +1315,23 @@ async fn main() {
         server.add_plugins(ExecIOPlugin::new(provider.clone()));
         Some((provider, input_tx, output_rx))
     } else {
-        // One shared log buffer feeds both the Logs panel and the conversation
-        // panel's Ctrl-O node timeline (which buckets entries by their
-        // enclosing node span). The log panel installs the global tracing
-        // subscriber over it.
+        // One shared log buffer feeds the conversation panel's Ctrl-O node
+        // timeline (which buckets entries by their enclosing node span). The
+        // log plugin installs the global tracing subscriber over it, with no
+        // Logs tab of its own.
         let log_buffer = LogBuffer::with_capacity(2_000);
         let callback_api = interrupt_api.clone();
         let callback_navigation = interrupt_navigation.clone();
         let callback_background = background_commands.clone();
-        server
-            // Terminal UI + panels. The conversation panel publishes the
-            // `UserIO` the agent's `receive_user_input`/`confirm` flow binds to.
-            // Enable mouse capture so the wheel scrolls the conversation
-            // transcript and logs (hold Shift/Option for native
-            // text-selection in most terminals).
-            .add_plugins(TuiPlugin::new(TuiConfig::default().with_mouse(true)))
-            // Only buffer `polaris*` traces — drop the noise from transitive
-            // deps (hyper, reqwest, oxigraph internals, …) so the Logs panel
-            // and the conversation timeline show the agent's own activity.
-            .add_plugins(
-                LogPanelPlugin::with_buffer(log_buffer.clone()).with_target_prefixes(["polaris"]),
-            )
-            .add_plugins(HelpPanelPlugin);
+        // Terminal UI + panels. The conversation panel publishes the
+        // `UserIO` the agent's `receive_user_input`/`confirm` flow binds to.
+        // Enable mouse capture so the wheel scrolls the conversation
+        // transcript and the graph (hold Shift/Option for native
+        // text-selection in most terminals).
+        server.add_plugins(TuiPlugin::new(TuiConfig::default().with_mouse(true)));
+        // The other tabs — Graph and Help — and the log capture behind the
+        // conversation's node timeline.
+        polaris_code::tabs::add_shell_tabs(&mut server, log_buffer.clone(), &CodeAgent);
         // The conversation panel's `UserIO` is wrapped so commands are
         // executed and answered before the agent's `receive` ever returns.
         // One call yields both host handles the front end needs: the replay
@@ -2050,7 +2054,7 @@ async fn main() {
                         .await;
                 }
             }
-            // A turn failure is the user's news, not the Logs panel's. It
+            // A turn failure is the user's news, not the log buffer's. It
             // lands in the transcript either way; whether the driver keeps
             // serving turns afterwards is `drive_turn_step`'s judgement,
             // bounded by the consecutive-failure ceiling. A ceiling stop
@@ -3057,6 +3061,26 @@ mod tests {
                 argv.push("hi");
             }
             assert!(Cli::try_parse_from(argv).is_err(), "{conflicting:?}");
+        }
+    }
+
+    /// The keys block names the panels the default shell shows (see
+    /// `tabs.rs`) and the Graph panel's keys, and does not name a Logs tab.
+    #[test]
+    fn help_names_the_default_panels_and_the_graph_keys() {
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_long_help().to_string();
+        assert!(
+            rendered.contains("cycle panels (Conversation, Graph, Help)"),
+            "--help does not list the default panels"
+        );
+        assert!(!rendered.contains("Logs"), "--help still names a Logs tab");
+        for needle in [
+            "KEYS (Graph panel)",
+            "follow the running node",
+            "live bottom",
+        ] {
+            assert!(rendered.contains(needle), "--help omits {needle}");
         }
     }
 

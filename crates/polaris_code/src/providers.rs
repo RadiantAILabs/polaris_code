@@ -58,8 +58,8 @@ use polaris::system::server::Server;
 use serde::Serialize;
 
 use crate::config::{
-    BUILTIN_MODELS, BUILTIN_OPENAI_MODELS, DEFAULT_BEDROCK_MODEL, DEFAULT_MODEL,
-    DEFAULT_OPENAI_MODEL, ModelCatalog,
+    BUILTIN_BEDROCK_MODELS, BUILTIN_MODELS, BUILTIN_OPENAI_MODELS, DEFAULT_BEDROCK_MODEL,
+    DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, ModelCatalog,
 };
 use crate::credentials::StoredCredentials;
 use crate::usage::{Price, price_for};
@@ -211,9 +211,6 @@ impl Provider {
     /// The models a run on this provider may select between, and the one it
     /// starts on: the provider's own defaults, overridden by
     /// `POLARIS_CODE_MODEL` / `POLARIS_CODE_MODELS` read through `env`.
-    ///
-    /// Bedrock has no built-in set: regional inference-profile ids vary by
-    /// account and region (see [`DEFAULT_BEDROCK_MODEL`]).
     #[must_use]
     pub fn catalog(self, env: Lookup<'_>) -> ModelCatalog {
         match self {
@@ -221,7 +218,9 @@ impl Provider {
             Self::OpenAi => {
                 ModelCatalog::from_lookup(DEFAULT_OPENAI_MODEL, BUILTIN_OPENAI_MODELS, env)
             }
-            Self::Bedrock => ModelCatalog::from_lookup(DEFAULT_BEDROCK_MODEL, &[], env),
+            Self::Bedrock => {
+                ModelCatalog::from_lookup(DEFAULT_BEDROCK_MODEL, BUILTIN_BEDROCK_MODELS, env)
+            }
         }
     }
 }
@@ -1824,8 +1823,18 @@ mod tests {
         assert!(anthropic.iter().all(|m| m.id.starts_with("anthropic/")));
 
         let bedrock = &listing.providers[2].models;
-        assert_eq!(bedrock.len(), 1);
-        assert_eq!(bedrock[0].id, DEFAULT_BEDROCK_MODEL);
+        assert_eq!(bedrock.len(), BUILTIN_BEDROCK_MODELS.len());
+        assert_eq!(bedrock.iter().filter(|m| m.default).count(), 1);
+        assert!(
+            bedrock
+                .iter()
+                .any(|m| m.default && m.id == DEFAULT_BEDROCK_MODEL)
+        );
+        assert!(
+            bedrock
+                .iter()
+                .any(|m| m.id == "aws.bedrock/global.anthropic.claude-opus-5-5")
+        );
     }
 
     #[test]

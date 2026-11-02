@@ -75,12 +75,23 @@ pub const BUILTIN_OPENAI_MODELS: &[&str] = &[
 /// Default model when `--provider bedrock` is selected and neither `--model`
 /// nor `POLARIS_CODE_MODEL` names one.
 ///
-/// Bedrock has no small built-in set analogous to [`BUILTIN_MODELS`]: regional
-/// inference-profile ids (`us.anthropic....`, `global.anthropic....`) vary by
-/// account and region in a way a baked-in handful would misrepresent, so this
-/// is the only default and `POLARIS_CODE_MODELS` is the supported way to
-/// declare more.
-pub const DEFAULT_BEDROCK_MODEL: &str = "aws.bedrock/global.anthropic.claude-sonnet-5";
+pub const DEFAULT_BEDROCK_MODEL: &str = "aws.bedrock/global.anthropic.claude-sonnet-5-5";
+
+/// The Bedrock models a build knows about with no configuration at all.
+///
+/// Only `global.` cross-region inference profiles: they are served from any
+/// commercial region, so prompts may be processed outside the caller's home
+/// region, and priced like the first-party models. Regional profiles
+/// (`us.`, `eu.`, ...) vary by account and region, so `POLARIS_CODE_MODELS`
+/// declares those. Newest first, mirroring [`BUILTIN_MODELS`].
+pub const BUILTIN_BEDROCK_MODELS: &[&str] = &[
+    "aws.bedrock/global.anthropic.claude-opus-5-5",
+    "aws.bedrock/global.anthropic.claude-sonnet-5-5",
+    "aws.bedrock/global.anthropic.claude-haiku-5-5",
+    "aws.bedrock/global.anthropic.claude-fable-5-1",
+    "aws.bedrock/global.anthropic.claude-opus-5",
+    "aws.bedrock/global.anthropic.claude-sonnet-5",
+];
 
 /// Why a requested model could not be used.
 ///
@@ -227,7 +238,7 @@ impl ModelCatalog {
 
     /// [`Self::from_env`], generalized to a caller-supplied default and
     /// built-in set — the seam `--provider bedrock` uses to fall back to
-    /// [`DEFAULT_BEDROCK_MODEL`] (and no built-ins) instead of the Anthropic
+    /// [`DEFAULT_BEDROCK_MODEL`] and [`BUILTIN_BEDROCK_MODELS`] instead of the Anthropic
     /// ones, while still honoring `POLARIS_CODE_MODEL` / `POLARIS_CODE_MODELS`
     /// exactly like the Anthropic path.
     #[must_use]

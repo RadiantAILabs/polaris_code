@@ -23,8 +23,8 @@ during their build phase, and the shell drains it once the server is ready.
 
 The repository root README lists the other workspace crates.
 
-The framework crate ships four built-in panels behind the `panels` feature
-(on by default): `conversation`, `logs`, `sessions`, `help`. Each has its
+The framework crate ships five built-in panels behind the `panels` feature
+(on by default): `conversation`, `graph`, `logs`, `sessions`, `help`. Each has its
 own contribution plugin so consumers pick the subset they want.
 
 ---
@@ -187,7 +187,9 @@ to coordinate on it:
 | `Alt-1` … `Alt-9`    | Jump directly to panel N.             |
 | `Ctrl-L`             | Toggle Single ↔ Tiled layout.         |
 | `Ctrl-S`             | Toggle selection mode (release/grab mouse capture). |
-| `Ctrl-C` / `Ctrl-Q`  | Quit the TUI.                         |
+| `Ctrl-Q`             | Quit the TUI immediately, from any state. |
+| `Ctrl-C`             | Offer to the focused panel first; quit if it declines (see [panel precedence](#shell-chords-and-panel-precedence)). |
+| `Ctrl-C` while the conversation is scrolled up or browsing | Return it to the live bottom, keeping the draft and any approval; does not count toward quit. |
 
 `LayoutMode::Single` (default) renders one focused panel filling the
 workspace, as a conversation-first layout; `LayoutMode::Tiled` tiles every panel with
@@ -197,7 +199,7 @@ mode is set via `TuiConfig::with_layout`.
 ### Mouse & selection mode
 
 When the host enables mouse capture (`TuiConfig::with_mouse(true)`), scrollable
-panels (the conversation transcript, the log panel) respond to the **mouse
+panels (the conversation transcript, the graph and log panels) respond to the **mouse
 wheel** — three rows per notch — and the app owns the mouse, so the terminal's
 own drag-select + copy are suppressed. Press **`Ctrl-S`** to drop into
 *selection mode*: capture is released back to the terminal so its native
@@ -205,6 +207,25 @@ selection and clipboard work; press `Ctrl-S` again to re-grab the mouse for
 in-app wheel scrolling. With mouse capture off (the default), the terminal
 never loses the mouse, so native selection always works and `Ctrl-S` is a
 no-op.
+
+### Graph panel
+
+The Graph panel draws the graph a host is running as an outline — one node per
+row, branches nested under the choice, loop or parallel group that owns them —
+and lights up the node that is executing, with how long it has run. A `✓`
+marks a node that already ran in the current run; `▸` marks one that is running
+something inside it. It scrolls when the graph is taller than the terminal.
+
+| Keys                              | Action                                  |
+| --------------------------------- | --------------------------------------- |
+| `↑` / `k`, `↓` / `j`              | Scroll one row.                         |
+| `PageUp` / `PageDown`             | Scroll one page.                        |
+| `Home` / `g`, `End` / `G`         | Jump to the top / bottom.               |
+| `f`                               | Follow the running node again.          |
+
+The panel follows the running node until you scroll; `f` hands control back.
+It is a pure renderer: the host converts its own graph into a `GraphModel` and
+reports activity through the `GraphFeed` that `GraphPanelPlugin` publishes.
 
 ### Conversation input editing
 
@@ -235,7 +256,7 @@ it works whether or not your terminal maps Option to Meta.
 | `/` at the start, `@` after a space | Open the command / file-mention popup (see [commands and mentions](#commands-and-file-mentions)). |
 | `Tab`, `↑` / `↓`, `Esc` (popup open) | Accept the highlighted entry, move the highlight, close the popup. |
 | `Esc`                             | Cancel history browsing/search; otherwise deny a pending approval; otherwise interrupt a running turn (when the host supplies an interrupt handle). Never quits. |
-| `Ctrl-C`                          | Deny a pending approval, interrupt a running turn, or clear the draft; press again to quit. |
+| `Ctrl-C`                          | Return from scrollback or browsing to the live bottom, keeping the draft and approval without counting toward quit. At the live bottom: deny a pending approval, clear a draft, then request interruption if available; otherwise quit. A second press within 1.5 s quits unless navigation takes precedence again. |
 
 ### Multi-line prompts
 
@@ -535,12 +556,14 @@ only if the panel returns `EventOutcome::Continue`:
 | Keys | Panel may claim it for | Shell does otherwise |
 | ---- | ---------------------- | -------------------- |
 | `Tab` / `Shift-Tab` | Accepting or cycling a completion; a host-bound command (`with_key_command`) | Cycle panel focus |
-| `Ctrl-C` | Denying an approval, clearing a draft, or requesting interruption through a host-supplied handle | Quit |
+| `Ctrl-C` | Returning to the live bottom from scrollback or browsing, then denying an approval, clearing a draft, or requesting interruption through a host-supplied handle | Quit |
 | `Esc` | Closing a popup or search, denying an approval, or requesting interruption through a host-supplied handle | Nothing — `Esc` never quits |
 
 A panel that claims nothing leaves the shell's own behaviour in place. A panel that
 claims everything still cannot trap you: `Ctrl-Q` and `Alt+N` are inviolable,
-and a second `Ctrl-C` within 1.5 s always falls through to the shell.
+and, after an approval, draft or interrupt action, a second `Ctrl-C` within
+1.5 s falls through to the shell unless scrollback/browsing navigation takes
+precedence again.
 
 ---
 
@@ -552,7 +575,8 @@ which subset to wire in.
 | Plugin                       | What it contributes                                                                                               |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approval dialogs. Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-N` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `with_notifications` opts in to a terminal bell and/or window-title change when an approval opens or a turn ends (see [notifications](#notifications)). `Ctrl-O` reveals hidden messages, expands diff previews, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. |
-| `LogPanelPlugin`             | Tail of `tracing` events fed by an installed `tracing-subscriber` layer.                                          |
+| `GraphPanelPlugin`           | Live graph of what a host is running, drawn from a `GraphModel` with the executing node highlighted. Publishes the `GraphFeed` global a producer writes to; the panel never sees the host's graph engine. |
+| `LogPanelPlugin`             | Tail of `tracing` events fed by an installed `tracing-subscriber` layer. `without_panel()` keeps the subscriber and the shared `LogBuffer` and contributes no tab, for a host that reads the buffer elsewhere (the conversation panel's `Ctrl-O` node timeline does). |
 | `SessionsPanelPlugin`        | Live list of active sessions read from `SessionsAPI`. Depends on `SessionsPlugin`.                                |
 | `HelpPanelPlugin`            | Static keymap + plugin help. The simplest possible example.                                                       |
 
@@ -617,7 +641,7 @@ polaris-tui = { version = "0.1.0", default-features = false }
 
 | Feature   | Default | Enables                                                                 |
 | --------- | ------- | ----------------------------------------------------------------------- |
-| `panels`  | yes     | The four built-in panels and their contribution plugins.                |
+| `panels`  | yes     | The built-in panels and their contribution plugins.                     |
 
 ---
 

@@ -43,6 +43,12 @@
 //! enters an *idle* node (for the agent loop, `receive_user_input`: a new turn)
 //! and increments per working node, so repeated loop iterations stay distinct.
 //!
+//! The Graph tab is fed from the same seam: the plugin also registers
+//! [`graph_view::observe`](crate::graph_view), which reports every node of every
+//! graph — decisions, loops and scopes as well as systems — to the tab's feed as
+//! it starts and finishes. A host with no Graph tab pays one failed resource
+//! lookup per node.
+//!
 //! Token usage is the one signal this can't carry: it lives on the
 //! [`LlmResponse`](polaris::models::llm::LlmResponse) inside `act`, which the
 //! middleware sees only by name. The agent emits a `io_type=tokens` delta there
@@ -365,6 +371,10 @@ impl Plugin for ProgressMiddlewarePlugin {
                 }
             })
         });
+
+        // The same seam also tells the Graph tab which node is running, for
+        // every node kind of every graph run under this chain.
+        crate::graph_view::observe(&mw);
     }
 }
 

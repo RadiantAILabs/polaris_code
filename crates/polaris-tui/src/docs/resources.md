@@ -8,9 +8,15 @@ and [`LocalResource`](polaris::system::resource::LocalResource) shipped by
 > it is listed in that test's `INTERNAL_RESOURCES` allowlist. Adding a new
 > consumer-facing resource without listing it here will fail CI.
 
-_none_ — `polaris-tui` registers no consumer-facing resources. The shell
-communicates through its [`TuiRegistry`](crate::TuiRegistry) and
+The shell communicates through its [`TuiRegistry`](crate::TuiRegistry) and
 [`TuiHandle`](crate::TuiHandle) APIs and owns its terminal state inside a
-background task, not in the resource registry. If that changes, add the resource
-here and document it per the
+background task, not in the resource registry. The one resource it ships is the
+feed a panel plugin shares with whatever produces the panel's data. Document any
+other per the
 [resource documentation standard](https://github.com/RadiantAILabs/polaris_code/blob/main/crates/polaris-tui/docs/reference/resources.md#documentation-standard).
+
+# Panels *(feature `panels`)*
+
+| Resource | Scope | What it exposes |
+|----------|-------|-----------------|
+| [`GraphFeed`](crate::panels::GraphFeed) | Global | The graph the Graph tab draws and what is running in it. A producer `publish`es the graph it normally runs, `announce`s a different one before running it, opens a run with `begin_run` and reports each node with `enter`; guards report completion when dropped, even if the turn is cancelled. The tab reads a `snapshot` only when `version` moved, so a producer's cost is one lock and one atomic increment. Provided by [`GraphPanelPlugin`](crate::panels::GraphPanelPlugin); a headless host installs none, so a producer must tolerate its absence. Global because a shell shows one graph. |

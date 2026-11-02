@@ -19,7 +19,7 @@ into it.**
 
 | Layer | Name | Owns |
 |-------|------|------|
-| **2** | Panels | the in-process panels plugins contribute (`conversation`, `sessions`, `logs`, `help`) |
+| **2** | Panels | the in-process panels plugins contribute (`conversation`, `graph`, `sessions`, `logs`, `help`) |
 | **1** | Shell & Panel Contract | the TUI runtime, the `TuiPanel` trait, the `TuiRegistry` / `TuiHandle` APIs, and the layout / nav / event / widget primitives |
 
 The whole crate turns on one composability seam — the `TuiPanel` trait plus the
@@ -55,15 +55,16 @@ logs; it only defines the seam they meet on.
 ## Layer 2: Panels
 
 **Files:** `src/panels/conversation.rs`, `src/panels/sessions.rs`,
-`src/panels/logs.rs`, `src/panels/help.rs`, the private conversation
+`src/panels/logs.rs`, `src/panels/help.rs`, `src/panels/graph/` (the Graph
+panel, its renderer-side `GraphModel`, and the `GraphFeed` a host writes), the private conversation
 rendering helpers in `src/transcript/`, and `src/commands/` — the host ↔
 conversation-panel contract for slash commands, `@` mention completion and
 composer attachments (wire protocol, `CompletionSource`, `AttachmentSource`,
 mention syntax, popup state machine).
 
 The swappable, optional panels contributed through the Layer-1 registry:
-`ConversationPanelPlugin`, `SessionsPanelPlugin`, `LogPanelPlugin`, and
-`HelpPanelPlugin`. Each is a self-contained plugin that registers one
+`ConversationPanelPlugin`, `SessionsPanelPlugin`, `LogPanelPlugin`,
+`GraphPanelPlugin`, and `HelpPanelPlugin`. Each is a self-contained plugin that registers one
 `TuiPanel`. A host application picks the panels it wants; downstream crates add
 their own (e.g. ontrace's inspect/SPARQL panels) the same way.
 

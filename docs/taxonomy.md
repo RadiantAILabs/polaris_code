@@ -67,7 +67,8 @@ control flow.
 
 **Files:** `src/tools/code.rs` (`CodeToolsPlugin`), `src/tools/code_graph.rs`
 (`CodeGraphPlugin`), `src/tools/memory.rs` (`MemoryToolsPlugin`),
-`src/tools/web.rs` (`WebToolsPlugin`), `src/progress.rs` (`ProgressMiddlewarePlugin`), `src/terminal/`
+`src/tools/web.rs` (`WebToolsPlugin`), `src/progress.rs` (`ProgressMiddlewarePlugin`),
+`src/graph_view.rs` (`GraphViewPlugin`, feeding the Graph tab; see [`graph-tab.md`](graph-tab.md)), `src/terminal/`
 (`CommandRegistry`, `CommandDispatch`, `WorkspaceFiles`, `LiveTranscript`),
 `src/exec/` (`ExecIOPlugin`).
 
@@ -82,7 +83,9 @@ The swappable capabilities this app contributes as Polaris plugins:
   pages as readable text (`WebTools`: `web_fetch`; see
   [`web-access.md`](web-access.md)).
 - **Instrumentation.** `ProgressMiddlewarePlugin` bridges graph execution events
-  to the conversation panel.
+  to the conversation panel and, through the same middleware, to the Graph tab:
+  `GraphViewPlugin` converts the running graph into the renderer-side model
+  `polaris-tui` draws, so the UI never sees the graph engine.
 - **Terminal policy.** `src/terminal/` supplies what `polaris-tui`'s
   conversation panel deliberately leaves to its host: the `/command` set and
   its execution (`CommandRegistry`, run by the `CommandDispatch` `IOProvider`

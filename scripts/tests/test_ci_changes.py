@@ -49,6 +49,8 @@ class CiChangesTests(unittest.TestCase):
         self.commit("crates/polaris_code/README.md", "package documentation\n")
         self.commit("evals/README.md", "evaluation instructions\n")
         self.commit("evals/results/report.md", "evaluation report\n")
+        self.commit("evals/reproduce/swebench-opus/compare.py", "print()\n")
+        self.commit("evals/reproduce/swebench-opus/instances.txt", "django__django-16145\n")
         head = self.commit("assets/polaris-logo.svg", "<svg/>\n")
         self.assertFalse(self.push_requires_ci(head))
 

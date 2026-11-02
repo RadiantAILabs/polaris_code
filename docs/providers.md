@@ -144,7 +144,12 @@ override them. `--list-models` prints the result.
 | --- | --- | --- |
 | `anthropic` | `anthropic/claude-sonnet-5-5` | Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1, and the earlier `claude-opus-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5` |
 | `openai` | `openai/gpt-5.5` | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-6-luna` |
-| `bedrock` | `aws.bedrock/global.anthropic.claude-sonnet-5` | none: inference-profile ids vary by account and region, so declare yours |
+| `bedrock` | `aws.bedrock/global.anthropic.claude-sonnet-5-5` | the `global.` profiles of Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1, `claude-opus-5` and `claude-sonnet-5`; declare regional (`us.`, `eu.`, ...) profiles yourself |
+
+The built-in Bedrock models are `global.` cross-region inference profiles, so
+AWS may process your prompts in a region other than your home region. To keep
+processing within a geography, declare `us.` or `eu.` profiles with
+`POLARIS_CODE_MODELS`.
 
 The OpenAI ids are the ones the framework's built-in price table lists. Every
 Anthropic id is in that table except `claude-haiku-5-5`, so `--max-cost-usd` on

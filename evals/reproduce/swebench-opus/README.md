@@ -1,6 +1,6 @@
 # Reproduce the SWE-bench Opus comparison
 
-This kit runs the same 150 public SWE-bench Verified tasks through two arms:
+This kit runs all 500 public SWE-bench Verified tasks through two arms:
 
 - `polaris-code` with the `gates` composition policy, `careful` topology
   intent, the generic domain, and the single-loop arm; and
@@ -77,7 +77,7 @@ A relative `OUT_DIR` is taken from the directory you run the script from; the
 default is `out/<name>` at the repository root. Run directories are immutable
 and must not already contain a prior run.
 
-## Run all 150 tasks
+## Run all 500 tasks
 
 The default `INSTANCES_FILE` is this directory's [instances.txt](instances.txt).
 The polaris-code script requires `POLARIS_CODE_BIN` and `GRADER_PYTHON`; the
@@ -85,10 +85,16 @@ Claude Code script requires `GRADER_PYTHON` and defaults `CLAUDE_BIN` to
 `claude` on `PATH`.
 
 ```bash
-export API_COST_CEILING_USD=150  # safety ceiling, not an expected bill
+export API_COST_CEILING_USD=500  # safety ceiling, not an expected bill
 evals/reproduce/swebench-opus/run-polaris-code.sh
 evals/reproduce/swebench-opus/run-claude-code.sh
 ```
+
+Each task has its own SWE-bench image, about 2.5 GB on average and up to 11 GB,
+so all 500 need over 1 TB of disk. To run on less, split the task list into
+chunks, give each chunk its own `INSTANCES_FILE` and `OUT_DIR`, and remove a
+chunk's images once both arms have run and graded it. Anonymous Docker Hub pulls
+are rate-limited, so `docker login` first for a large run.
 
 Defaults may be overridden with:
 
@@ -131,6 +137,13 @@ To print both runs side by side, with the token ratio:
 
 ```bash
 python3 evals/reproduce/swebench-opus/compare.py out/polaris-code out/claude-code
+```
+
+For a chunked run, pass each arm's run directories separated by commas:
+
+```bash
+python3 evals/reproduce/swebench-opus/compare.py \
+    out/pc-1,out/pc-2,out/pc-3 out/cc-1,out/cc-2,out/cc-3
 ```
 
 Official grading artifacts live below each run's `grader/` directory. Keep the

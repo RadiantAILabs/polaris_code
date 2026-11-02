@@ -17,9 +17,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
+use parking_lot::Mutex;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io::{self, Stdout};
+use std::io::{self, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -40,7 +41,84 @@ impl RuntimeShutdown {
     }
 }
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term<W> = Terminal<CrosstermBackend<W>>;
+
+/// Input redraws run independently of panel polling. Applying every event in
+/// order preserves scroll distance and direction changes, while drawing their
+/// combined result avoids one full-screen render per wheel/trackpad report.
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+struct FrameSchedule {
+    next: tokio::time::Instant,
+    dirty: bool,
+}
+
+impl FrameSchedule {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            next: now + FRAME_INTERVAL,
+            dirty: false,
+        }
+    }
+
+    fn request(&mut self) {
+        self.dirty = true;
+    }
+
+    fn rendered(&mut self, now: tokio::time::Instant) {
+        self.next = now + FRAME_INTERVAL;
+        self.dirty = false;
+    }
+}
+
+/// What wakes [`event_loop`]: the clock, the tick timer and terminal input.
+/// [`Live`] is the real set; a test supplies its own to run the production loop
+/// in controlled time. Methods take `&self` so one `select!` can wait on all of
+/// them at once.
+trait LoopSource {
+    /// The current time, against which frames are scheduled.
+    fn now(&self) -> tokio::time::Instant;
+    /// Complete once [`now`](Self::now) reaches `at`.
+    async fn sleep_until(&self, at: tokio::time::Instant);
+    /// Complete at each tick of the shell's wall clock.
+    async fn tick(&self);
+    /// The next terminal event.
+    async fn next_event(&self) -> io::Result<CtEvent>;
+}
+
+/// The real clock, tick timer and keyboard.
+struct Live {
+    tick: Mutex<tokio::time::Interval>,
+}
+
+impl Live {
+    fn new(tick_rate: Duration) -> Self {
+        let mut tick = tokio::time::interval(tick_rate);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            tick: Mutex::new(tick),
+        }
+    }
+}
+
+impl LoopSource for Live {
+    fn now(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+
+    async fn sleep_until(&self, at: tokio::time::Instant) {
+        tokio::time::sleep_until(at).await;
+    }
+
+    async fn tick(&self) {
+        // The lock is held only inside one poll, never across an await.
+        std::future::poll_fn(|cx| self.tick.lock().poll_tick(cx).map(|_| ())).await;
+    }
+
+    async fn next_event(&self) -> io::Result<CtEvent> {
+        next_terminal_event().await
+    }
+}
 
 /// The modes guard restores the terminal on errors, panic and task cancellation.
 pub(crate) async fn run(
@@ -67,24 +145,25 @@ pub(crate) async fn run(
         &config,
         shutdown,
         requests,
+        &Live::new(config.tick_rate),
     )
     .await;
     result.and(modes.suspend())
 }
 
-async fn event_loop(
-    terminal: &mut Term,
+async fn event_loop<W: Write>(
+    terminal: &mut Term<W>,
     modes: &mut TerminalModes,
     panels: Vec<Box<dyn TuiPanel>>,
     config: &TuiConfig,
     mut shutdown: RuntimeShutdown,
     mut requests: mpsc::Receiver<TerminalRequest>,
+    source: &impl LoopSource,
 ) -> io::Result<()> {
     let mut shell = AppShell::new(panels, config);
     shell.init_panels();
-    let mut tick = tokio::time::interval(config.tick_rate);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     terminal.draw(|frame| shell.render(frame))?;
+    let mut frames = FrameSchedule::new(source.now());
     loop {
         if *shutdown.rx.borrow() {
             break;
@@ -108,8 +187,21 @@ async fn event_loop(
                 shell.tick();
                 deliver_notifications(modes, &mut shell);
                 terminal.draw(|frame| shell.render(frame))?;
+                frames.rendered(source.now());
             }
-            event = next_terminal_event() => {
+            // A due frame wins over more input, so continuous wheel traffic
+            // cannot starve painting. Shutdown and child handoffs stay first.
+            _ = source.sleep_until(frames.next), if frames.dirty => {
+                terminal.draw(|frame| shell.render(frame))?;
+                frames.rendered(source.now());
+            }
+            _ = source.tick() => {
+                shell.tick();
+                if matches!(shell.handle_event(TuiEvent::Tick), ShellOutcome::Quit) { break; }
+                deliver_notifications(modes, &mut shell);
+                frames.request();
+            }
+            event = source.next_event() => {
                 match event {
                     Ok(ct) => {
                         if let Some(event) = translate_event(ct) {
@@ -126,18 +218,12 @@ async fn event_loop(
                                 }
                                 ShellOutcome::Continue => {}
                             }
+                            frames.request();
                         }
                     }
                     Err(err) => return Err(err),
                 }
                 deliver_notifications(modes, &mut shell);
-                terminal.draw(|frame| shell.render(frame))?;
-            }
-            _ = tick.tick() => {
-                shell.tick();
-                if matches!(shell.handle_event(TuiEvent::Tick), ShellOutcome::Quit) { break; }
-                deliver_notifications(modes, &mut shell);
-                terminal.draw(|frame| shell.render(frame))?;
             }
         }
     }
@@ -186,7 +272,7 @@ fn translate_event(event: CtEvent) -> Option<TuiEvent> {
     }
 }
 
-fn apply_mouse_capture(terminal: &mut Term, capture: bool) -> io::Result<()> {
+fn apply_mouse_capture<W: Write>(terminal: &mut Term<W>, capture: bool) -> io::Result<()> {
     if capture {
         terminal.backend_mut().execute(EnableMouseCapture)?;
     } else {
@@ -468,10 +554,327 @@ async fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panel::EventOutcome;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
+    use ratatui::layout::Rect;
+    use ratatui::{Frame, TerminalOptions, Viewport};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn input_bursts_share_one_frame_without_extending_the_deadline() {
+        let start = tokio::time::Instant::now();
+        let mut frames = FrameSchedule::new(start);
+        for _ in 0..100 {
+            frames.request();
+        }
+        assert!(frames.dirty);
+        assert_eq!(frames.next, start + FRAME_INTERVAL);
+        frames.rendered(frames.next);
+        assert!(!frames.dirty);
+        assert_eq!(frames.next, start + FRAME_INTERVAL * 2);
+        // After an idle period, a request is already due: no tick-sized wait.
+        frames.request();
+        assert!(frames.next < start + Duration::from_secs(1));
+    }
+
+    /// What the probe panel was shown, in the order the loop delivered it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Seen {
+        Up(u16),
+        Down(u16),
+        Tick,
+    }
+
+    #[derive(Default)]
+    struct ProbeLog {
+        seen: Vec<Seen>,
+        /// How many events the panel had seen at each paint, the loop's first
+        /// paint included.
+        painted_after: Vec<usize>,
+    }
+
+    /// A panel that records its input and its paints for the test to read.
+    struct Probe(Arc<Mutex<ProbeLog>>);
+
+    impl TuiPanel for Probe {
+        fn id(&self) -> &str {
+            "probe"
+        }
+
+        fn handle_event(&mut self, event: &TuiEvent) -> EventOutcome {
+            let seen = match event {
+                TuiEvent::Mouse(m) if m.kind == MouseEventKind::ScrollUp => Seen::Up(m.column),
+                TuiEvent::Mouse(m) if m.kind == MouseEventKind::ScrollDown => Seen::Down(m.column),
+                TuiEvent::Tick => Seen::Tick,
+                _ => return EventOutcome::Continue,
+            };
+            self.0.lock().seen.push(seen);
+            EventOutcome::Consumed
+        }
+
+        fn render(&mut self, _frame: &mut Frame<'_>, _area: Rect) {
+            let mut log = self.0.lock();
+            let seen = log.seen.len();
+            log.painted_after.push(seen);
+        }
+    }
+
+    struct FakeTime {
+        start: tokio::time::Instant,
+        elapsed: Duration,
+        /// Time that passes as each queued event is delivered, so that one poll
+        /// of the loop can span many frames.
+        per_event: Duration,
+        events: VecDeque<CtEvent>,
+        ticks: usize,
+    }
+
+    /// Time and input for the production loop, controlled by the test. Nothing
+    /// here waits: each future is ready or pending according to this state, and
+    /// the test changes the state between polls of the loop.
+    #[derive(Clone)]
+    struct Fake(Rc<RefCell<FakeTime>>);
+
+    impl Fake {
+        fn new() -> Self {
+            Self(Rc::new(RefCell::new(FakeTime {
+                start: tokio::time::Instant::now(),
+                elapsed: Duration::ZERO,
+                per_event: Duration::ZERO,
+                events: VecDeque::new(),
+                ticks: 0,
+            })))
+        }
+
+        fn advance(&self, by: Duration) {
+            self.0.borrow_mut().elapsed += by;
+        }
+
+        fn send(&self, event: CtEvent) {
+            self.0.borrow_mut().events.push_back(event);
+        }
+
+        fn fire_tick(&self) {
+            self.0.borrow_mut().ticks += 1;
+        }
+    }
+
+    impl LoopSource for Fake {
+        fn now(&self) -> tokio::time::Instant {
+            let time = self.0.borrow();
+            time.start + time.elapsed
+        }
+
+        async fn sleep_until(&self, at: tokio::time::Instant) {
+            std::future::poll_fn(|_| {
+                if self.now() >= at {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+
+        async fn tick(&self) {
+            std::future::poll_fn(|_| {
+                let mut time = self.0.borrow_mut();
+                if time.ticks > 0 {
+                    time.ticks -= 1;
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+
+        async fn next_event(&self) -> io::Result<CtEvent> {
+            std::future::poll_fn(|_| {
+                let mut time = self.0.borrow_mut();
+                match time.events.pop_front() {
+                    Some(event) => {
+                        let per_event = time.per_event;
+                        time.elapsed += per_event;
+                        Poll::Ready(Ok(event))
+                    }
+                    None => Poll::Pending,
+                }
+            })
+            .await
+        }
+    }
+
+    /// The production [`event_loop`] over a probe panel, with fake time, fake
+    /// input and a terminal that writes to memory.
+    struct Rig {
+        fake: Fake,
+        log: Arc<Mutex<ProbeLog>>,
+        shutdown: watch::Sender<bool>,
+        event_loop: Pin<Box<dyn Future<Output = io::Result<()>>>>,
+    }
+
+    impl Rig {
+        /// Start the loop and run it until it first waits.
+        fn start() -> Self {
+            let fake = Fake::new();
+            let log = Arc::new(Mutex::new(ProbeLog::default()));
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let panels: Vec<Box<dyn TuiPanel>> = vec![Box::new(Probe(log.clone()))];
+            let source = fake.clone();
+            let event_loop = Box::pin(async move {
+                let backend = CrosstermBackend::new(Vec::new());
+                let options = TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+                };
+                let mut terminal = Terminal::with_options(backend, options)?;
+                let mut modes = TerminalModes::default();
+                let (_requests_tx, requests) = mpsc::channel(1);
+                event_loop(
+                    &mut terminal,
+                    &mut modes,
+                    panels,
+                    &TuiConfig::default(),
+                    RuntimeShutdown::new(shutdown_rx),
+                    requests,
+                    &source,
+                )
+                .await
+            });
+            let mut rig = Self {
+                fake,
+                log,
+                shutdown,
+                event_loop,
+            };
+            assert!(rig.step().is_pending());
+            assert_eq!(rig.paints(), 1, "the loop paints once before any input");
+            rig
+        }
+
+        /// Poll the loop once. It keeps running while any input or timer is
+        /// ready, so this returns when the loop would wait or has finished.
+        fn step(&mut self) -> Poll<io::Result<()>> {
+            self.event_loop
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        }
+
+        fn paints(&self) -> usize {
+            self.log.lock().painted_after.len()
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.log.lock().seen.clone()
+        }
+    }
+
+    fn wheel(kind: MouseEventKind, id: u16) -> CtEvent {
+        CtEvent::Mouse(MouseEvent {
+            kind,
+            column: id,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn a_wheel_burst_is_applied_in_order_and_painted_once() {
+        let mut rig = Rig::start();
+        // Keep the direction change: netting these events before delivering
+        // them would lose clamping and tail-following at either end.
+        let expected: Vec<Seen> = (0..100)
+            .map(|id| {
+                if id < 80 {
+                    Seen::Up(id)
+                } else {
+                    Seen::Down(id)
+                }
+            })
+            .collect();
+        for seen in &expected {
+            rig.fake.send(match *seen {
+                Seen::Up(id) => wheel(MouseEventKind::ScrollUp, id),
+                Seen::Down(id) => wheel(MouseEventKind::ScrollDown, id),
+                Seen::Tick => unreachable!("the burst has no ticks"),
+            });
+        }
+        assert!(rig.step().is_pending());
+        assert_eq!(rig.seen(), expected, "every report arrives, in order");
+        assert_eq!(rig.paints(), 1, "no paint before the frame is due");
+
+        rig.fake.advance(FRAME_INTERVAL);
+        assert!(rig.step().is_pending());
+        assert_eq!(rig.paints(), 2, "100 reports need one full-screen paint");
+        assert_eq!(rig.log.lock().painted_after[1], 100);
+
+        rig.fake.advance(Duration::from_secs(1));
+        assert!(rig.step().is_pending());
+        assert_eq!(rig.paints(), 2, "an idle loop does not repaint");
+    }
+
+    #[test]
+    fn continuous_input_is_painted_while_it_keeps_arriving() {
+        let mut rig = Rig::start();
+        // One report every 5 ms for half a second, all queued before the loop
+        // runs. The loop never idles, so only its own priority between a due
+        // frame and more input can interleave paints with the reports.
+        let per_event = Duration::from_millis(5);
+        rig.fake.0.borrow_mut().per_event = per_event;
+        for id in 0..100 {
+            rig.fake.send(wheel(MouseEventKind::ScrollUp, id));
+        }
+        assert!(rig.step().is_pending());
+        assert_eq!(rig.seen().len(), 100);
+
+        let painted = rig.log.lock().painted_after.clone();
+        let mid_stream = painted.iter().filter(|&&n| 0 < n && n < 100).count();
+        let at_least = (per_event * 100).as_millis() / (2 * FRAME_INTERVAL.as_millis());
+        assert!(
+            mid_stream as u128 >= at_least,
+            "{mid_stream} paints while input arrived, expected at least {at_least}: {painted:?}"
+        );
+        assert!(
+            painted.len() < 100 / 2,
+            "100 reports must not paint per report: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_tick_asks_for_a_frame() {
+        let mut rig = Rig::start();
+        rig.fake.fire_tick();
+        assert!(rig.step().is_pending());
+        assert_eq!(rig.seen(), [Seen::Tick]);
+        assert_eq!(rig.paints(), 1, "the frame is not due yet");
+
+        rig.fake.advance(FRAME_INTERVAL);
+        assert!(rig.step().is_pending());
+        assert_eq!(rig.paints(), 2);
+        assert_eq!(rig.log.lock().painted_after[1], 1);
+    }
+
+    #[test]
+    fn shutdown_wins_over_a_due_frame() {
+        let mut rig = Rig::start();
+        rig.fake.send(wheel(MouseEventKind::ScrollUp, 0));
+        assert!(rig.step().is_pending());
+        // The frame is now due and input is waiting, but shutdown was asked for.
+        rig.fake.advance(FRAME_INTERVAL);
+        rig.fake.send(wheel(MouseEventKind::ScrollUp, 1));
+        rig.shutdown.send(true).unwrap();
+        assert!(matches!(rig.step(), Poll::Ready(Ok(()))));
+        assert_eq!(rig.paints(), 1, "no paint after shutdown is asked for");
+    }
 
     #[test]
     fn translates_key_mouse_and_resize() {

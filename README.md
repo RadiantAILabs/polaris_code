@@ -19,18 +19,83 @@
   <a href="#get-started"><strong>Get started</strong></a> ·
   <a href="https://github.com/RadiantAILabs/polaris_code/releases"><strong>Releases</strong></a> ·
   <a href="#documentation"><strong>Documentation</strong></a> ·
-  <a href="#benchmark"><strong>Benchmark</strong></a>
+  <a href="#benchmark"><strong>Benchmark</strong></a> ·
+  <a href="https://github.com/RadiantAILabs/polaris"><strong>Polaris framework</strong></a>
 </p>
 
-Polaris Code is a terminal coding agent written in Rust. It reads your
+<p align="center"><img src="docs/figures/agent-graph/agent-graph.svg" alt="Animated graph of the Polaris Code agent: Input, Load docs, Steer, Compact, Summarize, Prepare, Model, Retry, Fail, Review, Run tools and Answer, with a token moving between them" width="100%"></p>
+
+<p align="center"><em>The whole graph is configurable: plugins add or replace steps, or you can edit the graph directly in Rust.</em></p>
+
+Polaris Code is a terminal coding agent written in Rust, built on the
+[Polaris](https://github.com/RadiantAILabs/polaris) agent framework. It reads your
 project, edits code, and runs approved commands through Anthropic, OpenAI,
 any OpenAI-compatible server, or AWS Bedrock. Model providers, tools, memory, and agent workflows compose as
 plugins, and every decision and tool call is recorded in the session graph.
 
-In a comparison on 150 SWE-bench Verified tasks, Polaris Code solved
-136 tasks using **16% of the tokens** and **less than half the estimated
-cost** of Claude Code with the same model. See the
+On all 500 SWE-bench Verified tasks, Polaris Code matched Claude Code's
+solve rate with the same model, using **6.4x fewer tokens**, at **2.4x lower
+cost**, and finishing tasks **2.4x faster**. See the
 [benchmark and reproduction guide](#benchmark) for the measurements and scope.
+
+## Why Polaris Code
+
+- **Composable by design.** Replace model providers, tools, memory, or graph
+  steps through declared plugin contracts.
+- **Token efficient.** Plan the task and project the context needed for each
+  step. The [benchmark](#benchmark) records a comparison you can reproduce.
+- **Native Rust.** One executable, with no Node runtime, daemon, or telemetry.
+- **Inspectable sessions.** Trace decisions, tool calls, evidence, and
+  outcomes. Review changes and rewind a session.
+- **Explicit permissions.** Interactive edits and commands ask first;
+  unattended execution uses explicit grants.
+- **Your provider.** Connect through the Anthropic API, the OpenAI API, any
+  OpenAI-compatible server, or AWS Bedrock.
+
+## Benchmark
+
+All 500 SWE-bench Verified tasks, Claude Opus 5.5 on AWS Bedrock, one run per
+task for each agent:
+
+| | Polaris Code | Claude Code | Comparison |
+| --- | ---: | ---: | --- |
+| Solved | 451 / 500 (90.2%) | 455 / 500 (91.0%) | Same within chance (p = 0.56) |
+| Total tokens | 24,584,288 | 156,735,519 | **6.4x token savings** |
+| Cost (USD, estimated) | 44.52 | 108.34 | **2.4x cheaper** |
+| Median task time | 34 s | 82 s | **2.4x faster** |
+
+```text
+MEASURE           POLARIS CODE       CLAUDE CODE
+tasks solved      █████████░ 90.2%   █████████░ 91.0%
+total tokens      ██░░░░░░░░ 24.6M   ██████████ 156.7M
+cost (estimated)  ████░░░░░░ $44.52  ██████████ $108.34
+median task time  ████░░░░░░ 34 s    ██████████ 82 s
+```
+
+The full results are published separately.
+This repository contains the code and pinned inputs to re-run the comparison:
+see the [reproduction guide](evals/reproduce/swebench-opus/README.md).
+
+By repository, Polaris Code used between 3% and 24% of Claude Code's tokens
+(task counts in brackets):
+
+```text
+flask (1)          ▊░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  3%
+requests (8)       ███▌░░░░░░░░░░░░░░░░░░░░░░░░░░  12%
+xarray (22)        ███▋░░░░░░░░░░░░░░░░░░░░░░░░░░  12%
+django (231)       ████▏░░░░░░░░░░░░░░░░░░░░░░░░░  14%
+scikit-learn (32)  ████▋░░░░░░░░░░░░░░░░░░░░░░░░░  16%
+matplotlib (34)    ████▉░░░░░░░░░░░░░░░░░░░░░░░░░  16%
+sympy (75)         ████▉░░░░░░░░░░░░░░░░░░░░░░░░░  16%
+pylint (10)        █████░░░░░░░░░░░░░░░░░░░░░░░░░  17%
+seaborn (2)        █████▌░░░░░░░░░░░░░░░░░░░░░░░░  18%
+sphinx (44)        █████▋░░░░░░░░░░░░░░░░░░░░░░░░  19%
+astropy (22)       ██████▌░░░░░░░░░░░░░░░░░░░░░░░  21%
+pytest (19)        ███████▏░░░░░░░░░░░░░░░░░░░░░░  24%
+```
+
+The figures are drawn with [Glyph kit](https://github.com/alextraykov/glyph-kit)
+from the specs in [`docs/figures/swebench-500/`](docs/figures/swebench-500/).
 
 ## Get started
 
@@ -142,38 +207,6 @@ saved per project and ends when the reviewed file changes. See
 [startup configuration](docs/configuration.md#project-files-and-trust) and
 [MCP servers](docs/mcp.md#project-servers-and-trust).
 
-## Why Polaris Code
-
-- **Composable by design.** Replace model providers, tools, memory, or graph
-  steps through declared plugin contracts.
-- **Token efficient.** Plan the task and project the context needed for each
-  step. The [benchmark](#benchmark) records a comparison you can reproduce.
-- **Native Rust.** One executable, with no Node runtime, daemon, or telemetry.
-- **Inspectable sessions.** Trace decisions, tool calls, evidence, and
-  outcomes. Review changes and rewind a session.
-- **Explicit permissions.** Interactive edits and commands ask first;
-  unattended execution uses explicit grants.
-- **Your provider.** Connect through the Anthropic API, the OpenAI API, any
-  OpenAI-compatible server, or AWS Bedrock.
-
-## Benchmark
-
-150 SWE-bench Verified tasks, Claude Opus 5.5 on AWS Bedrock, one run per task
-for each agent:
-
-| | Polaris Code | Claude Code |
-| --- | ---: | ---: |
-| Solved | 136 / 150 | 135 / 150 |
-| Total tokens | 8,179,965 | 50,052,324 |
-| Cost (USD, estimated) | 14.20 | 32.96 |
-| Typical task time | ~30 s | ~110 s |
-
-Tokens count input, output, cache read, and cache write. Bedrock does not return
-a measured cost, so both costs are list-price estimates. These measurements
-describe this run and task sample. The full results are published separately.
-This repository contains the code and pinned inputs to re-run the comparison:
-see the [reproduction guide](evals/reproduce/swebench-opus/README.md).
-
 ## How it works
 
 The interactive terminal and headless command drive the same Polaris session
@@ -185,6 +218,12 @@ graph records their decisions and outcomes.
 Agent behavior is a graph of typed Rust systems. Replace a step or rewire a
 workflow to try another approach. The [design philosophy](docs/philosophy.md)
 explains the architecture.
+
+The animation at the top shows this graph. Its 12 boxes group the systems
+that `CodeAgent::build` adds, and a token walks one short task through them.
+It is drawn with [Glyph kit](https://github.com/alextraykov/glyph-kit); to
+rebuild it, run `node animate-svg.mjs <glyph-kit dir> agent-graph.mjs agent-graph.svg`
+in [`docs/figures/agent-graph/`](docs/figures/agent-graph/).
 
 ## Documentation
 
@@ -209,7 +248,7 @@ Browse [`docs/`](docs/) for the full documentation.
 
 ```toml
 [dependencies]
-polaris_code = "0.1.1"
+polaris_code = "0.2.0"
 ```
 
 Compose model, tool, and I/O plugins on a Polaris `Server`, create a session,
@@ -253,7 +292,8 @@ platform requirements and the tap handoff.
 | `crates/polaris-tui-examples` | Example TUI binaries. |
 | `evals/` | Evaluation harness, dataset packs, and external-agent baselines. |
 
-All crates inherit the single crates.io `polaris-ai` dependency from the root
+All crates inherit the single crates.io `polaris-ai` dependency
+([source](https://github.com/RadiantAILabs/polaris)) from the root
 `Cargo.toml`.
 
 ## Contributing

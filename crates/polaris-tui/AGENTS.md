@@ -15,7 +15,9 @@ terminal, focus, layout, and global key chords. It is one crate in the
   `tests/api_catalog.rs`, `tests/plugin_catalog.rs`, and
   `tests/resource_catalog.rs`.
 - `docs/prompt-history-editor.md` and `docs/session-rewind.md`: feature notes.
-- `src/panels/`: the built-in `conversation`, `logs`, `sessions`, and `help` panels.
+- `src/panels/`: the built-in `conversation`, `graph`, `logs`, `sessions`, and `help` panels.
+  The graph panel is a pure renderer of a host-supplied `GraphModel`; keep graph
+  engine types out of this crate.
 
 ## Build and test
 

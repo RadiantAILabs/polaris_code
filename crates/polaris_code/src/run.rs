@@ -130,7 +130,7 @@ impl StatusEmitter {
     ///
     /// The same `io_type = "error"` row the interactive front end already
     /// uses for a refused session switch, so a driver-level failure lands
-    /// where the user is looking rather than only in the Logs panel.
+    /// where the user is looking rather than only in the tracing log.
     pub async fn error(&self, text: &str) {
         self.emit(text, "error").await;
     }

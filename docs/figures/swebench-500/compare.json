@@ -1,0 +1,43 @@
+{
+ "kind": "compare",
+ "title": "Polaris Code vs Claude Code, same model",
+ "intent": "Same solve rate for a fraction of the tokens, cost and time.",
+ "source": "SWE-bench Verified, all 500 tasks, Claude Opus 5.5 on AWS Bedrock, 2026-10-29",
+ "data": [
+  {
+   "label": "tasks solved",
+   "a": 0.902,
+   "aText": "90.2%",
+   "b": 0.91,
+   "bText": "91.0%"
+  },
+  {
+   "label": "total tokens",
+   "a": 0.15685205342638384,
+   "aText": "24.6M",
+   "b": 1,
+   "bText": "156.7M"
+  },
+  {
+   "label": "cost (estimated)",
+   "a": 0.41091585287067234,
+   "aText": "$44.52",
+   "b": 1,
+   "bText": "$108.34"
+  },
+  {
+   "label": "median task time",
+   "a": 0.41595092024539876,
+   "aText": "34 s",
+   "b": 1,
+   "bText": "82 s"
+  }
+ ],
+ "options": {
+  "headers": [
+   "MEASURE",
+   "POLARIS CODE",
+   "CLAUDE CODE"
+  ]
+ }
+}
