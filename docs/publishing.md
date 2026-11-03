@@ -131,7 +131,7 @@ the required status check in branch protection. Documentation-only pushes do
 not cancel source builds already in progress. A newer source build cancels
 the older job for the same platform and branch; tagged jobs are retained.
 
-The workspace consumes the published `polaris-ai` 0.7.0 dependency rather than
+The workspace consumes the published `polaris-ai` 0.8.0 dependency rather than
 a developer's sibling checkout. The published 0.6.0 package lacks graph APIs
 that this workspace already uses. Every workspace crate still inherits the
 single root dependency.
@@ -175,7 +175,7 @@ To regenerate it locally after downloading both archives and their checksum
 files:
 
 ```bash
-python3 scripts/homebrew_formula.py 0.2.0 RadiantAILabs/polaris_code dist
+python3 scripts/homebrew_formula.py 0.3.0 RadiantAILabs/polaris_code dist
 ```
 
 The generator requires Python 3.11 or newer and rejects missing platforms and

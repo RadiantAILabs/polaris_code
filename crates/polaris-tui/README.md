@@ -696,7 +696,7 @@ To disable all built-ins and ship only the framework:
 
 ```toml
 [dependencies]
-polaris-tui = { version = "0.1.0", default-features = false }
+polaris-tui = { version = "0.2.0", default-features = false }
 ```
 
 ---

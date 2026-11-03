@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "futures",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tui-examples"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "polaris-ai",
  "polaris-tui",
@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "polaris_code"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3221,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "polaris_cosmos"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "polaris-ai",
@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "polaris_ontrace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "chrono",

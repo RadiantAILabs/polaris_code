@@ -5,10 +5,15 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
-Requires `polaris-tui` 0.1.2.
+## [0.3.0] - 2026-11-03
+
+Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.
 
 ### Added
-- Framed command approvals: `polaris-tui` exports `APPROVAL_SUBJECT` and `APPROVAL_CONTEXT`; a prompt carrying them shows the command once above the input, with the answers pinned under it and the full prompt behind `?`. `confirmed` and `approval_choice` still carry the answer, and `APPROVAL_CONTEXT` is a display hint only. With `APPROVAL_SUBJECT` the panel refuses a confirming answer until the whole command has been drawn, and accepts only a denial for a command over 64 KiB.
+- Approval picker: an approval request opens a picker in place of the input, with the command once and a numbered list of answers. One key press answers (a digit, the answer's own key, or `Enter`); `Esc` and `Ctrl-C` deny; `Tab` adds a one-line note; `?` shows the full prompt. Text typed while the picker is open is dropped, so it can neither answer the approval nor start a turn.
+- `polaris-tui` exports `APPROVAL_SUBJECT`, `APPROVAL_CONTEXT` and `APPROVAL_NOTE`. With `APPROVAL_SUBJECT` the panel refuses a confirming answer until the whole command has been drawn, and accepts only a denial for a command over 64 KiB. `APPROVAL_CONTEXT` is a display hint only; `confirmed` and `approval_choice` still carry the answer.
+- Approval notes: a note on an allow is sent as `approval_note`, recorded with the human decision, and added to that call's tool result as `User note on approval: ...` (control characters removed, cut to 1 KiB, secrets redacted). A note on a denial is the reason (`deny: <note>`). A note never changes the grant, and session grants do not carry it to later calls.
+- `HumanApproval`, an optional global resource, and `InteractiveApprovalPlugin`, which provides it. Interactive runs install the plugin; headless runs do not. With no approver, a call that needs a human is denied (`Permission denied: no approver is registered`), never allowed.
 - Collapsed tool output: a finished `tool` block may carry a one-line `summary`, shown in place of the body until `Ctrl-O`. `run_command` blocks show shell text and keep the executor's JSON as `document` metadata; `stream-json` output is unchanged.
 - `ConversationPanelPlugin::with_placeholder` and `DEFAULT_PLACEHOLDER` for the empty input's hint.
 - `Debug` for `ConversationPanelPlugin`.
@@ -16,8 +21,9 @@ Requires `polaris-tui` 0.1.2.
 - `CodeGraphPlugin::with_boot_index`, `tools::boot_index_wanted(headless, dir)` and `tools::looks_like_project`. An interactive `polaris` run outside a project skips the boot code index and says so; headless runs still index.
 
 ### Changed
-- Approval labels state their scope: `allow this exact command in <dir> for this session`, `allow prefix "<prefix>" (whole words, every subcommand) in <dir> for this session`, `deny (or no: reason)`.
-- A command too tall for the approval frame scrolls inside it (`↑`/`↓`, `PgUp`/`PgDn`), and a confirming answer is refused until its last row has been shown. A command over 64 KiB accepts only a denial.
+- Tool calls run through a per-call graph loop (`authorize_call`, `ask_human`, `execute_call`, `record_denial`, `advance_call`) with its own iteration bound, instead of one batch step. Read-only batches still run concurrently. Calls left over at the bound get error results.
+- Approval labels state their scope: `allow this exact command in <dir> for this session`, `allow prefix "<prefix>" (whole words, every subcommand) in <dir> for this session`, `deny`.
+- A command too tall for the approval picker scrolls inside it (`PgUp`/`PgDn`, `Shift-↑`/`Shift-↓`), and a confirming answer is refused until its last row has been shown. A command over 64 KiB accepts only a denial.
 - Default rendering every `polaris-tui` host gets: inline code is bold instead of yellow, a blank row separates turns, system messages and tool names/timings are dim, the empty input shows a placeholder, and the input title no longer repeats `Ctrl-N browse`.
 - The meta row shows state, short model name (`Sonnet 5.5 · Bedrock`), context %, cost and running tasks; token tally, session, permissions, workspace and the full context window move behind `Ctrl-O`. Facts and footer hints are dropped whole, by priority, on narrow terminals instead of being clipped.
 - Successful tool results longer than a line (other than diffs) collapse to a one-line summary; failures, denials and non-zero exits stay expanded.
@@ -27,11 +33,8 @@ Requires `polaris-tui` 0.1.2.
 - Approval answer labels are bounded in size before they are laid out, so a very long label no longer slows every frame.
 - The `p` (prefix) answer is left out when the prefix is very long, instead of showing an oversized label.
 - Approval labels, the context and the prompt's first line are cut to 2 KiB on arrival (a cut one ends in `…`).
-- On a terminal too small for the full answer labels, the keys move into the approval frame's top border, `?` shows the labels above the command, and a refusal reason shows in the bottom border, so the answers and the rest of the command stay reachable. With no room for any of the command, only a denial is accepted until the terminal is enlarged.
+- On a very small terminal the picker shrinks to the highlighted answer and its hint always keeps `Esc deny`, so the answers and the rest of the command stay reachable. With no room for any of the command, only a denial is accepted until the terminal is enlarged.
 - A confirming answer is refused while part of the command is too wide to draw (shown as `�`), and a burst of scroll keys between frames can no longer skip rows; a new width starts the read again from the top.
-- A refusal on the smallest terminals shows its reason in the input's title instead of nothing.
-- A refused confirming answer is cleared from the input, so `↓` / `PgDn` work at once.
-- The open details hint is now `? hide` (was `? hide details`).
 - Zero-width spaces, line and paragraph separators and byte-order marks are removed from transcript and approval text, like other invisible controls.
 - `TurnSteering::is_pending` returns `true` when its queue lock is poisoned, matching the trait's documented default, so a queued message keeps its `queued for run N` badge.
 - `home_dir` falls back to `USERPROFILE` when `HOME` is empty, as its documentation says.
@@ -71,7 +74,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/RadiantAILabs/polaris_code/releases/tag/v0.1.0
