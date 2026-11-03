@@ -28,5 +28,7 @@ and responses so a resolved approval cannot answer a later receive.
 [`APPROVAL_SUBJECT`](crate::APPROVAL_SUBJECT) and
 [`APPROVAL_CONTEXT`](crate::APPROVAL_CONTEXT) optionally name the one thing being
 approved and where, which the panel frames above the input instead of repeating
-the whole prompt. They are display hints only: the reply's `confirmed` metadata
-and `APPROVAL_CHOICE` alone decide the answer.
+the whole prompt. The reply's `confirmed` metadata and `APPROVAL_CHOICE` alone
+decide the answer. `APPROVAL_CONTEXT` is a display hint only; with an
+`APPROVAL_SUBJECT` the panel also refuses a confirming answer until the whole
+subject has been drawn, and accepts only a denial for a subject over 64 KiB.
