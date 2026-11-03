@@ -917,8 +917,13 @@ struct ApprovalFrame {
     wrapped: Option<WrappedBody>,
     /// The answers line, measured for the last width and details state drawn.
     footer: Option<WrappedFooter>,
-    /// First body row on screen.
+    /// First body row to draw next.
     scroll: usize,
+    /// First body row the last frame drew. Input is handled in batches
+    /// between frames, so `scroll` may be moved many times before the next
+    /// draw; it is never moved past one page beyond this, so that the rows in
+    /// between are drawn on the way down rather than skipped.
+    shown_scroll: usize,
     /// Body rows the last frame had room for: the page size for `PgUp`/`PgDn`.
     viewport: usize,
     /// Whether the subject's last row has been drawn.
@@ -1021,6 +1026,7 @@ impl ApprovalFrame {
             wrapped: None,
             footer: None,
             scroll: 0,
+            shown_scroll: 0,
             viewport: 0,
             seen_end: false,
             cramped: false,
@@ -1039,7 +1045,15 @@ impl ApprovalFrame {
             {
                 body
             }
-            _ => self.wrap(width, details, collapsed),
+            old => {
+                // A reflow moves the rows, so the offset no longer points at
+                // what was read: start again from the top.
+                if old.is_some_and(|old| old.width != width || old.collapsed != collapsed) {
+                    self.scroll = 0;
+                    self.shown_scroll = 0;
+                }
+                self.wrap(width, details, collapsed)
+            }
         };
         self.wrapped.insert(body)
     }
@@ -1140,7 +1154,9 @@ impl ApprovalFrame {
             return false;
         }
         let last = total - self.viewport;
-        self.scroll = self.scroll.saturating_add_signed(rows).min(last);
+        // Down to the next page at most: the rows between were never drawn.
+        let reach = self.shown_scroll + self.viewport.max(1);
+        self.scroll = self.scroll.saturating_add_signed(rows).min(last).min(reach);
         true
     }
 }
@@ -2515,6 +2531,7 @@ impl ConversationPanel {
         approval.viewport = viewport;
         approval.scroll = approval.scroll.min(total.saturating_sub(viewport));
         let scroll = approval.scroll;
+        approval.shown_scroll = scroll;
         let body = approval.body(width, details, collapsed);
         let shown = body
             .rows
@@ -10290,6 +10307,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The runtime paints on a timer and handles input in between, so many
+    /// scroll events can arrive before the next frame. A command whose
+    /// middle is what matters must not be approved because a burst of `PgDn`
+    /// carried the view past it: `y` waits until every row has been drawn.
+    #[tokio::test]
+    async fn batched_scrolling_cannot_skip_the_rows_in_between() {
+        use polaris::plugins::IOProvider;
+        let subject = std::iter::once("printf start".to_string())
+            .chain((1..=20).map(|row| format!("echo pad{row:02}")))
+            .chain(["rm -rf build".to_string()])
+            .chain((21..=40).map(|row| format!("echo pad{row:02}")))
+            .chain(["printf END".to_string()])
+            .collect::<Vec<_>>();
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel
+            .inbox
+            .lock()
+            .push_back(framed_approval(&subject.join("\n")));
+        panel.drain_inbox();
+
+        let mut drawn = String::new();
+        for frame in 0.. {
+            assert!(frame < 100, "the command never came on screen");
+            drawn.push_str(&draw(&mut panel, 80, 24).0.join("\n"));
+            type_str(&mut panel, "y");
+            panel.handle_key(key(KeyCode::Enter));
+            if panel.pending_confirm.is_none() {
+                break;
+            }
+            // A burst of input before the next frame.
+            for _ in 0..100 {
+                panel.handle_key(key(KeyCode::PageDown));
+                panel.handle_key(key(KeyCode::Down));
+                panel.handle_key(key(KeyCode::End));
+            }
+        }
+        for line in &subject {
+            assert!(drawn.contains(line.as_str()), "{line:?} was never drawn");
+        }
+        let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.metadata.get(CONFIRMED).map(String::as_str),
+            Some(CONFIRMED_TRUE)
+        );
+    }
+
+    /// A resize reflows the rows, so an offset read at one width points
+    /// somewhere else at another, and wider could skip what was never drawn.
+    /// The read starts again from the top.
+    #[tokio::test]
+    async fn a_reflow_starts_the_read_again_from_the_top() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel
+            .inbox
+            .lock()
+            .push_back(framed_approval(&hidden_tail_command()));
+        panel.drain_inbox();
+        for _ in 0..3 {
+            draw(&mut panel, 40, 24);
+            panel.handle_key(key(KeyCode::PageDown));
+        }
+        draw(&mut panel, 40, 24);
+        assert!(
+            panel.pending_frame_mut().unwrap().scroll > 0,
+            "read some of it"
+        );
+        draw(&mut panel, 80, 24);
+        assert_eq!(
+            panel.pending_frame_mut().unwrap().scroll,
+            0,
+            "a new width starts at the top"
+        );
+        type_str(&mut panel, "y");
+        panel.handle_key(key(KeyCode::Enter));
+        assert!(
+            panel.pending_confirm.is_some(),
+            "and the end is still to be read"
+        );
     }
 
     /// Denying never waits for the tail: `n`, `no: reason` and Esc answer at
