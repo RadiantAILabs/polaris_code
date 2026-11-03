@@ -52,7 +52,9 @@ round trips. It is a test fixture, not a prescribed production storage backend.
 `Ctrl-R` searches the loaded cache. Search acceptance changes only the draft;
 `Enter` must be pressed again to submit. Cancelling search restores the exact
 previous draft/caret and does not answer any approval that arrived during the
-search. `Esc` also cancels ordinary history browsing before acting on approvals.
+search. An approval that arrives during a search ends the search, and while the
+approval picker is open history keys do nothing. `Esc` cancels ordinary history
+browsing before the picker is open; once it is open, `Esc` denies.
 
 `Ctrl-G` outside search edits externally. `VISUAL` takes precedence over
 `EDITOR`; quoted whitespace and backslash escapes group literal arguments,
