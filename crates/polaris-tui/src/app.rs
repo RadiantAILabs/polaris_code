@@ -330,19 +330,44 @@ impl AppShell {
             LayoutMode::Single => "single",
             LayoutMode::Tiled => "tiled",
         };
-        let mut hint =
-            format!(" {mode} · tab/shift-tab switch · alt-1..9 jump · ctrl-l layout · ctrl-c quit");
+        // Hints in display order, each with its priority (lower keeps longer).
+        // A narrow terminal drops whole hints rather than clipping one.
+        let mut hints = vec![
+            (5, mode.to_string()),
+            (1, "tab/shift-tab switch".to_string()),
+            (3, "alt-1..9 jump".to_string()),
+            (4, "ctrl-l layout".to_string()),
+            (0, "ctrl-c quit".to_string()),
+        ];
         // Selection-mode affordance, shown only when the host enabled mouse
         // capture (otherwise native selection is always available).
         if self.mouse_enabled {
             if self.mouse_captured {
-                hint.push_str(" · ctrl-s select");
+                hints.push((2, "ctrl-s select".to_string()));
             } else {
-                hint.push_str(" · SELECT MODE: drag to copy · ctrl-s resume");
+                hints.push((2, "SELECT MODE: drag to copy · ctrl-s resume".to_string()));
             }
         }
-        hint.push(' ');
-        let line = Paragraph::new(hint).style(dim_style());
+        let width = usize::from(area.width);
+        let mut by_priority = (0..hints.len()).collect::<Vec<_>>();
+        by_priority.sort_by_key(|index| hints[*index].0);
+        let mut keep = vec![false; hints.len()];
+        // One leading and one trailing space, then " · " between hints.
+        let mut used = 2;
+        for index in by_priority {
+            let cost = hints[index].1.chars().count() + if used > 2 { 3 } else { 0 };
+            if used + cost <= width {
+                used += cost;
+                keep[index] = true;
+            }
+        }
+        let hint = hints
+            .into_iter()
+            .zip(keep)
+            .filter_map(|((_, text), keep)| keep.then_some(text))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let line = Paragraph::new(format!(" {hint} ")).style(dim_style());
         frame.render_widget(line, area);
     }
 }
@@ -696,5 +721,152 @@ mod tests {
     fn a_panel_that_never_notifies_costs_nothing() {
         let (mut shell, _, _) = shell_with_two_panels(LayoutMode::Single);
         assert!(shell.take_notifications().is_empty());
+    }
+
+    /// The footer hint row as drawn at `width` columns.
+    fn status_line(shell: &AppShell, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| shell.render_status_line(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// Wide, every hint shows in display order. As the terminal narrows, whole
+    /// hints drop by priority — layout name first, quit last — and none is
+    /// ever clipped mid-word.
+    #[test]
+    fn footer_hints_drop_whole_by_priority_as_the_terminal_narrows() {
+        let (mut shell, _, _) = shell_with_config(LayoutMode::Single, true);
+        shell.mouse_captured = true;
+        let all = [
+            "single",
+            "tab/shift-tab switch",
+            "alt-1..9 jump",
+            "ctrl-l layout",
+            "ctrl-c quit",
+            "ctrl-s select",
+        ];
+        assert_eq!(
+            status_line(&shell, 200),
+            format!(" {}", all.join(" · ")).trim_end(),
+            "all hints, in display order"
+        );
+        for (width, kept, dropped) in [
+            (
+                85,
+                &[
+                    "tab/shift-tab switch",
+                    "alt-1..9 jump",
+                    "ctrl-l layout",
+                    "ctrl-c quit",
+                    "ctrl-s select",
+                ][..],
+                &["single"][..],
+            ),
+            (
+                70,
+                &[
+                    "tab/shift-tab switch",
+                    "alt-1..9 jump",
+                    "ctrl-c quit",
+                    "ctrl-s select",
+                ][..],
+                &["single", "ctrl-l layout"][..],
+            ),
+            (
+                40,
+                &["tab/shift-tab switch", "ctrl-c quit"][..],
+                &["single", "alt-1..9 jump", "ctrl-l layout"][..],
+            ),
+            (
+                15,
+                &["ctrl-c quit"][..],
+                &["tab/shift-tab switch", "ctrl-s select"][..],
+            ),
+            (5, &[][..], &["ctrl-c quit"][..]),
+        ] {
+            let line = status_line(&shell, width);
+            for hint in kept {
+                assert!(line.contains(hint), "{width}: {hint} kept: {line:?}");
+            }
+            for hint in dropped {
+                assert!(!line.contains(hint), "{width}: {hint} dropped: {line:?}");
+            }
+            let pieces = line.trim().split(" · ").filter(|piece| !piece.is_empty());
+            for piece in pieces {
+                assert!(
+                    all.contains(&piece),
+                    "{width}: {piece:?} is a whole hint: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// A hint whose row exactly fills the width is kept; one column less drops
+    /// it. Widths are the hint text plus the two outer spaces and the " · "
+    /// between hints.
+    #[test]
+    fn a_footer_hint_that_exactly_fits_is_kept() {
+        let (mut shell, _, _) = shell_with_config(LayoutMode::Single, true);
+        shell.mouse_captured = true;
+        // Without "single": 70 characters of text, 4 separators, 2 outer spaces.
+        assert!(
+            status_line(&shell, 84).contains("ctrl-l layout"),
+            "84 columns fit five hints exactly"
+        );
+        assert!(
+            !status_line(&shell, 83).contains("ctrl-l layout"),
+            "83 columns drop the lowest-priority of the five"
+        );
+        // With "single": 76 characters, 5 separators, 2 outer spaces.
+        assert!(
+            status_line(&shell, 93).starts_with(" single · "),
+            "93 columns fit all six hints exactly"
+        );
+        assert!(
+            !status_line(&shell, 92).contains("single"),
+            "92 columns drop the layout name"
+        );
+        // The first hint has no separator: " ctrl-c quit " is 13 columns.
+        assert_eq!(status_line(&shell, 13), " ctrl-c quit");
+        assert!(!status_line(&shell, 12).contains("ctrl-c quit"));
+    }
+
+    #[test]
+    fn the_footer_names_the_tiled_layout() {
+        let (shell, _, _) = shell_with_config(LayoutMode::Tiled, false);
+        let line = status_line(&shell, 200);
+        assert!(line.starts_with(" tiled · "), "{line:?}");
+        assert!(!line.contains("single"), "{line:?}");
+    }
+
+    #[test]
+    fn the_footer_says_when_the_terminal_is_in_selection_mode() {
+        let (shell, _, _) = shell_with_config(LayoutMode::Single, true);
+        // The shell starts in selection mode with the mouse released.
+        assert!(!shell.mouse_captured);
+        let line = status_line(&shell, 200);
+        assert!(
+            line.ends_with("SELECT MODE: drag to copy · ctrl-s resume"),
+            "{line:?}"
+        );
+        assert!(!line.contains("ctrl-s select"), "{line:?}");
+    }
+
+    #[test]
+    fn the_footer_has_no_selection_hint_when_the_mouse_is_never_captured() {
+        let (shell, _, _) = shell_with_config(LayoutMode::Single, false);
+        let line = status_line(&shell, 200);
+        assert!(!line.contains("ctrl-s"), "{line:?}");
+        assert!(!line.contains("SELECT MODE"), "{line:?}");
+        assert!(line.ends_with("ctrl-c quit"), "{line:?}");
     }
 }

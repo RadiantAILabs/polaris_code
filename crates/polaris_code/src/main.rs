@@ -1236,6 +1236,19 @@ async fn main() {
     )
     .await;
     startup_notes.extend(mcp.startup_notes());
+    // Indexing `~` (or any folder that is not a project) walks everything
+    // under it before the first answer; skip the boot pass there and say how
+    // to get it. Interactive only: a headless run (evals, scripts) is pointed
+    // at its directory on purpose and keeps the index it always had.
+    let boot_index = polaris_code::tools::boot_index_wanted(headless, &working_dir);
+    if !boot_index {
+        startup_notes.push(format!(
+            "{} doesn't look like a project, so the code index was skipped. \
+             Start polaris inside a repository (e.g. `cd ~/my-repo && polaris`) \
+             for code navigation.",
+            working_dir.display()
+        ));
+    }
 
     let mut server = Server::new();
     server.add_plugins(ModelsPlugin);
@@ -1248,7 +1261,11 @@ async fn main() {
             CodeToolsConfig::new(&working_dir).with_edit_journal(edit_journal.clone()),
         ))
         .add_plugins(OxigraphPlugin::in_memory().with_tools(true))
-        .add_plugins(CodeGraphPlugin::new(&working_dir).with_search_mode(graph_search))
+        .add_plugins(
+            CodeGraphPlugin::new(&working_dir)
+                .with_search_mode(graph_search)
+                .with_boot_index(boot_index),
+        )
         // Reflective memory: memoize/recall structural conclusions,
         // content-hash-invalidated against the cited spans.
         .add_plugins(MemoryToolsPlugin::new(&working_dir))
@@ -1350,6 +1367,7 @@ async fn main() {
                     .with_settings(attachment_settings.clone()),
                 ))
                 .with_turn_input_handle(Arc::new(turn_steering.clone()))
+                .with_placeholder("Ask Polaris…")
                 .with_notifications(cli.notify.config())
                 .with_interrupt_handle(move || {
                     let Some(sessions) = callback_api.get().cloned() else {

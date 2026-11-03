@@ -119,9 +119,21 @@ A truncated stream names its overflow path — `[stdout truncated at the shell's
 output cap; all of it is in /tmp/…]` — so the model can read the rest with a
 tool it already has.
 
-Only the model's copy is rendered. The host activity block and the reified
-`ToolCall` in the Session `ABox` keep the raw JSON, so the trajectory stays
-structured and machine-queryable.
+The reified `ToolCall` in the Session `ABox` keeps the raw JSON, so the
+trajectory stays structured and machine-queryable. The host activity block
+shows the same shell text the model reads, and carries the executor's JSON
+document as `document` metadata (bounded to 8 KiB) for a consumer that branches
+on its fields. A successful run also carries a one-line `summary` — the command,
+then how it ended and how much it printed (`cargo test · exit 0 · 40 lines`) —
+which the conversation panel shows in place of the body until `Ctrl-O`. A
+non-zero exit carries no summary, so its output stays in view.
+`--output-format stream-json` keeps its earlier shape: the document is the tool
+block's body and neither `summary` nor `document` appears in the metadata.
+
+Other tools' blocks follow the same rule without a document: a successful
+result longer than one line, or longer than 160 characters, is summarised as
+the tool's detail plus its size (`src/lib.rs · 120 lines`). Diffs, failures and
+denials are never summarised.
 
 ## Web pages
 

@@ -45,6 +45,21 @@ pub fn resolve(
         .or_else(|| set(home).map(|dir| dir.join(".config").join("polaris")))
 }
 
+/// The user's home directory, read from the environment so it is the same
+/// directory their shell means by `~`. Empty values count as unset.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_dir_from(
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("USERPROFILE").map(PathBuf::from),
+    )
+}
+
+fn home_dir_from(home: Option<PathBuf>, userprofile: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|path| !path.as_os_str().is_empty())
+        .or(userprofile)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 /// Joins `file` onto the user configuration directory.
 pub fn config_file(file: impl AsRef<Path>) -> Option<PathBuf> {
     config_dir().map(|dir| dir.join(file))
@@ -52,7 +67,7 @@ pub fn config_file(file: impl AsRef<Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve;
+    use super::{home_dir_from, resolve};
     use std::path::PathBuf;
 
     fn p(path: &str) -> Option<PathBuf> {
@@ -74,5 +89,19 @@ mod tests {
     fn empty_values_count_as_unset() {
         assert_eq!(resolve(p(""), p(""), p("/h")), p("/h/.config/polaris"));
         assert_eq!(resolve(None, None, None), None);
+    }
+
+    #[test]
+    fn home_lookup_skips_empty_values_and_prefers_home() {
+        for (home, userprofile, expected) in [
+            (p("/home/ada"), p("/users/ada"), p("/home/ada")),
+            (p(""), p("/users/ada"), p("/users/ada")),
+            (None, p("/users/ada"), p("/users/ada")),
+            (p("/home/ada"), p(""), p("/home/ada")),
+            (p(""), p(""), None),
+            (None, None, None),
+        ] {
+            assert_eq!(home_dir_from(home, userprofile), expected);
+        }
     }
 }

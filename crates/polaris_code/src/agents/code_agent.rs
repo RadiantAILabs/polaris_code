@@ -66,7 +66,7 @@ use crate::terminal::transcript::{
     PHASE_OK, PHASE_PENDING, PHASE_RUNNING, PHASE_START, ToolActivity, tool_detail,
 };
 use crate::terminal::{ContainedPrompt, SessionSettings, TurnPrompt, TurnSteering};
-use crate::tools::shell_render::render_run_command;
+use crate::tools::shell_render::{render_run_command, run_command_outcome, run_command_succeeded};
 use crate::tools::{
     CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, code_index_state, enrich, tool_is_read_only,
 };
@@ -656,7 +656,14 @@ pub(crate) async fn execute_tools(
                 }
                 // Waiting on the user is not the tool running: say so, so the
                 // elapsed time on the block isn't read as the tool being slow.
-                activity.phase(&user_io, PHASE_PENDING, &detail).await;
+                // A command the approval frames above the input is not
+                // repeated on its row; the row says what it is waiting on.
+                let waiting = if request.frames_command() {
+                    "awaiting approval"
+                } else {
+                    detail.as_str()
+                };
+                activity.phase(&user_io, PHASE_PENDING, waiting).await;
                 // An unapproved command must not reach the background by the
                 // back door, so the slot says the block is parked and
                 // `BackgroundTasks::request` refuses while it is.
@@ -897,8 +904,8 @@ pub(crate) async fn execute_tools(
                     }
                     // Every toolset in this crate answers with the string it
                     // built; `run_command` answers with the executor's JSON
-                    // document. The document is what the trajectory and the
-                    // host block keep — it is the honest record — but what
+                    // document. The document is what the trajectory keeps —
+                    // it is the honest record — but what
                     // the model gets is that document rendered as the text a
                     // shell produced, with an exit marker it cannot miss.
                     let observed = value
@@ -919,7 +926,24 @@ pub(crate) async fn execute_tools(
                         .map(|rendered| redact_tool_output(redactor, name, rendered))
                         .unwrap_or_else(|| observed.clone());
                     tracing::info!("Observation: {observed}");
-                    activity.finish(&user_io, PHASE_OK, &observed).await;
+                    // The terminal block shows a command the way a shell
+                    // would — real lines, collapsed behind its exit status
+                    // and size — rather than the escaped JSON document, which
+                    // rides along as metadata. The trajectory keeps `observed`.
+                    // A run that did not exit 0 stays expanded: its output is
+                    // the reason.
+                    match (name == "run_command")
+                        .then(|| run_command_outcome(&value))
+                        .flatten()
+                    {
+                        Some(outcome) => {
+                            let outcome = run_command_succeeded(&value).then_some(outcome.as_str());
+                            activity
+                                .finish_rendered(&user_io, PHASE_OK, &output, outcome, &observed)
+                                .await;
+                        }
+                        None => activity.finish(&user_io, PHASE_OK, &observed).await,
+                    }
                     record_tool_call(
                         &store,
                         turn,

@@ -32,3 +32,41 @@ Approval prompts use `polaris_tui::ApprovalChoice` and the exported metadata key
 `ApprovalError::Denied` from `ApprovalError::Prompt`, preserving provider errors.
 Interrupted prompts are resolved using their `APPROVAL_REQUEST_ID` before the
 next input receive; an answer to a resolved prompt cannot approve a later call.
+
+A command prompt also carries `APPROVAL_SUBJECT` (the command, verbatim) and
+`APPROVAL_CONTEXT` (`run_command in <directory>`, home shown as `~`). The
+conversation panel frames the command once above the input instead of printing
+the whole prompt, with the answers pinned under it:
+
+```
+y allow once
+s allow this exact command in /home/me/repo for this session
+p allow prefix "cargo test" (whole words, every subcommand) in /home/me/repo for this session
+n deny (or no: reason)
+```
+
+The labels state each answer's scope: the exact grant covers that command
+string only, the prefix grant every command that starts with those whole words
+(any subcommand or extra arguments), and both are bound to the named canonical
+directory and end with the session. `p` is offered only when the command has a
+simple prefix; `s` and `p` only where remembering is allowed. `n`, `no`, `deny`
+and `Esc` deny; `no: reason` or `deny: reason` returns the reason to the model.
+
+A command taller than the frame scrolls inside it (`↑` / `↓`, `PgUp` / `PgDn`
+with an empty input), and the panel refuses a confirming answer until every row
+of the command has been on screen, and while any part of it is too wide to draw. A command longer than 64 KiB cannot be
+shown in full, so only a denial is accepted for it. `?` adds the full prompt —
+tool, directory and JSON arguments — to the frame. On a terminal too small for
+the labels above, the keys move into the frame's top border (`y s p n · ? details`),
+`?` shows the full labels above the command, and a refusal reason appears in the
+bottom border. With no room for any of the command, only a denial is accepted
+until the terminal is enlarged.
+
+The reply's `confirmed` metadata and `approval_choice` still decide the answer,
+and the grant is bound to the tool, arguments, canonical directory, generation
+and rule revision as above; nothing in `APPROVAL_SUBJECT` or `APPROVAL_CONTEXT`
+widens or narrows it. `APPROVAL_CONTEXT` is a display hint only.
+`APPROVAL_SUBJECT` also makes the panel refuse a confirming answer until the
+whole command has been drawn, and accept only a denial for a command over
+64 KiB; that can only make the panel stricter. A front end that ignores both
+keys shows the full prompt, which still names the command and directory.

@@ -58,10 +58,12 @@ use polaris_code::agents::{
 };
 use polaris_code::run::{self, TurnReason};
 use polaris_code::terminal::transcript::{
-    IO_TYPE_TOOL, META_LABEL, META_PHASE, PHASE_DENIED, PHASE_ERROR, PHASE_OK,
+    IO_TYPE_TOOL, META_DOCUMENT, META_LABEL, META_PHASE, META_SUMMARY, PHASE_DENIED, PHASE_ERROR,
+    PHASE_OK, PHASE_PENDING,
 };
 use polaris_code::usage::TokenMeter;
 use polaris_ontrace::oxigraph::OxigraphPlugin;
+use polaris_tui::APPROVAL_SUBJECT;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
@@ -318,7 +320,8 @@ impl ScriptedIOProvider {
         }
     }
 
-    /// The text of every tool-activity message that reached the given phase.
+    /// The text of every tool-activity message that reached the given phase:
+    /// the executor's JSON document where the block carries one, else the body.
     fn tool_messages(&self, phase: &str) -> Vec<String> {
         let state = self.state.lock().expect("scripted IO lock poisoned");
         state
@@ -329,10 +332,40 @@ impl ScriptedIOProvider {
                     && message.metadata.get(META_PHASE).map(String::as_str) == Some(phase)
                     && message.metadata.get(META_LABEL).map(String::as_str) == Some("run_command")
             })
-            .map(|message| match &message.content {
-                IOContent::Text(text) => text.clone(),
-                other => format!("{other:?}"),
+            .map(
+                |message| match (&message.content, message.metadata.get(META_DOCUMENT)) {
+                    (_, Some(document)) => document.clone(),
+                    (IOContent::Text(text), None) => text.clone(),
+                    (other, None) => format!("{other:?}"),
+                },
+            )
+            .collect()
+    }
+
+    /// Every `run_command` tool-activity message, in the order sent.
+    fn tool_blocks(&self) -> Vec<IOMessage> {
+        let state = self.state.lock().expect("scripted IO lock poisoned");
+        state
+            .sent
+            .iter()
+            .filter(|message| {
+                message.metadata.get(IO_TYPE).map(String::as_str) == Some(IO_TYPE_TOOL)
+                    && message.metadata.get(META_LABEL).map(String::as_str) == Some("run_command")
             })
+            .cloned()
+            .collect()
+    }
+
+    /// Every confirm dialog the agent opened, as sent.
+    fn confirm_messages(&self) -> Vec<IOMessage> {
+        let state = self.state.lock().expect("scripted IO lock poisoned");
+        state
+            .sent
+            .iter()
+            .filter(|message| {
+                message.metadata.get(IO_TYPE).map(String::as_str) == Some(IO_TYPE_CONFIRM)
+            })
+            .cloned()
             .collect()
     }
 
@@ -639,6 +672,85 @@ async fn approved_run_command_runs_exactly_one_process() {
 
     // Nothing is left live or retained: `execute` consumed the one result.
     assert!(turn.executor().processes().is_empty());
+}
+
+/// What a terminal front end receives for an approved command: the command
+/// named once for the approval frame, a waiting row that does not repeat it,
+/// and a finished block that reads as shell text collapsed behind a summary,
+/// with the executor's JSON document alongside for a consumer that branches on
+/// its fields.
+#[tokio::test]
+async fn an_approved_command_reaches_the_terminal_as_summary_text_and_document() {
+    const THREE_LINES: &str = "printf 'a\\nb\\nc\\n'";
+    let turn = CodingTurn::build(THREE_LINES, Answer::Approve, ToolPermission::Confirm).await;
+    let outcome = turn.drive().await;
+    assert_eq!(outcome.reason, TurnReason::Completed);
+
+    let confirms = turn.io.confirm_messages();
+    assert_eq!(confirms.len(), 1, "one approval: {confirms:?}");
+    assert_eq!(
+        confirms[0]
+            .metadata
+            .get(APPROVAL_SUBJECT)
+            .map(String::as_str),
+        Some(THREE_LINES),
+        "the frame is handed the command verbatim"
+    );
+
+    let blocks = turn.io.tool_blocks();
+    let pending = blocks
+        .iter()
+        .find(|message| message.metadata.get(META_PHASE).map(String::as_str) == Some(PHASE_PENDING))
+        .expect("the block waits on the approval");
+    assert!(
+        matches!(&pending.content, IOContent::Text(text) if text == "awaiting approval"),
+        "the waiting row says what it waits on instead of repeating the command: {pending:?}"
+    );
+
+    let done = blocks
+        .iter()
+        .find(|message| message.metadata.get(META_PHASE).map(String::as_str) == Some(PHASE_OK))
+        .expect("the block closes ok");
+    assert_eq!(
+        done.metadata.get(META_SUMMARY).map(String::as_str),
+        Some(format!("{THREE_LINES} · exit 0 · 3 lines").as_str()),
+        "{done:?}"
+    );
+    let IOContent::Text(body) = &done.content else {
+        panic!("a tool body is text: {done:?}");
+    };
+    assert!(
+        body.contains("a\nb\nc") && !body.contains("\"stdout\""),
+        "the body is what the shell printed, not the JSON document: {body}"
+    );
+    let document: Value = serde_json::from_str(
+        done.metadata
+            .get(META_DOCUMENT)
+            .expect("the executor document rides along"),
+    )
+    .expect("the document is the executor's JSON");
+    assert_eq!(document["status"], "executed", "{document}");
+    assert_eq!(document["exit_code"], 0, "{document}");
+}
+
+/// A failed command keeps its output in view: no summary, document kept.
+#[tokio::test]
+async fn a_failed_command_is_not_collapsed() {
+    let turn = CodingTurn::build(TWO_STREAM_FAILURE, Answer::Approve, ToolPermission::Allow).await;
+    assert_eq!(turn.drive().await.reason, TurnReason::Completed);
+    let blocks = turn.io.tool_blocks();
+    let done = blocks
+        .iter()
+        .find(|message| message.metadata.get(META_PHASE).map(String::as_str) == Some(PHASE_OK))
+        .expect("the block closes");
+    assert!(
+        !done.metadata.contains_key(META_SUMMARY),
+        "exit 3 is the reason; it stays expanded: {done:?}"
+    );
+    assert!(
+        done.metadata.contains_key(META_DOCUMENT),
+        "the document is still attached: {done:?}"
+    );
 }
 
 /// A command that writes to both streams and fails, so one result has to carry

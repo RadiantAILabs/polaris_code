@@ -75,7 +75,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use polaris::plugins::{IO_TYPE, IOMessage};
+use polaris::plugins::{IO_TYPE, IOContent, IOMessage};
 use polaris::sessions::{SessionId, TurnNumber};
 use polaris_cosmos::contracts::{
     CandidateConsideration, CompositionChoiceOrigin, CompositionEvidence, ContentDigest,
@@ -87,6 +87,7 @@ use crate::agents::FailureKind;
 use crate::cosmos::host::TopologyTurn;
 use crate::cosmos::inventory::TopologyInventory;
 use crate::run::{TurnOutcome, TurnReason};
+use crate::terminal::transcript::{META_DOCUMENT, META_SUMMARY};
 use crate::usage::{CeilingStatus, RUN_USAGE_SCHEMA, RunUsage};
 
 /// Which topology ran, and why it beat the alternatives — the same facts
@@ -749,17 +750,126 @@ pub fn usage_message(usage: &RunUsage) -> IOMessage {
 /// the front end reports as a diagnostic on stderr rather than emitting a
 /// malformed line.
 pub fn stream_json_line(message: &IOMessage) -> Result<String, serde_json::Error> {
+    // A finished tool block carries a collapsed summary, and `run_command`
+    // its rendered shell text, for the terminal. The stream keeps the shape it
+    // always had: the executor's document as the body, no display extras.
+    if message.metadata.contains_key(META_SUMMARY) || message.metadata.contains_key(META_DOCUMENT) {
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Content<'a> {
+            Document {
+                #[serde(rename = "Text")]
+                text: &'a str,
+            },
+            Original(&'a IOContent),
+        }
+
+        #[derive(Serialize)]
+        struct StreamMessage<'a> {
+            content: Content<'a>,
+            source: &'a polaris::plugins::IOSource,
+            metadata: std::collections::HashMap<&'a str, &'a str>,
+        }
+
+        let content = message
+            .metadata
+            .get(META_DOCUMENT)
+            .map_or(Content::Original(&message.content), |document| {
+                Content::Document { text: document }
+            });
+        return serde_json::to_string(&StreamMessage {
+            content,
+            source: &message.source,
+            metadata: message
+                .metadata
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), META_DOCUMENT | META_SUMMARY))
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect(),
+        });
+    }
     serde_json::to_string(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::agents::TurnFailure;
     use crate::usage::TokenMeter;
     use polaris::graph::RunId;
     use polaris::models::anthropic::DEFAULT_MAX_TOKENS;
     use std::time::Duration;
+
+    /// Decode one stream-json line for inspection.
+    fn streamed(message: &IOMessage) -> serde_json::Value {
+        serde_json::from_str(&stream_json_line(message).expect("a line")).expect("valid JSON")
+    }
+
+    fn tool_block(body: &str) -> IOMessage {
+        IOMessage::from_agent("code", IOContent::Text(body.into())).with_metadata(IO_TYPE, "tool")
+    }
+
+    #[test]
+    fn stream_json_keeps_the_executor_document_as_a_tool_body() {
+        let block = tool_block("a\nb\n[exit code: 0]")
+            .with_metadata(META_SUMMARY, "cat x · exit 0 · 2 lines")
+            .with_metadata(META_DOCUMENT, r#"{"status":"executed"}"#);
+        let line = streamed(&block);
+        assert_eq!(
+            line["content"]["Text"], r#"{"status":"executed"}"#,
+            "{line}"
+        );
+        assert!(line["metadata"].get(META_SUMMARY).is_none(), "{line}");
+        assert!(line["metadata"].get(META_DOCUMENT).is_none(), "{line}");
+    }
+
+    #[test]
+    fn stream_json_drops_a_summary_and_keeps_the_body() {
+        let line = streamed(&tool_block("a\nb\nc").with_metadata(META_SUMMARY, "x · 3 lines"));
+        assert_eq!(line["content"]["Text"], "a\nb\nc", "{line}");
+        assert!(line["metadata"].get(META_SUMMARY).is_none(), "{line}");
+        assert_eq!(line["metadata"][IO_TYPE], "tool", "{line}");
+    }
+
+    #[test]
+    fn stream_json_swaps_in_a_document_without_a_summary() {
+        // A failed run carries its document but is not collapsed.
+        let line = streamed(
+            &tool_block("boom\n[exit code: 1]")
+                .with_metadata(META_DOCUMENT, r#"{"status":"executed","exit_code":1}"#),
+        );
+        assert_eq!(
+            line["content"]["Text"], r#"{"status":"executed","exit_code":1}"#,
+            "{line}"
+        );
+        assert!(line["metadata"].get(META_DOCUMENT).is_none(), "{line}");
+    }
+
+    #[test]
+    fn stream_json_leaves_an_ordinary_message_untouched() {
+        let message = tool_block("plain");
+        assert_eq!(
+            stream_json_line(&message).expect("a line"),
+            serde_json::to_string(&message).expect("serialises")
+        );
+    }
+
+    #[test]
+    fn stream_json_preserves_non_text_content_and_other_fields() {
+        for content in [
+            IOContent::Structured(serde_json::json!({"answer": 42})),
+            IOContent::Binary {
+                mime_type: "application/octet-stream".into(),
+                data: vec![0, 1, 255],
+            },
+        ] {
+            let message = IOMessage::from_external("test", content).with_metadata("keep", "value");
+            let expected = serde_json::to_value(&message).unwrap();
+            let message = message.with_metadata(META_SUMMARY, "display only");
+            assert_eq!(streamed(&message), expected);
+        }
+    }
 
     /// A non-default limit, so a test that asserts on it cannot pass by
     /// accidentally matching [`DEFAULT_MAX_TOKENS`].

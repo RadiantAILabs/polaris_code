@@ -10,8 +10,8 @@ use polaris::shell::{ShellExecutor, ShellPermission};
 use polaris::system::resource::GlobalResource;
 use polaris::tools::{ToolContext, ToolError, ToolPermission, ToolRegistry};
 use polaris_tui::{
-    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_REQUEST_ID, ApprovalChoice,
-    IO_TYPE_APPROVAL_RESOLVED,
+    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_CONTEXT, APPROVAL_REQUEST_ID, APPROVAL_SUBJECT,
+    ApprovalChoice, IO_TYPE_APPROVAL_RESOLVED,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -23,6 +23,21 @@ use crate::tools::approval::{ApprovalReceipt, call_directory, call_paths};
 use super::rules::{command_permission, simple_prefix};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// `directory` with the user's home shown as `~`, for a prompt line that
+/// should be short enough to read at a glance.
+fn home_relative(directory: &Path) -> String {
+    home_relative_under(directory, crate::config_dir::home_dir().as_deref())
+}
+
+fn home_relative_under(directory: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| directory.strip_prefix(home).ok()) {
+        // Home itself is `~`, not `~/`.
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => Path::new("~").join(rest).display().to_string(),
+        None => directory.display().to_string(),
+    }
+}
 
 /// A user's refusal is distinct from failure of the approval channel.
 #[derive(Debug)]
@@ -251,6 +266,13 @@ impl ApprovalRequest {
         }
     }
 
+    /// Whether the prompt names a command for the front end to frame, so the
+    /// tool's own activity row need not repeat it.
+    #[must_use]
+    pub(crate) fn frames_command(&self) -> bool {
+        self.command.is_some()
+    }
+
     fn choices(&self) -> Vec<ApprovalChoice> {
         let mut choices = vec![ApprovalChoice::new(
             "once",
@@ -258,25 +280,40 @@ impl ApprovalRequest {
             &["y", "yes", "once"],
             true,
         )];
+        // The prompt frames the command once, so the labels do not repeat it;
+        // they do say how far each answer reaches and where, because that is
+        // what a session grant binds to.
         if self.remember
-            && let (Some(command), Some(directory)) = (&self.command, &self.directory)
+            && self.command.is_some()
+            && let Some(directory) = &self.directory
         {
             choices.push(ApprovalChoice::new(
                 "exact",
                 format!(
-                    "allow exact command {command:?} in {} for this session",
+                    "allow this exact command in {} for this session",
                     directory.display()
                 ),
                 &["s", "exact"],
                 true,
             ));
-            if let Some(prefix) = &self.prefix {
-                choices.push(ApprovalChoice::new("prefix", format!("allow prefix {prefix:?} (whole words, every subcommand) in {} for this session", directory.display()), &["p", "prefix"], true));
+            // Omit oversized scopes rather than abbreviating what is granted.
+            if let Some(prefix) = &self.prefix
+                && prefix.chars().count() <= 200
+            {
+                choices.push(ApprovalChoice::new(
+                    "prefix",
+                    format!(
+                        "allow prefix {prefix:?} (whole words, every subcommand) in {} for this session",
+                        directory.display()
+                    ),
+                    &["p", "prefix"],
+                    true,
+                ));
             }
         }
         choices.push(ApprovalChoice::new(
             "deny",
-            "deny (optional: deny: reason)",
+            "deny (or no: reason)",
             &["n", "no", "deny"],
             false,
         ));
@@ -338,14 +375,27 @@ impl ApprovalRequest {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        io.send(
-            IOMessage::system_text(format!("{prompt}\n\n{labels}"))
-                .with_metadata(IO_TYPE, IO_TYPE_CONFIRM)
-                .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
-                .with_metadata(APPROVAL_REQUEST_ID, &self.id),
-        )
-        .await
-        .map_err(ApprovalError::Prompt)?;
+        let mut message = IOMessage::system_text(format!("{prompt}\n\n{labels}"))
+            .with_metadata(IO_TYPE, IO_TYPE_CONFIRM)
+            .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
+            .with_metadata(APPROVAL_REQUEST_ID, &self.id);
+        // A command is the one thing being approved: name it once, verbatim,
+        // so the panel can frame it instead of repeating the whole prompt.
+        if let Some(command) = &self.command {
+            message = message
+                .with_metadata(APPROVAL_SUBJECT, command)
+                .with_metadata(
+                    APPROVAL_CONTEXT,
+                    format!(
+                        "{} in {}",
+                        self.tool,
+                        self.directory
+                            .as_deref()
+                            .map_or_else(|| "<invalid directory>".into(), home_relative)
+                    ),
+                );
+        }
+        io.send(message).await.map_err(ApprovalError::Prompt)?;
         let response = io.receive().await.map_err(ApprovalError::Prompt)?;
         if response
             .metadata
@@ -1111,6 +1161,133 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("inspect it first")
+        );
+        assert!(!grants.allows(1, "run_command", &json!({"command":"echo ok"}), dir.path()));
+    }
+
+    /// Session answers say how far they reach and where without repeating
+    /// the command the frame already shows: the directory is the one the
+    /// grant binds to, and a prefix grant names its breadth.
+    #[tokio::test]
+    async fn session_labels_state_their_directory_and_breadth() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = ApprovalRequest::new(
+            "run_command",
+            &json!({"command":"cargo test --workspace"}),
+            dir.path(),
+            1,
+            true,
+        );
+        let directory = request
+            .directory
+            .clone()
+            .expect("the call resolves inside the root");
+        let choices = request.choices();
+        let label = |id: &str| {
+            choices
+                .iter()
+                .find(|choice| choice.id == id)
+                .map(|choice| choice.label.clone())
+                .unwrap_or_else(|| panic!("no {id} choice in {choices:?}"))
+        };
+        assert_eq!(
+            label("exact"),
+            format!(
+                "allow this exact command in {} for this session",
+                directory.display()
+            )
+        );
+        assert_eq!(
+            label("prefix"),
+            format!(
+                "allow prefix \"cargo test\" (whole words, every subcommand) in {} for this session",
+                directory.display()
+            )
+        );
+        assert!(
+            choices
+                .iter()
+                .all(|choice| !choice.label.contains("--workspace")),
+            "the command is framed once, not repeated in a label: {choices:?}"
+        );
+        assert_eq!(label("deny"), "deny (or no: reason)");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prefix_is_not_offered_or_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        for length in [200, 201, 2 * 1024 * 1024] {
+            let command = format!("echo {}", "x".repeat(length - 5));
+            let request = ApprovalRequest::new(
+                "run_command",
+                &json!({"command": command}),
+                dir.path(),
+                1,
+                true,
+            );
+            let offered = request.choices().iter().any(|choice| choice.id == "prefix");
+            assert_eq!(offered, length <= 200, "prefix length {length}");
+            if !offered {
+                let (io, _) = io("prefix", true);
+                let grants = SessionGrants::default();
+                assert!(request.ask(&io, "Run?".into(), &grants).await.is_err());
+                assert!(!grants.allows(1, "run_command", &json!({"command": command}), dir.path()));
+            }
+        }
+    }
+
+    #[test]
+    fn home_relative_abbreviates_only_paths_under_home() {
+        let home = Path::new("/home/ada");
+        for (case, dir, home, shown) in [
+            ("home itself", "/home/ada", Some(home), "~"),
+            (
+                "under home",
+                "/home/ada/code/repo",
+                Some(home),
+                "~/code/repo",
+            ),
+            (
+                "a sibling sharing the prefix",
+                "/home/adam/repo",
+                Some(home),
+                "/home/adam/repo",
+            ),
+            ("outside home", "/srv/repo", Some(home), "/srv/repo"),
+            ("no home", "/home/ada/repo", None, "/home/ada/repo"),
+        ] {
+            assert_eq!(home_relative_under(Path::new(dir), home), shown, "{case}");
+        }
+    }
+
+    /// The deny label offers `no: reason`, so that spelling must carry its
+    /// reason to the model exactly as `deny: reason` does.
+    #[tokio::test]
+    async fn a_no_reason_answer_denies_and_returns_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = ApprovalRequest::new(
+            "run_command",
+            &json!({"command":"echo ok"}),
+            dir.path(),
+            1,
+            false,
+        );
+        let grants = SessionGrants::default();
+        let denied = UserIO::new(Arc::new(Answer {
+            reply: IOMessage::user_text("no: use the test script instead"),
+            prompts: Mutex::new(Vec::new()),
+        }));
+        let error = request
+            .ask(&denied, "Run?".into(), &grants)
+            .await
+            .expect_err("`no: reason` denies");
+        assert!(
+            matches!(error, ApprovalError::Denied { .. }),
+            "a refusal, not a channel failure: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("use the test script instead"),
+            "the reason reaches the model: {error}"
         );
         assert!(!grants.allows(1, "run_command", &json!({"command":"echo ok"}), dir.path()));
     }

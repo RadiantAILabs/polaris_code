@@ -24,6 +24,7 @@ use polaris::plugins::UserIO;
 use polaris_tui::commands::{Availability, ContextWindow, StatusReport, report_status};
 
 use crate::agents::PermissionPolicy;
+use crate::providers::Provider;
 use crate::tools::IndexPhase;
 use crate::usage::TokenMeter;
 
@@ -161,12 +162,81 @@ fn build(
         window = window.with_limit(limit);
     }
     StatusReport::default()
-        .with_model(model)
+        .with_model(short_model_name(model))
         .with_workspace(indexing(workspace, index))
         .with_session(format!("{session} · turn {turn}"))
         .with_permissions(permission_posture(permission))
         .with_context(window)
         .with_availability(Availability::Available)
+}
+
+/// The model as a person names it on the meta row: `Sonnet 5.5 · Bedrock`
+/// for `aws.bedrock/global.anthropic.claude-sonnet-5-5`, and
+/// `Haiku 4.5 · Bedrock eu` for an `eu.` inference profile.
+///
+/// Only ids served by a known provider are shortened; anything else is shown
+/// as given. `/status` still prints the full id.
+#[must_use]
+pub(crate) fn short_model_name(model_id: &str) -> String {
+    let Some(provider) = Provider::of_model(model_id) else {
+        return model_id.to_string();
+    };
+    let (_, model) = model_id.split_once('/').unwrap_or(("", model_id));
+    // Bedrock ids carry an inference-profile region, a vendor and sometimes
+    // a `-v1:0` revision. A geographic region stays visible — it says where
+    // requests are served, which matters for data residency — while
+    // `global.` says nothing a person needs at a glance.
+    let (region, model) = ["global.", "us.", "eu.", "apac.", "jp.", "au."]
+        .iter()
+        .find_map(|region| {
+            model
+                .strip_prefix(region)
+                .map(|rest| (region.trim_end_matches('.'), rest))
+        })
+        .unwrap_or(("global", model));
+    let model = model.strip_prefix("anthropic.").unwrap_or(model);
+    let model = model.split_once(':').map_or(model, |(model, _)| model);
+    let name = match model.strip_prefix("claude-") {
+        Some(rest) => {
+            let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+            let parts = rest
+                .split('-')
+                // A release date (`20251001`) or revision (`v1`) is not part
+                // of the name.
+                .filter(|part| !(part.len() >= 8 && digits(part)))
+                .filter(|part| !part.strip_prefix('v').is_some_and(digits))
+                .collect::<Vec<_>>();
+            let family = parts
+                .iter()
+                .filter(|part| !digits(part))
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_uppercase().chain(chars).collect()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let version = parts
+                .iter()
+                .filter(|part| digits(part))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(".");
+            match (family.is_empty(), version.is_empty()) {
+                (true, _) => model.to_string(),
+                (false, true) => family,
+                (false, false) => format!("{family} {version}"),
+            }
+        }
+        None => model.to_string(),
+    };
+    let provider = match (provider, region) {
+        (Provider::Bedrock, "global") => "Bedrock".to_string(),
+        (Provider::Bedrock, region) => format!("Bedrock {region}"),
+        (other, _) => other.name().to_string(),
+    };
+    format!("{name} · {provider}")
 }
 
 /// Send the latest host-priced cumulative session cost.
@@ -181,6 +251,35 @@ pub async fn send_cost(user_io: &UserIO, model: &str, meter: &TokenMeter) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_ids_shorten_to_the_name_a_person_uses() {
+        for (id, short) in [
+            (
+                "aws.bedrock/global.anthropic.claude-sonnet-5-5",
+                "Sonnet 5.5 · Bedrock",
+            ),
+            (
+                "aws.bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "Haiku 4.5 · Bedrock us",
+            ),
+            // The region decides where requests are served, so it stays.
+            (
+                "aws.bedrock/eu.anthropic.claude-sonnet-5-5",
+                "Sonnet 5.5 · Bedrock eu",
+            ),
+            ("anthropic/claude-opus-5", "Opus 5 · Anthropic"),
+            (
+                "anthropic/claude-3-5-sonnet-20241022",
+                "Sonnet 3.5 · Anthropic",
+            ),
+            ("openai/gpt-5.5", "gpt-5.5 · OpenAI"),
+            // Unknown providers are shown exactly as given.
+            ("scripted/startup", "scripted/startup"),
+        ] {
+            assert_eq!(short_model_name(id), short, "{id}");
+        }
+    }
     use crate::agents::{PermissionMode, UnattendedGrants};
     use polaris_tui::commands::Cost;
 
@@ -351,6 +450,24 @@ mod tests {
             row.contains("code index building"),
             "the report dropped what the workspace row knows about its index: {row:?}"
         );
+    }
+
+    /// The meta row reads `report.model`, so the short name has to be what
+    /// the report carries — not the raw id.
+    #[test]
+    fn the_report_names_the_model_as_a_person_does() {
+        let report = build(
+            "aws.bedrock/eu.anthropic.claude-sonnet-5-5",
+            Path::new("/repo"),
+            "session-a",
+            1,
+            &PermissionMode::Confirm.permission_policy(),
+            0,
+            None,
+            false,
+            IndexPhase::Ready,
+        );
+        assert_eq!(report.model.as_deref(), Some("Sonnet 5.5 · Bedrock eu"));
     }
 
     #[test]

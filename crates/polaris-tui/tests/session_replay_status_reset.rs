@@ -23,11 +23,8 @@ use polaris_tui::ratatui::Terminal;
 use polaris_tui::ratatui::backend::TestBackend;
 use polaris_tui::{EventOutcome, TuiEvent};
 
-/// Wide enough that the meta row draws every fact it has *and* has room to
-/// print them: the model, context and cost facts need 40 columns and the
-/// workspace, session and permission labels need 70, but the row also carries
-/// the activity word, the token tally and a hidden-row count, and anything
-/// past the last column is simply not on screen.
+/// Wide enough that the meta row, expanded with Ctrl-O, has room for every
+/// fact it has: facts that do not fit are dropped whole.
 const WIDE: u16 = 180;
 
 /// Everything the first session reported. Each value is deliberately
@@ -98,6 +95,12 @@ async fn replay_does_not_carry_the_previous_sessions_status_facts() {
         .send(report_status(&first_session_report()))
         .await
         .unwrap();
+    // Workspace, session and permissions are reference facts the row shows
+    // on Ctrl-O; ask for them so every fact is on screen to be cleared.
+    panel.handle_event(&TuiEvent::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )));
     let before = render(&mut panel, WIDE, 16).await;
     for fact in FIRST_SESSION_FACTS {
         assert!(
