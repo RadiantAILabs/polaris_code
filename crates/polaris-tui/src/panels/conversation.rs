@@ -3285,13 +3285,17 @@ fn strip_choice_labels(text: &str, choices: &[ApprovalChoice]) -> String {
 }
 
 /// Shorten `text` to at most `width` columns at a word boundary, marking the
-/// cut with `…`. A single word wider than `width` is cut at the glyph.
+/// cut with `…`. A single word wider than `width` is cut at the glyph, and
+/// nothing is left at `width` 0, where not even the `…` fits.
 fn clip_words(text: &str, width: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if text.width() <= width {
         return text.to_string();
     }
-    let budget = width.saturating_sub(1);
+    if width == 0 {
+        return String::new();
+    }
+    let budget = width - 1;
     let mut end = 0;
     let mut used = 0;
     for (index, ch) in text.char_indices() {
@@ -3302,10 +3306,16 @@ fn clip_words(text: &str, width: usize) -> String {
         used = next;
         end = index + ch.len_utf8();
     }
-    let cut = text[..end]
-        .rfind(' ')
-        .filter(|space| *space > 0)
-        .map_or(&text[..end], |space| text[..space].trim_end());
+    // Words that end exactly where the budget does are whole; otherwise the
+    // last one is partial and goes, unless it is the only one.
+    let cut = if text[end..].starts_with(char::is_whitespace) {
+        text[..end].trim_end()
+    } else {
+        text[..end]
+            .rfind(' ')
+            .filter(|space| *space > 0)
+            .map_or(&text[..end], |space| text[..space].trim_end())
+    };
     format!("{cut}…")
 }
 
@@ -4694,6 +4704,49 @@ mod tests {
         assert_eq!(fmt_tokens(1000), "1.0k");
         assert_eq!(fmt_tokens(5120), "5.1k");
         assert_eq!(fmt_tokens(133854), "133.9k");
+    }
+
+    /// `clip_words` ends at a word boundary when one fits, cuts a single long
+    /// word at the glyph, never overruns, and leaves nothing at width 0.
+    #[test]
+    fn clip_words_cuts_at_the_last_whole_word_that_fits() {
+        use unicode_width::UnicodeWidthStr;
+        let cases = [
+            // (case, text, width, clipped)
+            ("fits", "short", 10, "short"),
+            ("exact fit", "exactly", 7, "exactly"),
+            (
+                "a word ends where the budget does",
+                "reading src/main.rs and the tests",
+                20,
+                "reading src/main.rs…",
+            ),
+            ("the next word is partial", "one two three", 11, "one two…"),
+            ("a space ends the budget", "one two three", 9, "one two…"),
+            ("one word too wide", "abcdefghij", 5, "abcd…"),
+            ("the first word is the only one", "abcdefgh ij", 6, "abcde…"),
+            ("a wide glyph straddles the cut", "a漢漢", 3, "a…"),
+            ("wide glyphs at the glyph", "漢字漢字漢字", 6, "漢字…"),
+            ("wide words", "漢字 漢字", 6, "漢字…"),
+            ("width one", "abc", 1, "…"),
+            ("width one fits", "a", 1, "a"),
+            ("width zero", "abc", 0, ""),
+            ("width zero, empty", "", 0, ""),
+        ];
+        for (case, text, width, clipped) in cases {
+            assert_eq!(clip_words(text, width), clipped, "{case}: {text:?} in {width}");
+        }
+        // Whatever the width, the result fits in it.
+        for text in ["reading src/main.rs and the tests", "漢字 a漢b ccc", "  lead", "x"] {
+            for width in 0..=text.width() + 2 {
+                let clipped = clip_words(text, width);
+                assert!(
+                    clipped.width() <= width,
+                    "{text:?} in {width} gave {clipped:?} ({} columns)",
+                    clipped.width()
+                );
+            }
+        }
     }
 
     #[test]
