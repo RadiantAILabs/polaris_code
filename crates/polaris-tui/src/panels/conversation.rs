@@ -381,6 +381,15 @@ pub trait TurnInputHandle: Send + Sync {
     fn replace(&self, id: u64, text: String) -> Result<(), String>;
     /// Remove a message that has not yet been consumed.
     fn remove(&self, id: u64) -> Result<(), String>;
+    /// Whether the message `id` is still waiting to be consumed.
+    ///
+    /// The panel polls this to retire its "queued for run N" badge and to stop
+    /// offering Alt-Up / Alt-Backspace on a message the host already took.
+    /// Defaulted to `true`, which keeps both for a host that cannot tell.
+    fn is_pending(&self, id: u64) -> bool {
+        let _ = id;
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +467,9 @@ const META_OUT: &str = "out";
 /// count to tell a prompt still waiting in the channel from one the agent has
 /// taken. Panel-private: the copy sent to the agent never carries it.
 const META_SUBMISSION: &str = "submission";
+/// Metadata key carrying a turn input's receipt id, so its "queued" badge can
+/// be retired once the host consumes it.
+const META_TURN_INPUT_ID: &str = "turn_input_id";
 /// Rows scrolled per mouse-wheel notch. One row per event feels glacial;
 /// three matches the de-facto terminal convention.
 const WHEEL_LINES: usize = 3;
@@ -476,6 +488,8 @@ const COMPOSER_MAX_ROWS: usize = 10;
 /// Composer width assumed before the first frame has measured the real one.
 const DEFAULT_COMPOSER_WIDTH: usize = 80;
 /// Braille spinner frames cycled while a step is in flight.
+/// What the empty composer says when the host names nothing more specific.
+pub const DEFAULT_PLACEHOLDER: &str = "Send a message…";
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Default mpsc buffer for [`TuiIOProvider::new`] when the caller doesn't
@@ -923,6 +937,8 @@ pub struct ConversationPanel {
     turn_input: Option<Arc<dyn TurnInputHandle>>,
     /// Messages accepted by `turn_input` and not yet observed as consumed.
     pending_turn_inputs: VecDeque<PendingTurnInput>,
+    /// Dim hint drawn in the empty composer.
+    placeholder: String,
     /// Latches one request until the host reports idle or a terminal status.
     interrupt_requested: bool,
     /// True only after the host acknowledges the signal through IO.
@@ -1096,6 +1112,7 @@ impl ConversationPanel {
             pending_notification: None,
             turn_input: None,
             pending_turn_inputs: VecDeque::new(),
+            placeholder: DEFAULT_PLACEHOLDER.to_string(),
             interrupt_requested: false,
             interrupting: false,
             submissions: 0,
@@ -2076,7 +2093,8 @@ impl ConversationPanel {
         self.push_transcript(stamp_attachments(
             IOMessage::user_text(text.to_string())
                 .with_metadata("turn_input", label)
-                .with_metadata("target_run", receipt.target_run.to_string()),
+                .with_metadata("target_run", receipt.target_run.to_string())
+                .with_metadata(META_TURN_INPUT_ID, receipt.id.to_string()),
             &self.attachments,
         ));
         self.pending_turn_inputs.push_back(PendingTurnInput {
@@ -2094,16 +2112,18 @@ impl ConversationPanel {
     }
 
     fn edit_last_turn_input(&mut self) -> bool {
+        self.retire_turn_inputs();
         let Some(pending) = self.pending_turn_inputs.pop_back() else {
             return false;
         };
         let Some(handle) = self.turn_input.as_ref() else {
             return false;
         };
-        if let Err(reason) = handle.remove(pending.receipt.id) {
-            self.pending_turn_inputs.push_back(pending);
-            self.editor_notice = Some(reason);
-            return true;
+        // A refusal means the host already took the message: it is no longer
+        // ours to edit, so the key falls through to its ordinary binding
+        // rather than parking an error above the input.
+        if handle.remove(pending.receipt.id).is_err() {
+            return false;
         }
         self.composer.clear();
         self.composer.insert_paste(&pending.text);
@@ -2112,17 +2132,45 @@ impl ConversationPanel {
     }
 
     fn remove_last_turn_input(&mut self) -> bool {
+        self.retire_turn_inputs();
         let Some(pending) = self.pending_turn_inputs.pop_back() else {
             return false;
         };
         let Some(handle) = self.turn_input.as_ref() else {
             return false;
         };
-        if let Err(reason) = handle.remove(pending.receipt.id) {
-            self.pending_turn_inputs.push_back(pending);
-            self.editor_notice = Some(reason);
+        // As above: a consumed message leaves Alt-Backspace to delete a word.
+        handle.remove(pending.receipt.id).is_ok()
+    }
+
+    /// Forget turn inputs the host has consumed and drop their transcript
+    /// badge, so "queued for run N" only marks a message that is still waiting.
+    fn retire_turn_inputs(&mut self) {
+        let Some(handle) = self.turn_input.as_ref() else {
+            return;
+        };
+        let mut retired = Vec::new();
+        self.pending_turn_inputs.retain(|pending| {
+            let keep = handle.is_pending(pending.receipt.id);
+            if !keep {
+                retired.push(pending.receipt.id.to_string());
+            }
+            keep
+        });
+        if retired.is_empty() {
+            return;
         }
-        true
+        for message in &mut self.transcript {
+            if message
+                .metadata
+                .get(META_TURN_INPUT_ID)
+                .is_some_and(|id| retired.contains(id))
+            {
+                message.metadata.remove("turn_input");
+                message.metadata.remove("target_run");
+            }
+        }
+        self.content_rev = self.content_rev.wrapping_add(1);
     }
 
     /// Hand `message` to the channel, recording why it was refused. Returns
@@ -3072,6 +3120,7 @@ impl TuiPanel for ConversationPanel {
         self.drain_mention_results();
         self.drain_attachment_results();
         self.drain_browse_results();
+        self.retire_turn_inputs();
         if self.status.is_some() {
             self.spinner = self.spinner.wrapping_add(1);
         }
@@ -3278,7 +3327,7 @@ impl TuiPanel for ConversationPanel {
         // the fold once the draft outgrows the frame.
         let title = match (self.focused, self.composer.is_multiline()) {
             (true, true) => format!(" › {} lines ", self.composer.text().split('\n').count()),
-            (true, false) => " › · Ctrl-N browse ".to_string(),
+            (true, false) => " › ".to_string(),
             (false, _) => " input ".to_string(),
         };
         let input_block = Block::default()
@@ -3304,12 +3353,21 @@ impl TuiPanel for ConversationPanel {
             .composer_scroll
             .min(composer_rows.len().saturating_sub(visible_rows));
 
-        let lines: Vec<Line<'_>> = composer_rows
-            .iter()
-            .skip(self.composer_scroll)
-            .take(visible_rows)
-            .map(|row| Line::from(self.composer.render_row(*row)))
-            .collect();
+        let lines: Vec<Line<'_>> = if self.composer.is_empty() && self.focused {
+            // An empty input says what it is for and how to reach the
+            // transcript browser, instead of a bare border.
+            vec![Line::styled(
+                format!("{}  (Ctrl-N browse transcript)", self.placeholder),
+                Style::default().fg(Color::DarkGray),
+            )]
+        } else {
+            composer_rows
+                .iter()
+                .skip(self.composer_scroll)
+                .take(visible_rows)
+                .map(|row| Line::from(self.composer.render_row(*row)))
+                .collect()
+        };
         frame.render_widget(Paragraph::new(lines), input_inner);
 
         if self.focused && !self.browse.active && input_inner.width > 0 && input_inner.height > 0 {
@@ -3635,6 +3693,7 @@ pub struct ConversationPanelPlugin {
     key_commands: Vec<(Key, String)>,
     turn_input: Option<Arc<dyn TurnInputHandle>>,
     attachment_source: Option<Arc<dyn AttachmentSource>>,
+    placeholder: Option<String>,
 }
 
 /// A host hook that builds the [`UserIO`] handed to agents from the panel's
@@ -3657,11 +3716,20 @@ impl Default for ConversationPanelPlugin {
             key_commands: Vec::new(),
             turn_input: None,
             attachment_source: None,
+            placeholder: None,
         }
     }
 }
 
 impl ConversationPanelPlugin {
+    /// Dim hint shown in the empty input, such as "Ask Polaris…". Without
+    /// one the panel shows [`DEFAULT_PLACEHOLDER`].
+    #[must_use]
+    pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+
     /// Enable prompt history using the host's persistence and explicit namespace.
     /// See [`PromptHistoryStore`](crate::PromptHistoryStore) for the store contract.
     #[must_use]
@@ -3887,6 +3955,9 @@ impl Plugin for ConversationPanelPlugin {
         panel.notifications = self.notifications.clone();
         panel.key_commands = self.key_commands.clone();
         panel.turn_input = self.turn_input.clone();
+        if let Some(placeholder) = &self.placeholder {
+            panel.placeholder.clone_from(placeholder);
+        }
         if let Some(source) = &self.attachment_source {
             panel.set_attachment_source(source.clone());
         }
@@ -8618,5 +8689,70 @@ mod tests {
             .submit_with_attachments("hi".into(), TurnInputMode::Queue, Vec::new())
             .unwrap();
         assert_eq!(*legacy.0.lock(), ["hi"]);
+    }
+
+    /// Once the host takes a queued message its badge goes, and Alt-Backspace
+    /// is a word delete again rather than an "already consumed" error.
+    #[tokio::test]
+    async fn a_consumed_turn_input_loses_its_badge_and_frees_alt_backspace() {
+        #[derive(Default)]
+        struct Queue(Mutex<Vec<u64>>);
+        impl TurnInputHandle for Queue {
+            fn submit(
+                &self,
+                _text: String,
+                mode: TurnInputMode,
+            ) -> Result<TurnInputReceipt, String> {
+                let mut pending = self.0.lock();
+                let id = pending.len() as u64 + 1;
+                pending.push(id);
+                Ok(TurnInputReceipt {
+                    id,
+                    target_run: 1,
+                    mode,
+                })
+            }
+            fn replace(&self, _id: u64, _text: String) -> Result<(), String> {
+                Err("message was already consumed".into())
+            }
+            fn remove(&self, id: u64) -> Result<(), String> {
+                let mut pending = self.0.lock();
+                let before = pending.len();
+                pending.retain(|queued| *queued != id);
+                if pending.len() == before {
+                    Err("message was already consumed".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn is_pending(&self, id: u64) -> bool {
+                self.0.lock().contains(&id)
+            }
+        }
+
+        let queue = Arc::new(Queue::default());
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.turn_input = Some(queue.clone());
+        type_str(&mut panel, "first");
+        panel.handle_key(key(KeyCode::Enter));
+        let rendered = |panel: &ConversationPanel| {
+            panel
+                .message_lines()
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(rendered(&panel).contains("queued for run 1"));
+
+        // The host's run takes the message.
+        queue.0.lock().clear();
+        panel.tick();
+        assert!(!rendered(&panel).contains("queued for run"));
+
+        type_str(&mut panel, "hello world");
+        panel.handle_key(alt(KeyCode::Backspace));
+        assert_eq!(panel.composer.text(), "hello ");
+        assert!(panel.editor_notice.is_none());
     }
 }

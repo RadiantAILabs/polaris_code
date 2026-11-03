@@ -399,4 +399,10 @@ impl TurnInputHandle for TurnSteering {
         state.pending.remove(index);
         Ok(())
     }
+
+    fn is_pending(&self, id: u64) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.pending.iter().any(|input| input.receipt.id == id))
+    }
 }

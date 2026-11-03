@@ -1350,6 +1350,7 @@ async fn main() {
                     .with_settings(attachment_settings.clone()),
                 ))
                 .with_turn_input_handle(Arc::new(turn_steering.clone()))
+                .with_placeholder("Ask Polaris…")
                 .with_notifications(cli.notify.config())
                 .with_interrupt_handle(move || {
                     let Some(sessions) = callback_api.get().cloned() else {
