@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use polaris::models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, LlmProvider,
@@ -20,14 +21,16 @@ use polaris::models::llm::{
 use polaris::models::{ModelRegistry, ModelsPlugin};
 use polaris::plugins::{IOContent, IOMessage, IOProvider, PersistenceAPI, PersistencePlugin};
 use polaris::sessions::{AgentTypeId, FileStore, SessionId, SessionsAPI, SessionsPlugin};
+use polaris::shell::{ShellConfig, ShellPlugin};
 use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
-use polaris::tools::ToolsPlugin;
+use polaris::tools::{ToolPermission, ToolsPlugin};
 use polaris_code::agents::policy::PolicySnapshot;
 use polaris_code::agents::{AgentConfig, CodeAgent, CodeAgentPlugin, ContextManager, LoopState};
 use polaris_code::exec::{ExecIOPlugin, ExecIOProvider, OutputFormat, RunReport, stream_json_line};
 use polaris_code::run::{self, TurnReason};
 use polaris_code::terminal::history::CanonicalHistory;
+use polaris_code::terminal::transcript::{META_DOCUMENT, META_SUMMARY};
 use polaris_code::usage::TokenMeter;
 use polaris_ontrace::oxigraph::OxigraphPlugin;
 use tokio::sync::mpsc;
@@ -47,12 +50,14 @@ const RECOVERY_ANSWER: &str = "recovered after a system error";
 /// configures one — the reported value is the registration, not a measurement.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
 
-/// An `LlmProvider` that streams one fixed text answer and no tool calls while
-/// returning a distinct answer to non-streaming recovery requests.
+/// An `LlmProvider` that optionally calls the shell once, then streams a fixed
+/// answer, with a distinct answer for non-streaming recovery requests.
 ///
 /// The distinction proves which path served the turn without needing a real
 /// model or an API key.
-struct ScriptedProvider;
+struct ScriptedProvider {
+    shell_call_pending: AtomicBool,
+}
 
 impl LlmProvider for ScriptedProvider {
     fn name(&self) -> &'static str {
@@ -79,6 +84,32 @@ impl LlmProvider for ScriptedProvider {
         _request: LlmRequest,
     ) -> Result<LlmStream, GenerationError> {
         use futures_util::StreamExt as _;
+        if self.shell_call_pending.swap(false, Ordering::Relaxed) {
+            return Ok(futures_util::stream::iter([
+                Ok(StreamEvent::ContentBlockStart {
+                    index: 0,
+                    block: ContentBlockStartData::ToolCall {
+                        id: "headless-shell-1".into(),
+                        call_id: None,
+                        name: "run_command".into(),
+                    },
+                }),
+                Ok(StreamEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: ContentBlockDelta::ToolCall {
+                        arguments: r#"{"command":"printf 'headless tool output\\n'"}"#.into(),
+                    },
+                }),
+                Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                    id: None,
+                    model: None,
+                }),
+            ])
+            .boxed());
+        }
         let events = vec![
             Ok(StreamEvent::ContentBlockStart {
                 index: 0,
@@ -107,7 +138,10 @@ impl LlmProvider for ScriptedProvider {
 
 /// Registers [`ScriptedProvider`] with [`ModelRegistry`] once `ModelsPlugin`
 /// has inserted it — the same seam `AnthropicPlugin` uses in production.
-struct ScriptedModelPlugin;
+#[derive(Default)]
+struct ScriptedModelPlugin {
+    shell_call: bool,
+}
 
 impl Plugin for ScriptedModelPlugin {
     const ID: &'static str = "test::scripted_model";
@@ -121,7 +155,9 @@ impl Plugin for ScriptedModelPlugin {
         server
             .get_resource_mut::<ModelRegistry>()
             .expect("ModelsPlugin must build before ScriptedModelPlugin")
-            .register_llm_provider(ScriptedProvider);
+            .register_llm_provider(ScriptedProvider {
+                shell_call_pending: AtomicBool::new(self.shell_call),
+            });
     }
 }
 
@@ -191,6 +227,18 @@ async fn headless_server(
     mpsc::Sender<IOMessage>,
     mpsc::Receiver<IOMessage>,
 ) {
+    headless_server_with_shell(data_dir, None).await
+}
+
+async fn headless_server_with_shell(
+    data_dir: &Path,
+    shell_dir: Option<&Path>,
+) -> (
+    Server,
+    Arc<ExecIOProvider>,
+    mpsc::Sender<IOMessage>,
+    mpsc::Receiver<IOMessage>,
+) {
     let (provider, input_tx, output_rx) = ExecIOProvider::new(64);
     let provider = Arc::new(provider);
 
@@ -201,7 +249,9 @@ async fn headless_server(
     server.insert_global(TokenMeter::new());
     server
         .add_plugins(ModelsPlugin)
-        .add_plugins(ScriptedModelPlugin)
+        .add_plugins(ScriptedModelPlugin {
+            shell_call: shell_dir.is_some(),
+        })
         .add_plugins(ToolsPlugin)
         .add_plugins(OxigraphPlugin::in_memory())
         .add_plugins(PersistencePlugin)
@@ -210,6 +260,18 @@ async fn headless_server(
         ))))
         .add_plugins(CodeAgentPlugin::new())
         .add_plugins(ExecIOPlugin::new(provider.clone()));
+
+    if let Some(dir) = shell_dir {
+        server
+            .add_plugins(ShellPlugin::new(
+                ShellConfig::new()
+                    .with_working_dir(dir)
+                    .with_allowed_dirs(vec![dir.to_path_buf()])
+                    .with_allowed_commands(vec!["printf *".into()])
+                    .with_cache_dir(data_dir.join("shell")),
+            ))
+            .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin);
+    }
 
     server.finish().await.unwrap();
 
@@ -358,6 +420,65 @@ async fn headless_turn_streams_events_and_reports_identity_and_exit_code() {
 }
 
 #[tokio::test]
+async fn headless_shell_result_streams_the_document_without_display_metadata() {
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let (server, provider, input, mut output) =
+        headless_server_with_shell(data.path(), Some(workspace.path())).await;
+    let sessions = server.api::<SessionsAPI>().unwrap();
+    let id = SessionId::new();
+    let config = AgentConfig::new("scripted/test-model", workspace.path().to_path_buf());
+    sessions
+        .create_session_with_executor(
+            server.create_context(),
+            &id,
+            &AgentTypeId::from_name(CodeAgent::NAME),
+            executor(),
+            move |ctx| {
+                ctx.insert(config.clone());
+            },
+        )
+        .unwrap();
+    sessions
+        .with_context(&id, |ctx| {
+            ctx.get_resource_mut::<PolicySnapshot>()
+                .unwrap()
+                .permission
+                .overrides
+                .insert("run_command".into(), ToolPermission::Allow);
+        })
+        .await
+        .unwrap();
+    enqueue(input, "run the shell tool").await;
+    let drain = tokio::spawn(async move {
+        let mut saw_shell_result = false;
+        while let Some(message) = output.recv().await {
+            let line = stream_json_line(&message).unwrap();
+            let streamed: IOMessage = serde_json::from_str(&line).unwrap();
+            assert!(!streamed.metadata.contains_key(META_SUMMARY), "{line}");
+            assert!(!streamed.metadata.contains_key(META_DOCUMENT), "{line}");
+            if let Some(document) = message.metadata.get(META_DOCUMENT) {
+                assert!(message.metadata.contains_key(META_SUMMARY));
+                assert!(matches!(&streamed.content, IOContent::Text(text) if text == document));
+                let result: serde_json::Value = serde_json::from_str(document).unwrap();
+                assert_eq!(result["stdout"], "headless tool output\n");
+                assert_eq!(result["exit_code"], 0);
+                saw_shell_result = true;
+            }
+        }
+        saw_shell_result
+    });
+    let outcome = run::drive_turn(sessions, &id).await;
+    provider.close().await;
+    assert!(
+        drain.await.unwrap(),
+        "the real shell result must be emitted"
+    );
+    assert_eq!(outcome.reason, TurnReason::Completed);
+    assert_eq!(outcome.final_text.as_deref(), Some(ANSWER));
+}
+
+#[tokio::test]
 async fn a_session_error_before_execution_is_reported_as_failed_with_exit_code_one() {
     // Driving a session id that was never created never reaches the
     // executor: no run id, turn number defaults to 0, and the reason names
@@ -365,7 +486,7 @@ async fn a_session_error_before_execution_is_reported_as_failed_with_exit_code_o
     let mut server = Server::new();
     server
         .add_plugins(ModelsPlugin)
-        .add_plugins(ScriptedModelPlugin)
+        .add_plugins(ScriptedModelPlugin::default())
         .add_plugins(ToolsPlugin)
         .add_plugins(OxigraphPlugin::in_memory())
         .add_plugins(PersistencePlugin)

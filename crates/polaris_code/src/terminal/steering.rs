@@ -401,15 +401,31 @@ impl TurnInputHandle for TurnSteering {
     }
 
     fn is_pending(&self, id: u64) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| state.pending.iter().any(|input| input.receipt.id == id))
+        self.state.lock().map_or(true, |state| {
+            state.pending.iter().any(|input| input.receipt.id == id)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unavailable_queue_preserves_pending_badges() {
+        let steering = TurnSteering::enabled();
+        let queued = steering
+            .submit("first".into(), TurnInputMode::Queue)
+            .unwrap();
+        let state = steering.state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison the queue for this test");
+        })
+        .join();
+        assert!(steering.state.is_poisoned());
+        assert!(steering.is_pending(queued.id));
+    }
 
     /// The panel retires a "queued" badge on `is_pending`, so it has to turn
     /// false exactly when the run takes the prompt or the user removes it.

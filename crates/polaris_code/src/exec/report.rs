@@ -754,12 +754,39 @@ pub fn stream_json_line(message: &IOMessage) -> Result<String, serde_json::Error
     // its rendered shell text, for the terminal. The stream keeps the shape it
     // always had: the executor's document as the body, no display extras.
     if message.metadata.contains_key(META_SUMMARY) || message.metadata.contains_key(META_DOCUMENT) {
-        let mut message = message.clone();
-        if let Some(document) = message.metadata.remove(META_DOCUMENT) {
-            message.content = IOContent::Text(document);
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Content<'a> {
+            Document {
+                #[serde(rename = "Text")]
+                text: &'a str,
+            },
+            Original(&'a IOContent),
         }
-        message.metadata.remove(META_SUMMARY);
-        return serde_json::to_string(&message);
+
+        #[derive(Serialize)]
+        struct StreamMessage<'a> {
+            content: Content<'a>,
+            source: &'a polaris::plugins::IOSource,
+            metadata: std::collections::HashMap<&'a str, &'a str>,
+        }
+
+        let content = message
+            .metadata
+            .get(META_DOCUMENT)
+            .map_or(Content::Original(&message.content), |document| {
+                Content::Document { text: document }
+            });
+        return serde_json::to_string(&StreamMessage {
+            content,
+            source: &message.source,
+            metadata: message
+                .metadata
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), META_DOCUMENT | META_SUMMARY))
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect(),
+        });
     }
     serde_json::to_string(message)
 }
@@ -826,6 +853,22 @@ mod tests {
             stream_json_line(&message).expect("a line"),
             serde_json::to_string(&message).expect("serialises")
         );
+    }
+
+    #[test]
+    fn stream_json_preserves_non_text_content_and_other_fields() {
+        for content in [
+            IOContent::Structured(serde_json::json!({"answer": 42})),
+            IOContent::Binary {
+                mime_type: "application/octet-stream".into(),
+                data: vec![0, 1, 255],
+            },
+        ] {
+            let message = IOMessage::from_external("test", content).with_metadata("keep", "value");
+            let expected = serde_json::to_value(&message).unwrap();
+            let message = message.with_metadata(META_SUMMARY, "display only");
+            assert_eq!(streamed(&message), expected);
+        }
     }
 
     /// A non-default limit, so a test that asserts on it cannot pass by

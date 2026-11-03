@@ -43,6 +43,8 @@ use polaris::system::resource::LocalResource;
 use polaris_ontrace::oxigraph::OxigraphStore;
 use tokio::process::Command;
 
+use crate::config_dir::home_dir;
+
 /// Load every `*.ttl` ontology pack in `packs_dir` into the store's `TBox` graph.
 ///
 /// Each file is parsed as Turtle and merged into the ontology (`TBox`) named
@@ -385,15 +387,6 @@ fn discovery_ceiling_with<'a>(
         return dir;
     }
     working_dir
-}
-
-/// The user's home directory, read from the environment so the boundary is the
-/// same one their shell means by `~`.
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
 }
 
 /// Run a command in `dir`, returning trimmed stdout on success (non-empty).

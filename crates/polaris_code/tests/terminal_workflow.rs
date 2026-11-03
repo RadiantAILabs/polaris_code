@@ -1192,7 +1192,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     let screen = host
         .wait_for("the command approval", |screen| screen.contains("approve?"))
         .await;
-    // A command is framed once above the input with one line of answers;
+    // A command is framed once above the input with wrapped answers;
     // the raw prompt (tool, directory, JSON arguments) waits behind `?`.
     assert!(screen.contains("approve? · run_command in"), "{screen}");
     assert!(
