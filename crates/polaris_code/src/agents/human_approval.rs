@@ -9,7 +9,7 @@ use polaris::system::plugin::{Plugin, Version};
 use polaris::system::resource::GlobalResource;
 use polaris::system::server::Server;
 
-use super::permission_rules::{ApprovalError, ApprovalRequest, ApprovalScope, SessionGrants};
+use super::permission_rules::{ApprovalAnswer, ApprovalError, ApprovalRequest, SessionGrants};
 
 /// Transport for a single human decision and cancellation of its pending prompt.
 ///
@@ -18,13 +18,13 @@ use super::permission_rules::{ApprovalError, ApprovalRequest, ApprovalScope, Ses
 /// implementation uses [`ApprovalRequest`]'s
 /// existing confirmation protocol.
 pub trait HumanApprover: Send + Sync + 'static {
-    /// Present the exact request and return the selected scope or refusal.
+    /// Present the exact request and return its scope and optional note or refusal.
     fn ask<'a>(
         &'a self,
         request: &'a ApprovalRequest,
         io: &'a UserIO,
         prompt: String,
-    ) -> BoxFuture<'a, Result<ApprovalScope, ApprovalError>>;
+    ) -> BoxFuture<'a, Result<ApprovalAnswer, ApprovalError>>;
 
     /// Resolve a prompt whose wait was interrupted, before another input receive.
     fn cancel<'a>(
@@ -76,7 +76,7 @@ impl HumanApproval {
         Self(Arc::new(approver))
     }
 
-    /// Ask the registered transport for an explicitly offered scope.
+    /// Ask the registered transport for an explicitly offered scope and optional note.
     ///
     /// # Errors
     ///
@@ -87,10 +87,10 @@ impl HumanApproval {
         io: &UserIO,
         prompt: String,
         grants: &SessionGrants,
-    ) -> Result<ApprovalScope, ApprovalError> {
-        let scope = self.0.ask(request, io, prompt).await?;
-        request.remember_scope(grants, scope)?;
-        Ok(scope)
+    ) -> Result<ApprovalAnswer, ApprovalError> {
+        let answer = self.0.ask(request, io, prompt).await?;
+        request.remember_scope(grants, answer.scope)?;
+        Ok(answer)
     }
 
     /// Resolve an interrupted prompt before the next input receive.
@@ -110,8 +110,8 @@ impl HumanApprover for InteractiveApprover {
         request: &'a ApprovalRequest,
         io: &'a UserIO,
         prompt: String,
-    ) -> BoxFuture<'a, Result<ApprovalScope, ApprovalError>> {
-        Box::pin(request.receive_scope(io, prompt))
+    ) -> BoxFuture<'a, Result<ApprovalAnswer, ApprovalError>> {
+        Box::pin(request.receive_answer(io, prompt))
     }
 
     fn cancel<'a>(
@@ -168,6 +168,7 @@ impl Plugin for InteractiveApprovalPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::permission_rules::ApprovalScope;
     use polaris::plugins::{IOMessage, IOProvider};
     use serde_json::json;
 
@@ -178,8 +179,8 @@ mod tests {
             _: &'a ApprovalRequest,
             _: &'a UserIO,
             _: String,
-        ) -> BoxFuture<'a, Result<ApprovalScope, ApprovalError>> {
-            Box::pin(async { Ok(ApprovalScope::Exact) })
+        ) -> BoxFuture<'a, Result<ApprovalAnswer, ApprovalError>> {
+            Box::pin(async { Ok(ApprovalScope::Exact.into()) })
         }
         fn cancel<'a>(
             &'a self,

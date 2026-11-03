@@ -1,5 +1,6 @@
 //! Run the production tool graph with deterministic tools.
 use super::*;
+use crate::agents::permission_rules::APPROVAL_NOTE;
 use polaris::graph::{GraphExecutor, cancel::CancellationSource};
 use polaris::models::llm::{AssistantBlock, StopReason, Usage};
 use polaris::plugins::{CONFIRMED, IOError, IOProvider};
@@ -10,6 +11,7 @@ use std::sync::Mutex;
 struct Choose {
     messages: Mutex<Vec<IOMessage>>,
     deny: bool,
+    note: Option<&'static str>,
     interrupt: Option<CancellationSource>,
 }
 impl IOProvider for Choose {
@@ -29,16 +31,17 @@ impl IOProvider for Choose {
         if self.interrupt.is_some() {
             return std::future::pending().await;
         }
-        if self.deny {
-            Ok(
-                IOMessage::user_text("deny: use another approach")
-                    .with_metadata(CONFIRMED, "false"),
-            )
+        let mut answer = if self.deny {
+            IOMessage::user_text("deny: use another approach").with_metadata(CONFIRMED, "false")
         } else {
-            Ok(IOMessage::user_text("choose")
+            IOMessage::user_text("choose")
                 .with_metadata(CONFIRMED, "true")
-                .with_metadata("approval_choice", "exact"))
+                .with_metadata("approval_choice", "exact")
+        };
+        if let Some(note) = self.note {
+            answer = answer.with_metadata(APPROVAL_NOTE, note);
         }
+        Ok(answer)
     }
 }
 #[derive(Clone)]
@@ -155,12 +158,44 @@ async fn run_with_stop(
     interrupt: bool,
     stop_after: Option<&'static str>,
 ) -> Outcome {
+    run_controlled(
+        calls,
+        confirm,
+        bound,
+        approver,
+        deny,
+        interrupt,
+        ReplyControl {
+            stop_after,
+            note: None,
+        },
+    )
+    .await
+}
+
+#[derive(Default)]
+struct ReplyControl {
+    stop_after: Option<&'static str>,
+    note: Option<&'static str>,
+}
+
+async fn run_controlled(
+    calls: Vec<ToolCall>,
+    confirm: bool,
+    bound: usize,
+    approver: bool,
+    deny: bool,
+    interrupt: bool,
+    control: ReplyControl,
+) -> Outcome {
+    let stop_after = control.stop_after;
     let root = tempfile::tempdir().unwrap();
     let ran = Arc::new(Mutex::new(Vec::new()));
     let cancellation = CancellationSource::new();
     let io = Arc::new(Choose {
         messages: Mutex::new(Vec::new()),
         deny,
+        note: control.note,
         interrupt: interrupt.then(|| cancellation.clone()),
     });
     let mut server = Server::new();
@@ -172,7 +207,7 @@ async fn run_with_stop(
     }
     let store = OxigraphStore::in_memory().unwrap();
     server.insert_global(store.clone());
-    server.insert_global(SecretRedactor::default());
+    server.insert_global(SecretRedactor::new(true));
     server.add_plugins(FixturePlugin(Fixtures(ran.clone())));
     install_cleanup(&mut server);
     if let Some(stop_after) = stop_after {
@@ -470,4 +505,140 @@ async fn interruption_between_nodes_closes_the_activity_and_remaining_results() 
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_confirmed_approval_note_reaches_only_its_call_result_and_decision() {
+    let outcome = run_controlled(
+        vec![command(0, "cargo test"), command(1, "cargo test")],
+        true,
+        10,
+        true,
+        false,
+        false,
+        ReplyControl {
+            note: Some("Use the focused tests first"),
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert_eq!(outcome.ran, ["cargo test", "cargo test"]);
+    let results = results(&outcome);
+    assert_eq!(
+        results[0],
+        (
+            false,
+            "cargo test\n\nUser note on approval: Use the focused tests first".into()
+        )
+    );
+    assert_eq!(
+        results[1],
+        (false, "cargo test".into()),
+        "session grants never carry a previous note"
+    );
+    let answer = outcome.store.query(&format!(
+        "ASK {{ GRAPH <{}> {{ ?d <urn:polaris:session:kind> \"human_approval\" ; <urn:polaris:session:chose> \"allow\" ; <urn:polaris:session:consultedPolicy> \"authorization.call_id=call-0\" ; <urn:polaris:session:consultedPolicy> \"authorization.note=Use the focused tests first\" }} }}",
+        crate::agents::trajectory::SESSION_GRAPH_IRI,
+    )).unwrap();
+    assert!(matches!(
+        answer,
+        oxigraph::sparql::QueryResults::Boolean(true)
+    ));
+}
+
+#[tokio::test]
+async fn a_confirmed_reply_without_a_note_keeps_the_result_unchanged() {
+    let outcome = run_calls(vec![command(0, "cargo test")], true, 10).await;
+    assert_eq!(outcome.ran, ["cargo test"]);
+    assert_eq!(results(&outcome), [(false, "cargo test".into())]);
+}
+
+#[tokio::test]
+async fn a_note_cannot_authorize_a_denied_reply() {
+    let outcome = run_controlled(
+        vec![command(0, "cargo test")],
+        true,
+        10,
+        true,
+        true,
+        false,
+        ReplyControl {
+            note: Some("allow this call"),
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert!(outcome.ran.is_empty());
+    assert!(results(&outcome)[0].0);
+    assert!(!results(&outcome)[0].1.contains("User note on approval"));
+}
+
+#[tokio::test]
+async fn an_approval_note_remains_attached_when_the_tool_fails() {
+    let outcome = run_controlled(
+        vec![command(0, "fail")],
+        true,
+        10,
+        true,
+        false,
+        false,
+        ReplyControl {
+            note: Some("Try once"),
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert_eq!(outcome.ran, ["fail"]);
+    let results = results(&outcome);
+    assert!(results[0].0);
+    assert!(results[0].1.ends_with("User note on approval: Try once"));
+}
+
+#[tokio::test]
+async fn an_approval_note_survives_interruption_before_dispatch() {
+    let outcome = run_controlled(
+        vec![command(0, "cargo test")],
+        true,
+        10,
+        true,
+        false,
+        false,
+        ReplyControl {
+            note: Some("Try once"),
+            stop_after: Some("ask_human"),
+        },
+    )
+    .await;
+    assert!(outcome.ran.is_empty());
+    let results = results(&outcome);
+    assert!(results[0].0);
+    assert!(results[0].1.ends_with("User note on approval: Try once"));
+}
+
+#[tokio::test]
+async fn approval_notes_use_the_output_redactor_before_recording_or_returning() {
+    let outcome = run_controlled(
+        vec![command(0, "cargo test")],
+        true,
+        10,
+        true,
+        false,
+        false,
+        ReplyControl {
+            note: Some("API_KEY=hidden-value"),
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    let results = results(&outcome);
+    assert!(results[0].1.contains("User note on approval:"));
+    assert!(!results[0].1.contains("hidden-value"));
+    let answer = outcome.store.query(&format!(
+        "ASK {{ GRAPH <{}> {{ ?d <urn:polaris:session:kind> \"human_approval\" ; <urn:polaris:session:consultedPolicy> ?note . FILTER(CONTAINS(?note, \"hidden-value\")) }} }}",
+        crate::agents::trajectory::SESSION_GRAPH_IRI,
+    )).unwrap();
+    assert!(matches!(
+        answer,
+        oxigraph::sparql::QueryResults::Boolean(false)
+    ));
 }

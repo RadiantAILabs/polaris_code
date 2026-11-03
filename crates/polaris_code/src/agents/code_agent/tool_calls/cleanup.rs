@@ -147,9 +147,9 @@ fn close_interrupted_batch(ctx: &mut SystemContext<'_>) {
             "interrupted",
             reason,
         );
-        batch.results.push(UserBlock::tool_error(
-            &active.call.id,
-            ToolResultContent::Text(reason.into()),
+        batch.results.push(with_approval_note(
+            UserBlock::tool_error(&active.call.id, ToolResultContent::Text(reason.into())),
+            active.approval_note.as_deref(),
         ));
     }
     for (_, call) in batch.calls.drain(..) {

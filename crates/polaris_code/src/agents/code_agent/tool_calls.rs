@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use super::*;
 use crate::agents::human_approval::HumanApproval;
-use crate::agents::permission_rules::ApprovalReceipt;
+use crate::agents::permission_rules::{ApprovalAnswer, ApprovalReceipt};
 use crate::terminal::background::Invocation;
 
 /// Independent of the outer model-turn budget.
@@ -25,6 +25,7 @@ pub(crate) struct StartedCall {
     activity: ToolActivity,
     invocation: Invocation,
     call: ToolCall,
+    approval_note: Option<String>,
 }
 
 // The slot owns the invocation across graph nodes. Clearing it releases the
@@ -45,7 +46,7 @@ impl CallLifetime {
         }
     }
 
-    fn active(&self) -> &StartedCall {
+    fn active_mut(&mut self) -> &mut StartedCall {
         match self {
             Self::Active(call) => call,
             Self::Idle => unreachable!("authorization starts the call before routing it"),
@@ -87,11 +88,22 @@ pub(crate) struct AuthorizedCall {
 }
 
 pub(crate) enum CallDecision {
-    Allow(Option<ApprovalScope>),
+    Allow(Option<ApprovalAnswer>),
     Deny(String),
 }
 
 impl CallDecision {
+    fn note(&self) -> Option<&str> {
+        match self {
+            Self::Allow(Some(answer)) => answer.note.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn push_result(&self, batch: &mut ToolBatch, block: UserBlock) {
+        batch.results.push(with_approval_note(block, self.note()));
+    }
+
     fn record(&self, call: &AuthorizedCall, store: &OxigraphStore, turn: usize) {
         let mut record = call.record.clone();
         record.chosen = if matches!(self, Self::Allow(_)) {
@@ -100,14 +112,25 @@ impl CallDecision {
             "deny"
         }
         .into();
-        if let Self::Allow(Some(scope)) = self {
+        if let Self::Allow(Some(answer)) = self {
             record.policy_refs.push(format!(
                 "authorization.scope={}",
-                approval_scope_label(*scope)
+                approval_scope_label(answer.scope)
             ));
         }
         record.record(store, turn);
     }
+}
+
+fn with_approval_note(mut block: UserBlock, note: Option<&str>) -> UserBlock {
+    if let Some(note) = note
+        && let UserBlock::ToolResult(result) = &mut block
+        && let ToolResultContent::Text(text) = &mut result.content
+    {
+        text.push_str("\n\nUser note on approval: ");
+        text.push_str(note);
+    }
+    block
 }
 
 #[system]
@@ -274,6 +297,7 @@ pub(crate) async fn authorize_call(
         activity,
         invocation,
         call: tool_call.clone(),
+        approval_note: None,
     }));
     let review = policy
         .uses_reviewer()
@@ -373,6 +397,7 @@ pub(crate) async fn ask_human(
     mut lifetime: ResMut<CallLifetime>,
     user_io: Res<UserIO>,
     grants: Res<SessionGrants>,
+    redactor: Res<SecretRedactor>,
     cancel: Res<RunCancellation>,
     store: Res<OxigraphStore>,
     mut context: ResMut<ContextManager>,
@@ -392,7 +417,7 @@ pub(crate) async fn ask_human(
         );
         return decision;
     };
-    let active = lifetime.active();
+    let active = lifetime.active_mut();
     let waiting = if call.request.frames_command() {
         "awaiting approval"
     } else {
@@ -407,13 +432,17 @@ pub(crate) async fn ask_human(
         .run_until_cancelled(approver.ask(&call.request, &user_io, prompt.clone(), &grants))
         .await
     {
-        Some(Ok(scope)) => {
+        Some(Ok(mut answer)) => {
+            answer.note = answer
+                .note
+                .map(|note| redact_tool_output(*redactor, &call.call.function.name, note));
+            active.approval_note = answer.note.clone();
             active.invocation.executing();
             active
                 .activity
                 .phase(&user_io, PHASE_START, &call.detail)
                 .await;
-            CallDecision::Allow(Some(scope))
+            CallDecision::Allow(Some(answer))
         }
         Some(Err(reason)) => CallDecision::Deny(reason.to_string()),
         None => {
@@ -473,17 +502,22 @@ fn record_human_decision(
     ]);
     record.options = vec!["allow".into(), "deny".into()];
     match decision {
-        CallDecision::Allow(Some(scope)) => {
+        CallDecision::Allow(Some(answer)) => {
             record.chosen = "allow".into();
             record.policy_refs.push(format!(
                 "authorization.scope={}",
-                approval_scope_label(*scope)
+                approval_scope_label(answer.scope)
             ));
         }
         CallDecision::Allow(None) => record.chosen = "allow".into(),
         CallDecision::Deny(reason) => record
             .policy_refs
             .push(format!("authorization.reason={reason}")),
+    }
+    if let Some(note) = decision.note() {
+        record
+            .policy_refs
+            .push(format!("authorization.note={note}"));
     }
     record.record(store, turn);
 }
@@ -617,10 +651,10 @@ pub(crate) async fn execute_call(
                 "interrupted",
                 &output,
             );
-            batch.results.push(UserBlock::tool_error(
-                &tool_call.id,
-                ToolResultContent::Text(output),
-            ));
+            decision.push_result(
+                &mut batch,
+                UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output)),
+            );
             *lifetime = CallLifetime::Idle;
             batch.interrupted = true;
             finish_pending(
@@ -664,10 +698,10 @@ pub(crate) async fn execute_call(
                         "error",
                         &reason,
                     );
-                    batch.results.push(UserBlock::tool_error(
-                        &tool_call.id,
-                        ToolResultContent::Text(reason),
-                    ));
+                    decision.push_result(
+                        &mut batch,
+                        UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason)),
+                    );
                     return;
                 }
             };
@@ -682,10 +716,13 @@ pub(crate) async fn execute_call(
                 &body,
             );
             tasks.report_backgrounded(task.number);
-            batch.results.push(UserBlock::tool_result(
-                &tool_call.id,
-                ToolResultContent::Text(background_receipt(&task)),
-            ));
+            decision.push_result(
+                &mut batch,
+                UserBlock::tool_result(
+                    &tool_call.id,
+                    ToolResultContent::Text(background_receipt(&task)),
+                ),
+            );
             return;
         };
         // The run's task answered. A wait that ended without an answer —
@@ -708,10 +745,10 @@ pub(crate) async fn execute_call(
                         "denied",
                         &reason,
                     );
-                    batch.results.push(UserBlock::tool_error(
-                        &tool_call.id,
-                        ToolResultContent::Text(reason),
-                    ));
+                    decision.push_result(
+                        &mut batch,
+                        UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason)),
+                    );
                     return;
                 }
                 // Every toolset in this crate answers with the string it
@@ -791,7 +828,7 @@ pub(crate) async fn execute_call(
             }
         }
     };
-    batch.results.push(block);
+    decision.push_result(&mut batch, block);
 }
 
 #[system]

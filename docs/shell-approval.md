@@ -100,3 +100,13 @@ interrupt resolves the pending request before the next input receive. Human
 answers are recorded as `human_approval` trajectory decisions, with the call
 identity and chosen scope or denial reason, alongside permission and tool-call
 records. Confirmation metadata and denial text use the existing wire format.
+
+Confirmed replies may include `approval_note`, an optional line of user text of
+at most 1 KiB. The interactive approver reads it only after validating
+`confirmed` and `approval_choice`; the note never grants or widens permission.
+It is redacted with the normal output policy, recorded on the human decision,
+and appended to that call's model-visible result as
+`User note on approval: <note>`, including an error result if execution fails or
+is interrupted. A remembered session scope does not copy the note to later
+calls. Replies without this metadata keep their existing result text. Denial
+notes continue to use `deny: <reason>` or `no: <reason>` text.
