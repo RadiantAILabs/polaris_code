@@ -985,26 +985,55 @@ fn bounded_safe_text(text: &str) -> (String, usize) {
     (safe_text(&text[..end]), text.len() - end)
 }
 
-/// Split `text` into rows of at most `width` columns, breaking at any glyph.
+/// The columns ratatui gives one grapheme cluster when it draws it (the
+/// `CellWidth` it implements for `str`): the cluster's string width, with each
+/// halfwidth (semi-)voiced sound mark counted as a cell of its own, because
+/// terminals draw it as one although `unicode-width` calls it zero-width.
 ///
-/// A command is not prose: every character is kept, in order, with nothing
+/// A width taken char by char differs: `♥` + U+FE0F is two columns drawn but
+/// one counted. `cell_width_matches_what_ratatui_draws` keeps this in step
+/// with ratatui.
+fn cell_width(grapheme: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    if grapheme.len() == 1 {
+        return 1;
+    }
+    let marks = grapheme
+        .chars()
+        .filter(|ch| matches!(ch, '\u{ff9e}' | '\u{ff9f}'))
+        .count();
+    grapheme.width() + marks
+}
+
+/// Split `text` into rows of at most `width` columns, breaking between
+/// grapheme clusters.
+///
+/// A command is not prose: every cluster is kept, in order, with nothing
 /// trimmed or reflowed, so the rows the frame scrolls are exactly the rows it
-/// measured.
+/// drew. They are measured the way ratatui draws them ([`cell_width`]); a row
+/// that was wider than the area would lose its end, which is where a command's
+/// last words are.
+///
+/// ratatui skips a cluster wider than the whole row, so at one column a
+/// two-column cluster is shown as `�` rather than as nothing.
 fn hard_wrap(text: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1);
     let mut rows = Vec::new();
     for line in text.split('\n') {
         let mut row = String::new();
         let mut used = 0;
-        for ch in line.chars() {
-            let glyph = ch.width().unwrap_or(0);
-            if used + glyph > width && !row.is_empty() {
+        for grapheme in line.graphemes(true) {
+            let (grapheme, columns) = match cell_width(grapheme) {
+                columns if columns > width => ("\u{fffd}", 1),
+                columns => (grapheme, columns),
+            };
+            if used + columns > width {
                 rows.push(std::mem::take(&mut row));
                 used = 0;
             }
-            row.push(ch);
-            used += glyph;
+            row.push_str(grapheme);
+            used += columns;
         }
         rows.push(row);
     }
@@ -9555,6 +9584,159 @@ mod tests {
             );
         }
         panic!("{needle:?} never came on screen");
+    }
+
+    /// Step a framed approval for `subject` through a `width`×`height`
+    /// terminal one row at a time, answering `y` on every frame. The gate must
+    /// follow the screen: `y` is refused for as long as `needle` — text only
+    /// the subject's last row holds — is not drawn, and answers on the first
+    /// frame it is. Returns how many frames refused it.
+    async fn gate_follows_the_screen(
+        label: &str,
+        subject: &str,
+        needle: &str,
+        width: u16,
+        height: u16,
+    ) -> usize {
+        use polaris::plugins::IOProvider;
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(framed_approval(subject));
+        panel.drain_inbox();
+        for refused in 0..4000 {
+            let screen = draw(&mut panel, width, height).0.join("\n");
+            let shown = screen.contains(needle);
+            type_str(&mut panel, "y");
+            panel.handle_key(key(KeyCode::Enter));
+            if shown {
+                assert!(
+                    panel.pending_confirm.is_none(),
+                    "{label} {width}×{height}: `y` is refused with {needle:?} on screen:\n{screen}"
+                );
+                let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    response.metadata.get(CONFIRMED).map(String::as_str),
+                    Some(CONFIRMED_TRUE),
+                    "{label} {width}×{height}"
+                );
+                return refused;
+            }
+            assert!(
+                panel.pending_confirm.is_some() && nothing_submitted(&panel),
+                "{label} {width}×{height}, after {refused} refusals: `y` was accepted with \
+                 {needle:?} off screen:\n{screen}"
+            );
+            assert_eq!(
+                panel.handle_key(key(KeyCode::Down)),
+                EventOutcome::Consumed,
+                "{label} {width}×{height}: nothing left to scroll, yet {needle:?} never came \
+                 on screen:\n{screen}"
+            );
+        }
+        panic!("{label} {width}×{height}: {needle:?} never came on screen");
+    }
+
+    /// Clusters whose width is not their chars' widths summed, and some whose
+    /// is.
+    const CLUSTERS: [(&str, &str); 8] = [
+        ("emoji presentation sequence", "♥\u{fe0f}"),
+        ("keycap sequence", "1\u{fe0f}\u{20e3}"),
+        ("ZWJ sequence", "👨\u{200d}👩\u{200d}👧"),
+        ("combining marks", "e\u{301}\u{302}"),
+        ("halfwidth voiced sound mark", "ﾊﾞ"),
+        ("halfwidth semi-voiced sound mark", "ﾊﾟ"),
+        ("wide CJK", "漢"),
+        ("regional-indicator flag", "🇺🇸"),
+    ];
+
+    /// What ratatui draws for `row` in `width` columns, as the cells it fills.
+    fn drawn(row: &str, width: u16) -> String {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(Line::raw(row.to_string())).render(area, &mut buffer);
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The rows are measured the way they are drawn: drawn in exactly their
+    /// width, each shows what it shows with room to spare, so nothing was cut.
+    #[test]
+    fn hard_wrap_rows_are_drawn_whole() {
+        for (label, unit) in CLUSTERS {
+            for width in 1..=20_u16 {
+                for repeats in [1, 5, 11, 40] {
+                    let text = format!("a{}b ", unit.repeat(repeats));
+                    for row in hard_wrap(&text, usize::from(width)) {
+                        assert_eq!(
+                            drawn(&row, width),
+                            drawn(&row, width + 8),
+                            "{label} ×{repeats} at {width} columns: row {row:?} was cut"
+                        );
+                    }
+                }
+            }
+        }
+        // Nothing is dropped or reordered: the rows read back as the text.
+        let text = "printf '♥\u{fe0f}ﾊﾞ漢'; rm -rf build";
+        assert_eq!(hard_wrap(text, 7).concat(), text);
+    }
+
+    /// A cluster wider than the row is skipped by ratatui, so at one column it
+    /// is shown as a stand-in rather than as nothing.
+    #[test]
+    fn hard_wrap_shows_a_stand_in_for_a_cluster_wider_than_the_row() {
+        assert_eq!(hard_wrap("a漢b", 1), ["a", "\u{fffd}", "b"]);
+        assert_eq!(hard_wrap("a漢b", 2), ["a", "漢", "b"]);
+        assert_eq!(hard_wrap("", 5), [""]);
+        assert_eq!(hard_wrap("ab\ncd", 5), ["ab", "cd"]);
+    }
+
+    /// `cell_width` mirrors ratatui's own measure, so the two cannot drift
+    /// apart unnoticed when ratatui is upgraded.
+    #[test]
+    fn cell_width_matches_what_ratatui_draws() {
+        use ratatui::buffer::CellWidth;
+        use unicode_segmentation::UnicodeSegmentation;
+        for (label, unit) in CLUSTERS {
+            let text = format!("a{unit} b{unit}{unit}\u{3042}");
+            for grapheme in text.graphemes(true) {
+                assert_eq!(
+                    cell_width(grapheme),
+                    usize::from(grapheme.cell_width()),
+                    "{label}: {grapheme:?}"
+                );
+            }
+        }
+    }
+
+    /// Must-fix regression: ratatui draws grapheme clusters, but a row wrapped
+    /// by `char` widths undercounted `♥` + U+FE0F, overflowed, and lost its
+    /// end — while the gate counted that end as seen and `y` ran an unseen
+    /// `rm -rf build`.
+    #[tokio::test]
+    async fn a_row_of_wide_graphemes_cannot_hide_the_command_tail() {
+        // The reviewer's reproduction, one line, at 80×24.
+        let repro = format!("printf '{}'; rm -rf build", "♥\u{fe0f}".repeat(39));
+        gate_follows_the_screen("reviewer's repro", &repro, "rm -rf build", 80, 24).await;
+
+        // Every kind of cluster whose width differs from its chars' summed
+        // widths, the tail on the same row as the cluster run that ends the
+        // wrap. A one-char needle cannot be split across rows.
+        for (label, unit) in CLUSTERS {
+            for repeats in [37, 38, 39, 40, 300] {
+                let subject = format!("printf '{}'; rm -rf build ‡", unit.repeat(repeats));
+                for (width, height) in [(80, 24), (80, 12), (40, 24)] {
+                    gate_follows_the_screen(label, &subject, "‡", width, height).await;
+                }
+            }
+        }
     }
 
     /// Must-fix regression: at 80×24 and 80×12 the end of a long command was
