@@ -199,9 +199,10 @@
 //! empty input), and a confirming answer is refused until the subject's last
 //! row has been *drawn*, counting rows by grapheme cluster as ratatui draws
 //! them. The refused answer leaves the input, so the scroll keys the notice
-//! names work at once. A frame with no room to draw any of the subject (under
-//! about six rows) refuses every confirming answer and says to enlarge the
-//! terminal; `n` and `Esc` still deny. A subject over 64 KiB cannot be shown
+//! names work at once. A frame with no room to draw any of the subject (five
+//! rows, or six beside a meta row, and fewer) refuses every confirming answer
+//! and says to enlarge the terminal; `n` and `Esc` still deny. Below four rows
+//! only the input fits and the frame is not drawn. A subject over 64 KiB cannot be shown
 //! in full and can only be denied. Host text drawn on every frame (labels, the
 //! context, the prompt's first line) is bounded to 2 KiB when it arrives, and
 //! a cut one ends in `…`.
