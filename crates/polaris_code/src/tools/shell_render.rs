@@ -46,6 +46,39 @@ pub(crate) fn render_run_command(value: &Value) -> Option<String> {
     }
 }
 
+/// How a completed run ended and how much it printed, for the collapsed
+/// terminal row (`exit 0 · 40 lines`), or `None` if `value` is not one.
+///
+/// Counted over the whole of stdout and stderr, not the bounded display copy,
+/// so the number is what the command produced.
+pub(crate) fn run_command_outcome(value: &Value) -> Option<String> {
+    if value.get("status").and_then(Value::as_str)? != "executed" {
+        return None;
+    }
+    let outcome = value.get("outcome").and_then(Value::as_str).unwrap_or("");
+    let ended = if value.get("timed_out").and_then(Value::as_bool) == Some(true)
+        || outcome == "timed_out"
+    {
+        "timed out".to_string()
+    } else if outcome == "cancelled" {
+        "cancelled".to_string()
+    } else {
+        match value.get("exit_code").and_then(Value::as_i64) {
+            Some(code) => format!("exit {code}"),
+            None => "killed".to_string(),
+        }
+    };
+    let lines = ["stdout", "stderr"]
+        .iter()
+        .map(|stream| text(value, stream).trim_end_matches('\n').lines().count())
+        .sum::<usize>();
+    Some(match lines {
+        0 => format!("{ended} · no output"),
+        1 => format!("{ended} · 1 line"),
+        n => format!("{ended} · {n} lines"),
+    })
+}
+
 /// A completed run, as the text it produced plus a status marker.
 fn render_executed(value: &Value) -> String {
     let mut out = String::new();
@@ -123,6 +156,20 @@ fn text<'v>(value: &'v Value, field: &str) -> &'v str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_collapsed_outcome_counts_every_line_the_command_printed() {
+        let value = json!({
+            "status": "executed", "exit_code": 3, "outcome": "exited",
+            "stdout": "a\nb\nc\n", "stderr": "boom\n",
+        });
+        assert_eq!(run_command_outcome(&value).unwrap(), "exit 3 · 4 lines");
+        let quiet = json!({"status": "executed", "exit_code": 0, "stdout": "", "stderr": ""});
+        assert_eq!(run_command_outcome(&quiet).unwrap(), "exit 0 · no output");
+        let slow = json!({"status": "executed", "timed_out": true, "stdout": "x"});
+        assert_eq!(run_command_outcome(&slow).unwrap(), "timed out · 1 line");
+        assert!(run_command_outcome(&json!({"status": "confirmation_required"})).is_none());
+    }
 
     /// The executor's document for a run that wrote to both streams and failed.
     fn executed(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Value {

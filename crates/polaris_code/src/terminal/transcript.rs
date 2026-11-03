@@ -35,9 +35,12 @@
 //! | `phase` | [`PHASE_PENDING`], [`PHASE_START`], [`PHASE_RUNNING`], [`PHASE_BACKGROUND`], [`PHASE_OK`], [`PHASE_DENIED`] or [`PHASE_ERROR`]. |
 //! | `label` | Short human name (`edit_file`). |
 //! | `elapsed_ms` | Wall time from `start` to a terminal phase. |
+//! | `summary` | Optional, terminal phases only: one line the panel shows in place of the body until the user expands it. |
 //!
 //! Body is a one-line detail while running (the path, the command) and the
-//! result once terminal.
+//! result once terminal. A successful result longer than a line carries a
+//! `summary` (`cat notes.txt · exit 0 · 40 lines`), so a finished tool reads as
+//! one row and its output is a `Ctrl-O` away rather than filling the screen.
 //!
 //! # Blocks that outlive their turn
 //!
@@ -80,6 +83,8 @@ pub const META_LABEL: &str = "label";
 pub const META_ELAPSED_MS: &str = "elapsed_ms";
 /// Metadata key carrying why a message block ended.
 pub const META_OUTCOME: &str = "outcome";
+/// Metadata key carrying a finished tool block's collapsed one-line summary.
+pub const META_SUMMARY: &str = "summary";
 
 /// [`META_FINAL`] value marking a block closed.
 pub const FINAL_TRUE: &str = "true";
@@ -302,6 +307,8 @@ pub struct ToolActivity {
     id: String,
     parent: Option<String>,
     label: String,
+    /// The one-line detail the block opened with, reused to lead its summary.
+    detail: String,
     started: Instant,
 }
 
@@ -319,25 +326,55 @@ impl ToolActivity {
             id: id.into(),
             parent: parent.map(str::to_owned),
             label: label.into(),
+            detail: detail.to_owned(),
             started: Instant::now(),
         };
-        activity.emit(user_io, PHASE_START, detail).await;
+        activity.emit(user_io, PHASE_START, detail, None).await;
         activity
     }
 
     /// Move the block to `phase` while it is still running — used for the
     /// approval wait, which is time the user is spending, not the tool.
     pub async fn phase(&self, user_io: &UserIO, phase: &str, detail: &str) {
-        self.emit(user_io, phase, detail).await;
+        self.emit(user_io, phase, detail, None).await;
     }
 
     /// Close the block with its terminal phase and result body.
+    ///
+    /// A successful result longer than one line is summarised as the opening
+    /// detail plus its size, so it collapses to one row. Failures and denials
+    /// keep their body in view: that text is the reason.
     pub async fn finish(self, user_io: &UserIO, phase: &str, result: &str) {
-        self.emit(user_io, phase, result).await;
+        let summary = (phase == PHASE_OK)
+            .then(|| result_size(result))
+            .flatten()
+            .map(|size| self.summary(&size));
+        self.emit(user_io, phase, result, summary.as_deref()).await;
     }
 
-    async fn emit(&self, user_io: &UserIO, phase: &str, body: &str) {
-        let msg = tool_message(
+    /// Close the block with `result` collapsed behind the opening detail
+    /// followed by `outcome` (`exit 0 · 40 lines`).
+    pub async fn finish_with_summary(
+        self,
+        user_io: &UserIO,
+        phase: &str,
+        result: &str,
+        outcome: &str,
+    ) {
+        let summary = self.summary(outcome);
+        self.emit(user_io, phase, result, Some(&summary)).await;
+    }
+
+    fn summary(&self, outcome: &str) -> String {
+        if self.detail.is_empty() {
+            outcome.to_owned()
+        } else {
+            format!("{} · {outcome}", self.detail)
+        }
+    }
+
+    async fn emit(&self, user_io: &UserIO, phase: &str, body: &str, summary: Option<&str>) {
+        let mut msg = tool_message(
             &self.id,
             self.parent.as_deref(),
             &self.label,
@@ -345,6 +382,9 @@ impl ToolActivity {
             u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             body,
         );
+        if let Some(summary) = summary {
+            msg = msg.with_metadata(META_SUMMARY, summary.to_owned());
+        }
         let _ = user_io.send(msg).await;
     }
 }
@@ -406,6 +446,22 @@ pub fn tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
     };
     cap_detail(&detail.map_or_else(|| args.to_string(), str::to_owned))
 }
+
+/// How big a result is, in the words a collapsed row uses — or `None` when it
+/// already fits on one row and collapsing it would only hide it.
+fn result_size(result: &str) -> Option<String> {
+    let lines = result.trim_end_matches('\n').lines().count();
+    if lines > 1 {
+        Some(format!("{lines} lines"))
+    } else if result.chars().count() > SUMMARY_INLINE_CHARS {
+        Some(format!("{} chars", result.chars().count()))
+    } else {
+        None
+    }
+}
+
+/// Longest single-line result shown inline rather than collapsed.
+const SUMMARY_INLINE_CHARS: usize = 160;
 
 /// How much of a tool's detail line is shown before it is elided.
 const DETAIL_CHARS: usize = 80;

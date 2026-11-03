@@ -77,6 +77,7 @@
 //! | `"phase"` | `tool` | `pending`, `start`, `ok`, `denied` or `error`, rendered as a glyph. An unrecognised value still renders, so a host may extend the lifecycle. |
 //! | `"label"` | `tool` | The invocation's short name. The panel prints it and knows nothing about what the tool does. |
 //! | `"elapsed_ms"` | `tool` | Wall time, shown once the block reaches a terminal phase. |
+//! | `"summary"` | `tool` | One line shown in place of the body until `Ctrl-O` expands it, so a finished tool with a long result stays one row. |
 //!
 //! A non-final `message` body is a **delta** — the new text only — so a
 //! producer forwards what its provider emits without buffering the answer.
@@ -447,6 +448,8 @@ const META_LABEL: &str = "label";
 const META_ELAPSED_MS: &str = "elapsed_ms";
 /// Metadata key carrying why a `message` block ended.
 const META_OUTCOME: &str = "outcome";
+/// Metadata key carrying a finished `tool` block's collapsed one-line summary.
+const META_SUMMARY: &str = "summary";
 /// [`META_FINAL`] value marking a block closed.
 const FINAL_TRUE: &str = "true";
 /// [`META_OUTCOME`] value marking a block that ended before the answer did.
@@ -2970,7 +2973,18 @@ fn build_message_layout(
         let prefix = format!("{nest}{} ❯ ", safe_text(&label));
         let indent = " ".repeat(unicode_width::UnicodeWidthStr::width(prefix.as_str()));
         let rich = matches!(kind, Some(TYPE_MESSAGE | "error"));
-        let mut rendered = if matches!(kind, Some(TYPE_TOOL | TYPE_CONFIRM)) {
+        // A finished tool the host summarised reads as one row; its output is
+        // the same Ctrl-O away as every other folded body.
+        let summary = message
+            .metadata
+            .get(META_SUMMARY)
+            .filter(|_| kind == Some(TYPE_TOOL) && !expanded);
+        let mut rendered = if let Some(summary) = summary {
+            vec![Line::from(vec![
+                Span::raw(safe_text(summary).replace('\n', " ")),
+                Span::styled("  · ctrl-o", Style::default().fg(Color::DarkGray)),
+            ])]
+        } else if matches!(kind, Some(TYPE_TOOL | TYPE_CONFIRM)) {
             preview_lines(&body, expanded)
         } else {
             body_lines(&body, rich, expanded)
@@ -6946,6 +6960,34 @@ mod tests {
         // because the number would still be climbing.
         assert!(text.contains("1.5s"), "{text}");
         assert!(text.contains('✓'), "{text}");
+    }
+
+    /// A host summary folds a long result to one row; Ctrl-O shows the body
+    /// as real lines.
+    #[tokio::test]
+    async fn a_summarised_tool_result_is_one_row_until_expanded() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(
+            tool(
+                "call_1",
+                None,
+                "run_command",
+                "ok",
+                "one\ntwo\nthree\n[exit code: 0]",
+            )
+            .with_metadata(META_SUMMARY, "cat notes.txt · exit 0 · 3 lines"),
+        );
+        panel.drain_inbox();
+
+        let text = rendered(&panel);
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("cat notes.txt · exit 0 · 3 lines"), "{text}");
+        assert!(!text.contains("two"), "{text}");
+
+        panel.expanded = true;
+        let text = rendered(&panel);
+        assert!(text.contains("two"), "{text}");
+        assert!(!text.contains("3 lines"), "{text}");
     }
 
     #[tokio::test]

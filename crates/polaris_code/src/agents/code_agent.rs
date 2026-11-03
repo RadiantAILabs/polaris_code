@@ -66,7 +66,7 @@ use crate::terminal::transcript::{
     PHASE_OK, PHASE_PENDING, PHASE_RUNNING, PHASE_START, ToolActivity, tool_detail,
 };
 use crate::terminal::{ContainedPrompt, SessionSettings, TurnPrompt, TurnSteering};
-use crate::tools::shell_render::render_run_command;
+use crate::tools::shell_render::{render_run_command, run_command_outcome};
 use crate::tools::{
     CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, code_index_state, enrich, tool_is_read_only,
 };
@@ -897,8 +897,8 @@ pub(crate) async fn execute_tools(
                     }
                     // Every toolset in this crate answers with the string it
                     // built; `run_command` answers with the executor's JSON
-                    // document. The document is what the trajectory and the
-                    // host block keep — it is the honest record — but what
+                    // document. The document is what the trajectory keeps —
+                    // it is the honest record — but what
                     // the model gets is that document rendered as the text a
                     // shell produced, with an exit marker it cannot miss.
                     let observed = value
@@ -919,7 +919,21 @@ pub(crate) async fn execute_tools(
                         .map(|rendered| redact_tool_output(redactor, name, rendered))
                         .unwrap_or_else(|| observed.clone());
                     tracing::info!("Observation: {observed}");
-                    activity.finish(&user_io, PHASE_OK, &observed).await;
+                    // The terminal block shows a command the way a shell
+                    // would — real lines, collapsed behind its exit status
+                    // and size — rather than the escaped JSON document. That
+                    // is display only: the trajectory keeps `observed`.
+                    match (name == "run_command")
+                        .then(|| run_command_outcome(&value))
+                        .flatten()
+                    {
+                        Some(outcome) => {
+                            activity
+                                .finish_with_summary(&user_io, PHASE_OK, &output, &outcome)
+                                .await;
+                        }
+                        None => activity.finish(&user_io, PHASE_OK, &observed).await,
+                    }
                     record_tool_call(
                         &store,
                         turn,
