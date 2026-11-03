@@ -2405,10 +2405,15 @@ impl ConversationPanel {
         let accepted = match (invocation, answer) {
             (Some(invocation), _) => self.submit_command(invocation, &text),
             // A confirming answer waits until the user has been shown the
-            // whole subject. The draft stays, and nothing is sent: it is not
-            // an ordinary prompt either.
+            // whole subject. Nothing is sent: it is not an ordinary prompt
+            // either. The refused answer is spent, so it leaves the input: the
+            // scroll keys the notice points to only work on an empty one, and
+            // a later `n` would otherwise be typed after it.
             (None, Some(true)) if self.approval_blocked().is_some() => {
                 self.confirm_notice = self.approval_blocked();
+                self.composer.clear();
+                self.composer_scroll = 0;
+                self.refresh_popup();
                 false
             }
             (None, Some(confirmed)) if self.pending_confirm.is_some() => {
@@ -9582,15 +9587,24 @@ mod tests {
                 "{width}×{height}: the frame says rows are below:\n{screen}"
             );
 
-            // `y` before the tail has been shown is refused, keeps the draft
-            // and sends nothing.
+            // `y` before the tail has been shown is refused and sends
+            // nothing. The refused answer leaves the input, so the scroll keys
+            // the notice points to are not stuck behind it.
             type_str(&mut panel, "y");
             panel.handle_key(key(KeyCode::Enter));
             assert!(
                 panel.pending_confirm.is_some(),
                 "{width}×{height}: an unseen tail cannot be approved"
             );
-            assert_eq!(panel.composer.text(), "y", "the answer stays in the input");
+            assert!(
+                nothing_submitted(&panel),
+                "{width}×{height}: a refused answer sends nothing"
+            );
+            assert!(
+                panel.composer.is_empty(),
+                "{width}×{height}: the refused answer is cleared: {:?}",
+                panel.composer.text()
+            );
             let screen = draw(&mut panel, width, height).0.join("\n");
             assert!(
                 screen.contains("scroll to the end"),
@@ -9601,9 +9615,17 @@ mod tests {
                 "{width}×{height}: with the notice up, a body row still shows:\n{screen}"
             );
 
-            // Scrolling needs an empty input; the tail then comes into view
-            // with the answers still on screen.
-            panel.composer.clear();
+            // Following the notice works: the very next PgDn scrolls, and the
+            // tail then comes into view with the answers still on screen.
+            let before = panel.pending_frame_mut().unwrap().scroll;
+            assert_eq!(
+                panel.handle_key(key(KeyCode::PageDown)),
+                EventOutcome::Consumed
+            );
+            assert!(
+                panel.pending_frame_mut().unwrap().scroll > before,
+                "{width}×{height}: PgDn after the refusal scrolls the body"
+            );
             let screen = page_until(&mut panel, width, height, "SECURITY_HIDDEN_TAIL");
             assert!(
                 screen.contains("y allow once"),
@@ -9735,8 +9757,9 @@ mod tests {
     /// only be denied, and the frame says so.
     #[tokio::test]
     async fn an_oversized_subject_can_only_be_denied() {
+        use polaris::plugins::IOProvider;
         let subject = format!("{}printf TAIL", "x".repeat(APPROVAL_RENDER_BYTES + 10));
-        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
         panel.inbox.lock().push_back(framed_approval(&subject));
         panel.drain_inbox();
         let screen = page_until(&mut panel, 80, 24, "21 more bytes not shown");
@@ -9754,6 +9777,20 @@ mod tests {
                 .is_some_and(|notice| notice.contains("can only be denied")),
             "{:?}",
             panel.confirm_notice
+        );
+        // The refused `y` is gone, so the denial the notice points to is not
+        // typed after it.
+        assert!(panel.composer.is_empty(), "{:?}", panel.composer.text());
+        type_str(&mut panel, "n");
+        panel.handle_key(key(KeyCode::Enter));
+        assert!(panel.pending_confirm.is_none(), "`n` denies at once");
+        let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.metadata.get(CONFIRMED).map(String::as_str),
+            Some(CONFIRMED_FALSE)
         );
     }
 
