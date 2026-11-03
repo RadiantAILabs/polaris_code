@@ -306,6 +306,7 @@ impl LiveTranscript {
 ///
 /// Holds the invocation's identity and start instant so the terminal message
 /// can report elapsed time under the same `id` the `start` message used.
+#[derive(Debug)]
 pub struct ToolActivity {
     id: String,
     parent: Option<String>,
@@ -355,20 +356,23 @@ impl ToolActivity {
         self.emit(user_io, phase, result, summary.as_deref()).await;
     }
 
-    /// Close the block with `rendered` collapsed behind the opening detail
-    /// followed by `outcome` (`exit 0 · 40 lines`), keeping the structured
+    /// Close the block with `rendered` as its body, keeping the structured
     /// `document` it was rendered from alongside.
+    ///
+    /// With an `outcome` (`exit 0 · 40 lines`) the body collapses behind the
+    /// opening detail followed by it; without one (a failed run) the body
+    /// stays in view, because that output is the reason.
     pub async fn finish_rendered(
         self,
         user_io: &UserIO,
         phase: &str,
         rendered: &str,
-        outcome: &str,
+        outcome: Option<&str>,
         document: &str,
     ) {
-        let summary = self.summary(outcome);
+        let summary = outcome.map(|outcome| self.summary(outcome));
         let msg = self
-            .message(phase, rendered, Some(&summary))
+            .message(phase, rendered, summary.as_deref())
             .with_metadata(META_DOCUMENT, bounded(document));
         let _ = user_io.send(msg).await;
     }
@@ -498,6 +502,178 @@ fn cap_detail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records every message a block sends, so a test can read the shape of
+    /// the update the panel would receive.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<IOMessage>>);
+    impl polaris::plugins::IOProvider for Recorder {
+        async fn send(&self, message: IOMessage) -> Result<(), polaris::plugins::IOError> {
+            self.0.lock().expect("recorder lock").push(message);
+            Ok(())
+        }
+        async fn receive(&self) -> Result<IOMessage, polaris::plugins::IOError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Open a block with `detail`, close it with `phase` and `result`, and
+    /// return the closing message.
+    async fn finished(detail: &str, phase: &str, result: &str) -> IOMessage {
+        let recorder = Arc::new(Recorder::default());
+        let io = UserIO::new(recorder.clone());
+        ToolActivity::start(&io, "call", None, "read_file", detail)
+            .await
+            .finish(&io, phase, result)
+            .await;
+        let sent = recorder.0.lock().expect("recorder lock");
+        sent.last().cloned().expect("finish sends a message")
+    }
+
+    fn body(message: &IOMessage) -> &str {
+        match &message.content {
+            IOContent::Text(text) => text,
+            other => panic!("a tool body is text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_size_collapses_only_what_does_not_fit_one_row() {
+        let exactly = "x".repeat(SUMMARY_INLINE_CHARS);
+        let over = "x".repeat(SUMMARY_INLINE_CHARS + 1);
+        for (case, result, expected) in [
+            ("short single line", "ok", None),
+            ("empty", "", None),
+            ("exactly the inline limit", exactly.as_str(), None),
+            ("161-char line", over.as_str(), Some("161 chars")),
+            ("multi-line", "a\nb\nc", Some("3 lines")),
+            ("single line with trailing newline", "done\n", None),
+            (
+                "multi-line with trailing newlines",
+                "a\nb\n\n",
+                Some("2 lines"),
+            ),
+            ("bare diff", "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b", None),
+            (
+                "diff after a preface",
+                "Edited x:\n--- a/x\n+++ b/x\n-a\n+b",
+                None,
+            ),
+            (
+                "dashes without a diff header",
+                "one\n--- not a diff\nthree",
+                Some("3 lines"),
+            ),
+        ] {
+            assert_eq!(result_size(result).as_deref(), expected, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_successful_result_is_summarised_behind_its_detail() {
+        let message = finished("src/lib.rs", PHASE_OK, "a\nb\nc\n").await;
+        assert_eq!(
+            message.metadata.get(META_SUMMARY).map(String::as_str),
+            Some("src/lib.rs · 3 lines")
+        );
+        assert_eq!(body(&message), "a\nb\nc\n", "the body is kept whole");
+        assert!(
+            !message.metadata.contains_key(META_DOCUMENT),
+            "only a rendered result carries a document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_without_a_detail_is_just_the_size() {
+        let long = "y".repeat(200);
+        let message = finished("", PHASE_OK, &long).await;
+        assert_eq!(
+            message.metadata.get(META_SUMMARY).map(String::as_str),
+            Some("200 chars")
+        );
+    }
+
+    #[tokio::test]
+    async fn short_results_failures_and_denials_are_not_summarised() {
+        for (phase, result) in [
+            (PHASE_OK, "ok"),
+            (PHASE_ERROR, "error: one\ntwo\nthree"),
+            (PHASE_DENIED, "User denied execution\nbecause\nreasons"),
+        ] {
+            let message = finished("src/lib.rs", phase, result).await;
+            assert!(
+                !message.metadata.contains_key(META_SUMMARY),
+                "{phase}: the body stays in view: {:?}",
+                message.metadata
+            );
+            assert_eq!(body(&message), result, "{phase}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rendered_result_without_an_outcome_stays_in_view() {
+        let recorder = Arc::new(Recorder::default());
+        let io = UserIO::new(recorder.clone());
+        ToolActivity::start(&io, "call", None, "run_command", "false")
+            .await
+            .finish_rendered(&io, PHASE_OK, "boom\n[exit code: 1]", None, "{}")
+            .await;
+        let message = recorder
+            .0
+            .lock()
+            .expect("recorder lock")
+            .last()
+            .cloned()
+            .expect("finish sends a message");
+        assert!(
+            !message.metadata.contains_key(META_SUMMARY),
+            "a failed run is not collapsed: {:?}",
+            message.metadata
+        );
+        assert_eq!(
+            message.metadata.get(META_DOCUMENT).map(String::as_str),
+            Some("{}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rendered_result_keeps_its_bounded_document() {
+        let recorder = Arc::new(Recorder::default());
+        let io = UserIO::new(recorder.clone());
+        let document = format!("{{\"stdout\":\"{}\"}}", "z".repeat(MAX_TOOL_BODY));
+        ToolActivity::start(&io, "call", None, "run_command", "cat notes.txt")
+            .await
+            .finish_rendered(
+                &io,
+                PHASE_OK,
+                "one\ntwo\n",
+                Some("exit 0 · 2 lines"),
+                &document,
+            )
+            .await;
+        let message = recorder
+            .0
+            .lock()
+            .expect("recorder lock")
+            .last()
+            .cloned()
+            .expect("finish sends a message");
+        assert_eq!(
+            message.metadata.get(META_SUMMARY).map(String::as_str),
+            Some("cat notes.txt · exit 0 · 2 lines")
+        );
+        assert_eq!(body(&message), "one\ntwo\n");
+        let kept = message
+            .metadata
+            .get(META_DOCUMENT)
+            .expect("the document rides along");
+        assert_eq!(kept, &bounded(&document), "bounded like a body");
+        assert!(
+            kept.ends_with("(the model received the whole result)"),
+            "an oversized document is cut and says so: {}",
+            &kept[kept.len().saturating_sub(80)..]
+        );
+    }
 
     #[test]
     fn minted_ids_are_unique() {

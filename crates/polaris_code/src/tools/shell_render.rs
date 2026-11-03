@@ -79,6 +79,19 @@ pub(crate) fn run_command_outcome(value: &Value) -> Option<String> {
     })
 }
 
+/// Whether `value` is a run that exited 0 — the only result whose output is
+/// safe to fold behind a one-line summary. A failure, timeout, kill or
+/// cancellation keeps its output in view: that text is the reason.
+pub(crate) fn run_command_succeeded(value: &Value) -> bool {
+    value.get("status").and_then(Value::as_str) == Some("executed")
+        && value.get("timed_out").and_then(Value::as_bool) != Some(true)
+        && !matches!(
+            value.get("outcome").and_then(Value::as_str),
+            Some("timed_out" | "cancelled")
+        )
+        && value.get("exit_code").and_then(Value::as_i64) == Some(0)
+}
+
 /// A completed run, as the text it produced plus a status marker.
 fn render_executed(value: &Value) -> String {
     let mut out = String::new();
@@ -168,7 +181,51 @@ mod tests {
         assert_eq!(run_command_outcome(&quiet).unwrap(), "exit 0 · no output");
         let slow = json!({"status": "executed", "timed_out": true, "stdout": "x"});
         assert_eq!(run_command_outcome(&slow).unwrap(), "timed out · 1 line");
-        assert!(run_command_outcome(&json!({"status": "confirmation_required"})).is_none());
+        assert!(
+            run_command_outcome(&json!({"status": "confirmation_required"})).is_none(),
+            "a command that never ran has no outcome"
+        );
+        let cancelled = json!({"status": "executed", "outcome": "cancelled", "stdout": ""});
+        assert_eq!(
+            run_command_outcome(&cancelled).unwrap(),
+            "cancelled · no output"
+        );
+        let killed = json!({"status": "executed", "outcome": "exited", "stdout": "a\nb"});
+        assert_eq!(run_command_outcome(&killed).unwrap(), "killed · 2 lines");
+    }
+
+    #[test]
+    fn only_a_zero_exit_counts_as_success() {
+        for (case, value, success) in [
+            (
+                "exit 0",
+                json!({"status": "executed", "exit_code": 0}),
+                true,
+            ),
+            (
+                "exit 3",
+                json!({"status": "executed", "exit_code": 3}),
+                false,
+            ),
+            ("killed", json!({"status": "executed"}), false),
+            (
+                "timed out",
+                json!({"status": "executed", "exit_code": 0, "timed_out": true}),
+                false,
+            ),
+            (
+                "cancelled",
+                json!({"status": "executed", "exit_code": 0, "outcome": "cancelled"}),
+                false,
+            ),
+            (
+                "not run",
+                json!({"status": "confirmation_required", "exit_code": 0}),
+                false,
+            ),
+        ] {
+            assert_eq!(run_command_succeeded(&value), success, "{case}");
+        }
     }
 
     /// The executor's document for a run that wrote to both streams and failed.
