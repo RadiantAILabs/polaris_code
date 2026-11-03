@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/RadiantAILabs/polaris_code"
@@ -21,16 +21,16 @@ rust-version = "1.97.0"
 # `UserIO`, …) unify across crates. Each crate adds the features it needs.
 [workspace.dependencies]
 # The agent runtime. `package = "polaris-ai"` keeps `use polaris::…` short.
-polaris = { package = "polaris-ai", version = "0.7.1", default-features = false }
+polaris = { package = "polaris-ai", version = "0.8.0", default-features = false }
 # Domain-neutral cognition: the topology catalog and admission boundary, the
 # selection policy points, the evidence provider contract, and the shared value
 # vocabulary. `polaris_code` supplies the *coding* embodiment of those
 # contracts (see `crates/polaris_code/src/cosmos/`).
-polaris_cosmos = { path = "crates/polaris_cosmos", version = "0.1.0" }
+polaris_cosmos = { path = "crates/polaris_cosmos", version = "0.2.0" }
 # Composable ratatui TUI: panels contributed via a shared registry.
-polaris-tui = { path = "crates/polaris-tui", version = "0.1.2" }
+polaris-tui = { path = "crates/polaris-tui", version = "0.2.0" }
 # Ontology-driven tools/resources/agents: oxigraph RDF store + SPARQL toolset.
-polaris_ontrace = { path = "crates/polaris_ontrace", version = "0.1.0", default-features = false, features = [
+polaris_ontrace = { path = "crates/polaris_ontrace", version = "0.2.0", default-features = false, features = [
     "oxigraph",
 ] }
 

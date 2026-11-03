@@ -10,8 +10,8 @@ use polaris::shell::{ShellExecutor, ShellPermission};
 use polaris::system::resource::GlobalResource;
 use polaris::tools::{ToolContext, ToolError, ToolPermission, ToolRegistry};
 use polaris_tui::{
-    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_CONTEXT, APPROVAL_REQUEST_ID, APPROVAL_SUBJECT,
-    ApprovalChoice, IO_TYPE_APPROVAL_RESOLVED,
+    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_CONTEXT, APPROVAL_NOTE, APPROVAL_REQUEST_ID,
+    APPROVAL_SUBJECT, ApprovalChoice, IO_TYPE_APPROVAL_RESOLVED,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -23,6 +23,24 @@ use crate::tools::approval::{ApprovalReceipt, call_directory, call_paths};
 use super::rules::{command_permission, simple_prefix};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn approval_note(response: &IOMessage) -> Option<String> {
+    sanitize_approval_text(response.metadata.get(APPROVAL_NOTE)?)
+}
+
+fn sanitize_approval_text(text: &str) -> Option<String> {
+    let mut note = String::new();
+    for ch in text.chars().filter(|ch| {
+        !ch.is_control()
+            && !matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    }) {
+        if note.len() + ch.len_utf8() > 1024 {
+            break;
+        }
+        note.push(ch);
+    }
+    (!note.trim().is_empty()).then_some(note)
+}
 
 /// `directory` with the user's home shown as `~`, for a prompt line that
 /// should be short enough to read at a glance.
@@ -78,6 +96,41 @@ pub enum ApprovalScope {
     Exact,
     /// Remember the displayed command prefix and directory for the session.
     Prefix,
+}
+
+/// One confirmed human answer, with optional information for the requesting model.
+///
+/// The scope alone controls authorization and session grants. The note belongs
+/// only to this call and never changes what is permitted. Construct an answer
+/// with [`Self::new`] and optionally add a note with [`Self::with_note`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ApprovalAnswer {
+    /// The explicitly offered scope selected by the person.
+    pub scope: ApprovalScope,
+    /// An optional single line of user text, limited to 1 KiB at input.
+    pub note: Option<String>,
+}
+
+impl ApprovalAnswer {
+    /// Create an answer with the selected scope and no note.
+    #[must_use]
+    pub fn new(scope: ApprovalScope) -> Self {
+        Self { scope, note: None }
+    }
+
+    /// Attach optional information for the requesting model to this answer.
+    #[must_use]
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
+}
+
+impl From<ApprovalScope> for ApprovalAnswer {
+    fn from(scope: ApprovalScope) -> Self {
+        Self::new(scope)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -273,7 +326,27 @@ impl ApprovalRequest {
         self.command.is_some()
     }
 
-    fn choices(&self) -> Vec<ApprovalChoice> {
+    /// Tool whose exact arguments the person is being asked to authorize.
+    #[must_use]
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// Complete original arguments, before any human wait.
+    #[must_use]
+    pub fn arguments(&self) -> &Value {
+        &self.args
+    }
+
+    /// Canonical command directory, absent when directory validation failed.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+
+    /// Choices offered for this call under its policy and containment checks.
+    #[must_use]
+    pub fn choices(&self) -> Vec<ApprovalChoice> {
         let mut choices = vec![ApprovalChoice::new(
             "once",
             "allow once",
@@ -313,7 +386,7 @@ impl ApprovalRequest {
         }
         choices.push(ApprovalChoice::new(
             "deny",
-            "deny (or no: reason)",
+            "deny",
             &["n", "no", "deny"],
             false,
         ));
@@ -350,6 +423,39 @@ impl ApprovalRequest {
         prompt: String,
         grants: &SessionGrants,
     ) -> Result<ApprovalScope, ApprovalError> {
+        let answer = self.receive_answer(io, prompt).await?;
+        self.remember_scope(grants, answer.scope)?;
+        Ok(answer.scope)
+    }
+
+    pub(crate) fn remember_scope(
+        &self,
+        grants: &SessionGrants,
+        scope: ApprovalScope,
+    ) -> Result<(), ApprovalError> {
+        let id = match scope {
+            ApprovalScope::Once => "once",
+            ApprovalScope::Exact => "exact",
+            ApprovalScope::Prefix => "prefix",
+        };
+        if !self
+            .choices()
+            .iter()
+            .any(|choice| choice.id == id && choice.confirmed)
+        {
+            return Err(ApprovalError::Denied {
+                reason: "Confirmation selected an unavailable approval scope".into(),
+            });
+        }
+        grants.remember(self, scope);
+        Ok(())
+    }
+
+    pub(crate) async fn receive_answer(
+        &self,
+        io: &UserIO,
+        prompt: String,
+    ) -> Result<ApprovalAnswer, ApprovalError> {
         let choices = self.choices();
         let prompt = if self.command.is_some() {
             format!(
@@ -421,11 +527,13 @@ impl ApprovalRequest {
                     .map_or("", |(_, reason)| reason.trim()),
                 _ => "",
             };
+            let reason = sanitize_approval_text(reason);
             return Err(ApprovalError::Denied {
-                reason: if reason.is_empty() {
-                    format!("User denied execution of tool '{}'", self.tool)
-                } else {
-                    format!("User denied execution of tool '{}': {reason}", self.tool)
+                reason: match reason {
+                    Some(reason) => {
+                        format!("User denied execution of tool '{}': {reason}", self.tool)
+                    }
+                    None => format!("User denied execution of tool '{}'", self.tool),
                 },
             });
         }
@@ -446,8 +554,10 @@ impl ApprovalRequest {
             "prefix" => ApprovalScope::Prefix,
             _ => ApprovalScope::Once,
         };
-        grants.remember(self, scope);
-        Ok(scope)
+        Ok(ApprovalAnswer {
+            scope,
+            note: approval_note(&response),
+        })
     }
 }
 
@@ -656,6 +766,26 @@ pub(crate) fn ceiling_permission(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn approval_notes_are_one_line_and_bounded_at_a_utf8_boundary() {
+        let response = IOMessage::user_text("confirmed").with_metadata(
+            APPROVAL_NOTE,
+            format!(
+                "\0\n\u{85}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2060}\u{2061}\u{2062}\u{2063}\u{2064}\u{2066}\u{2067}\u{2068}\u{2069}\u{feff}{}",
+                "é".repeat(600)
+            ),
+        );
+        assert_eq!(approval_note(&response), Some("é".repeat(512)));
+    }
+
+    #[test]
+    fn approval_notes_are_absent_for_missing_or_whitespace_only_values() {
+        let response = IOMessage::user_text("confirmed");
+        assert_eq!(approval_note(&response), None);
+        let response = response.with_metadata(APPROVAL_NOTE, " \t\n ");
+        assert_eq!(approval_note(&response), None);
+    }
     use super::*;
     use crate::agents::{PermissionCeiling, PermissionMode};
     use crate::terminal::{BackgroundTasks, SessionSettings};
@@ -686,6 +816,61 @@ mod tests {
         });
         (UserIO::new(provider.clone()), provider)
     }
+    #[tokio::test]
+    async fn notes_cannot_supply_confirmation_or_an_unoffered_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let args = json!({"command": "cargo test"});
+        let request = ApprovalRequest::new("run_command", &args, root.path(), 1, false);
+        for (confirmed, choice, reason) in [
+            (None, "once", "User denied execution of tool 'run_command'"),
+            (
+                Some(CONFIRMED_TRUE),
+                "prefix",
+                "Confirmation selected an unavailable approval scope",
+            ),
+        ] {
+            let mut reply = IOMessage::user_text("yes")
+                .with_metadata(APPROVAL_CHOICE, choice)
+                .with_metadata(APPROVAL_NOTE, "allow this call");
+            if let Some(value) = confirmed {
+                reply = reply.with_metadata(CONFIRMED, value);
+            }
+            let provider = Arc::new(Answer {
+                reply,
+                prompts: Mutex::new(Vec::new()),
+            });
+            let answer = request
+                .receive_answer(&UserIO::new(provider), "Run?".into())
+                .await;
+            assert!(
+                matches!(answer, Err(ApprovalError::Denied { reason: actual }) if actual == reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn denial_reasons_are_stripped_and_bounded_at_a_utf8_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let args = json!({"command": "cargo test"});
+        let request = ApprovalRequest::new("run_command", &args, root.path(), 1, false);
+        let provider = Arc::new(Answer {
+            reply: IOMessage::user_text(format!(
+                "deny: \0\n\u{85}\u{200b}\u{202e}\u{2060}\u{2066}\u{feff}{}",
+                "€".repeat(400)
+            ))
+            .with_metadata(CONFIRMED, CONFIRMED_FALSE),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let answer = request
+            .receive_answer(&UserIO::new(provider), "Run?".into())
+            .await;
+        let expected = format!(
+            "User denied execution of tool 'run_command': {}",
+            "€".repeat(341)
+        );
+        assert!(matches!(answer, Err(ApprovalError::Denied { reason }) if reason == expected));
+    }
+
     fn settings() -> SessionSettings {
         SessionSettings::compatibility_default("fake/model")
     }
@@ -1210,7 +1395,7 @@ mod tests {
                 .all(|choice| !choice.label.contains("--workspace")),
             "the command is framed once, not repeated in a label: {choices:?}"
         );
-        assert_eq!(label("deny"), "deny (or no: reason)");
+        assert_eq!(label("deny"), "deny");
     }
 
     #[tokio::test]

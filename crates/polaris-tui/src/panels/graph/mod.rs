@@ -19,7 +19,7 @@
 //! ✓   ├─ • prepare_context                            0.1s
 //! ▶   ├─ • act                                running 2.1s
 //!     └─ ? has_tool_calls
-//!        ├─ yes → • execute_tools
+//!        ├─ yes → ↻ tool_calls
 //!        └─ no → • finalize
 //! ```
 //!

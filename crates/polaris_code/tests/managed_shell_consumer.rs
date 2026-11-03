@@ -3,14 +3,14 @@
 //! **Part 1 — the real coding permission path.** A scripted `LlmProvider` asks
 //! for `run_command` with a controlled command and a scripted `IOProvider`
 //! answers the confirm dialog, so one real turn runs through the binary's own
-//! `receive_user_input → act → execute_tools` graph with no model key and no
+//! `receive_user_input → act → prepare_calls → tool_calls` graph with no model key and no
 //! network. The command's only observable effect is an append to a marker file,
 //! so "one process ran" and "no process ran" are counted from the filesystem
 //! rather than inferred from a log line; the executor's monotonic
 //! `ShellProcessId` is read back as a second, independent witness that a denied
 //! call allocates no run identity at all.
 //!
-//! The gate under test is the one `execute_tools` honours: the `run_command`
+//! The gate under test is the one `authorize_call` honours: the `run_command`
 //! entry in the session's `PolicySnapshot`. It is installed there rather than on
 //! the `ToolRegistry` because the registry is frozen into a global before the
 //! composition root gets another look at it — see
@@ -24,10 +24,10 @@
 //! descendant cleanup.
 //!
 //! What this file deliberately does **not** prove: integration with the turn
-//! cancellation token. `execute_tools` still calls `ToolRegistry::execute` with
-//! an empty context, so the sink and cancel observers below are supplied by the
+//! cancellation token. The streaming tests call `ToolRegistry::execute_with` with
+//! a test-owned context, so the sink and cancel observers below are supplied by the
 //! test, not by the agent. Carrying the real turn token and the host sink into
-//! `execute_tools` is covered by the cancellation and terminal-background tests.
+//! `execute_call` is covered by the cancellation and terminal-background tests.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -298,7 +298,7 @@ struct ScriptedIOState {
 /// A scripted front end: hands the agent one prompt, then answers each confirm
 /// dialog the same way, and records everything the agent sends back.
 ///
-/// This is the `UserIO` side of the real permission path — `execute_tools`
+/// This is the `UserIO` side of the real permission path — `ask_human`
 /// cannot tell it from `TuiIOProvider` or `ExecIOProvider`, because it answers
 /// the same `confirm` request with the same `confirmed` metadata.
 struct ScriptedIOProvider {
@@ -482,6 +482,7 @@ impl CodingTurn {
             .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new(
                 data.path().to_str().expect("a UTF-8 temp path"),
             ))))
+            .add_plugins(polaris_code::agents::InteractiveApprovalPlugin)
             .add_plugins(CodeAgentPlugin::new())
             .add_plugins(ScriptedIOPlugin {
                 provider: io.clone(),

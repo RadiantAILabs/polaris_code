@@ -1165,7 +1165,7 @@ async fn main() {
 
     // Managed shell runs pushed out of a turn, by the `Ctrl-T` chord or by the
     // model's own `run_in_background` call. The table is shared:
-    // `execute_tools` fills it through the sink it installs, the chord, the
+    // `execute_call` fills it through the sink it installs, the chord, the
     // four `/commands` and the task toolset read it, and the reporter below
     // closes each run's block when it ends. `Backgrounded` is the one-way
     // announcement that a run has left its turn.
@@ -1332,6 +1332,7 @@ async fn main() {
         server.add_plugins(ExecIOPlugin::new(provider.clone()));
         Some((provider, input_tx, output_rx))
     } else {
+        server.add_plugins(polaris_code::agents::InteractiveApprovalPlugin);
         // One shared log buffer feeds the conversation panel's Ctrl-O node
         // timeline (which buckets entries by their enclosing node span). The
         // log plugin installs the global tracing subscriber over it, with no
@@ -1732,7 +1733,7 @@ async fn main() {
     }
 
     // Coding permission policy, injected into the session context the agent's
-    // decisions actually read (`execute_tools` resolves
+    // decisions actually read (`authorize_call` resolves
     // `PolicySnapshot::permission` over the registry's default).
     //
     // It cannot be a `ToolRegistry::set_permission` call from here: `ToolsPlugin`

@@ -26,9 +26,9 @@ Add these direct dependencies to the application that runs the full example:
 
 ```toml
 [dependencies]
-polaris_code = "0.2.0"
-polaris = { package = "polaris-ai", version = "0.7.0", default-features = false, features = ["anthropic"] }
-polaris_ontrace = { version = "0.1.0", default-features = false, features = ["oxigraph"] }
+polaris_code = "0.3.0"
+polaris = { package = "polaris-ai", version = "0.8.0", default-features = false, features = ["anthropic"] }
+polaris_ontrace = { version = "0.2.0", default-features = false, features = ["oxigraph"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -99,8 +99,8 @@ A documented entry point that hides a constraint is worse than none, so:
   [`PermissionMode::Unattended`](crate::agents::PermissionMode::Unattended) if no
   human is watching. `Unattended` is the only mode that is fail-closed on an
   ambiguous shell verdict. See `docs/permission-modes.md`.
-* **A confirmation parks the turn until you answer it.** `UserIO::confirm`
-  sends a question with `io_type = "confirm"` and then blocks on `receive()` —
+* **An installed approver parks the turn until you answer it.**
+  `InteractiveApprovalPlugin` sends a question with `io_type = "confirm"` and then blocks on `receive()` —
   the same channel your prompt came in on. Under an attended posture your
   program *is* the human: reply with an `IOMessage` carrying metadata
   `confirmed = "true"`, or the turn waits forever. Dropping the input sender
@@ -238,3 +238,10 @@ let was_running = run::request_interrupt(sessions, session_id);
 # let _ = was_running;
 # }
 ```
+
+For attended confirmation, explicitly add
+[`InteractiveApprovalPlugin`](crate::agents::InteractiveApprovalPlugin). It uses
+that session's existing `UserIO` and offers the same scopes as the terminal.
+Omitting the plugin denies calls that require a person, with a tool error
+explaining that no approver is registered. Modes and explicit run grants that
+allow calls without asking continue to work without the plugin.

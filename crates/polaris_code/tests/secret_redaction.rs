@@ -1,7 +1,7 @@
 //! Proof that a secret a tool reads never leaves the agent loop in clear text.
 //!
 //! One real coding turn runs through the binary's own
-//! `receive_user_input → act → execute_tools` graph — the same plugin set
+//! `receive_user_input → act → prepare_calls → tool_calls` graph — the same plugin set
 //! `src/main.rs` composes, with a scripted `LlmProvider` and a scripted
 //! `IOProvider` standing in for the model and the terminal, so there is no key
 //! and no network. The model asks to `read_file` a `.env` that holds

@@ -185,6 +185,7 @@ impl Harness {
             ))
             .add_plugins(crate::tools::approval::ApprovalShellPlugin)
             .add_plugins(crate::tools::TaskToolsPlugin::new(tasks.clone()))
+            .add_plugins(crate::agents::InteractiveApprovalPlugin)
             .add_plugins(rules)
             .add_plugins(AutoReviewPlugin::new(ReviewPolicy {
                 timeout: Duration::from_millis(10),
@@ -203,6 +204,8 @@ impl Harness {
             ..PolicySnapshot::defaults()
         });
         ctx.insert(ContextManager::default());
+        ctx.insert(super::super::code_agent::tool_calls::ToolBatch::default());
+        ctx.insert(super::super::code_agent::tool_calls::CallLifetime::default());
         ctx.insert(LiveTranscript::default());
         ctx.insert(RunCancellation::never());
         ctx.insert(tasks);
@@ -240,7 +243,7 @@ impl Harness {
         graph.add_system(propose);
         graph.add_system(review_tools);
         if dispatch {
-            graph.add_system(super::super::code_agent::execute_tools);
+            super::super::code_agent::tool_calls::build_tool_calls(&mut graph);
         } else {
             graph.add_system(retain_review);
         }
@@ -849,7 +852,7 @@ async fn dispatch_rechecks_hard_policy_and_ceiling_after_a_reviewer_allow() {
         } else {
             graph.add_system(hard_deny_before_dispatch);
         }
-        graph.add_system(super::super::code_agent::execute_tools);
+        super::super::code_agent::tool_calls::build_tool_calls(&mut graph);
         assert_valid(&graph);
         GraphExecutor::new()
             .execute(&graph, &mut h.ctx, None, None)

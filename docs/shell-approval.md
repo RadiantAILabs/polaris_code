@@ -6,8 +6,8 @@ depends on the shell plugin and replaces its standard `run_command` registration
 with a receipt-aware tool before the registry freezes. The framework shell plugin
 owns the executor and cleanup; background tools use that same executor.
 
-Authorization belongs to host policy. After approval, the host issues an
-`ApprovalReceipt` and injects it into `ToolContext`. Model JSON cannot mint a
+Authorization belongs to host policy. Before asking, the host binds an
+`ApprovalReceipt`; only an allow decision injects it into `ToolContext`. Model JSON cannot mint a
 receipt. An embedding host can use `ApprovalReceipt::issue` with its own
 validator without installing the coding agent. The validator must compare the
 current rule revision and session generation with those captured by the host.
@@ -35,32 +35,44 @@ next input receive; an answer to a resolved prompt cannot approve a later call.
 
 A command prompt also carries `APPROVAL_SUBJECT` (the command, verbatim) and
 `APPROVAL_CONTEXT` (`run_command in <directory>`, home shown as `~`). The
-conversation panel frames the command once above the input instead of printing
-the whole prompt, with the answers pinned under it:
+conversation panel opens an approval picker in place of the input: the command
+once, then a numbered list of answers.
 
 ```
-y allow once
-s allow this exact command in /home/me/repo for this session
-p allow prefix "cargo test" (whole words, every subcommand) in /home/me/repo for this session
-n deny (or no: reason)
+┌ approve? · run_command in ~/repo ─────────────────────────────────────────┐
+│cargo test -p polaris_code                                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│❯ 1. allow once                                                            │
+│  2. allow this exact command in /home/me/repo for this session            │
+│  3. allow prefix "cargo test" (whole words, every subcommand) in /home/me/…│
+│  4. deny                                                                  │
+└ ↑↓ move · 1-4 pick · Enter confirm · Tab add note · ? details · Esc deny ─┘
 ```
 
 The labels state each answer's scope: the exact grant covers that command
 string only, the prefix grant every command that starts with those whole words
 (any subcommand or extra arguments), and both are bound to the named canonical
-directory and end with the session. `p` is offered only when the command has a
-simple prefix; `s` and `p` only where remembering is allowed. `n`, `no`, `deny`
-and `Esc` deny; `no: reason` or `deny: reason` returns the reason to the model.
+directory and end with the session. The prefix answer is offered only when the
+command has a simple prefix; the session answers only where remembering is
+allowed.
 
-A command taller than the frame scrolls inside it (`↑` / `↓`, `PgUp` / `PgDn`
-with an empty input), and the panel refuses a confirming answer until every row
-of the command has been on screen, and while any part of it is too wide to draw. A command longer than 64 KiB cannot be
-shown in full, so only a denial is accepted for it. `?` adds the full prompt —
-tool, directory and JSON arguments — to the frame. On a terminal too small for
-the labels above, the keys move into the frame's top border (`y s p n · ? details`),
-`?` shows the full labels above the command, and a refusal reason appears in the
-bottom border. With no room for any of the command, only a denial is accepted
-until the terminal is enlarged.
+One key press answers: a digit, an answer's own key (`y`, `s`, `p`, `n`), or
+`Enter` on the highlighted row. `Esc` and `Ctrl-C` deny. `Tab` opens a one-line
+note on the highlighted answer. A note on a denial goes back to the model as the
+reason (`deny: <note>`); a note on an allow is sent as `approval_note` and added
+to that call's tool result as `User note on approval: ...`. The note never
+changes the grant. Text typed while the picker is open is dropped, so it can
+neither answer the approval nor start a turn. Answer keys are ignored for 400 ms
+after a stray key press.
+
+A command taller than the picker scrolls inside it (`PgUp` / `PgDn`,
+`Shift-↑` / `Shift-↓`), and the panel refuses a confirming answer until every
+row of the command has been on screen, and while any part of it is too wide to
+draw. A command longer than 64 KiB cannot be shown in full, so only a denial is
+accepted for it. `?` shows the full prompt (tool, directory and JSON arguments)
+in place of the command. On a very small terminal the list shrinks to the
+highlighted answer and the hint always keeps `Esc deny`; with no room for any of
+the command, only a denial is accepted until the terminal is enlarged.
 
 The reply's `confirmed` metadata and `approval_choice` still decide the answer,
 and the grant is bound to the tool, arguments, canonical directory, generation
@@ -70,3 +82,43 @@ widens or narrows it. `APPROVAL_CONTEXT` is a display hint only.
 whole command has been drawn, and accept only a denial for a command over
 64 KiB; that can only make the panel stricter. A front end that ignores both
 keys shows the full prompt, which still names the command and directory.
+
+The agent graph authorizes one call at a time. `prepare_calls` creates a local
+queue; `authorize_call` re-reads session grants and checks a review against the
+original call index and current policy. An allowed call reaches `execute_call`,
+a refusal reaches `record_denial`, and an unresolved confirmation reaches
+`ask_human`. The tool loop has its own iteration bound, independent of
+`--max-turns`. If that bound is reached, every remaining call receives an
+explicit error result. Tool failures remain results, so later calls can run.
+Entirely allowed read-only batches retain their concurrent execution path.
+
+Install `agents::InteractiveApprovalPlugin` to publish the optional global
+`HumanApproval`. `ask_human` reads it as `Option<Res<HumanApproval>>`; without
+an approver, it returns "Permission denied: no approver is registered" and the
+batch continues. Permission modes that allow calls without asking still work.
+An embedding can replace the transport through `HumanApproval::new` and the
+`HumanApprover` contract. The capability validates any returned scope against
+the request's offered choices before recording session grants.
+
+The binary installs the plugin for interactive sessions. `--print` retains
+unattended authorization: explicit launch grants decide which calls may run,
+and other mutations are denied before human input. Its input channel carries
+one prompt and closes; it has no human answer source and no approval plugin.
+
+The shell receipt is bound before the human wait and attached only after an
+allow decision. The activity block shows "awaiting approval" during the wait,
+and the background slot refuses detachment until approval finishes. An
+interrupt resolves the pending request before the next input receive. Human
+answers are recorded as `human_approval` trajectory decisions, with the call
+identity and chosen scope or denial reason, alongside permission and tool-call
+records. Confirmation metadata and denial text use the existing wire format.
+
+Confirmed replies may include `approval_note`, an optional line of user text of
+at most 1 KiB. The interactive approver reads it only after validating
+`confirmed` and `approval_choice`; the note never grants or widens permission.
+It is redacted with the normal output policy, recorded on the human decision,
+and appended to that call's model-visible result as
+`User note on approval: <note>`, including an error result if execution fails or
+is interrupted. A remembered session scope does not copy the note to later
+calls. Replies without this metadata keep their existing result text. Denial
+notes continue to use `deny: <reason>` or `no: <reason>` text.

@@ -5,7 +5,7 @@
 //! that check the refusal itself use the default configuration and count how
 //! many requests reached the server: a refused fetch must reach it zero times.
 //!
-//! The permission tests go through the same gate `execute_tools` applies
+//! The permission tests go through the same gate `authorize_call` applies
 //! (registry default, then the mode's policy), so they fail if the tool's
 //! registered permission or a mode's overrides change.
 
@@ -688,7 +688,7 @@ async fn published() -> (ToolPermission, ToolPolicyRegistry) {
     (registered, facts)
 }
 
-/// The policy `execute_tools` resolves a call against: the mode's policy, with
+/// The policy `authorize_call` resolves a call against: the mode's policy, with
 /// the facts the capabilities declared.
 fn policy_for(mode: &PermissionMode, facts: &ToolPolicyRegistry) -> PermissionPolicy {
     let mut policy = mode.permission_policy();
@@ -696,7 +696,7 @@ fn policy_for(mode: &PermissionMode, facts: &ToolPolicyRegistry) -> PermissionPo
     policy
 }
 
-/// The gate `execute_tools` applies: the registry's permission, then the
+/// The gate `authorize_call` applies: the registry's permission, then the
 /// mode's policy resolution.
 fn gate(
     registered: ToolPermission,

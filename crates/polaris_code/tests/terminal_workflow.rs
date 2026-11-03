@@ -424,6 +424,7 @@ impl Host {
             .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin)
             .add_plugins(PersistencePlugin)
             .add_plugins(SessionsPlugin::new(session_store.clone()))
+            .add_plugins(polaris_code::agents::InteractiveApprovalPlugin)
             .add_plugins(CodeAgentPlugin::new())
             .add_plugins(ProgressMiddlewarePlugin)
             .add_plugins(HeadlessTuiPlugin);
@@ -707,6 +708,15 @@ impl Host {
             self.turn_signal.notify_one();
         }
         self.key(KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    /// Answer an open approval picker with one key, as a user does: after a
+    /// pause, because the picker ignores answer keys pressed within 400 ms of
+    /// other typing.
+    async fn answer(&mut self, key: char) {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        self.key(KeyCode::Char(key), KeyModifiers::NONE);
+        let _ = self.frame().await;
     }
 
     /// Type a line and submit it.
@@ -1172,7 +1182,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
         "nothing runs before the answer"
     );
 
-    host.submit("y").await;
+    host.answer('y').await;
     let screen = host.wait_ready().await;
     assert!(screen.contains("✓ edit_file"), "{screen}");
     assert!(screen.contains("code ❯ Edited."), "{screen}");
@@ -1192,11 +1202,11 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     let screen = host
         .wait_for("the command approval", |screen| screen.contains("approve?"))
         .await;
-    // A command is framed once above the input with wrapped answers;
-    // the raw prompt (tool, directory, JSON arguments) waits behind `?`.
+    // A command is framed once above a numbered list of answers; the raw
+    // prompt (tool, directory, JSON arguments) waits behind `?`.
     assert!(screen.contains("approve? · run_command in"), "{screen}");
     assert!(
-        screen.contains("s allow this exact command in"),
+        screen.contains("2. allow this exact command in"),
         "a session answer says where it applies:\n{screen}"
     );
     // The real tool row waits beside the frame without repeating the
@@ -1214,7 +1224,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     host.key(KeyCode::Char('?'), KeyModifiers::NONE);
     let details = host.frame().await.join("\n");
     assert!(details.contains("Arguments:"), "{details}");
-    host.submit("n").await;
+    host.answer('n').await;
     let screen = host.wait_ready().await;
     assert!(screen.contains("⊘ run_command"), "{screen}");
     assert!(screen.contains("User denied execution"), "{screen}");
@@ -1236,7 +1246,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     host.submit("really run it").await;
     host.wait_for("the third approval", |screen| screen.contains("approve?"))
         .await;
-    host.submit("yes").await;
+    host.answer('y').await;
     let screen = host.wait_ready().await;
     assert!(screen.contains("✓ run_command"), "{screen}");
     assert_eq!(
@@ -1269,14 +1279,14 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     );
 }
 
-/// A prompt typed while an approval is open is neither the answer nor lost:
-/// it waits behind the dialog and becomes the next turn.
+/// While the approval picker is open it takes every key: a prompt typed in a
+/// hurry neither answers the approval (answer keys pressed within 400 ms of
+/// other typing are ignored) nor reaches the input. The approval waits for a
+/// deliberate answer, and only the original prompt becomes a turn.
 #[tokio::test]
-async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
+async fn typing_during_an_approval_neither_answers_it_nor_queues_a_turn() {
     let workspace = workspace();
     let mut host = Host::boot(workspace.path(), "default").await;
-    // The open dialog lists its answer choices under the diff, so it needs more
-    // rows than the default screen to keep the finished edit block in view.
     host.resize(160, 40);
     host.spawn_driver();
 
@@ -1287,34 +1297,29 @@ async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
         "newer line",
     ));
     host.script.push(Reply::Text("Applied.".to_string()));
-    host.script
-        .push(Reply::Text("Second turn answer.".to_string()));
     host.submit("edit it").await;
     host.wait_for("the approval", |screen| screen.contains("approve?"))
         .await;
 
-    host.submit("and then tell me a joke").await;
-    let screen = host
-        .wait_for("the queued notice", |screen| {
-            screen.contains("queued for the next turn")
-        })
-        .await;
+    // Contains `n`, `y` and other answer keys, typed without a pause. Typing
+    // and Enter go in back to back, with no frame between them, so Enter
+    // lands within the picker's quiet window however slow the run is.
+    host.type_text("and then tell me a joke, yes");
+    host.enter();
+    let screen = host.frame().await.join("\n");
     assert!(
         screen.contains("approve?"),
-        "the dialog is still open:\n{screen}"
+        "the picker is still open:\n{screen}"
+    );
+    assert!(
+        !screen.contains("queued for the next turn"),
+        "nothing was queued:\n{screen}"
     );
     assert_eq!(host.workspace_file("notes.txt"), "old line\n");
 
-    host.submit("y").await;
-    host.wait_for("the first turn", |screen| {
-        screen.contains("code ❯ Applied.")
-    })
-    .await;
-    host.turn_signal.notify_one();
+    host.answer('y').await;
     let screen = host
-        .wait_for("both turns", |screen| {
-            screen.contains("Second turn answer.")
-        })
+        .wait_for("the turn", |screen| screen.contains("code ❯ Applied."))
         .await;
     assert!(screen.contains("✓ edit_file"), "{screen}");
     assert_eq!(host.workspace_file("notes.txt"), "newer line\n");
@@ -1323,11 +1328,11 @@ async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
     host.pause_driver().await;
     assert_eq!(
         host.user_prompts(&session).await,
-        vec!["edit it".to_string(), "and then tell me a joke".to_string()]
+        vec!["edit it".to_string()]
     );
     assert_eq!(
         host.sessions().session_info(&session).unwrap().turn_number,
-        2
+        1
     );
 }
 
@@ -1700,7 +1705,7 @@ async fn interactive_settings_apply_at_the_next_turn_boundary() {
         })
         .await;
     assert!(screen.contains(STARTUP_MODEL), "{screen}");
-    host.submit("y").await;
+    host.answer('y').await;
     host.wait_ready().await;
     assert_eq!(host.workspace_file("notes.txt"), "fresh line\n");
 }

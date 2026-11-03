@@ -595,11 +595,11 @@ async fn the_sealed_catalog_lists_the_default_loop() {
     );
 
     // The signature explanation is the loop's real boundary, not a summary of
-    // it: thirty-five resource accesses over twenty-eight types (seven are
-    // read and written), one sanctioned free output read, seven produced
+    // it: thirty-seven resource accesses over thirty types (seven are
+    // read and written), one sanctioned free output read, ten produced
     // outputs.
     let explanation = metadata.signature_explanation();
-    assert_eq!(explanation.required_resources().len(), 35);
+    assert_eq!(explanation.required_resources().len(), 37);
     assert_eq!(
         explanation
             .required_resources()
@@ -607,10 +607,10 @@ async fn the_sealed_catalog_lists_the_default_loop() {
             .map(|requirement| requirement.type_key().clone())
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
-        28
+        30
     );
     assert_eq!(explanation.required_outputs().len(), 1);
-    assert_eq!(explanation.produced_outputs().len(), 7);
+    assert_eq!(explanation.produced_outputs().len(), 10);
 
     // It claims nothing about its own worth. The three prior-free coding
     // registrations already establish that this is a legal thing to claim.
@@ -671,7 +671,7 @@ fn the_default_loops_availability_is_answered_both_ways() {
             .iter()
             .filter(|code| *code == "resource.missing")
             .count(),
-        28,
+        30,
         "every uninstalled session resource is reported, not just the first: {codes:?}"
     );
     assert!(

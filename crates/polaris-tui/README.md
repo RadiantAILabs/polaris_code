@@ -250,8 +250,8 @@ it works whether or not your terminal maps Option to Meta.
 | `Enter`                           | Submit the message.             |
 | `Shift+Enter` / `Alt+Enter`       | Insert a newline (see [multi-line prompts](#multi-line-prompts)). |
 | `\` then `Enter`                  | Insert a newline on any terminal. |
-| `Ctrl-O`                          | Reveal hidden messages, expand diff previews and summarised tool output, show a framed approval's full prompt in the transcript, spell out the meta row (token tally, session, permissions, workspace, full context window), and show the agent-graph timeline. |
-| `?` on an empty input             | Show or hide the full prompt inside a framed approval (see [tool approvals](#tool-approvals)). |
+| `Ctrl-O`                          | Reveal hidden messages, expand diff previews and summarised tool output, show a named approval's full prompt in the transcript, spell out the meta row (token tally, session, permissions, workspace, full context window), and show the agent-graph timeline. |
+| `?` while an approval is open     | Show or hide the full prompt after the command in the picker (see [tool approvals](#tool-approvals)). |
 | `Ctrl-R`                          | Search prompt history; repeat to find an older match. |
 | `Ctrl-G`                          | Open the draft in VISUAL/EDITOR; cancel when searching. |
 | `Ctrl-N`                          | Browse the transcript (see [search, navigation, and export](#transcript-search-navigation-and-export)). |
@@ -351,55 +351,117 @@ When a tool's permission resolves to `ToolPermission::Confirm`, Polaris calls
 `confirmed` metadata on the reply — an absent value counts as denial. The
 conversation panel implements that contract:
 
-- the request opens an **approval dialog**: its prompt — the command or edit
-  being approved — enters the transcript under an `approve ❯` label, and a
-  banner above the input names the answers that resolve it;
-- `y` / `yes` / `approve` / `allow` / `ok` approves; `n` / `no` / `deny` /
-  `reject` / `cancel` and `Esc` deny. Only that answer is stamped;
-- anything else is an ordinary prompt — including anything typed *before* the
-  request arrived. `TuiIOProvider` holds those back until the dialog is
-  answered, so a queued message can neither approve the tool nor be swallowed
-  as a failed answer; it arrives on the turn it was meant for.
+- the request opens an **approval picker** in place of the input. Its prompt —
+  the command or edit being approved — also enters the transcript under an
+  `approve ❯` label;
+- the picker lists the host's answers (`approval_choices`, labels as given),
+  or just *allow* and *deny* when the host sent none, and is answered with one
+  key press;
+- anything the user was typing stays in the draft and comes back after the
+  answer. Anything sent *before* the request arrived is held back by
+  `TuiIOProvider` until the approval is answered, so a queued message can
+  neither approve the tool nor be swallowed as a failed answer; it arrives on
+  the turn it was meant for.
 
-A plain "yes" typed with no dialog open is just a message, and an answer that
-cannot be delivered leaves the dialog open. Only a stamped, delivered approval
-runs the tool. Which actions need approval is the tool's permission — set by
-the consumer, not by this panel.
+```text
+┌ approve? · run_command in ~/proj ────────────────────────────────────────┐
+│cargo test -p polaris_code --test permission_modes                        │
+├──────────────────────────────────────────────────────────────────────────┤
+│❯ 1. allow once                                                           │
+│  2. allow for session                                                    │
+│  3. allow prefix "cargo test" for session                                │
+│  4. deny                                                                 │
+└ ↑↓ move · 1-4 pick · Enter confirm · Tab add note · ? details · Esc deny ┘
+```
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓`, `k` / `j` | Move the highlight (wraps around). |
+| `1` … `9` | Answer with that item at once. |
+| `Enter` | Answer with the highlighted item. |
+| a choice's own keys (`y`, `n`, `s`, `p`, …) | Answer with that choice, as a single press. |
+| `Esc`, `Ctrl-C` | Deny. |
+| `Tab` | Open a one-line note on the highlighted item; `Enter` sends the answer with the note, `Esc` closes the field. |
+| `?` | Show the whole prompt instead of the command, and back (only when the host's prompt says more than the command). |
+| `PgUp` / `PgDn`, `Shift-↑` / `Shift-↓` | Scroll the command, or the details. |
+
+The box shares out its rows in a fixed order: the borders, the note field
+when it is open, the first answer, one row of the command with its marker
+row, the panel's notice, the rest of the answers, and last the rest of the
+command. The highlighted answer and `Esc deny` are therefore always on
+screen. A command taller than its rows ends in `… N more rows`, counted in
+wrapped rows, and scrolls. The key hint drops its less important parts first
+on a narrow terminal and always keeps `Esc deny`.
+
+Text from the host is cut before it is drawn: the command and the details to
+64 KiB, and the text drawn on every frame (labels, the context and the
+prompt's first line) to 2 KiB when it arrives, with a cut one ending in `…`.
+The wrapped rows are kept until the width changes, so a huge command cannot
+slow the screen down. Terminal control characters, bidirectional overrides,
+zero-width spaces, byte-order marks and carriage returns are removed from the
+command, the context, the labels and the note before anything is drawn; a
+zero-width joiner stays, because emoji sequences are built with it.
+
+A key that can answer (`Enter`, a digit or a choice key) is ignored for 400 ms
+after any other key press, so text typed just before the picker opened cannot
+approve the tool by accident. Moving, scrolling, `Tab` and `Esc` always work.
+
+The reply carries the same metadata whichever way it was picked: `confirmed`,
+`approval_choice` (the item's id) and `approval_request_id`. A note on a
+**denial** is sent as the text `deny: <note>`, exactly like a typed reason and
+with no `approval_choice`. A note on an **allow** is sent in the
+`APPROVAL_NOTE` metadata key (`approval_note`); a host that does not read it
+ignores it, and it never changes what is allowed.
+
+Typed answers (`y`, `deny: reason`, a choice key followed by `Enter`) are not
+accepted while the picker is open: pick an item, and use `Tab` to give a
+reason. A pasted block goes to the note field when it is open and is dropped
+otherwise. An answer that cannot be delivered leaves the picker open. Only a
+stamped, delivered approval runs the tool. Which actions need approval is the
+tool's permission — set by the consumer, not by this panel.
 
 A host may also name the one thing being approved. `APPROVAL_SUBJECT` carries
 it verbatim (a command) and `APPROVAL_CONTEXT` says where it applies
-(`run_command in ~/repo`). The panel then frames the subject once, above the
-input, instead of printing the whole prompt into the transcript:
+(`run_command in ~/repo`). The picker then shows the subject once, above the
+list, instead of printing the whole prompt into the transcript, and puts the
+context in its title. A subject is what a confirming answer runs, so it has to
+be seen first:
 
-- the answers (`APPROVAL_CHOICES` labels, or `y` / `n`) and any notice sit on
-  the frame's last rows, wrapped to the width, however long the subject is. If
-  the terminal is too small for the full labels, the answers move into the
-  frame's top border as keys (`y s p n · ? details`), `?` shows the labels above
-  the command, and a refusal reason appears in the bottom border. A refused
-  answer is cleared from the input. With no room for any of the command, every
-  confirming answer is refused with a notice to enlarge the terminal; `n` and
-  `Esc` still deny. Labels, the context and the prompt's first line are cut to
-  2 KiB on arrival (a cut one ends in `…`);
-- a subject taller than the frame scrolls inside it: `↑` / `↓` move one row and
-  `PgUp` / `PgDn` a page while the input is empty, and the frame's border says
-  how many rows are above and below;
-- a confirming answer is refused, with a notice, until every row of the subject
-  has been on screen (a scroll moves at most a page past the last drawn frame,
-  and a new width starts the read again from the top), and while any part of it
-  is too wide to draw and shows as `�`. Where the frame has no bottom border, the
-  reason is in the input's title. Denials (`n`, `no: reason`, `Esc`) always go through;
+- a subject taller than its rows scrolls inside the box: `PgUp` / `PgDn` move
+  a page and `Shift-↑` / `Shift-↓` one row, and the marker row says how many
+  rows are above and below;
+- a confirming answer — any item the host marked `confirmed`, by digit, choice
+  key or `Enter` — is refused, with the reason in the box, until the subject's
+  last row has been *drawn*, counting rows by grapheme cluster as ratatui draws
+  them. A `… N more rows` marker on screen is not enough. A scroll moves at
+  most a page past the last drawn frame, so a burst of keys cannot skip rows,
+  and a new width starts the read again from the top. The reason names the
+  scroll keys;
+- a grapheme cluster wider than the box can only be drawn as a stand-in (`�`),
+  so a confirming answer is refused until the terminal is wide enough to show
+  it;
+- a terminal with no row to spare for the subject refuses every confirming
+  answer, and the reason says to enlarge the terminal;
 - a subject longer than 64 KiB cannot be shown in full, so only a denial is
   accepted for it;
-- `?` on an empty input adds the full prompt to the same scrolling frame,
-  bounded at 64 KiB with a marker where it was cut. `Ctrl-O` shows the prompt
-  in the transcript.
+- denying is never gated: `Esc`, `Ctrl-C` and every item the host did not mark
+  `confirmed` always work. A refused answer leaves the picker open and keeps
+  the note;
+- `?` adds the full prompt after the subject in the same scroll, cut at 64 KiB
+  with a marker where it was cut. `Ctrl-O` shows the prompt in the transcript.
+
+Small terminals: the reason takes a row under the list, or the bottom border
+in place of the key hint when there is no row. With fewer than three rows the
+picker is a bar with no borders and none of the subject. A one-row bar shows
+the reason when an answer was just refused, else the note field when it is
+open, else the highlighted answer. A two-row bar shows the note field or the
+highlighted answer, then the reason, the panel's notice or the key hint.
 
 The answer is still decided by the `confirmed` metadata and, where choices
 were offered, `approval_choice`; nothing in the subject or context changes what
 a reply authorizes. `APPROVAL_CONTEXT` is a display hint only. `APPROVAL_SUBJECT`
-also gates the panel: it refuses a confirming answer until the whole subject has
-been drawn, and accepts only a denial for a subject over 64 KiB. Without a
-subject the prompt renders as before.
+also gates a confirming answer as above. Without a subject the first line of
+the prompt stands in for it and no answer is gated.
 
 ### Notifications
 
@@ -434,7 +496,7 @@ let plugin = ConversationPanelPlugin::default().with_notifications(
 
 | Setting | Default | Meaning |
 | ------- | ------- | ------- |
-| `with_approval` | on | An approval dialog opened and the agent is waiting. |
+| `with_approval` | on | An approval picker opened and the agent is waiting. |
 | `with_turn_end` | off | A running turn ended on its own (`turn finished`) or with an error (`turn failed`). A turn you interrupted never notifies. |
 | `with_bell` | on | Ring the terminal bell. |
 | `with_title` | on | Show the message in the window title. |
@@ -474,10 +536,11 @@ neither sees no popup, and `/` and `@` are ordinary text.
   entry, `Shift-Tab`/`↑`/`↓` move the highlight, `Esc` closes the popup until
   the draft changes. `Enter` fills in a partial match; once the query already
   spells the entry exactly, `Enter` submits. With no popup, every one of those
-  keys keeps its usual meaning — `Tab` cycles panel focus, `Esc` denies an
-  approval — and accepting or dismissing never touches text outside the token.
+  keys keeps its usual meaning — `Tab` cycles panel focus — and accepting or
+  dismissing never touches text outside the token.
 - The popup draws just above the meta line, borrowing rows from the
-  transcript; it never covers the approval or delivery banners.
+  transcript; it never covers the delivery banners. It closes when an approval
+  opens, and no popup opens while the approval picker is shown.
 
 Hosts advertise with `commands::advertise_commands` (a `status` message
 carrying a `commands` list) and read dispatches with
@@ -507,7 +570,7 @@ it only claims a key the panel would otherwise leave alone: typing, the other
 chords above and an open popup keep theirs, and a key that is unbound, or bound
 to a command the host has not announced, falls through to the shell (`Shift-Tab`
 then cycles panel focus backward). While an approval is open the command waits
-until it is answered, like a typed command. `Shift` is not compared for
+until it is answered, like a command typed then. `Shift` is not compared for
 `Shift-Tab`, since terminals disagree on whether they report it.
 
 A host may replace the visible conversation after a session switch by sending
@@ -613,7 +676,7 @@ which subset to wire in.
 
 | Plugin                       | What it contributes                                                                                               |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approval dialogs. Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-N` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `with_notifications` opts in to a terminal bell and/or window-title change when an approval opens or a turn ends (see [notifications](#notifications)). `Ctrl-O` reveals hidden messages, expands diff previews and summarised tool output, spells out the meta row, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. `with_placeholder` sets the dim hint in the empty input (default `DEFAULT_PLACEHOLDER`, `Send a message…`). Approval prompts may carry `APPROVAL_SUBJECT` / `APPROVAL_CONTEXT` to be framed above the input (see [tool approvals](#tool-approvals)), and a finished `tool` block may carry a one-line `summary` shown until `Ctrl-O`. |
+| `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approvals from a picker (one key press, an optional note). Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-N` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `with_notifications` opts in to a terminal bell and/or window-title change when an approval opens or a turn ends (see [notifications](#notifications)). `Ctrl-O` reveals hidden messages, expands diff previews and summarised tool output, spells out the meta row, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. `with_placeholder` sets the dim hint in the empty input (default `DEFAULT_PLACEHOLDER`, `Send a message…`). Approval prompts may carry `APPROVAL_SUBJECT` / `APPROVAL_CONTEXT` to be shown above the picker's answers, which wait until the whole subject has been drawn (see [tool approvals](#tool-approvals)), and a finished `tool` block may carry a one-line `summary` shown until `Ctrl-O`. |
 | `GraphPanelPlugin`           | Live graph of what a host is running, drawn from a `GraphModel` with the executing node highlighted. Publishes the `GraphFeed` global a producer writes to; the panel never sees the host's graph engine. |
 | `LogPanelPlugin`             | Tail of `tracing` events fed by an installed `tracing-subscriber` layer. `without_panel()` keeps the subscriber and the shared `LogBuffer` and contributes no tab, for a host that reads the buffer elsewhere (the conversation panel's `Ctrl-O` node timeline does). |
 | `SessionsPanelPlugin`        | Live list of active sessions read from `SessionsAPI`. Depends on `SessionsPlugin`.                                |
@@ -633,7 +696,7 @@ To disable all built-ins and ship only the framework:
 
 ```toml
 [dependencies]
-polaris-tui = { version = "0.1.0", default-features = false }
+polaris-tui = { version = "0.2.0", default-features = false }
 ```
 
 ---
@@ -816,7 +879,8 @@ run will consume it. Alt-Up recalls the newest unconsumed item into the composer
 for editing; Alt-Backspace removes it. A host that overrides
 `TurnInputHandle::is_pending` lets the panel drop the `queued for run N` badge
 once the host takes a message, after which Alt-Up and Alt-Backspace go back to
-their ordinary editing meaning; the default answers `true` and keeps both. Approval answers never enter this queue,
+their ordinary editing meaning; the default answers `true` and keeps both.
+Approval answers come from the picker and never enter this queue,
 and a host that does not install the handle keeps the original `UserIO` delivery
 path unchanged.
 

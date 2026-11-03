@@ -1,7 +1,7 @@
 //! Live progress reporting bridge: graph instrumentation → conversation panel.
 //!
 //! The agent's `ReAct` loop spends most of a turn parked on an `await` — the
-//! LLM call in `act`, a tool in `execute_tools`. Those systems only emit
+//! LLM call in `act`, a tool in `execute_call`. Those systems only emit
 //! transcript traces *after* they return, so a turn that calls no tools shows
 //! nothing until the final answer lands. This bridge closes that gap.
 //!
@@ -150,7 +150,7 @@ impl NodeActivity {
 
     /// Creates the registry the shipped agent loop is described by.
     ///
-    /// The agent loop's own six nodes read exactly as they always have; its
+    /// The agent loop's work nodes describe what the user is waiting for; its
     /// structural nodes stay silent, because "entering the loop" is not
     /// something a user is waiting on. The one stage of the model call a user
     /// can see is a backoff, which reads "Waiting to retry…".
@@ -161,7 +161,19 @@ impl NodeActivity {
         activities.idle("receive_user_input");
         activities.describe("prepare_context", "Preparing context…");
         activities.describe("act", "Thinking…");
-        activities.describe("execute_tools", "Running tools…");
+        activities.describe("execute_call", "Running tools…");
+        activities.describe("dispatch_read_only_batch", "Running tools…");
+        activities.describe("ask_human", "Awaiting approval…");
+        for node in [
+            "prepare_calls",
+            "authorize_call",
+            "settle_authorization",
+            "record_denial",
+            "advance_call",
+            "finish_calls",
+        ] {
+            activities.silence(node);
+        }
         activities.describe("finalize", "Finalizing…");
         activities.describe("recover", "Recovering…");
         // A backoff before the next attempt is the one stage of the model call
@@ -383,11 +395,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_agent_loop_reads_exactly_as_before() {
+    fn the_agent_loop_describes_model_tools_and_approval_waits() {
         let activities = NodeActivity::with_agent_loop();
         assert_eq!(activities.activity("act").as_deref(), Some("Thinking…"));
         assert_eq!(
-            activities.activity("execute_tools").as_deref(),
+            activities.activity("ask_human").as_deref(),
+            Some("Awaiting approval…")
+        );
+        assert_eq!(activities.activity("authorize_call"), None);
+        assert_eq!(
+            activities.activity("execute_call").as_deref(),
             Some("Running tools…")
         );
         assert_eq!(
