@@ -722,4 +722,91 @@ mod tests {
         let (mut shell, _, _) = shell_with_two_panels(LayoutMode::Single);
         assert!(shell.take_notifications().is_empty());
     }
+
+    /// The footer hint row as drawn at `width` columns.
+    fn status_line(shell: &AppShell, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| shell.render_status_line(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// Wide, every hint shows in display order. As the terminal narrows, whole
+    /// hints drop by priority — layout name first, quit last — and none is
+    /// ever clipped mid-word.
+    #[test]
+    fn footer_hints_drop_whole_by_priority_as_the_terminal_narrows() {
+        let (mut shell, _, _) = shell_with_config(LayoutMode::Single, true);
+        shell.mouse_captured = true;
+        let all = [
+            "single",
+            "tab/shift-tab switch",
+            "alt-1..9 jump",
+            "ctrl-l layout",
+            "ctrl-c quit",
+            "ctrl-s select",
+        ];
+        assert_eq!(
+            status_line(&shell, 200),
+            format!(" {}", all.join(" · ")).trim_end(),
+            "all hints, in display order"
+        );
+        for (width, kept, dropped) in [
+            (
+                85,
+                &[
+                    "tab/shift-tab switch",
+                    "alt-1..9 jump",
+                    "ctrl-l layout",
+                    "ctrl-c quit",
+                    "ctrl-s select",
+                ][..],
+                &["single"][..],
+            ),
+            (
+                70,
+                &[
+                    "tab/shift-tab switch",
+                    "alt-1..9 jump",
+                    "ctrl-c quit",
+                    "ctrl-s select",
+                ][..],
+                &["single", "ctrl-l layout"][..],
+            ),
+            (
+                40,
+                &["tab/shift-tab switch", "ctrl-c quit"][..],
+                &["single", "alt-1..9 jump", "ctrl-l layout"][..],
+            ),
+            (
+                15,
+                &["ctrl-c quit"][..],
+                &["tab/shift-tab switch", "ctrl-s select"][..],
+            ),
+            (5, &[][..], &["ctrl-c quit"][..]),
+        ] {
+            let line = status_line(&shell, width);
+            for hint in kept {
+                assert!(line.contains(hint), "{width}: {hint} kept: {line:?}");
+            }
+            for hint in dropped {
+                assert!(!line.contains(hint), "{width}: {hint} dropped: {line:?}");
+            }
+            let pieces = line.trim().split(" · ").filter(|piece| !piece.is_empty());
+            for piece in pieces {
+                assert!(
+                    all.contains(&piece),
+                    "{width}: {piece:?} is a whole hint: {line:?}"
+                );
+            }
+        }
+    }
 }
