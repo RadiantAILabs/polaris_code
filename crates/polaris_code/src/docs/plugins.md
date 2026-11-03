@@ -58,8 +58,9 @@ skips both halves of that startup pass: `build` asserts no pending index and
 `ready` spawns none. The tools still register and answer that the index was not
 built, and edits still refresh the files they touch. The `polaris` binary does
 this for an interactive run whose working directory does not look like a
-project ([`looks_like_project`](crate::tools::looks_like_project)); a headless
-run always indexes.
+project; a headless run always indexes.
+[`boot_index_wanted`](crate::tools::boot_index_wanted) makes that choice for a
+host that wants the same rule.
 
 `InertModelPlugin` (private, `crate::cosmos::compare`) is not part of the
 public plugin surface, so it has no rustdoc page to link: a topology
