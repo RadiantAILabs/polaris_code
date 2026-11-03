@@ -22,13 +22,17 @@ Both APIs are provided by [`TuiPlugin`](crate::TuiPlugin).
 
 Approval rendering uses the ordinary typed [`ApprovalChoice`](crate::ApprovalChoice)
 protocol, not another framework API. Hosts encode choices using
-[`APPROVAL_CHOICES`](crate::APPROVAL_CHOICES); replies identify the selected scope
-with [`APPROVAL_CHOICE`](crate::APPROVAL_CHOICE). Prompt IDs correlate cancellation
+[`APPROVAL_CHOICES`](crate::APPROVAL_CHOICES); the panel lists them in a picker
+that replaces the input, and replies identify the selected scope with
+[`APPROVAL_CHOICE`](crate::APPROVAL_CHOICE). Prompt IDs correlate cancellation
 and responses so a resolved approval cannot answer a later receive.
 [`APPROVAL_SUBJECT`](crate::APPROVAL_SUBJECT) and
 [`APPROVAL_CONTEXT`](crate::APPROVAL_CONTEXT) optionally name the one thing being
-approved and where, which the panel frames above the input instead of repeating
+approved and where, which the picker shows above the list instead of repeating
 the whole prompt. The reply's `confirmed` metadata and `APPROVAL_CHOICE` alone
 decide the answer. `APPROVAL_CONTEXT` is a display hint only; with an
-`APPROVAL_SUBJECT` the panel also refuses a confirming answer until the whole
-subject has been drawn, and accepts only a denial for a subject over 64 KiB.
+`APPROVAL_SUBJECT` the picker also refuses a confirming answer until the whole
+subject has been drawn, and accepts only a denial for a subject over 64 KiB. A
+note the user adds to an allow travels in
+[`APPROVAL_NOTE`](crate::APPROVAL_NOTE) on the reply; a note on a denial is its
+`deny: <note>` text.
