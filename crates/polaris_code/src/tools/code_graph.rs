@@ -1833,6 +1833,7 @@ impl ConceptTools {
 ///     .add_plugins(OxigraphPlugin::in_memory())
 ///     .add_plugins(CodeGraphPlugin::new("."));
 /// ```
+#[derive(Debug)]
 pub struct CodeGraphPlugin {
     working_dir: std::path::PathBuf,
     search_mode: GraphSearchMode,
@@ -1894,12 +1895,27 @@ const PROJECT_MARKERS: [&str; 16] = [
 ///
 /// Conservative on purpose: the home directory and the filesystem root never
 /// are (a dotfiles repo can make `~` a git work tree), and otherwise `dir` or
-/// an ancestor below the home directory must carry a [`PROJECT_MARKERS`]
-/// entry. A subdirectory of a repository therefore still counts.
+/// an ancestor below the home directory must carry a project marker — a
+/// version-control directory (`.git`, `.hg`, `.jj`) or a build manifest such
+/// as `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod` or a
+/// `Makefile`. A subdirectory of a repository therefore still counts.
 #[must_use]
 pub fn looks_like_project(dir: &Path) -> bool {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    looks_like_project_under(dir, home.as_deref())
+    looks_like_project_under(dir, crate::config_dir::home_dir().as_deref())
+}
+
+/// Whether the agent should index `dir` when it starts: always for a
+/// headless run, which is pointed at its directory on purpose (evals,
+/// scripts), and interactively only when `dir`
+/// [looks like a project](looks_like_project), so starting in `~` does not
+/// walk everything under it before the first answer.
+#[must_use]
+pub fn boot_index_wanted(headless: bool, dir: &Path) -> bool {
+    boot_index_wanted_under(headless, dir, crate::config_dir::home_dir().as_deref())
+}
+
+fn boot_index_wanted_under(headless: bool, dir: &Path, home: Option<&Path>) -> bool {
+    headless || looks_like_project_under(dir, home)
 }
 
 fn looks_like_project_under(dir: &Path, home: Option<&Path>) -> bool {
@@ -2002,11 +2018,83 @@ mod tests {
         // A dotfiles repo makes home itself a work tree.
         std::fs::create_dir(home.join(".git")).unwrap();
 
-        assert!(looks_like_project_under(&repo, Some(&home)));
-        assert!(looks_like_project_under(&repo.join("src"), Some(&home)));
-        assert!(!looks_like_project_under(&home, Some(&home)));
-        assert!(!looks_like_project_under(&loose, Some(&home)));
-        assert!(!looks_like_project_under(Path::new("/"), Some(&home)));
+        assert!(
+            looks_like_project_under(&repo, Some(&home)),
+            "a marked repository is a project"
+        );
+        assert!(
+            looks_like_project_under(&repo.join("src"), Some(&home)),
+            "so is a directory inside one"
+        );
+        assert!(
+            !looks_like_project_under(&home, Some(&home)),
+            "home is never a project, even as a dotfiles work tree"
+        );
+        assert!(
+            !looks_like_project_under(&loose, Some(&home)),
+            "an unmarked folder under home is not a project"
+        );
+        assert!(
+            !looks_like_project_under(Path::new("/"), Some(&home)),
+            "the filesystem root is never a project"
+        );
+    }
+
+    /// The host's gate: a headless run always indexes its directory; an
+    /// interactive one only a project, so starting in `~` skips the pass.
+    #[test]
+    fn the_boot_index_is_skipped_only_interactively_outside_a_project() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        for (case, headless, dir, wanted) in [
+            ("interactive in a project", false, &repo, true),
+            ("interactive in home", false, &home, false),
+            ("headless in a project", true, &repo, true),
+            ("headless in home", true, &home, true),
+        ] {
+            assert_eq!(
+                boot_index_wanted_under(headless, dir, Some(&home)),
+                wanted,
+                "{case}"
+            );
+        }
+    }
+
+    /// Off, the plugin still registers its tools but never announces or
+    /// starts an index: the store stays `Unstarted`, which is what the tools
+    /// answer from.
+    #[tokio::test]
+    async fn without_the_boot_index_the_store_is_never_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn indexed_if_walked() {}").unwrap();
+        let mut server = Server::new();
+        server
+            .add_plugins(ToolsPlugin)
+            .add_plugins(OxigraphPlugin::in_memory())
+            .add_plugins(CodeGraphPlugin::new(dir.path()).with_boot_index(false));
+        server.finish().await.unwrap();
+        // Give a (wrongly) spawned index a moment to announce itself.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let store = OxigraphStore::clone(
+            &server
+                .get_global::<OxigraphStore>()
+                .expect("the store is a global"),
+        );
+        assert_eq!(
+            code_index_state(&store).phase,
+            IndexPhase::Unstarted,
+            "no index was announced or built"
+        );
+        let ctx = server.create_context();
+        let registry = ctx.get_resource::<ToolRegistry>().unwrap();
+        assert!(
+            registry.names().contains(&"find_definition"),
+            "the tools still register: {:?}",
+            registry.names()
+        );
     }
 
     /// Index `src` as `lib.rs` and return the tools plus the tempdir they read

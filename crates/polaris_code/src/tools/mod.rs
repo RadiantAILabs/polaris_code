@@ -28,8 +28,8 @@ pub mod web;
 pub use code::{CodeTools, CodeToolsConfig, CodeToolsPlugin, FILE_WRITE_TOOLS};
 pub use code_graph::{
     CODE_GRAPH_IRI, CodeGraphPlugin, CodeGraphTools, CodeIndexState, CodeIndexer, ConceptTools,
-    ENRICHED_GRAPH_IRI, GraphSearchMode, IndexPhase, ROLES, code_index_state, enrich,
-    looks_like_project,
+    ENRICHED_GRAPH_IRI, GraphSearchMode, IndexPhase, ROLES, boot_index_wanted, code_index_state,
+    enrich, looks_like_project,
 };
 pub use fileset::{PathGlob, Selection, WalkLimits, select_files};
 pub use memory::{MEMORY_GRAPH_IRI, MemoryTools, MemoryToolsPlugin};

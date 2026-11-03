@@ -768,14 +768,27 @@ pub fn stream_json_line(message: &IOMessage) -> Result<String, serde_json::Error
 mod tests {
     use super::*;
 
+    use crate::agents::TurnFailure;
+    use crate::usage::TokenMeter;
+    use polaris::graph::RunId;
+    use polaris::models::anthropic::DEFAULT_MAX_TOKENS;
+    use std::time::Duration;
+
+    /// Decode one stream-json line for inspection.
+    fn streamed(message: &IOMessage) -> serde_json::Value {
+        serde_json::from_str(&stream_json_line(message).expect("a line")).expect("valid JSON")
+    }
+
+    fn tool_block(body: &str) -> IOMessage {
+        IOMessage::from_agent("code", IOContent::Text(body.into())).with_metadata(IO_TYPE, "tool")
+    }
+
     #[test]
     fn stream_json_keeps_the_executor_document_as_a_tool_body() {
-        let block = IOMessage::from_agent("code", IOContent::Text("a\nb\n[exit code: 0]".into()))
-            .with_metadata(IO_TYPE, "tool")
+        let block = tool_block("a\nb\n[exit code: 0]")
             .with_metadata(META_SUMMARY, "cat x · exit 0 · 2 lines")
             .with_metadata(META_DOCUMENT, r#"{"status":"executed"}"#);
-        let line: serde_json::Value =
-            serde_json::from_str(&stream_json_line(&block).unwrap()).unwrap();
+        let line = streamed(&block);
         assert_eq!(
             line["content"]["Text"], r#"{"status":"executed"}"#,
             "{line}"
@@ -783,11 +796,37 @@ mod tests {
         assert!(line["metadata"].get(META_SUMMARY).is_none(), "{line}");
         assert!(line["metadata"].get(META_DOCUMENT).is_none(), "{line}");
     }
-    use crate::agents::TurnFailure;
-    use crate::usage::TokenMeter;
-    use polaris::graph::RunId;
-    use polaris::models::anthropic::DEFAULT_MAX_TOKENS;
-    use std::time::Duration;
+
+    #[test]
+    fn stream_json_drops_a_summary_and_keeps_the_body() {
+        let line = streamed(&tool_block("a\nb\nc").with_metadata(META_SUMMARY, "x · 3 lines"));
+        assert_eq!(line["content"]["Text"], "a\nb\nc", "{line}");
+        assert!(line["metadata"].get(META_SUMMARY).is_none(), "{line}");
+        assert_eq!(line["metadata"][IO_TYPE], "tool", "{line}");
+    }
+
+    #[test]
+    fn stream_json_swaps_in_a_document_without_a_summary() {
+        // A failed run carries its document but is not collapsed.
+        let line = streamed(
+            &tool_block("boom\n[exit code: 1]")
+                .with_metadata(META_DOCUMENT, r#"{"status":"executed","exit_code":1}"#),
+        );
+        assert_eq!(
+            line["content"]["Text"], r#"{"status":"executed","exit_code":1}"#,
+            "{line}"
+        );
+        assert!(line["metadata"].get(META_DOCUMENT).is_none(), "{line}");
+    }
+
+    #[test]
+    fn stream_json_leaves_an_ordinary_message_untouched() {
+        let message = tool_block("plain");
+        assert_eq!(
+            stream_json_line(&message).expect("a line"),
+            serde_json::to_string(&message).expect("serialises")
+        );
+    }
 
     /// A non-default limit, so a test that asserts on it cannot pass by
     /// accidentally matching [`DEFAULT_MAX_TOKENS`].

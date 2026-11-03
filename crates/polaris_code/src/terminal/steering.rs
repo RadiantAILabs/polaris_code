@@ -406,3 +406,41 @@ impl TurnInputHandle for TurnSteering {
             .is_ok_and(|state| state.pending.iter().any(|input| input.receipt.id == id))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The panel retires a "queued" badge on `is_pending`, so it has to turn
+    /// false exactly when the run takes the prompt or the user removes it.
+    #[tokio::test]
+    async fn a_message_is_pending_until_taken_or_removed() {
+        let steering = TurnSteering::enabled();
+        let taken = steering
+            .submit("first".into(), TurnInputMode::Queue)
+            .expect("queued");
+        let removed = steering
+            .submit("second".into(), TurnInputMode::Queue)
+            .expect("queued");
+        assert!(steering.is_pending(taken.id), "queued, not yet taken");
+        assert!(steering.is_pending(removed.id), "queued, not yet taken");
+        assert!(
+            !steering.is_pending(u64::MAX),
+            "an unknown id is not pending"
+        );
+
+        steering.activate();
+        assert_eq!(steering.receive_prompt().await.text.as_str(), "first");
+        assert!(
+            !steering.is_pending(taken.id),
+            "the run took the first message"
+        );
+        assert!(steering.is_pending(removed.id), "the second still waits");
+
+        steering.remove(removed.id).expect("still pending");
+        assert!(
+            !steering.is_pending(removed.id),
+            "a removed message is gone"
+        );
+    }
+}
