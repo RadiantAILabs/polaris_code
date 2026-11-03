@@ -2075,19 +2075,20 @@ mod tests {
             .add_plugins(OxigraphPlugin::in_memory())
             .add_plugins(CodeGraphPlugin::new(dir.path()).with_boot_index(false));
         server.finish().await.unwrap();
-        // Give a (wrongly) spawned index a moment to announce itself.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
         let store = OxigraphStore::clone(
             &server
                 .get_global::<OxigraphStore>()
                 .expect("the store is a global"),
         );
-        assert_eq!(
-            code_index_state(&store).phase,
-            IndexPhase::Unstarted,
-            "no index was announced or built"
-        );
+        // Let a (wrongly) spawned index announce itself without a fixed sleep.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                code_index_state(&store).phase,
+                IndexPhase::Unstarted,
+                "no index was announced or built"
+            );
+        }
         let ctx = server.create_context();
         let registry = ctx.get_resource::<ToolRegistry>().unwrap();
         assert!(
