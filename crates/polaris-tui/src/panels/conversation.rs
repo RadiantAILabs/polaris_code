@@ -3166,15 +3166,24 @@ fn build_message_layout(
         let rich = matches!(kind, Some(TYPE_MESSAGE | "error"));
         // A finished tool the host summarised reads as one row; its output is
         // the same Ctrl-O away as every other folded body.
+        // Expanded, the summary stays as the block's first row so the command
+        // still heads its output.
         let summary = message
             .metadata
             .get(META_SUMMARY)
-            .filter(|_| kind == Some(TYPE_TOOL) && !expanded);
+            .filter(|_| kind == Some(TYPE_TOOL))
+            .map(|summary| safe_text(summary).replace('\n', " "));
         let mut rendered = if let Some(summary) = summary {
-            vec![Line::from(vec![
-                Span::raw(safe_text(summary).replace('\n', " ")),
-                Span::styled("  · ctrl-o", Style::default().fg(Color::DarkGray)),
-            ])]
+            if expanded {
+                let mut rows = vec![Line::raw(summary)];
+                rows.extend(preview_lines(&body, expanded));
+                rows
+            } else {
+                vec![Line::from(vec![
+                    Span::raw(summary),
+                    Span::styled("  · ctrl-o", Style::default().fg(Color::DarkGray)),
+                ])]
+            }
         } else if matches!(kind, Some(TYPE_TOOL | TYPE_CONFIRM)) {
             preview_lines(&body, expanded)
         } else {
@@ -7383,7 +7392,11 @@ mod tests {
         panel.expanded = true;
         let text = rendered(&panel);
         assert!(text.contains("two"), "{text}");
-        assert!(!text.contains("3 lines"), "{text}");
+        assert!(
+            text.lines().next().unwrap().contains("cat notes.txt"),
+            "{text}"
+        );
+        assert!(!text.contains("ctrl-o"), "{text}");
     }
 
     #[tokio::test]
