@@ -207,8 +207,11 @@
 //! context, the prompt's first line) is bounded to 2 KiB when it arrives, and
 //! a cut one ends in `…`.
 //!
-//! Both keys are display hints: the reply's `confirmed` and `approval_choice`
-//! decide the answer. Without a subject the prompt renders as before.
+//! The reply's `confirmed` and `approval_choice` alone decide what is
+//! authorized; nothing in the subject or the context changes it.
+//! `approval_context` is a display hint only. `approval_subject` is shown, and
+//! also gates a confirming answer as above. Without a subject the prompt
+//! renders as before.
 //!
 //! The panel decides nothing about *which* actions need approval — that is the
 //! tool's permission, set by the consumer. This is presentation and the answer
@@ -790,17 +793,19 @@ pub const APPROVAL_REQUEST_ID: &str = "approval_request_id";
 /// Metadata key naming, verbatim, the one thing an approval authorizes (a
 /// command). Its presence switches the panel to the framed approval block.
 ///
-/// A display hint only: the answer is decided by the [`CONFIRMED`] and
-/// [`APPROVAL_CHOICE`] metadata on the reply, never by this text. The panel
-/// does, however, refuse a confirming answer until the whole subject has been
-/// on screen, and accepts only a denial for a subject too long to show.
+/// What the reply authorizes is decided by the [`CONFIRMED`] and
+/// [`APPROVAL_CHOICE`] metadata on it, never by this text. It is more than a
+/// display hint, though: the panel refuses a confirming answer until the whole
+/// subject has been drawn, and accepts only a denial for a subject too long to
+/// show.
 pub const APPROVAL_SUBJECT: &str = "approval_subject";
 /// Metadata key with a short line saying where the subject applies, shown in
 /// the framed approval block's title (`run_command in ~/repo`). A frame with
 /// no room for answer rows keeps the answer keys in the title and the context
 /// only if it fits beside them; it is always at the top of the `?` view.
 ///
-/// A display hint only, like [`APPROVAL_SUBJECT`]; it grants nothing.
+/// A display hint only: it grants nothing, and the panel's gate on a confirming
+/// answer does not read it.
 pub const APPROVAL_CONTEXT: &str = "approval_context";
 /// [`IO_TYPE`] value closing a resolved approval without soliciting another answer.
 pub const IO_TYPE_APPROVAL_RESOLVED: &str = "approval_resolved";
