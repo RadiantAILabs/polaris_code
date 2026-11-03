@@ -330,19 +330,44 @@ impl AppShell {
             LayoutMode::Single => "single",
             LayoutMode::Tiled => "tiled",
         };
-        let mut hint =
-            format!(" {mode} · tab/shift-tab switch · alt-1..9 jump · ctrl-l layout · ctrl-c quit");
+        // Hints in display order, each with its priority (lower keeps longer).
+        // A narrow terminal drops whole hints rather than clipping one.
+        let mut hints = vec![
+            (5, mode.to_string()),
+            (1, "tab/shift-tab switch".to_string()),
+            (3, "alt-1..9 jump".to_string()),
+            (4, "ctrl-l layout".to_string()),
+            (0, "ctrl-c quit".to_string()),
+        ];
         // Selection-mode affordance, shown only when the host enabled mouse
         // capture (otherwise native selection is always available).
         if self.mouse_enabled {
             if self.mouse_captured {
-                hint.push_str(" · ctrl-s select");
+                hints.push((2, "ctrl-s select".to_string()));
             } else {
-                hint.push_str(" · SELECT MODE: drag to copy · ctrl-s resume");
+                hints.push((2, "SELECT MODE: drag to copy · ctrl-s resume".to_string()));
             }
         }
-        hint.push(' ');
-        let line = Paragraph::new(hint).style(dim_style());
+        let width = usize::from(area.width);
+        let mut by_priority = (0..hints.len()).collect::<Vec<_>>();
+        by_priority.sort_by_key(|index| hints[*index].0);
+        let mut keep = vec![false; hints.len()];
+        // One leading and one trailing space, then " · " between hints.
+        let mut used = 2;
+        for index in by_priority {
+            let cost = hints[index].1.chars().count() + if used > 2 { 3 } else { 0 };
+            if used + cost <= width {
+                used += cost;
+                keep[index] = true;
+            }
+        }
+        let hint = hints
+            .into_iter()
+            .zip(keep)
+            .filter_map(|((_, text), keep)| keep.then_some(text))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let line = Paragraph::new(format!(" {hint} ")).style(dim_style());
         frame.render_widget(line, area);
     }
 }
