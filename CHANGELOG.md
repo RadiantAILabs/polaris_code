@@ -8,11 +8,11 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 Requires `polaris-tui` 0.1.2.
 
 ### Added
-- Framed command approvals: `polaris-tui` exports `APPROVAL_SUBJECT` and `APPROVAL_CONTEXT`; a prompt carrying them shows the command once above the input, with the answers pinned under it and the full prompt behind `?`. The keys are display hints only; `confirmed` and `approval_choice` still decide the answer.
+- Framed command approvals: `polaris-tui` exports `APPROVAL_SUBJECT` and `APPROVAL_CONTEXT`; a prompt carrying them shows the command once above the input, with the answers pinned under it and the full prompt behind `?`. `confirmed` and `approval_choice` still carry the answer, and `APPROVAL_CONTEXT` is a display hint only. With `APPROVAL_SUBJECT` the panel refuses a confirming answer until the whole command has been drawn, and accepts only a denial for a command over 64 KiB.
 - Collapsed tool output: a finished `tool` block may carry a one-line `summary`, shown in place of the body until `Ctrl-O`. `run_command` blocks show shell text and keep the executor's JSON as `document` metadata; `stream-json` output is unchanged.
 - `ConversationPanelPlugin::with_placeholder` and `DEFAULT_PLACEHOLDER` for the empty input's hint.
 - `TurnInputHandle::is_pending` (defaults to `true`), so the panel can retire `queued for run N` badges on messages the host has taken.
-- `CodeGraphPlugin::with_boot_index` and `tools::looks_like_project`. An interactive `polaris` run outside a project skips the boot code index and says so; headless runs still index.
+- `CodeGraphPlugin::with_boot_index` and `tools::boot_index_wanted(headless, dir)`. An interactive `polaris` run outside a project skips the boot code index and says so; headless runs still index.
 
 ### Changed
 - Approval labels state their scope: `allow this exact command in <dir> for this session`, `allow prefix "<prefix>" (whole words, every subcommand) in <dir> for this session`, `deny (or no: reason)`.
@@ -20,6 +20,14 @@ Requires `polaris-tui` 0.1.2.
 - Default rendering every `polaris-tui` host gets: inline code is bold instead of yellow, a blank row separates turns, system messages and tool names/timings are dim, the empty input shows a placeholder, and the input title no longer repeats `Ctrl-N browse`.
 - The meta row shows state, short model name (`Sonnet 5.5 · Bedrock`), context %, cost and running tasks; token tally, session, permissions, workspace and the full context window move behind `Ctrl-O`. Facts and footer hints are dropped whole, by priority, on narrow terminals instead of being clipped.
 - Successful tool results longer than a line (other than diffs) collapse to a one-line summary; failures, denials and non-zero exits stay expanded.
+
+### Fixed
+- Approval text wraps by grapheme cluster, the way the terminal draws it, so an emoji or other multi-character grapheme can no longer push the end of a command out of view and still count as shown.
+- Approval answer labels are bounded in size before they are laid out, so a very long label no longer slows every frame.
+- The `p` (prefix) answer is left out when the prefix is very long, instead of showing an oversized label.
+- On a terminal too small for the full answer labels, the approval footer collapses to the keys (`y s p n ?`) with the labels behind `?`, and a refusal reason shows in the frame's border title, so the answers and the rest of the command stay reachable.
+- `TurnSteering::is_pending` returns `true` when its queue lock is poisoned, matching the trait's documented default, so a queued message keeps its `queued for run N` badge.
+- `home_dir` falls back to `USERPROFILE` when `HOME` is empty, as its documentation says.
 
 ## [0.2.0] - 2026-11-02
 

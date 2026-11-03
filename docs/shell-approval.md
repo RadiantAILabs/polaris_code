@@ -56,10 +56,15 @@ A command taller than the frame scrolls inside it (`↑` / `↓`, `PgUp` / `PgDn
 with an empty input), and the panel refuses a confirming answer until the
 command's last row has been on screen. A command longer than 64 KiB cannot be
 shown in full, so only a denial is accepted for it. `?` adds the full prompt —
-tool, directory and JSON arguments — to the frame.
+tool, directory and JSON arguments — to the frame. On a terminal too small for
+the labels above, the footer shows only the keys (`y s p n ?`) and `?` shows the
+full labels; a refusal reason then appears in the frame's border title.
 
-`APPROVAL_SUBJECT` and `APPROVAL_CONTEXT` are display hints only. The reply's
-`confirmed` metadata and `approval_choice` decide the answer, and the grant is
-bound to the tool, arguments, canonical directory, generation and rule revision
-as above; nothing in the hints widens or narrows it. A front end that ignores
-them shows the full prompt, which still names the command and directory.
+The reply's `confirmed` metadata and `approval_choice` still decide the answer,
+and the grant is bound to the tool, arguments, canonical directory, generation
+and rule revision as above; nothing in `APPROVAL_SUBJECT` or `APPROVAL_CONTEXT`
+widens or narrows it. `APPROVAL_CONTEXT` is a display hint only.
+`APPROVAL_SUBJECT` also makes the panel refuse a confirming answer until the
+whole command has been drawn, and accept only a denial for a command over
+64 KiB; that can only make the panel stricter. A front end that ignores both
+keys shows the full prompt, which still names the command and directory.

@@ -372,7 +372,10 @@ it verbatim (a command) and `APPROVAL_CONTEXT` says where it applies
 input, instead of printing the whole prompt into the transcript:
 
 - the answers (`APPROVAL_CHOICES` labels, or `y` / `n`) and any notice sit on
-  the frame's last rows and are never clipped, however long the subject is;
+  the frame's last rows, wrapped to the width, however long the subject is. If
+  the terminal is too small for the full labels, the footer collapses to the
+  keys (`y s p n ?`) and `?` shows the labels; a refusal reason then appears in
+  the frame's border title;
 - a subject taller than the frame scrolls inside it: `↑` / `↓` move one row and
   `PgUp` / `PgDn` a page while the input is empty, and the frame's border says
   how many rows are above and below;
@@ -384,10 +387,12 @@ input, instead of printing the whole prompt into the transcript:
   bounded at 64 KiB with a marker where it was cut. `Ctrl-O` shows the prompt
   in the transcript.
 
-Both keys are display hints only. The answer is decided by the `confirmed`
-metadata and, where choices were offered, `approval_choice`; nothing in the
-subject or context changes what a reply authorizes. Without a subject the
-prompt renders as before.
+The answer is still decided by the `confirmed` metadata and, where choices
+were offered, `approval_choice`; nothing in the subject or context changes what
+a reply authorizes. `APPROVAL_CONTEXT` is a display hint only. `APPROVAL_SUBJECT`
+also gates the panel: it refuses a confirming answer until the whole subject has
+been drawn, and accepts only a denial for a subject over 64 KiB. Without a
+subject the prompt renders as before.
 
 ### Notifications
 

@@ -809,4 +809,64 @@ mod tests {
             }
         }
     }
+
+    /// A hint whose row exactly fills the width is kept; one column less drops
+    /// it. Widths are the hint text plus the two outer spaces and the " · "
+    /// between hints.
+    #[test]
+    fn a_footer_hint_that_exactly_fits_is_kept() {
+        let (mut shell, _, _) = shell_with_config(LayoutMode::Single, true);
+        shell.mouse_captured = true;
+        // Without "single": 70 characters of text, 4 separators, 2 outer spaces.
+        assert!(
+            status_line(&shell, 84).contains("ctrl-l layout"),
+            "84 columns fit five hints exactly"
+        );
+        assert!(
+            !status_line(&shell, 83).contains("ctrl-l layout"),
+            "83 columns drop the lowest-priority of the five"
+        );
+        // With "single": 76 characters, 5 separators, 2 outer spaces.
+        assert!(
+            status_line(&shell, 93).starts_with(" single · "),
+            "93 columns fit all six hints exactly"
+        );
+        assert!(
+            !status_line(&shell, 92).contains("single"),
+            "92 columns drop the layout name"
+        );
+        // The first hint has no separator: " ctrl-c quit " is 13 columns.
+        assert_eq!(status_line(&shell, 13), " ctrl-c quit");
+        assert!(!status_line(&shell, 12).contains("ctrl-c quit"));
+    }
+
+    #[test]
+    fn the_footer_names_the_tiled_layout() {
+        let (shell, _, _) = shell_with_config(LayoutMode::Tiled, false);
+        let line = status_line(&shell, 200);
+        assert!(line.starts_with(" tiled · "), "{line:?}");
+        assert!(!line.contains("single"), "{line:?}");
+    }
+
+    #[test]
+    fn the_footer_says_when_the_terminal_is_in_selection_mode() {
+        let (shell, _, _) = shell_with_config(LayoutMode::Single, true);
+        // The shell starts in selection mode with the mouse released.
+        assert!(!shell.mouse_captured);
+        let line = status_line(&shell, 200);
+        assert!(
+            line.ends_with("SELECT MODE: drag to copy · ctrl-s resume"),
+            "{line:?}"
+        );
+        assert!(!line.contains("ctrl-s select"), "{line:?}");
+    }
+
+    #[test]
+    fn the_footer_has_no_selection_hint_when_the_mouse_is_never_captured() {
+        let (shell, _, _) = shell_with_config(LayoutMode::Single, false);
+        let line = status_line(&shell, 200);
+        assert!(!line.contains("ctrl-s"), "{line:?}");
+        assert!(!line.contains("SELECT MODE"), "{line:?}");
+        assert!(line.ends_with("ctrl-c quit"), "{line:?}");
+    }
 }
