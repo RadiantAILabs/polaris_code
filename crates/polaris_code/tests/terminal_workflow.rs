@@ -983,12 +983,17 @@ async fn a_typed_prompt_streams_its_answer_onto_the_screen_before_the_turn_ends(
         "the closed block carries the full answer once:\n{screen}"
     );
     assert_eq!(screen.matches("forty-two").count(), 1, "{screen}");
-    // Host-owned facts on the meta row: model, estimated context, session/turn,
-    // and the token tally the stream billed.
+    // Host-owned facts on the meta row: model and estimated context by
+    // default; session/turn and the token tally the stream billed once Ctrl-O
+    // asks for the detail.
     assert!(screen.contains(STARTUP_MODEL), "{screen}");
     assert!(screen.contains("ctx ~"), "{screen}");
+    assert!(!screen.contains("default · turn"), "{screen}");
+    host.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    let screen = host.frame().await.join("\n");
     assert!(screen.contains("default · turn"), "{screen}");
     assert!(screen.contains("↑1.0k ↓50"), "{screen}");
+    host.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
 
     let session = host.session_id.clone();
     host.pause_driver().await;
@@ -1704,8 +1709,8 @@ async fn a_narrow_terminal_keeps_the_workflow_readable() {
         "nothing is drawn past the right edge:\n{screen}"
     );
     assert!(
-        !screen.contains(STARTUP_MODEL),
-        "below 40 columns the meta row drops host facts:\n{screen}"
+        screen.contains("● ready") && !screen.contains("cost n/a"),
+        "a narrow meta row keeps the state and drops whole facts:\n{screen}"
     );
 
     host.resize(160, 30);

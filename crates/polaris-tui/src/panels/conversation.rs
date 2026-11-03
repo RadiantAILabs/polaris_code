@@ -1692,76 +1692,76 @@ impl ConversationPanel {
     }
 
     fn meta_line_for_width(&self, width: u16) -> Line<'static> {
-        let total = self.tokens_in.saturating_add(self.tokens_out);
-        let tokens = format!(
-            "↑{} ↓{} · {} tok",
-            fmt_tokens(self.tokens_in),
-            fmt_tokens(self.tokens_out),
-            fmt_tokens(total),
-        );
-        let show_tokens = width >= 40;
+        let width = usize::from(width);
         let dim = Style::default().fg(Color::DarkGray);
         let availability_error = self.report.availability.unavailable_reason();
         let error = availability_error.or(self.last_error.as_deref());
-        let mut spans = if let Some(reason) = error {
-            vec![Span::styled(
+        // The lead always shows: hidden-message count, then the state. Facts
+        // and hints follow in priority order and each is kept or dropped
+        // whole, so a narrow terminal loses the least useful fact rather than
+        // clipping the row mid-word.
+        let mut lead = Vec::new();
+        let hidden = self
+            .transcript
+            .iter()
+            .filter(|message| unknown_message(message))
+            .count();
+        if hidden > 0 {
+            lead.push(Span::styled(
+                format!(
+                    "{hidden} {} · Ctrl-O  ",
+                    if self.expanded { "revealed" } else { "hidden" }
+                ),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lead.push(if let Some(reason) = error {
+            Span::styled(
                 format!("● error · {}", safe_text(reason)),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )]
+            )
         } else {
             match &self.status {
                 Some(activity) => {
                     let frame = SPINNER[self.spinner % SPINNER.len()];
-                    vec![
-                        Span::styled(
-                            format!("{frame} {}", safe_text(activity)),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            if show_tokens {
-                                format!("  {tokens}")
-                            } else {
-                                String::new()
-                            },
-                            dim,
-                        ),
-                        Span::styled(
-                            if show_tokens && self.esc_interrupts() {
-                                "  · esc to interrupt"
-                            } else {
-                                ""
-                            },
-                            dim,
-                        ),
-                    ]
+                    Span::styled(
+                        format!("{frame} {}", safe_text(activity)),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 }
-                None => vec![Span::styled(
-                    if show_tokens {
-                        format!("● ready  {tokens}")
-                    } else {
-                        "● ready".to_string()
-                    },
-                    dim,
-                )],
+                None => Span::styled("● ready", dim),
             }
-        };
+        });
+        let mut used = lead.iter().map(Span::width).sum::<usize>();
+        if used > width
+            && let Some(last) = lead.last_mut()
+        {
+            let budget = width.saturating_sub(used - last.width());
+            last.content = clip_words(&last.content, budget).into();
+            used = lead.iter().map(Span::width).sum();
+        }
+        let mut spans = lead;
+
         let mut facts = Vec::new();
-        if width >= 40 {
+        if error.is_none() {
             if let Some(model) = &self.report.model {
                 facts.push(safe_text(model));
             }
             if let Some(context) = self.report.context {
                 let estimate = if context.estimated { "~" } else { "" };
-                let mut value = match context.limit {
-                    Some(limit) => format!(
+                let mut value = match (context.limit, self.expanded) {
+                    (Some(limit), true) => format!(
                         "ctx {estimate}{}/{} ({}%)",
                         fmt_tokens(context.tokens),
                         fmt_tokens(limit),
                         context.percent().unwrap_or(0)
                     ),
-                    None => format!("ctx {estimate}{} / ?", fmt_tokens(context.tokens)),
+                    (Some(_), false) => {
+                        format!("ctx {estimate}{}%", context.percent().unwrap_or(0))
+                    }
+                    (None, _) => format!("ctx {estimate}{}", fmt_tokens(context.tokens)),
                 };
                 if context.compacting {
                     value.push_str(" · compacting");
@@ -1774,52 +1774,58 @@ impl ConversationPanel {
                 Cost::Unstated => {}
             }
             // Work the user pushed off-screen is the archetypal hidden state,
-            // so its count keeps the same priority as cost rather than being
-            // dropped first on a narrow terminal. A reported zero renders
-            // nothing: there is nothing left to discover.
+            // so its count keeps the same priority as cost. A reported zero
+            // renders nothing: there is nothing left to discover.
             if let Some(running) = self.report.tasks_running.filter(|count| *count > 0) {
                 facts.push(format!("{running} running"));
             }
-        }
-        if width >= 70 {
-            if let Some(workspace) = &self.report.workspace {
-                facts.push(safe_text(workspace));
+            // The rest is reference, not state: Ctrl-O (or `/status`) shows it.
+            if self.expanded {
+                let total = self.tokens_in.saturating_add(self.tokens_out);
+                facts.push(format!(
+                    "↑{} ↓{} · {} tok",
+                    fmt_tokens(self.tokens_in),
+                    fmt_tokens(self.tokens_out),
+                    fmt_tokens(total),
+                ));
+                // The workspace path is usually the longest, so it goes last
+                // and a narrow row keeps the shorter facts.
+                for fact in [
+                    &self.report.session,
+                    &self.report.permissions,
+                    &self.report.workspace,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    facts.push(safe_text(fact));
+                }
             }
-            if let Some(session) = &self.report.session {
-                facts.push(safe_text(session));
-            }
-            if let Some(permissions) = &self.report.permissions {
-                facts.push(safe_text(permissions));
-            }
         }
-        if !facts.is_empty() && error.is_none() {
-            spans.push(Span::styled(format!("  · {}", facts.join(" · ")), dim));
+        if self.status.is_some() && self.esc_interrupts() {
+            facts.push("esc to interrupt".to_string());
         }
-        // Ctrl-O affordance, shown once the timeline has any nodes.
-        if !self.timeline.is_empty() {
-            let hint = if self.expanded {
-                format!("  · ctrl-o: hide ({} steps)", self.timeline.len())
+        // Ctrl-O affordance: more detail is always a keystroke away.
+        facts.push(if self.expanded {
+            "ctrl-o less".to_string()
+        } else if self.timeline.is_empty() {
+            "ctrl-o more".to_string()
+        } else {
+            format!("ctrl-o: {} steps", self.timeline.len())
+        });
+        let mut first = true;
+        for fact in facts {
+            let piece = if first {
+                format!("  {fact}")
             } else {
-                format!("  · ctrl-o: {} steps", self.timeline.len())
+                format!(" · {fact}")
             };
-            spans.push(Span::styled(hint, dim));
-        }
-        let hidden = self
-            .transcript
-            .iter()
-            .filter(|message| unknown_message(message))
-            .count();
-        if hidden > 0 {
-            spans.insert(
-                0,
-                Span::styled(
-                    format!(
-                        "{hidden} {} · Ctrl-O  ",
-                        if self.expanded { "revealed" } else { "hidden" }
-                    ),
-                    Style::default().fg(Color::Yellow),
-                ),
-            );
+            let piece_width = unicode_width::UnicodeWidthStr::width(piece.as_str());
+            if used + piece_width <= width {
+                used += piece_width;
+                first = false;
+                spans.push(Span::styled(piece, dim));
+            }
         }
         Line::from(spans)
     }
@@ -2841,6 +2847,31 @@ fn phase_style(phase: &str) -> (&'static str, Color) {
         "error" => ("✗", Color::Red),
         _ => ("·", Color::Yellow),
     }
+}
+
+/// Shorten `text` to at most `width` columns at a word boundary, marking the
+/// cut with `…`. A single word wider than `width` is cut at the glyph.
+fn clip_words(text: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1);
+    let mut end = 0;
+    let mut used = 0;
+    for (index, ch) in text.char_indices() {
+        let next = used + ch.width().unwrap_or(0);
+        if next > budget {
+            break;
+        }
+        used = next;
+        end = index + ch.len_utf8();
+    }
+    let cut = text[..end]
+        .rfind(' ')
+        .filter(|space| *space > 0)
+        .map_or(&text[..end], |space| text[..space].trim_end());
+    format!("{cut}…")
 }
 
 /// Format a tool block's elapsed milliseconds for display beside its label.
@@ -6235,9 +6266,55 @@ mod tests {
         assert_eq!(panel.status.as_deref(), Some("Thinking…"));
         assert_eq!(panel.tokens_in, 0, "projected context is not billed usage");
         let line = panel.meta_line().to_string();
-        assert!(line.contains("ctx ~48.0k/120.0k (40%)"), "{line}");
+        assert!(line.contains("ctx ~40%"), "{line}");
         assert!(line.contains("compacting"), "{line}");
         assert!(line.contains("cost n/a"), "{line}");
+        // Ctrl-O spells the window out in full.
+        panel.expanded = true;
+        let line = panel.meta_line().to_string();
+        assert!(line.contains("ctx ~48.0k/120.0k (40%)"), "{line}");
+    }
+
+    /// The row keeps its most useful facts whole as the terminal narrows:
+    /// reference facts sit behind Ctrl-O and nothing is clipped mid-word.
+    #[tokio::test]
+    async fn the_meta_row_drops_whole_facts_by_priority_as_it_narrows() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(crate::commands::report_status(
+            &StatusReport::default()
+                .with_model("Sonnet 5.5 · Bedrock")
+                .with_workspace("/private/tmp/ui-demo")
+                .with_session("default · turn 1")
+                .with_permissions("confirm · edits and commands ask first")
+                .with_context(crate::commands::ContextWindow::new(6_000).with_limit(60_000))
+                .with_cost_usd(0.0243),
+        ));
+        panel.tick();
+        let wide = panel.meta_line_for_width(120).to_string();
+        assert!(wide.contains("Sonnet 5.5 · Bedrock"), "{wide}");
+        assert!(wide.contains("ctx 10%"), "{wide}");
+        assert!(wide.contains("$0.0243"), "{wide}");
+        assert!(
+            !wide.contains("ui-demo"),
+            "workspace waits for Ctrl-O: {wide}"
+        );
+        assert!(!wide.contains("edits and"), "{wide}");
+        assert!(!wide.contains("tok"), "{wide}");
+
+        let narrow = panel.meta_line_for_width(40).to_string();
+        assert!(narrow.starts_with("● ready"), "{narrow}");
+        assert!(narrow.contains("Sonnet 5.5 · Bedrock"), "{narrow}");
+        assert!(!narrow.contains("$0.0243"), "{narrow}");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(narrow.as_str()) <= 40,
+            "{narrow}"
+        );
+
+        panel.expanded = true;
+        let full = panel.meta_line_for_width(400).to_string();
+        assert!(full.contains("ui-demo"), "{full}");
+        assert!(full.contains("default · turn 1"), "{full}");
+        assert!(full.contains("↑0 ↓0"), "{full}");
     }
 
     #[tokio::test]
