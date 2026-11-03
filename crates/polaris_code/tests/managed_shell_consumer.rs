@@ -58,7 +58,7 @@ use polaris_code::agents::{
 };
 use polaris_code::run::{self, TurnReason};
 use polaris_code::terminal::transcript::{
-    IO_TYPE_TOOL, META_LABEL, META_PHASE, PHASE_DENIED, PHASE_ERROR, PHASE_OK,
+    IO_TYPE_TOOL, META_DOCUMENT, META_LABEL, META_PHASE, PHASE_DENIED, PHASE_ERROR, PHASE_OK,
 };
 use polaris_code::usage::TokenMeter;
 use polaris_ontrace::oxigraph::OxigraphPlugin;
@@ -318,7 +318,8 @@ impl ScriptedIOProvider {
         }
     }
 
-    /// The text of every tool-activity message that reached the given phase.
+    /// The text of every tool-activity message that reached the given phase:
+    /// the executor's JSON document where the block carries one, else the body.
     fn tool_messages(&self, phase: &str) -> Vec<String> {
         let state = self.state.lock().expect("scripted IO lock poisoned");
         state
@@ -329,10 +330,13 @@ impl ScriptedIOProvider {
                     && message.metadata.get(META_PHASE).map(String::as_str) == Some(phase)
                     && message.metadata.get(META_LABEL).map(String::as_str) == Some("run_command")
             })
-            .map(|message| match &message.content {
-                IOContent::Text(text) => text.clone(),
-                other => format!("{other:?}"),
-            })
+            .map(
+                |message| match (&message.content, message.metadata.get(META_DOCUMENT)) {
+                    (_, Some(document)) => document.clone(),
+                    (IOContent::Text(text), None) => text.clone(),
+                    (other, None) => format!("{other:?}"),
+                },
+            )
             .collect()
     }
 

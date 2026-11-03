@@ -342,7 +342,7 @@ async fn a_large_tool_result_is_bounded_on_screen() {
 
     let screen = screen(&mut panel).await;
     assert!(
-        screen.contains("Ctrl-O to expand"),
+        screen.contains("cargo test · 5000 lines") && screen.contains("ctrl-o"),
         "a large result must collapse with a way to see the rest: {screen}"
     );
     assert!(

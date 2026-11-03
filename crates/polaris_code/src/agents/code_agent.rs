@@ -921,15 +921,15 @@ pub(crate) async fn execute_tools(
                     tracing::info!("Observation: {observed}");
                     // The terminal block shows a command the way a shell
                     // would — real lines, collapsed behind its exit status
-                    // and size — rather than the escaped JSON document. That
-                    // is display only: the trajectory keeps `observed`.
+                    // and size — rather than the escaped JSON document, which
+                    // rides along as metadata. The trajectory keeps `observed`.
                     match (name == "run_command")
                         .then(|| run_command_outcome(&value))
                         .flatten()
                     {
                         Some(outcome) => {
                             activity
-                                .finish_with_summary(&user_io, PHASE_OK, &output, &outcome)
+                                .finish_rendered(&user_io, PHASE_OK, &output, &outcome, &observed)
                                 .await;
                         }
                         None => activity.finish(&user_io, PHASE_OK, &observed).await,

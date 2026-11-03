@@ -36,6 +36,7 @@
 //! | `label` | Short human name (`edit_file`). |
 //! | `elapsed_ms` | Wall time from `start` to a terminal phase. |
 //! | `summary` | Optional, terminal phases only: one line the panel shows in place of the body until the user expands it. |
+//! | `document` | Optional, `run_command` only: the executor's JSON result, bounded like the body, for a consumer that branches on its fields. The body is the same result rendered as shell text. |
 //!
 //! Body is a one-line detail while running (the path, the command) and the
 //! result once terminal. A successful result longer than a line carries a
@@ -85,6 +86,8 @@ pub const META_ELAPSED_MS: &str = "elapsed_ms";
 pub const META_OUTCOME: &str = "outcome";
 /// Metadata key carrying a finished tool block's collapsed one-line summary.
 pub const META_SUMMARY: &str = "summary";
+/// Metadata key carrying the structured result a rendered tool body came from.
+pub const META_DOCUMENT: &str = "document";
 
 /// [`META_FINAL`] value marking a block closed.
 pub const FINAL_TRUE: &str = "true";
@@ -352,17 +355,22 @@ impl ToolActivity {
         self.emit(user_io, phase, result, summary.as_deref()).await;
     }
 
-    /// Close the block with `result` collapsed behind the opening detail
-    /// followed by `outcome` (`exit 0 · 40 lines`).
-    pub async fn finish_with_summary(
+    /// Close the block with `rendered` collapsed behind the opening detail
+    /// followed by `outcome` (`exit 0 · 40 lines`), keeping the structured
+    /// `document` it was rendered from alongside.
+    pub async fn finish_rendered(
         self,
         user_io: &UserIO,
         phase: &str,
-        result: &str,
+        rendered: &str,
         outcome: &str,
+        document: &str,
     ) {
         let summary = self.summary(outcome);
-        self.emit(user_io, phase, result, Some(&summary)).await;
+        let msg = self
+            .message(phase, rendered, Some(&summary))
+            .with_metadata(META_DOCUMENT, bounded(document));
+        let _ = user_io.send(msg).await;
     }
 
     fn summary(&self, outcome: &str) -> String {
@@ -374,6 +382,10 @@ impl ToolActivity {
     }
 
     async fn emit(&self, user_io: &UserIO, phase: &str, body: &str, summary: Option<&str>) {
+        let _ = user_io.send(self.message(phase, body, summary)).await;
+    }
+
+    fn message(&self, phase: &str, body: &str, summary: Option<&str>) -> IOMessage {
         let mut msg = tool_message(
             &self.id,
             self.parent.as_deref(),
@@ -385,7 +397,7 @@ impl ToolActivity {
         if let Some(summary) = summary {
             msg = msg.with_metadata(META_SUMMARY, summary.to_owned());
         }
-        let _ = user_io.send(msg).await;
+        msg
     }
 }
 
