@@ -363,7 +363,7 @@ impl ApprovalRequest {
         }
         choices.push(ApprovalChoice::new(
             "deny",
-            "deny (or no: reason)",
+            "deny",
             &["n", "no", "deny"],
             false,
         ));
@@ -1325,7 +1325,7 @@ mod tests {
                 .all(|choice| !choice.label.contains("--workspace")),
             "the command is framed once, not repeated in a label: {choices:?}"
         );
-        assert_eq!(label("deny"), "deny (or no: reason)");
+        assert_eq!(label("deny"), "deny");
     }
 
     #[tokio::test]

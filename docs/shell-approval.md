@@ -35,32 +35,44 @@ next input receive; an answer to a resolved prompt cannot approve a later call.
 
 A command prompt also carries `APPROVAL_SUBJECT` (the command, verbatim) and
 `APPROVAL_CONTEXT` (`run_command in <directory>`, home shown as `~`). The
-conversation panel frames the command once above the input instead of printing
-the whole prompt, with the answers pinned under it:
+conversation panel opens an approval picker in place of the input: the command
+once, then a numbered list of answers.
 
 ```
-y allow once
-s allow this exact command in /home/me/repo for this session
-p allow prefix "cargo test" (whole words, every subcommand) in /home/me/repo for this session
-n deny (or no: reason)
+┌ approve? · run_command in ~/repo ─────────────────────────────────────────┐
+│cargo test -p polaris_code                                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│❯ 1. allow once                                                            │
+│  2. allow this exact command in /home/me/repo for this session            │
+│  3. allow prefix "cargo test" (whole words, every subcommand) in /home/me/…│
+│  4. deny                                                                  │
+└ ↑↓ move · 1-4 pick · Enter confirm · Tab add note · ? details · Esc deny ─┘
 ```
 
 The labels state each answer's scope: the exact grant covers that command
 string only, the prefix grant every command that starts with those whole words
 (any subcommand or extra arguments), and both are bound to the named canonical
-directory and end with the session. `p` is offered only when the command has a
-simple prefix; `s` and `p` only where remembering is allowed. `n`, `no`, `deny`
-and `Esc` deny; `no: reason` or `deny: reason` returns the reason to the model.
+directory and end with the session. The prefix answer is offered only when the
+command has a simple prefix; the session answers only where remembering is
+allowed.
 
-A command taller than the frame scrolls inside it (`↑` / `↓`, `PgUp` / `PgDn`
-with an empty input), and the panel refuses a confirming answer until every row
-of the command has been on screen, and while any part of it is too wide to draw. A command longer than 64 KiB cannot be
-shown in full, so only a denial is accepted for it. `?` adds the full prompt —
-tool, directory and JSON arguments — to the frame. On a terminal too small for
-the labels above, the keys move into the frame's top border (`y s p n · ? details`),
-`?` shows the full labels above the command, and a refusal reason appears in the
-bottom border. With no room for any of the command, only a denial is accepted
-until the terminal is enlarged.
+One key press answers: a digit, an answer's own key (`y`, `s`, `p`, `n`), or
+`Enter` on the highlighted row. `Esc` and `Ctrl-C` deny. `Tab` opens a one-line
+note on the highlighted answer. A note on a denial goes back to the model as the
+reason (`deny: <note>`); a note on an allow is sent as `approval_note` and added
+to that call's tool result as `User note on approval: ...`. The note never
+changes the grant. Text typed while the picker is open is dropped, so it can
+neither answer the approval nor start a turn. Answer keys are ignored for 400 ms
+after a stray key press.
+
+A command taller than the picker scrolls inside it (`PgUp` / `PgDn`,
+`Shift-↑` / `Shift-↓`), and the panel refuses a confirming answer until every
+row of the command has been on screen, and while any part of it is too wide to
+draw. A command longer than 64 KiB cannot be shown in full, so only a denial is
+accepted for it. `?` shows the full prompt (tool, directory and JSON arguments)
+in place of the command. On a very small terminal the list shrinks to the
+highlighted answer and the hint always keeps `Esc deny`; with no room for any of
+the command, only a denial is accepted until the terminal is enlarged.
 
 The reply's `confirmed` metadata and `approval_choice` still decide the answer,
 and the grant is bound to the tool, arguments, canonical directory, generation
