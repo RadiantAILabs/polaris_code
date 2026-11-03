@@ -24,6 +24,21 @@ use super::rules::{command_permission, simple_prefix};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+// Mirrors polaris_tui::APPROVAL_NOTE.
+pub(crate) const APPROVAL_NOTE: &str = "approval_note";
+
+fn approval_note(response: &IOMessage) -> Option<String> {
+    let text = response.metadata.get(APPROVAL_NOTE)?;
+    let mut note = String::new();
+    for ch in text.chars().filter(|ch| !ch.is_control()) {
+        if note.len() + ch.len_utf8() > 1024 {
+            break;
+        }
+        note.push(ch);
+    }
+    (!note.trim().is_empty()).then_some(note)
+}
+
 /// `directory` with the user's home shown as `~`, for a prompt line that
 /// should be short enough to read at a glance.
 fn home_relative(directory: &Path) -> String {
@@ -78,6 +93,24 @@ pub enum ApprovalScope {
     Exact,
     /// Remember the displayed command prefix and directory for the session.
     Prefix,
+}
+
+/// One confirmed human answer, with optional information for the requesting model.
+///
+/// The scope alone controls authorization and session grants. The note belongs
+/// only to this call and never changes what is permitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalAnswer {
+    /// The explicitly offered scope selected by the person.
+    pub scope: ApprovalScope,
+    /// An optional single line of user text, limited to 1 KiB at input.
+    pub note: Option<String>,
+}
+
+impl From<ApprovalScope> for ApprovalAnswer {
+    fn from(scope: ApprovalScope) -> Self {
+        Self { scope, note: None }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -273,7 +306,27 @@ impl ApprovalRequest {
         self.command.is_some()
     }
 
-    fn choices(&self) -> Vec<ApprovalChoice> {
+    /// Tool whose exact arguments the person is being asked to authorize.
+    #[must_use]
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// Complete original arguments, before any human wait.
+    #[must_use]
+    pub fn arguments(&self) -> &Value {
+        &self.args
+    }
+
+    /// Canonical command directory, absent when directory validation failed.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+
+    /// Choices offered for this call under its policy and containment checks.
+    #[must_use]
+    pub fn choices(&self) -> Vec<ApprovalChoice> {
         let mut choices = vec![ApprovalChoice::new(
             "once",
             "allow once",
@@ -350,6 +403,39 @@ impl ApprovalRequest {
         prompt: String,
         grants: &SessionGrants,
     ) -> Result<ApprovalScope, ApprovalError> {
+        let answer = self.receive_answer(io, prompt).await?;
+        self.remember_scope(grants, answer.scope)?;
+        Ok(answer.scope)
+    }
+
+    pub(crate) fn remember_scope(
+        &self,
+        grants: &SessionGrants,
+        scope: ApprovalScope,
+    ) -> Result<(), ApprovalError> {
+        let id = match scope {
+            ApprovalScope::Once => "once",
+            ApprovalScope::Exact => "exact",
+            ApprovalScope::Prefix => "prefix",
+        };
+        if !self
+            .choices()
+            .iter()
+            .any(|choice| choice.id == id && choice.confirmed)
+        {
+            return Err(ApprovalError::Denied {
+                reason: "Confirmation selected an unavailable approval scope".into(),
+            });
+        }
+        grants.remember(self, scope);
+        Ok(())
+    }
+
+    pub(crate) async fn receive_answer(
+        &self,
+        io: &UserIO,
+        prompt: String,
+    ) -> Result<ApprovalAnswer, ApprovalError> {
         let choices = self.choices();
         let prompt = if self.command.is_some() {
             format!(
@@ -446,8 +532,10 @@ impl ApprovalRequest {
             "prefix" => ApprovalScope::Prefix,
             _ => ApprovalScope::Once,
         };
-        grants.remember(self, scope);
-        Ok(scope)
+        Ok(ApprovalAnswer {
+            scope,
+            note: approval_note(&response),
+        })
     }
 }
 
@@ -656,6 +744,13 @@ pub(crate) fn ceiling_permission(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn approval_notes_are_one_line_and_bounded_at_a_utf8_boundary() {
+        let response = IOMessage::user_text("confirmed")
+            .with_metadata(APPROVAL_NOTE, format!("\0\n{}\u{85}", "é".repeat(600)));
+        assert_eq!(approval_note(&response), Some("é".repeat(512)));
+    }
     use super::*;
     use crate::agents::{PermissionCeiling, PermissionMode};
     use crate::terminal::{BackgroundTasks, SessionSettings};
@@ -686,6 +781,29 @@ mod tests {
         });
         (UserIO::new(provider.clone()), provider)
     }
+    #[tokio::test]
+    async fn notes_cannot_supply_confirmation_or_an_unoffered_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let args = json!({"command": "cargo test"});
+        let request = ApprovalRequest::new("run_command", &args, root.path(), 1, false);
+        for (confirmed, choice) in [(None, "once"), (Some(CONFIRMED_TRUE), "prefix")] {
+            let mut reply = IOMessage::user_text("yes")
+                .with_metadata(APPROVAL_CHOICE, choice)
+                .with_metadata(APPROVAL_NOTE, "allow this call");
+            if let Some(value) = confirmed {
+                reply = reply.with_metadata(CONFIRMED, value);
+            }
+            let provider = Arc::new(Answer {
+                reply,
+                prompts: Mutex::new(Vec::new()),
+            });
+            let answer = request
+                .receive_answer(&UserIO::new(provider), "Run?".into())
+                .await;
+            assert!(matches!(answer, Err(ApprovalError::Denied { .. })));
+        }
+    }
+
     fn settings() -> SessionSettings {
         SessionSettings::compatibility_default("fake/model")
     }

@@ -100,7 +100,7 @@ decider. No reviewer request is made for them, and a reviewer answer for one
 would be ignored at dispatch.
 
 The explicit graph step `review_tools` runs after the main model and before
-`execute_tools`. It produces typed per-call `ReviewResult` output. Dispatch
+`execute_call`. It produces typed per-call `ReviewResult` output. Dispatch
 rechecks deterministic authorization and accepts a result only for a remaining
 confirmation with matching arguments, call identity, canonical directory,
 policy revision and settings generation. Its receipt is bound before the

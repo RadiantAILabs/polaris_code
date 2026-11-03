@@ -49,7 +49,7 @@ fn cap(s: &str, limit: usize) -> &str {
 /// A reified control decision: the choice a decision point made, with provenance.
 #[derive(Debug, Clone)]
 pub struct Decision {
-    /// Decision point: `retrieval` | `tool_palette` | `permission` | `retry` | `termination`.
+    /// Decision point: `retrieval` | `tool_palette` | `permission` | `human_approval` | `retry` | `termination`.
     pub kind: &'static str,
     /// IRI of the Intent this decision serves, if known.
     pub intent: Option<String>,

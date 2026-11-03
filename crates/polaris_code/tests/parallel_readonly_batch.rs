@@ -329,6 +329,7 @@ impl Harness {
             .add_plugins(OxigraphPlugin::in_memory())
             .add_plugins(PersistencePlugin)
             .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())))
+            .add_plugins(polaris_code::agents::InteractiveApprovalPlugin)
             .add_plugins(CodeAgentPlugin::new())
             .add_plugins(ExecIOPlugin::new(provider.clone()));
         server.finish().await.unwrap();

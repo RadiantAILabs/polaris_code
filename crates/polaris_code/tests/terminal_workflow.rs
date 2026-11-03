@@ -424,6 +424,7 @@ impl Host {
             .add_plugins(polaris_code::tools::approval::ApprovalShellPlugin)
             .add_plugins(PersistencePlugin)
             .add_plugins(SessionsPlugin::new(session_store.clone()))
+            .add_plugins(polaris_code::agents::InteractiveApprovalPlugin)
             .add_plugins(CodeAgentPlugin::new())
             .add_plugins(ProgressMiddlewarePlugin)
             .add_plugins(HeadlessTuiPlugin);

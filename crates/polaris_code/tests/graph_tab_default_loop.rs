@@ -233,7 +233,12 @@ async fn a_conversational_turn_marks_the_published_nodes_it_ran() {
 
     // Paths this turn did not take stay unmarked.
     for label in [
-        "execute_tools",
+        "prepare_calls",
+        "authorize_call",
+        "ask_human",
+        "execute_call",
+        "record_denial",
+        "finish_calls",
         "wait_to_retry",
         "recover",
         "report_failure",

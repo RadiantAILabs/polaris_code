@@ -8,7 +8,7 @@
 //!     compact_context → manual ? finish_compaction :
 //!         prepare_context → begin_model_call → act → loop("model_retries") { … } →
 //!             model_answered ? (accept_response →
-//!                 has_tool_calls ? (review_tools → execute_tools) : finalize) :
+//!                 has_tool_calls ? (review_tools → prepare_calls → tool_calls → finish_calls) : finalize) :
 //!                 report_failure
 //!     on error → recover
 //! }
@@ -27,6 +27,8 @@
 //! the discovered `AGENTS.md`/`CLAUDE.md` chain so a mid-session edit reaches the
 //! model on the next turn, and changes nothing — leaving the cached prompt
 //! prefix byte-identical — on the turns where no document moved.
+
+pub(crate) mod tool_calls;
 
 use std::future::Future;
 use std::ops::Deref;
@@ -446,574 +448,12 @@ async fn prepare_context(
     }
 }
 
-/// Execute the response's tool calls, gating by the policy-resolved permission,
-/// and reify each call into the trajectory graph.
-///
-/// Tools run as [`ToolRun`]s — the [`ToolRegistry::to_arc`] + `Tool::execute`
-/// pair `ToolRegistry::execute_with` performs inline, in a task of their own —
-/// so the two `#[context]` parameters `run_command` already declares are
-/// actually supplied: a host sink that streams the command's output into the
-/// block the invocation opened, and a cancellation observer adapted from this
-/// run's token. The model-visible tool schema is unchanged — `#[context]`
-/// values never appear in it.
-///
-/// The wait is raced against the user's backgrounding request. Losing that
-/// race **hands the wait to the host and nothing else**: the run is reserved
-/// for the `execute` caller inside `run_command`, and that caller's handle
-/// requests a stop when dropped, so the caller must outlive the turn for the
-/// command to keep running and for its result to reach anyone. The task keeps
-/// it alive; [`BackgroundReporter`](crate::terminal::BackgroundReporter) takes
-/// the task over and receives the same `executed` response the model would
-/// have. No `start`, `start_confirmed` or `execute` is called here, so nothing
-/// is re-run and nothing spawns twice, and the invocation still closes exactly
-/// once — with a normal `tool_result` naming the task. An *interrupted* wait,
-/// by contrast, is aborted: the tool's future is dropped, as it always was.
-///
-/// # Lanes
-///
-/// A batch whose every call only reads and is permitted outright takes the
-/// concurrent lane ([`execute_read_only_batch`]); anything else — one mutating
-/// call, one confirmation, one denial — keeps the sequential loop below,
-/// unchanged. See [`batch_runs_concurrently`] for why the test is that coarse.
-#[system]
-pub(crate) async fn execute_tools(
-    decision: Out<LlmResponse>,
-    reviews: Out<ReviewResult>,
-    mut context: ResMut<ContextManager>,
-    tool_registry: Res<ToolRegistry>,
-    user_io: Res<UserIO>,
-    policy: Res<PolicySnapshot>,
-    store: Res<OxigraphStore>,
-    config: Res<AgentConfig>,
-    live: Res<LiveTranscript>,
-    cancel: Res<RunCancellation>,
-    session: Res<SessionInfo>,
-    tasks: Res<BackgroundTasks>,
-    redactor: Res<SecretRedactor>,
-    rules: Res<PermissionRules>,
-    tool_policies: Res<ToolPolicyRegistry>,
-    grants: Res<SessionGrants>,
-    shell_approval: Res<ShellApproval>,
-    tool_grants: Res<RunToolGrants>,
-    settings: Res<SessionSettings>,
-) -> Result<(), SystemError> {
-    let redactor = *redactor;
-    let turn = context.turn_marker();
-    let mut result_blocks = Vec::new();
-    // Files a successful `edit_file` mutated this turn; their Code `ABox` facts
-    // (notably symbol spans) are re-indexed after the loop so navigation/reads
-    // don't drift against the edited source.
-    let mut edited: Vec<std::path::PathBuf> = Vec::new();
-
-    let calls = decision.tool_calls();
-    // Only the permission part of the snapshot is read below, so only it is copied.
-    let mut effective = policy.permission.clone();
-    effective.rules = Some((*rules).clone());
-    effective.tools = (*tool_policies).clone();
-    tool_grants.apply(
-        &mut effective,
-        calls.iter().map(|call| call.function.name.as_str()),
-    );
-    let policy = &effective;
-    let generation = settings.approval_generation();
-    let resolve = |call: &ToolCall| {
-        shell_approval.resolve(
-            policy,
-            &PermissionCall {
-                tool: &call.function.name,
-                args: &call.function.arguments,
-                registry_default: tool_registry
-                    .permission(&call.function.name)
-                    .unwrap_or(ToolPermission::Deny),
-                root: &config.working_dir,
-                generation,
-                ceiling: settings.permission_ceiling(),
-            },
-            &grants,
-        )
-    };
-    // The concurrent lane needs every verdict before dispatch. The sequential
-    // lane re-resolves calls so a newly granted session scope applies at once.
-    let permissions: Vec<ToolPermission> =
-        calls.iter().map(|call| resolve(call).permission).collect();
-
-    if batch_runs_concurrently(&calls, &permissions) {
-        return execute_read_only_batch(
-            &calls,
-            &mut context,
-            &tool_registry,
-            &user_io,
-            policy,
-            &store,
-            &live,
-            &cancel,
-            &tasks,
-            redactor,
-            turn,
-        )
-        .await;
-    }
-
-    for (call_index, tool_call) in calls.iter().enumerate() {
-        let name = &tool_call.function.name;
-        // Re-read session grants: an earlier call in this batch may have just
-        // received an explicit session approval.
-        let authorization = resolve(tool_call);
-        let permission = authorization.permission;
-        let request = ApprovalRequest::new(
-            name,
-            &tool_call.function.arguments,
-            &config.working_dir,
-            generation,
-            authorization.remember,
-        );
-        // Bind the directory and policy revision before waiting. Only the
-        // allowed branch can attach this pending receipt to tool context.
-        let mut receipt = (!policy.is_unattended())
-            .then(|| shell_approval.receipt_for(&request, &rules, &settings))
-            .flatten();
-
-        // One activity block per invocation, keyed by the provider's own call
-        // id and nested under the message that asked for it. Every exit below
-        // closes it, so a block can never be left spinning.
-        let detail = tool_detail(name, &tool_call.function.arguments);
-        let activity = ToolActivity::start(
-            &user_io,
-            &tool_call.id,
-            live.current_id(),
-            name.clone(),
-            &detail,
-        )
-        .await;
-        // Claims the backgrounding slot for as long as this invocation lives.
-        // Dropping it releases the claim, so a denial, an interrupt, an error
-        // and a normal return all leave the host truthful about what is running
-        // without each exit path below having to remember.
-        let invocation = tasks.enter(&tool_call.id, name, live.current_id());
-
-        // The eligibility check lives inside `matching`, so a review recorded
-        // earlier cannot authorize a call that has since become human-only.
-        let review = policy
-            .uses_reviewer()
-            .then(|| {
-                reviews.matching(
-                    call_index,
-                    tool_call,
-                    &config.working_dir,
-                    &rules,
-                    &settings,
-                    &authorization,
-                )
-            })
-            .flatten();
-        if let Some(review) = review {
-            // Preserve the binding made before the model wait. Rebinding now
-            // could authorize a symlink target the reviewer never saw.
-            receipt = review.receipt.clone();
-        }
-        let reviewer_denial = review.filter(|r| r.decision == ReviewDecision::Deny);
-        let mut approval_scope = None;
-        let (denied_reason, chosen) = match permission {
-            ToolPermission::Deny => (
-                Some(format!(
-                    "Permission denied: tool '{name}' is not allowed ({})",
-                    authorization.source
-                )),
-                "deny",
-            ),
-            ToolPermission::Confirm
-                if review.is_some_and(|r| r.decision == ReviewDecision::Allow) =>
-            {
-                (None, "allow")
-            }
-            ToolPermission::Confirm if reviewer_denial.is_some() => (
-                reviewer_denial.map(|r| format!("Permission denied: {}", r.notice())),
-                "deny",
-            ),
-            ToolPermission::Confirm => {
-                let mut prompt = format!(
-                    "{}\nDecision source: {}",
-                    build_confirm_prompt(name, &tool_call.function.arguments),
-                    authorization.source
-                );
-                // Only `auto` has a review to report; the other modes keep the
-                // prompt they always had.
-                if policy.uses_reviewer() {
-                    prompt.push('\n');
-                    prompt.push_str(&review.map_or_else(
-                        || match authorization.review {
-                            ReviewEligibility::HumanOnly => {
-                                "This call needs a person's approval; automatic review does not apply"
-                                    .into()
-                            }
-                            ReviewEligibility::Eligible => {
-                                "No matching review for the current call and policy; human approval required"
-                                    .into()
-                            }
-                        },
-                        |r| r.notice(),
-                    ));
-                }
-                // Waiting on the user is not the tool running: say so, so the
-                // elapsed time on the block isn't read as the tool being slow.
-                // A command the approval frames above the input is not
-                // repeated on its row; the row says what it is waiting on.
-                let waiting = if request.frames_command() {
-                    "awaiting approval"
-                } else {
-                    detail.as_str()
-                };
-                activity.phase(&user_io, PHASE_PENDING, waiting).await;
-                // An unapproved command must not reach the background by the
-                // back door, so the slot says the block is parked and
-                // `BackgroundTasks::request` refuses while it is.
-                invocation.awaiting_approval();
-                // Reify the permission decision (its outcome is the user's answer).
-                let answer = match cancel
-                    .run_until_cancelled(request.ask(&user_io, prompt, &grants))
-                    .await
-                {
-                    Some(Ok(scope)) => {
-                        approval_scope = Some(scope);
-                        None
-                    }
-                    Some(Err(reason)) => Some(reason.to_string()),
-                    None => {
-                        let reason = match request.cancel(&user_io).await {
-                            Ok(()) => "Approval interrupted by user".into(),
-                            Err(error) => format!(
-                                "Approval interrupted by user; could not resolve prompt: {error}"
-                            ),
-                        };
-                        Some(reason)
-                    }
-                };
-                if answer.is_none() {
-                    invocation.executing();
-                    activity.phase(&user_io, PHASE_START, &detail).await;
-                }
-                let chosen = if answer.is_none() { "allow" } else { "deny" };
-                (answer, chosen)
-            }
-            ToolPermission::Allow => (None, "allow"),
-        };
-        let mut recorded = permission_decision(policy, permission, chosen);
-        recorded
-            .policy_refs
-            .push(format!("authorization.source={}", authorization.source));
-        if let Some(review) = review {
-            let source = match review.decision {
-                ReviewDecision::Allow | ReviewDecision::Deny => "reviewer",
-                ReviewDecision::Ask => "human",
-            };
-            recorded
-                .policy_refs
-                .push(format!("authorization.decision_source={source}"));
-            recorded
-                .policy_refs
-                .push(format!("authorization.reviewer={}", review.model));
-            recorded
-                .policy_refs
-                .push(format!("authorization.review={}", review.notice()));
-        } else if policy.uses_reviewer()
-            && permission == ToolPermission::Confirm
-            && authorization.review == ReviewEligibility::HumanOnly
-        {
-            // The reviewer was never consulted, so the audit trail says whose
-            // decision this is rather than leaving the field out.
-            recorded
-                .policy_refs
-                .push("authorization.decision_source=human".into());
-        }
-        if let Some(scope) = approval_scope {
-            recorded.policy_refs.push(format!(
-                "authorization.scope={}",
-                approval_scope_label(scope)
-            ));
-        }
-        recorded.record(&store, turn);
-
-        let block = if let Some(reason) = denied_reason {
-            activity.finish(&user_io, PHASE_DENIED, &reason).await;
-            record_tool_call(
-                &store,
-                turn,
-                name,
-                &tool_call.function.arguments,
-                "denied",
-                &reason,
-            );
-            UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason))
-        } else {
-            // A run the model deliberately detached is not holding the turn,
-            // so it does not inherit the deadline that exists to stop a turn
-            // hanging. The tool applies the same fallback to the request; this
-            // keeps the table's view of the deadline equal to the real one.
-            let deadline = if name == RUN_IN_BACKGROUND {
-                tasks.background_deadline_for(&tool_call.function.arguments)
-            } else {
-                tasks.deadline_for(&tool_call.function.arguments)
-            };
-            let sink = invocation.sink(&session.session_id, session.turn_number, deadline);
-            // The turn's token reaches this command, and stops reaching it the
-            // moment the user backgrounds it: a detached run is no longer part
-            // of the turn, so Ctrl-C must not take it with the turn.
-            let (detached_tx, detached_rx) = tokio::sync::watch::channel(false);
-            let mut tool_context = ToolContext::new()
-                .with(ShellSinkHandle::new(sink))
-                .with(detachable_cancel(&cancel, detached_rx));
-            if let Some(receipt) = receipt {
-                tool_context = tool_context.with(receipt);
-            }
-            let mut run = shell_approval.spawn(
-                &tool_registry,
-                name,
-                tool_call.function.arguments.clone(),
-                tool_context,
-            );
-            let outcome = cancel
-                .run_until_cancelled(async {
-                    loop {
-                        tokio::select! {
-                            value = &mut run => break Some(value),
-                            () = tokio::time::sleep(COALESCE_TICK) => {
-                                if invocation.take_request() {
-                                    break None;
-                                }
-                                // At most one message per tick, carrying the
-                                // newest line — never one per chunk.
-                                if let Some(line) = tasks.take_update(&tool_call.id) {
-                                    // Live stdout reaches the terminal ahead
-                                    // of the result, so it is redacted here
-                                    // too — best effort, because a secret
-                                    // split across two chunks is two lines by
-                                    // the time either is seen.
-                                    let line = redactor.scan(&line).into_text();
-                                    activity.phase(&user_io, PHASE_RUNNING, &line).await;
-                                }
-                            }
-                        }
-                    }
-                })
-                .await;
-            let Some(outcome) = outcome else {
-                // The turn is over, and so is its wait: drop the tool's
-                // future, as an interrupted invocation always has. For a
-                // command that is the executor's own stop-on-drop on top of
-                // the turn token the run was started with.
-                run.abort();
-                let output = "Interrupted by user".to_string();
-                activity.finish(&user_io, PHASE_ERROR, &output).await;
-                record_tool_call(
-                    &store,
-                    turn,
-                    name,
-                    &tool_call.function.arguments,
-                    "interrupted",
-                    &output,
-                );
-                result_blocks.push(UserBlock::tool_error(
-                    &tool_call.id,
-                    ToolResultContent::Text(output),
-                ));
-                context.push(Message::User {
-                    content: result_blocks,
-                });
-                return Err(SystemError::ExecutionError("turn interrupted".into()));
-            };
-            // The user pushed this command out of the turn. Say so on the
-            // block, close the invocation once with an ordinary result naming
-            // the task, and hand the wait to the host's reporter — which is
-            // the only thing that will ever wait on it again.
-            let Some(result) = outcome else {
-                // Latch the detachment before the sender goes out of scope, so
-                // the observer this run was started with stops relaying the
-                // turn's token: the user backgrounded it precisely so that
-                // Ctrl-C on the turn would leave it alone.
-                let _ = detached_tx.send(true);
-                let task = match invocation.background(run) {
-                    Ok(task) => task,
-                    Err(run) => {
-                        // Nothing tracks the run, so nothing would report it
-                        // or let the user stop it by number. The wait was
-                        // never handed over, so it is ended the way an
-                        // interrupted one is rather than left as an orphan.
-                        run.abort();
-                        let reason = "the command could not be backgrounded because the \
-                                      host lost track of it, so it was stopped rather than \
-                                      left running unwatched"
-                            .to_string();
-                        activity.finish(&user_io, PHASE_ERROR, &reason).await;
-                        record_tool_call(
-                            &store,
-                            turn,
-                            name,
-                            &tool_call.function.arguments,
-                            "error",
-                            &reason,
-                        );
-                        result_blocks.push(UserBlock::tool_error(
-                            &tool_call.id,
-                            ToolResultContent::Text(reason),
-                        ));
-                        continue;
-                    }
-                };
-                let body = background_body(&task);
-                activity.finish(&user_io, PHASE_BACKGROUND, &body).await;
-                record_tool_call(
-                    &store,
-                    turn,
-                    name,
-                    &tool_call.function.arguments,
-                    "backgrounded",
-                    &body,
-                );
-                tasks.report_backgrounded(task.number);
-                result_blocks.push(UserBlock::tool_result(
-                    &tool_call.id,
-                    ToolResultContent::Text(background_receipt(&task)),
-                ));
-                continue;
-            };
-            // The run's task answered. A wait that ended without an answer —
-            // the tool panicked — is reported as the error it is rather than
-            // taking the turn down with it.
-            let result = result.unwrap_or_else(|err| {
-                Err(ToolError::execution_error(format!(
-                    "the tool's task ended without a result: {err}"
-                )))
-            });
-            match result {
-                Ok(value) => {
-                    if let Some(reason) = unattended_shell_refusal(name, &value, policy) {
-                        activity.finish(&user_io, PHASE_DENIED, &reason).await;
-                        record_tool_call(
-                            &store,
-                            turn,
-                            name,
-                            &tool_call.function.arguments,
-                            "denied",
-                            &reason,
-                        );
-                        result_blocks.push(UserBlock::tool_error(
-                            &tool_call.id,
-                            ToolResultContent::Text(reason),
-                        ));
-                        continue;
-                    }
-                    // Every toolset in this crate answers with the string it
-                    // built; `run_command` answers with the executor's JSON
-                    // document. The document is what the trajectory keeps —
-                    // it is the honest record — but what
-                    // the model gets is that document rendered as the text a
-                    // shell produced, with an exit marker it cannot miss.
-                    let observed = value
-                        .as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| value.to_string());
-                    // The one seam, applied to both strings: everything
-                    // downstream — the log line below, the terminal block, the
-                    // reified `ToolCall` in the Session `ABox`, and the
-                    // provider-bound `UserBlock` — is built from these two and
-                    // nothing else. The rendering is scanned in its own right
-                    // because it is re-read from the raw response, not from
-                    // the scanned text.
-                    let observed = redact_tool_output(redactor, name, observed);
-                    let output = (name == "run_command")
-                        .then(|| render_run_command(&value))
-                        .flatten()
-                        .map(|rendered| redact_tool_output(redactor, name, rendered))
-                        .unwrap_or_else(|| observed.clone());
-                    tracing::info!("Observation: {observed}");
-                    // The terminal block shows a command the way a shell
-                    // would — real lines, collapsed behind its exit status
-                    // and size — rather than the escaped JSON document, which
-                    // rides along as metadata. The trajectory keeps `observed`.
-                    // A run that did not exit 0 stays expanded: its output is
-                    // the reason.
-                    match (name == "run_command")
-                        .then(|| run_command_outcome(&value))
-                        .flatten()
-                    {
-                        Some(outcome) => {
-                            let outcome = run_command_succeeded(&value).then_some(outcome.as_str());
-                            activity
-                                .finish_rendered(&user_io, PHASE_OK, &output, outcome, &observed)
-                                .await;
-                        }
-                        None => activity.finish(&user_io, PHASE_OK, &observed).await,
-                    }
-                    record_tool_call(
-                        &store,
-                        turn,
-                        name,
-                        &tool_call.function.arguments,
-                        "ok",
-                        &observed,
-                    );
-                    if name == "edit_file"
-                        && let Some(rel) = tool_call
-                            .function
-                            .arguments
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                    {
-                        edited.push(config.working_dir.join(rel));
-                    }
-                    UserBlock::tool_result(&tool_call.id, ToolResultContent::Text(output))
-                }
-                Err(err) => {
-                    // A failure message carries tool output too — a command's
-                    // stderr, a parser's echo of the line it choked on.
-                    let output = redact_tool_output(redactor, name, err.to_string());
-                    activity.finish(&user_io, PHASE_ERROR, &output).await;
-                    record_tool_call(
-                        &store,
-                        turn,
-                        name,
-                        &tool_call.function.arguments,
-                        "error",
-                        &output,
-                    );
-                    UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output))
-                }
-            }
-        };
-        result_blocks.push(block);
-    }
-
-    context.push(Message::User {
-        content: result_blocks,
-    });
-
-    // Keep the Code `ABox` fresh: incrementally re-index every file an
-    // `edit_file` mutated this turn, so spans don't drift after a write. Best
-    // effort — a stale graph degrades navigation but must not fail the turn.
-    if !edited.is_empty() {
-        match CodeIndexer::index_paths(&store, &config.working_dir, &edited).await {
-            Ok(n) => {
-                tracing::debug!("code graph: re-indexed {} file(s), {n} facts", edited.len());
-                // Re-derive the conceptual-role layer so concept queries track
-                // the edited source too. This rebuilds the whole enrichment graph
-                // each edit; scoping it to re-indexed symbols is deferred.
-                if let Err(e) = enrich(&store) {
-                    tracing::warn!("code graph: enrichment after edit failed: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("code graph: incremental re-index failed: {e}"),
-        }
-    }
-
-    Ok(())
-}
-
 /// Whether this batch may be run concurrently rather than one call at a time.
 ///
 /// Three conditions, and the batch is judged as a whole rather than sliced into
 /// runs:
 ///
-/// 1. **More than one call.** A single call is the sequential loop's own case;
+/// 1. **More than one call.** A single call uses the sequential graph lane;
 ///    routing it here would buy nothing and cost it the streaming and
 ///    backgrounding the loop gives it.
 /// 2. **Every call is read-only.** Read-only-ness is the tool's declared
@@ -1558,7 +998,7 @@ impl Redaction {
 ///
 /// # Consuming system
 ///
-/// [`execute_tools`] reads it as `Res<SecretRedactor>` and applies it to each
+/// `execute_call` reads it as `Res<SecretRedactor>` and applies it to each
 /// tool result — the one seam every consumer of that result is downstream of.
 ///
 /// # Example
@@ -2044,7 +1484,7 @@ fn name_words(name: &str) -> Vec<String> {
 /// Applies `redactor` to one tool result, announcing the substitution to the
 /// reader and to the log without putting the value in either.
 ///
-/// This is the single seam: `execute_tools` calls it once, and the redacted
+/// This is the single seam: `execute_call` calls it once, and the redacted
 /// string is what the transcript renders, what `record_tool_call` reifies,
 /// what `tracing` observes, and what the provider-bound `UserBlock` carries.
 fn redact_tool_output(redactor: SecretRedactor, tool: &str, output: String) -> String {
@@ -2397,6 +1837,9 @@ impl Agent for CodeAgent {
         ctx.insert(PolicySnapshot::defaults());
         ctx.insert(LiveTranscript::default());
         ctx.insert(AttemptLedger::default());
+        ctx.insert(tool_calls::ToolBatch::default());
+        ctx.insert(tool_calls::CallLifetime::default());
+        tool_calls::setup_cleanup(ctx);
         // Bind the queue's containment root to the very directory this agent
         // is configured with, so the gate the composer submits through and the
         // sandbox the tools run in can never disagree about what is inside the
@@ -2424,7 +1867,7 @@ impl Agent for CodeAgent {
         }
         // A host that runs managed commands shares its own table here, so the
         // chord, the commands and this system all address the same runs. Every
-        // other host gets one that reports to nobody: `execute_tools` reads it
+        // other host gets one that reports to nobody: `execute_call` reads it
         // unconditionally, and a run nothing ever backgrounds only ever costs
         // it a bounded tail.
         if ctx.get_resource::<BackgroundTasks>().is_err() {
@@ -2494,7 +1937,7 @@ impl Agent for CodeAgent {
                                     |response| response.has_tool_calls(),
                                     |tool_branch| {
                                         tool_branch.add_system(review_tools);
-                                        tool_branch.add_system(execute_tools);
+                                        tool_calls::build_tool_calls(tool_branch);
                                     },
                                     |done_branch| {
                                         done_branch.add_system(finalize);
@@ -2572,6 +2015,11 @@ where
 ///   state that attended `auto` mode reads. Its default is
 ///   `ReviewPolicy::default()`; add it with your own policy to change the
 ///   reviewer model, timeout, output cap or denial cutoff.
+///
+/// Human input is optional and is never installed by this plugin. Add
+/// [`InteractiveApprovalPlugin`](super::human_approval::InteractiveApprovalPlugin)
+/// to serve attended confirmation requests; without it, calls that need a
+/// person receive an explicit denial and other calls continue.
 ///
 /// Both depend on [`ToolPolicyPlugin`](crate::tools::ToolPolicyPlugin), which is
 /// added by default as well, so tool capabilities can publish policy facts the
@@ -2679,6 +2127,7 @@ impl Plugin for CodeAgentPlugin {
                 ))))
             });
         }
+        tool_calls::install_cleanup(server);
         server.register_local(LoopState::default);
         server.register_local(PolicySnapshot::defaults);
         // Process configuration, not session state: one rule set decided at
