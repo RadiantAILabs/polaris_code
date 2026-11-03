@@ -804,9 +804,38 @@ mod tests {
         let tools = find(&model, "has_tool_calls");
         assert_eq!(
             labels(branch(tools, "yes").steps()),
-            ["review_tools", "execute_tools"]
+            [
+                "review_tools",
+                "prepare_calls",
+                "dispatch_read_only_batch",
+                "tool_calls",
+                "finish_calls"
+            ]
         );
         assert_eq!(labels(branch(tools, "no").steps()), ["finalize"]);
+        let calls = find(&model, "tool_calls");
+        assert_eq!(calls.kind(), GraphNodeKind::Loop);
+        assert_eq!(
+            labels(branch(calls, "").steps()),
+            [
+                "authorize_call",
+                "needs_human",
+                "call_allowed",
+                "advance_call"
+            ]
+        );
+        assert_eq!(
+            labels(branch(find(&model, "needs_human"), "yes").steps()),
+            ["ask_human"]
+        );
+        assert_eq!(
+            labels(branch(find(&model, "call_allowed"), "yes").steps()),
+            ["execute_call"]
+        );
+        assert_eq!(
+            labels(branch(find(&model, "call_allowed"), "no").steps()),
+            ["record_denial"]
+        );
     }
 
     /// Draws `panel` into a terminal of the given size and returns its rows.

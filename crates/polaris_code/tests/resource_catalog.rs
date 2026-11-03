@@ -37,6 +37,9 @@ const INTERNAL_RESOURCES: &[&str] = &[
     // How many attempts the current model call has used and when it began, read
     // by the agent's own retry stage; reset for every call.
     "AttemptLedger",
+    // Per-response tool queue and the active invocation owned by graph nodes.
+    "ToolBatch",
+    "CallLifetime",
     // The published progress middleware chain, read by a host that builds its
     // own `GraphExecutor` so its graph is watched like the agent loop is.
     // Listed here rather than in `src/docs/resources.md`; it belongs in the
