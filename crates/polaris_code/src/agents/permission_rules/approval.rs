@@ -296,7 +296,10 @@ impl ApprovalRequest {
                 &["s", "exact"],
                 true,
             ));
-            if let Some(prefix) = &self.prefix {
+            // Omit oversized scopes rather than abbreviating what is granted.
+            if let Some(prefix) = &self.prefix
+                && prefix.chars().count() <= 200
+            {
                 choices.push(ApprovalChoice::new(
                     "prefix",
                     format!(
@@ -1208,6 +1211,29 @@ mod tests {
             "the command is framed once, not repeated in a label: {choices:?}"
         );
         assert_eq!(label("deny"), "deny (or no: reason)");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prefix_is_not_offered_or_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        for length in [200, 201, 2 * 1024 * 1024] {
+            let command = format!("echo {}", "x".repeat(length - 5));
+            let request = ApprovalRequest::new(
+                "run_command",
+                &json!({"command": command}),
+                dir.path(),
+                1,
+                true,
+            );
+            let offered = request.choices().iter().any(|choice| choice.id == "prefix");
+            assert_eq!(offered, length <= 200, "prefix length {length}");
+            if !offered {
+                let (io, _) = io("prefix", true);
+                let grants = SessionGrants::default();
+                assert!(request.ask(&io, "Run?".into(), &grants).await.is_err());
+                assert!(!grants.allows(1, "run_command", &json!({"command": command}), dir.path()));
+            }
+        }
     }
 
     #[test]
