@@ -1663,8 +1663,19 @@ mod tests {
         assert!(picker.scroll() > 0);
         draw(&mut picker, 41, 10, None);
         assert_eq!(picker.scroll(), 0);
-        assert!(!picker.seen_end || picker.blocked().is_none());
+        // Halfway through, the end has not been drawn, so the gate stays shut.
+        assert_eq!(picker.blocked(), Some(Gate::Unseen));
         assert_eq!(press(&mut picker, KeyCode::Char('y')), Outcome::Consumed);
+
+        // Once the end has been drawn, a new width restarts the scroll but
+        // not the gate: the same command was already seen in full.
+        let mut picker = self::picker(&lines(60));
+        read_to_the_end(&mut picker, 40, 10);
+        assert!(picker.scroll() > 0);
+        draw(&mut picker, 41, 10, None);
+        assert_eq!(picker.scroll(), 0);
+        assert_eq!(picker.blocked(), None);
+        assert!(answer(press(&mut picker, KeyCode::Char('y'))).confirmed);
     }
 
     #[test]

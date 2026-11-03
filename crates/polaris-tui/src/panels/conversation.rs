@@ -3790,10 +3790,15 @@ impl ConversationPanel {
     /// A key while an approval is open: the picker first, then the few
     /// panel-wide chords that do not edit the hidden composer.
     fn approval_key(&mut self, key: KeyEvent) -> EventOutcome {
+        self.approval_key_at(key, Instant::now())
+    }
+
+    /// [`Self::approval_key`] for a key pressed at `now`.
+    fn approval_key_at(&mut self, key: KeyEvent, now: Instant) -> EventOutcome {
         let Some(pending) = self.pending_confirm.as_mut() else {
             return EventOutcome::Continue;
         };
-        match pending.picker.handle_key(key, Instant::now()) {
+        match pending.picker.handle_key(key, now) {
             Outcome::Consumed => EventOutcome::Consumed,
             Outcome::Deny => {
                 self.answer_confirmation("no", false);
@@ -6288,8 +6293,14 @@ mod tests {
         let user = async {
             assert!(tick_until_confirm(&mut panel, 32).await);
             settle_picker(&mut panel);
-            type_str(&mut panel, "actually, rename it first");
-            panel.handle_key(key(KeyCode::Enter));
+            // Explicit instants, 10 ms apart: the keys land inside the
+            // picker's quiet window however slow the machine is.
+            let mut at = Instant::now();
+            for c in "actually, rename it first".chars() {
+                at += Duration::from_millis(10);
+                panel.approval_key_at(key(KeyCode::Char(c)), at);
+            }
+            panel.approval_key_at(key(KeyCode::Enter), at + Duration::from_millis(10));
             assert!(
                 panel.pending_confirm.is_some(),
                 "typing right before Enter does not resolve the picker"
@@ -6718,6 +6729,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tall_picker_leaves_the_transcript_rows_and_a_small_panel_gives_it_its_minimum() {
+        let command = (0..40)
+            .map(|n| format!("echo line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // A normal panel keeps `APPROVAL_TRANSCRIPT_ROWS` of transcript above
+        // the picker; a panel too small for that gives the picker its
+        // comfortable minimum first.
+        for (height, picker_rows) in [(24, 24 - APPROVAL_TRANSCRIPT_ROWS), (5, COMFORTABLE_ROWS)] {
+            let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+            for n in 0..30 {
+                panel.inbox.lock().push_back(IOMessage::from_agent(
+                    "code",
+                    IOContent::Text(format!("history {n}")),
+                ));
+            }
+            panel.tick();
+            open_approval(&provider, &mut panel, &command, &command).await;
+            let (screen, _) = draw(&mut panel, 80, height);
+            let top = screen
+                .iter()
+                .position(|row| row.contains("approve?"))
+                .unwrap_or_else(|| panic!("{height}: no picker:\n{}", screen.join("\n")));
+            assert_eq!(
+                height - u16::try_from(top).unwrap(),
+                picker_rows,
+                "{height}: the picker's rows:\n{}",
+                screen.join("\n")
+            );
+            assert!(
+                screen[..top].iter().any(|row| row.contains("history")),
+                "{height}: the transcript shows above the picker:\n{}",
+                screen.join("\n")
+            );
+            assert!(
+                screen[top..].iter().all(|row| !row.contains("history")),
+                "{height}: the transcript stays above the picker:\n{}",
+                screen.join("\n")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_hidden_command_tail_is_flagged_then_reachable_by_scrolling() {
         let tail = "SECURITY_HIDDEN_TAIL";
         let command = "printf safe; ".repeat(200) + "printf " + tail;
@@ -6855,8 +6909,11 @@ mod tests {
         type_str(&mut panel, "yes");
         panel.inbox.lock().push_back(confirm_msg("Run?"));
         panel.drain_inbox();
-        panel.handle_key(key(KeyCode::Char('y')));
-        panel.handle_key(key(KeyCode::Enter));
+        // The picker was built with the panel's own stamp of the last key;
+        // press 100 ms and 200 ms after it, whatever the clock says now.
+        let typed = panel.last_key_press.expect("keys were typed");
+        panel.approval_key_at(key(KeyCode::Char('y')), typed + Duration::from_millis(100));
+        panel.approval_key_at(key(KeyCode::Enter), typed + Duration::from_millis(200));
         assert!(panel.pending_confirm.is_some());
     }
 
@@ -7733,12 +7790,12 @@ mod tests {
         let choices = [
             ApprovalChoice::new("once", "allow once", &["y"], true),
             ApprovalChoice::new("exact", "allow for session", &["s"], true),
-            ApprovalChoice::new("deny", "deny (or no: reason)", &["n"], false),
+            ApprovalChoice::new("deny", "deny", &["n"], false),
         ];
         panel.inbox.lock().push_back(
             IOMessage::system_text(
                 "Run command:\n  cat notes.txt\n\nArguments: {\"command\":\"cat notes.txt\"}\n\n\
-                 y: allow once\ns: allow for session\nn: deny (or no: reason)",
+                 y: allow once\ns: allow for session\nn: deny",
             )
             .with_metadata(IO_TYPE, TYPE_CONFIRM)
             .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
@@ -7753,11 +7810,7 @@ mod tests {
             screen.contains("approve? · run_command in ~/demo"),
             "{screen}"
         );
-        for row in [
-            "1. allow once",
-            "2. allow for session",
-            "3. deny (or no: reason)",
-        ] {
+        for row in ["1. allow once", "2. allow for session", "3. deny"] {
             assert!(screen.contains(row), "{screen}");
         }
         assert!(!screen.contains("Arguments"), "{screen}");
@@ -9643,7 +9696,7 @@ mod tests {
                 &["p"],
                 true,
             ),
-            ApprovalChoice::new("deny", "deny (or no: reason)", &["n"], false),
+            ApprovalChoice::new("deny", "deny", &["n"], false),
         ]
     }
 
@@ -10155,7 +10208,7 @@ mod tests {
                 "2. allow this exact command",
                 "(whole words, every subcommand)",
                 "for this session",
-                "4. deny (or no: reason)",
+                "4. deny",
             ] {
                 assert!(
                     screen.contains(part),
@@ -10273,7 +10326,7 @@ mod tests {
     async fn long_answer_labels_wrap_and_stay_whole() {
         let (_provider, mut panel) = open_framed("ls", false).await;
         let screen = draw(&mut panel, 40, 40).0.join("\n");
-        for word in ["once", "subcommand)", "reason)"] {
+        for word in ["once", "subcommand)", "4. deny"] {
             assert!(screen.contains(word), "{word} was cut:\n{screen}");
         }
         assert!(screen.contains("3. allow prefix"), "{screen}");
@@ -10346,7 +10399,7 @@ mod tests {
                 &["p"],
                 true,
             ),
-            ApprovalChoice::new("deny", "deny (or no: reason)", &["n"], false),
+            ApprovalChoice::new("deny", "deny", &["n"], false),
         ];
         for framed in [true, false] {
             let (provider, mut panel) = TuiIOProvider::new_with_panel(8);

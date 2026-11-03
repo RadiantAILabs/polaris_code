@@ -710,7 +710,6 @@ impl Host {
         self.key(KeyCode::Enter, KeyModifiers::NONE);
     }
 
-    /// Type a line and submit it.
     /// Answer an open approval picker with one key, as a user does: after a
     /// pause, because the picker ignores answer keys pressed within 400 ms of
     /// other typing.
@@ -720,6 +719,7 @@ impl Host {
         let _ = self.frame().await;
     }
 
+    /// Type a line and submit it.
     async fn submit(&mut self, text: &str) {
         self.type_text(text);
         // Completion sources are asynchronous. Give the panel one runtime
@@ -1301,8 +1301,11 @@ async fn typing_during_an_approval_neither_answers_it_nor_queues_a_turn() {
     host.wait_for("the approval", |screen| screen.contains("approve?"))
         .await;
 
-    // Contains `n`, `y` and other answer keys, typed without a pause.
-    host.submit("and then tell me a joke, yes").await;
+    // Contains `n`, `y` and other answer keys, typed without a pause. Typing
+    // and Enter go in back to back, with no frame between them, so Enter
+    // lands within the picker's quiet window however slow the run is.
+    host.type_text("and then tell me a joke, yes");
+    host.enter();
     let screen = host.frame().await.join("\n");
     assert!(
         screen.contains("approve?"),
