@@ -10455,6 +10455,43 @@ mod tests {
         }
     }
 
+    /// The empty input says what it is for and how to reach the transcript.
+    /// Typing replaces the hint, clearing the draft brings it back, and a
+    /// panel that does not have focus shows none.
+    #[tokio::test]
+    async fn the_empty_input_shows_its_placeholder_until_typed_into() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        let hint = format!("{DEFAULT_PLACEHOLDER}  (Ctrl-N browse transcript)");
+        let screen = draw(&mut panel, 60, 6).0.join("\n");
+        assert!(screen.contains(&hint), "{screen}");
+
+        type_str(&mut panel, "hi");
+        let screen = draw(&mut panel, 60, 6).0.join("\n");
+        assert!(!screen.contains(DEFAULT_PLACEHOLDER), "{screen}");
+        assert!(screen.contains("hi"), "{screen}");
+
+        panel.composer.clear();
+        let screen = draw(&mut panel, 60, 6).0.join("\n");
+        assert!(
+            screen.contains(&hint),
+            "emptied, the hint is back:\n{screen}"
+        );
+
+        // A custom hint is drawn the same way, ahead of the browse cue.
+        panel.placeholder = "Ask Polaris…".into();
+        let screen = draw(&mut panel, 60, 6).0.join("\n");
+        assert!(
+            screen.contains("Ask Polaris…  (Ctrl-N browse transcript)"),
+            "{screen}"
+        );
+
+        // An unfocused input is not waiting for anything to be typed.
+        panel.handle_event(&TuiEvent::FocusLost);
+        let screen = draw(&mut panel, 60, 6).0.join("\n");
+        assert!(!screen.contains("Ask Polaris…"), "{screen}");
+        assert!(!screen.contains("Ctrl-N"), "{screen}");
+    }
+
     /// A multi-MiB answer label — the shape of the `p` prefix label with a
     /// huge model-derived word in it — was sanitised, copied and wrapped on
     /// every frame, about 1.8 s a frame at 2 MiB. Host text drawn every frame
