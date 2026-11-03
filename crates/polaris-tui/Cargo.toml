@@ -23,8 +23,10 @@ panels = ["dep:tracing-subscriber", "dep:serde_json", "dep:pulldown-cmark"]
 polaris.workspace = true
 # `unstable-rendered-line-info` surfaces `Paragraph::line_count`, which
 # `widgets::ScrollableTranscript` uses to clamp scroll against the *wrapped*
-# row count. Reimplementing ratatui's word-wrap to get that number ourselves
-# would be fragile; the unstable API is hidden behind our widget.
+# row count and the conversation panel uses to size the approval footer.
+# Reimplementing ratatui's word-wrap to get that number ourselves would be
+# fragile. Calls to the unstable API stay inside `widgets` and the
+# conversation panel; nothing re-exports it.
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm.workspace = true
 tokio.workspace = true
