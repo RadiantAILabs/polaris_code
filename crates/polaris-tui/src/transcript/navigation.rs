@@ -650,9 +650,7 @@ mod tests {
             id: None,
             summary: "run command?".into(),
             choices: Vec::new(),
-            subject: None,
-            context: None,
-            details: String::new(),
+            frame: None,
         });
         enter(&mut panel);
         panel.load_history(false);

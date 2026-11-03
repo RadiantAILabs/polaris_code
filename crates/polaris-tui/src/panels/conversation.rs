@@ -184,10 +184,15 @@
 //!
 //! A host may also name the one thing being approved with `approval_subject`
 //! (a command, verbatim) and where with `approval_context` (`run_command in
-//! ~/repo`). The panel then shows the subject once, in a framed block pinned
-//! above the input with a single compact line of answers, keeps the full
-//! prompt out of the transcript, and reveals it inside the frame when `?` is
-//! pressed on an empty input. Without a subject the prompt renders as before.
+//! ~/repo`). The panel then shows the subject once, in a framed block above
+//! the input, keeps the full prompt out of the transcript, and adds it to the
+//! frame when `?` is pressed on an empty input. The answers are pinned at the
+//! bottom of the frame and never clipped. A subject taller than the frame
+//! scrolls (`↑`/`↓`, `PgUp`/`PgDn` on an empty input), and a confirming
+//! answer is refused until the subject's last row has been on screen; a
+//! subject over 64 KiB cannot be shown in full and can only be denied. Both
+//! keys are display hints: the reply's `confirmed` and `approval_choice`
+//! decide the answer. Without a subject the prompt renders as before.
 //!
 //! The panel decides nothing about *which* actions need approval — that is the
 //! tool's permission, set by the consumer. This is presentation and the answer
@@ -495,13 +500,20 @@ const INTERRUPT_ESCALATION: Duration = Duration::from_millis(1500);
 /// contents. Tall enough for a pasted function, short enough that the
 /// transcript never collapses to nothing.
 const COMPOSER_MAX_ROWS: usize = 10;
-/// Rows of a framed approval's subject shown before the rest folds behind `?`.
-const APPROVAL_SUBJECT_ROWS: usize = 6;
+/// Bytes of a framed approval's subject, and of its `?` details, the panel
+/// renders. The same budget as a transcript body; it is applied before the
+/// text is sanitised, so a huge command costs nothing per frame.
+const APPROVAL_RENDER_BYTES: usize = 64 * 1024;
+/// Why a framed approval refuses a confirming answer before its subject's
+/// last row has been on screen.
+const UNSEEN_TAIL_NOTICE: &str = "scroll to the end of the command (↓ / PgDn) before approving it";
+/// Rows the input takes at its smallest: one row of draft and its borders.
+const COMPOSER_MIN_HEIGHT: usize = 3;
 /// Composer width assumed before the first frame has measured the real one.
 const DEFAULT_COMPOSER_WIDTH: usize = 80;
-/// Braille spinner frames cycled while a step is in flight.
 /// What the empty composer says when the host names nothing more specific.
 pub const DEFAULT_PLACEHOLDER: &str = "Send a message…";
+/// Braille spinner frames cycled while a step is in flight.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Default mpsc buffer for [`TuiIOProvider::new`] when the caller doesn't
@@ -747,9 +759,16 @@ pub const APPROVAL_CHOICE: &str = "approval_choice";
 pub const APPROVAL_REQUEST_ID: &str = "approval_request_id";
 /// Metadata key naming, verbatim, the one thing an approval authorizes (a
 /// command). Its presence switches the panel to the framed approval block.
+///
+/// A display hint only: the answer is decided by the [`CONFIRMED`] and
+/// [`APPROVAL_CHOICE`] metadata on the reply, never by this text. The panel
+/// does, however, refuse a confirming answer until the whole subject has been
+/// on screen, and accepts only a denial for a subject too long to show.
 pub const APPROVAL_SUBJECT: &str = "approval_subject";
 /// Metadata key with a short line saying where the subject applies, shown in
 /// the framed approval block's title (`run_command in ~/repo`).
+///
+/// A display hint only, like [`APPROVAL_SUBJECT`]; it grants nothing.
 pub const APPROVAL_CONTEXT: &str = "approval_context";
 /// [`IO_TYPE`] value closing a resolved approval without soliciting another answer.
 pub const IO_TYPE_APPROVAL_RESOLVED: &str = "approval_resolved";
@@ -826,13 +845,170 @@ struct PendingConfirm {
     summary: String,
     /// Generic host-provided answer keys and labels; the panel interprets no tool rules.
     choices: Vec<ApprovalChoice>,
-    /// The host-named thing being approved ([`APPROVAL_SUBJECT`]), framed above
-    /// the input in place of the one-line banner.
-    subject: Option<String>,
+    /// The framed view of a host-named subject ([`APPROVAL_SUBJECT`]), shown
+    /// above the input in place of the one-line banner.
+    frame: Option<ApprovalFrame>,
+}
+
+/// A framed approval: what it shows, sanitised once on arrival, and how far
+/// the user has read it.
+///
+/// The subject is what `y` runs, so every row of it must be reachable: the
+/// body scrolls, and a confirming answer is refused until its last row has
+/// been on screen ([`ApprovalFrame::blocked`]).
+struct ApprovalFrame {
+    /// The subject, bounded to [`APPROVAL_RENDER_BYTES`] and sanitised.
+    subject: String,
+    /// Bytes of the subject past the bound. Nonzero means it cannot be shown
+    /// in full, so only a denial is accepted.
+    omitted: usize,
     /// Where the subject applies ([`APPROVAL_CONTEXT`]), titled on the frame.
     context: Option<String>,
-    /// The full prompt, shown inside the frame on `?`.
+    /// The full prompt for `?`, bounded and sanitised, with a marker when cut.
     details: String,
+    /// Body rows wrapped for the last width and details state drawn.
+    wrapped: Option<WrappedBody>,
+    /// First body row on screen.
+    scroll: usize,
+    /// Body rows the last frame had room for: the page size for `PgUp`/`PgDn`.
+    viewport: usize,
+    /// Whether the subject's last row has been drawn.
+    seen_end: bool,
+}
+
+/// [`ApprovalFrame`]'s body hard-wrapped to one width.
+struct WrappedBody {
+    width: usize,
+    details: bool,
+    rows: Vec<Line<'static>>,
+    /// Rows belonging to the subject (and its omission marker), which come
+    /// first.
+    subject_rows: usize,
+}
+
+impl ApprovalFrame {
+    fn new(subject: &str, context: Option<&str>, details: &str) -> Self {
+        let (subject, omitted) = bounded_safe_text(subject);
+        let (mut details, cut) = bounded_safe_text(details);
+        if cut > 0 {
+            details.push_str(&format!(
+                "\n… {cut} more bytes not shown; the request is retained in full"
+            ));
+        }
+        Self {
+            subject,
+            omitted,
+            context: context.map(|context| safe_text(context).replace('\n', " ")),
+            details,
+            wrapped: None,
+            scroll: 0,
+            viewport: 0,
+            seen_end: false,
+        }
+    }
+
+    /// The body hard-wrapped to `width`, reusing the last wrap when neither
+    /// the width nor the details toggle changed.
+    fn body(&mut self, width: usize, details: bool) -> &WrappedBody {
+        let width = width.max(1);
+        let stale = self
+            .wrapped
+            .as_ref()
+            .is_none_or(|body| body.width != width || body.details != details);
+        if stale {
+            let strong = Style::default().add_modifier(Modifier::BOLD);
+            let dim = Style::default().fg(Color::DarkGray);
+            let mut rows = hard_wrap(&self.subject, width)
+                .into_iter()
+                .map(|row| Line::styled(row, strong))
+                .collect::<Vec<_>>();
+            if self.omitted > 0 {
+                rows.extend(
+                    hard_wrap(
+                        &format!(
+                            "… {} more bytes not shown: too long to review here, so only a denial is accepted",
+                            self.omitted
+                        ),
+                        width,
+                    )
+                    .into_iter()
+                    .map(|row| Line::styled(row, Style::default().fg(Color::Yellow))),
+                );
+            }
+            let subject_rows = rows.len();
+            if details {
+                rows.push(Line::default());
+                rows.extend(
+                    hard_wrap(&self.details, width)
+                        .into_iter()
+                        .map(|row| Line::styled(row, dim)),
+                );
+            }
+            self.wrapped = Some(WrappedBody {
+                width,
+                details,
+                rows,
+                subject_rows,
+            });
+        }
+        self.wrapped.as_ref().expect("wrapped above")
+    }
+
+    /// Why a confirming answer is refused right now, or `None` once the
+    /// whole subject has been on screen.
+    fn blocked(&self) -> Option<String> {
+        if self.omitted > 0 {
+            return Some(
+                "this command is too long to review here, so it can only be denied (n)".into(),
+            );
+        }
+        (!self.seen_end).then(|| UNSEEN_TAIL_NOTICE.to_string())
+    }
+
+    /// Move the body by `rows` (negative is up), within what the last frame
+    /// measured. Returns whether there was anything to scroll.
+    fn scroll_by(&mut self, rows: isize) -> bool {
+        let total = self.wrapped.as_ref().map_or(0, |body| body.rows.len());
+        if total <= self.viewport {
+            return false;
+        }
+        let last = total - self.viewport;
+        self.scroll = self.scroll.saturating_add_signed(rows).min(last);
+        true
+    }
+}
+
+/// `text` bounded to [`APPROVAL_RENDER_BYTES`] before it is sanitised, and
+/// how many bytes the bound left out.
+fn bounded_safe_text(text: &str) -> (String, usize) {
+    let end = text.floor_char_boundary(APPROVAL_RENDER_BYTES.min(text.len()));
+    (safe_text(&text[..end]), text.len() - end)
+}
+
+/// Split `text` into rows of at most `width` columns, breaking at any glyph.
+///
+/// A command is not prose: every character is kept, in order, with nothing
+/// trimmed or reflowed, so the rows the frame scrolls are exactly the rows it
+/// measured.
+fn hard_wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for ch in line.chars() {
+            let glyph = ch.width().unwrap_or(0);
+            if used + glyph > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(ch);
+            used += glyph;
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 impl PendingConfirm {
@@ -1567,13 +1743,18 @@ impl ConversationPanel {
                         IOContent::Text(text) => strip_choice_labels(text, &choices),
                         other => other_body(other),
                     };
+                    let frame = message.metadata.get(APPROVAL_SUBJECT).map(|subject| {
+                        ApprovalFrame::new(
+                            subject,
+                            message.metadata.get(APPROVAL_CONTEXT).map(String::as_str),
+                            &details,
+                        )
+                    });
                     self.pending_confirm = Some(PendingConfirm {
                         id: message.metadata.get(APPROVAL_REQUEST_ID).cloned(),
                         summary,
                         choices,
-                        subject: message.metadata.get(APPROVAL_SUBJECT).cloned(),
-                        context: message.metadata.get(APPROVAL_CONTEXT).cloned(),
-                        details,
+                        frame,
                     });
                     self.confirm_notice = None;
                     self.approval_details = false;
@@ -1870,7 +2051,7 @@ impl ConversationPanel {
         let pending = self
             .pending_confirm
             .as_ref()
-            .filter(|pending| pending.subject.is_none())?;
+            .filter(|pending| pending.frame.is_none())?;
         let accent = Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
@@ -1911,58 +2092,28 @@ impl ConversationPanel {
         Some(Line::from(spans))
     }
 
-    /// The framed approval block for a host-named subject: its title and
-    /// rows, or `None` when no such approval is open.
-    ///
-    /// The subject is shown once, verbatim and capped at
-    /// [`APPROVAL_SUBJECT_ROWS`]; the answers follow on one line. `?` adds the
-    /// full prompt underneath, bounded the same way a tool body is.
-    fn approval_frame(&self) -> Option<(String, Vec<Line<'static>>)> {
+    /// The framed approval block's title and pinned footer (answers, then
+    /// any notice), or `None` when no framed approval is open. The body — the
+    /// subject, and the full prompt on `?` — scrolls above the footer; see
+    /// [`ApprovalFrame::body`].
+    fn approval_chrome(&self) -> Option<(String, Vec<Line<'static>>)> {
         let pending = self.pending_confirm.as_ref()?;
-        let subject = pending.subject.as_deref()?;
-        let title = match &pending.context {
-            Some(context) => format!(" approve? · {} ", safe_text(context).replace('\n', " ")),
+        let frame = pending.frame.as_ref()?;
+        let title = match &frame.context {
+            Some(context) => format!(" approve? · {context} "),
             None => " approve? ".to_string(),
         };
-        let strong = Style::default().add_modifier(Modifier::BOLD);
         let dim = Style::default().fg(Color::DarkGray);
         let key_style = Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
-        let subject = safe_text(subject);
-        let subject_rows = subject.lines().count();
-        let mut lines = subject
-            .lines()
-            .take(APPROVAL_SUBJECT_ROWS)
-            .map(|row| Line::styled(row.to_string(), strong))
-            .collect::<Vec<_>>();
-        if subject_rows > APPROVAL_SUBJECT_ROWS && !self.approval_details {
-            lines.push(Line::styled(
-                format!(
-                    "… {} more lines · ? shows all",
-                    subject_rows - APPROVAL_SUBJECT_ROWS
-                ),
-                dim,
-            ));
-        }
-        if self.approval_details {
-            lines.push(Line::default());
-            lines.extend(
-                preview_lines(&pending.details, false)
-                    .into_iter()
-                    .map(|mut line| {
-                        line.style = line.style.patch(dim);
-                        line
-                    }),
-            );
-        }
         let mut answers = Vec::new();
         for choice in &pending.choices {
             if !answers.is_empty() {
                 answers.push(Span::styled(" · ", dim));
             }
             answers.push(Span::styled(
-                choice.keys.first().cloned().unwrap_or_default(),
+                safe_text(&choice.keys.first().cloned().unwrap_or_default()),
                 key_style,
             ));
             answers.push(Span::raw(format!(" {}", safe_text(&choice.label))));
@@ -1980,14 +2131,99 @@ impl ConversationPanel {
         } else {
             " details"
         }));
-        lines.push(Line::from(answers));
+        let mut footer = vec![Line::from(answers)];
         if let Some(notice) = &self.confirm_notice {
-            lines.push(Line::styled(
+            footer.push(Line::styled(
                 safe_text(notice),
                 Style::default().fg(Color::Red),
             ));
         }
-        Some((title, lines))
+        Some((title, footer))
+    }
+
+    fn pending_frame_mut(&mut self) -> Option<&mut ApprovalFrame> {
+        self.pending_confirm.as_mut()?.frame.as_mut()
+    }
+
+    /// Draw the framed approval into `area`: the footer pinned at the bottom,
+    /// the body scrolled above it, and the border saying what is off screen.
+    /// Records the viewport and whether the subject's last row was drawn.
+    fn render_approval(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        title: String,
+        footer: Vec<Line<'static>>,
+        footer_rows: usize,
+    ) {
+        let details = self.approval_details;
+        let Some(approval) = self.pending_frame_mut() else {
+            return;
+        };
+        let accent = Style::default().fg(Color::Yellow);
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, accent.add_modifier(Modifier::BOLD)))
+            .border_style(accent);
+        let inner = block.inner(area);
+        let footer_height = u16::try_from(footer_rows)
+            .unwrap_or(u16::MAX)
+            .min(inner.height);
+        let viewport = usize::from(inner.height - footer_height);
+        let width = usize::from(inner.width).max(1);
+        let total = approval.body(width, details).rows.len();
+        approval.viewport = viewport;
+        approval.scroll = approval.scroll.min(total.saturating_sub(viewport));
+        let scroll = approval.scroll;
+        let body = approval.body(width, details);
+        let shown = body
+            .rows
+            .iter()
+            .skip(scroll)
+            .take(viewport)
+            .cloned()
+            .collect::<Vec<_>>();
+        let subject_end_shown =
+            viewport > 0 && scroll < body.subject_rows && scroll + viewport >= body.subject_rows;
+        let above = scroll;
+        let below = total.saturating_sub(scroll + viewport);
+        let newly_seen = subject_end_shown && !approval.seen_end;
+        if subject_end_shown {
+            approval.seen_end = true;
+        }
+        if above > 0 || below > 0 {
+            let position = match (above, below) {
+                (_, 0) => format!(" ↑ {above} rows above · ↑/PgUp "),
+                (0, _) => format!(" ↓ {below} more rows · ↓/PgDn "),
+                _ => format!(" ↑ {above} above · ↓ {below} more · ↑↓ PgUp/PgDn "),
+            };
+            block = block.title_bottom(Span::styled(position, accent));
+        }
+        frame.render_widget(block, area);
+        let body_area = Rect {
+            height: inner.height - footer_height,
+            ..inner
+        };
+        let footer_area = Rect {
+            y: inner.y + body_area.height,
+            height: footer_height,
+            ..inner
+        };
+        frame.render_widget(Paragraph::new(shown), body_area);
+        frame.render_widget(
+            Paragraph::new(footer).wrap(Wrap { trim: false }),
+            footer_area,
+        );
+        // The refusal asked for the tail; once it has been shown, the advice
+        // is stale and comes down on the next frame.
+        if newly_seen && self.confirm_notice.as_deref() == Some(UNSEEN_TAIL_NOTICE) {
+            self.confirm_notice = None;
+        }
+    }
+
+    /// Why a confirming answer to the open approval is refused, if it is.
+    fn approval_blocked(&self) -> Option<String> {
+        self.pending_confirm.as_ref()?.frame.as_ref()?.blocked()
     }
 
     /// One-line delivery banner: why the last submission was refused, and
@@ -2168,6 +2404,13 @@ impl ConversationPanel {
             .and_then(|pending| pending.answer(&text));
         let accepted = match (invocation, answer) {
             (Some(invocation), _) => self.submit_command(invocation, &text),
+            // A confirming answer waits until the user has been shown the
+            // whole subject. The draft stays, and nothing is sent: it is not
+            // an ordinary prompt either.
+            (None, Some(true)) if self.approval_blocked().is_some() => {
+                self.confirm_notice = self.approval_blocked();
+                false
+            }
             (None, Some(confirmed)) if self.pending_confirm.is_some() => {
                 self.answer_confirmation(&text, confirmed)
             }
@@ -2243,11 +2486,11 @@ impl ConversationPanel {
         let Some(handle) = self.turn_input.as_ref() else {
             return false;
         };
-        // A refusal means the host already took the message: it is no longer
-        // ours to edit, so the key falls through to its ordinary binding
-        // rather than parking an error above the input.
-        if handle.remove(pending.receipt.id).is_err() {
-            return false;
+        // A refusal for a message the host already took means it is no
+        // longer ours to edit, so the key falls through to its ordinary
+        // binding. Any other refusal (the queue is unavailable) is reported.
+        if let Err(reason) = handle.remove(pending.receipt.id) {
+            return self.refused_turn_input(pending, reason);
         }
         self.composer.clear();
         self.composer.insert_paste(&pending.text);
@@ -2264,7 +2507,25 @@ impl ConversationPanel {
             return false;
         };
         // As above: a consumed message leaves Alt-Backspace to delete a word.
-        handle.remove(pending.receipt.id).is_ok()
+        match handle.remove(pending.receipt.id) {
+            Ok(()) => true,
+            Err(reason) => self.refused_turn_input(pending, reason),
+        }
+    }
+
+    /// Handle the host refusing to remove `pending`: if it still holds the
+    /// message, keep it queued and say why; if it already took it, fall
+    /// through. Returns whether the key was consumed.
+    fn refused_turn_input(&mut self, pending: PendingTurnInput, reason: String) -> bool {
+        let still_pending = self
+            .turn_input
+            .as_ref()
+            .is_some_and(|handle| handle.is_pending(pending.receipt.id));
+        if still_pending {
+            self.pending_turn_inputs.push_back(pending);
+            self.editor_notice = Some(reason);
+        }
+        still_pending
     }
 
     /// Forget turn inputs the host has consumed and drop their transcript
@@ -2989,15 +3250,6 @@ fn strip_choice_labels(text: &str, choices: &[ApprovalChoice]) -> String {
     }
 }
 
-/// How many terminal rows `lines` occupy once wrapped to `width` columns.
-fn wrapped_rows(lines: &[Line<'_>], width: usize) -> usize {
-    let width = width.max(1);
-    lines
-        .iter()
-        .map(|line| line.width().div_ceil(width).max(1))
-        .sum()
-}
-
 /// Shorten `text` to at most `width` columns at a word boundary, marking the
 /// cut with `…`. A single word wider than `width` is cut at the glyph.
 fn clip_words(text: &str, width: usize) -> String {
@@ -3462,14 +3714,39 @@ impl TuiPanel for ConversationPanel {
             banner_lines.push(line);
         }
         let banner_height = u16::try_from(banner_lines.len()).unwrap_or(u16::MAX);
-        // The framed approval sits directly above the input. It may take up
-        // to half the panel; whatever it cannot fit is clipped at the bottom,
-        // where the answers would be, so it is measured before layout.
-        let approval = self.approval_frame();
-        let approval_height = approval.as_ref().map_or(0, |(_, lines)| {
-            let rows = wrapped_rows(lines, usize::from(area.width.saturating_sub(2))) + 2;
-            u16::try_from(rows).unwrap_or(u16::MAX).min(area.height / 2)
+        // The framed approval sits directly above the input: its body (the
+        // subject) scrolls, and its footer (the answers) is pinned below the
+        // body so it is never the part that gets cut. Both are measured
+        // exactly before layout — the body is hard-wrapped by the panel, the
+        // footer by the same wrapper that draws it.
+        let approval_width = usize::from(area.width.saturating_sub(2)).max(1);
+        let approval = self.approval_chrome().map(|(title, footer)| {
+            let footer_rows = Paragraph::new(footer.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(u16::try_from(approval_width).unwrap_or(u16::MAX));
+            (title, footer, footer_rows)
         });
+        let details = self.approval_details;
+        let approval_height = match (&approval, self.pending_frame_mut()) {
+            (Some((_, _, footer_rows)), Some(frame)) => {
+                let body_rows = frame.body(approval_width, details).rows.len();
+                // Up to half the panel, but always room for the footer and
+                // one body row — taking the transcript's last row if that is
+                // what it costs — and never so much that the meta row,
+                // banners or a one-row input lose theirs.
+                let wanted = body_rows + footer_rows + 2;
+                let floor = footer_rows + 3;
+                let others =
+                    usize::from(meta_height) + usize::from(banner_height) + COMPOSER_MIN_HEIGHT;
+                let with_transcript = usize::from(area.height).saturating_sub(others + 1);
+                let without = usize::from(area.height).saturating_sub(others);
+                let rows = wanted
+                    .min(usize::from(area.height / 2).max(floor))
+                    .min(with_transcript.max(floor.min(without)));
+                u16::try_from(rows).unwrap_or(u16::MAX)
+            }
+            _ => 0,
+        };
         // The composer grows with its content and then scrolls inside a fixed
         // frame. Its width is known before layout (the area's, less borders),
         // so the wrapped row count — and therefore the height it wants — can be
@@ -3492,7 +3769,13 @@ impl TuiPanel for ConversationPanel {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),
+                Constraint::Min(u16::from(
+                    area.height
+                        > meta_height
+                            .saturating_add(banner_height)
+                            .saturating_add(approval_height)
+                            .saturating_add(composer_height),
+                )),
                 Constraint::Length(meta_height),
                 Constraint::Length(banner_height),
                 Constraint::Length(approval_height),
@@ -3578,24 +3861,10 @@ impl TuiPanel for ConversationPanel {
             frame.render_widget(Paragraph::new(banner_lines), chunks[2]);
         }
 
-        if let Some((title, lines)) = approval
+        if let Some((title, footer, footer_rows)) = approval
             && chunks[3].height > 0
         {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .border_style(Style::default().fg(Color::Yellow));
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .block(block),
-                chunks[3],
-            );
+            self.render_approval(frame, chunks[3], title, footer, footer_rows);
         }
 
         // A multi-line draft says so in its title: `Enter` submits the whole
@@ -3686,20 +3955,8 @@ impl ConversationPanel {
         if let Some(outcome) = self.browse_key(key) {
             return outcome;
         }
-        // `?` on an empty input opens the framed approval's details. Typed
-        // anywhere else it is just a character.
-        if key.code == KeyCode::Char('?')
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            && self.composer.is_empty()
-            && self
-                .pending_confirm
-                .as_ref()
-                .is_some_and(|pending| pending.subject.is_some())
-        {
-            self.approval_details = !self.approval_details;
-            return EventOutcome::Consumed;
+        if let Some(outcome) = self.approval_key(key) {
+            return outcome;
         }
         // An open popup gets first refusal on the keys it claims. Everything
         // it declines is an ordinary edit, after which the popup is
@@ -3719,6 +3976,36 @@ impl ConversationPanel {
             self.refresh_attachments();
         }
         outcome
+    }
+
+    /// Keys a framed approval claims while the input is empty: `?` toggles
+    /// its details, and when its body overflows, `↑`/`↓` scroll a row and
+    /// `PgUp`/`PgDn` a page. There is deliberately no jump to the end: the
+    /// subject must pass through the viewport to be approved. Typed into a
+    /// draft, or with no framed approval open, these are ordinary keys.
+    fn approval_key(&mut self, key: KeyEvent) -> Option<EventOutcome> {
+        if !self.composer.is_empty()
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        if key.code == KeyCode::Char('?') {
+            self.pending_frame_mut()?;
+            self.approval_details = !self.approval_details;
+            return Some(EventOutcome::Consumed);
+        }
+        let approval = self.pending_frame_mut()?;
+        let page = isize::try_from(approval.viewport.max(1)).unwrap_or(isize::MAX);
+        let rows = match key.code {
+            KeyCode::Up => -1,
+            KeyCode::Down => 1,
+            KeyCode::PageUp => -page,
+            KeyCode::PageDown => page,
+            _ => return None,
+        };
+        approval.scroll_by(rows).then_some(EventOutcome::Consumed)
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> EventOutcome {
@@ -5019,9 +5306,7 @@ mod tests {
             id: None,
             summary: "approve?".into(),
             choices: Vec::new(),
-            subject: None,
-            context: None,
-            details: String::new(),
+            frame: None,
         });
         // Even a previously armed escalation must not override navigation.
         panel.last_interrupt = Some(Instant::now());
@@ -9205,5 +9490,478 @@ mod tests {
         panel.handle_key(alt(KeyCode::Backspace));
         assert_eq!(panel.composer.text(), "hello ");
         assert!(panel.editor_notice.is_none());
+    }
+
+    /// The reviewer's reproduction: a long harmless head hiding a tail.
+    fn hidden_tail_command() -> String {
+        format!("{}printf SECURITY_HIDDEN_TAIL", "printf safe; ".repeat(200))
+    }
+
+    /// The choices polaris_code offers, with its long scope labels, so the
+    /// footer wraps the way it does in the real host.
+    fn scoped_choices() -> Vec<ApprovalChoice> {
+        vec![
+            ApprovalChoice::new("once", "allow once", &["y"], true),
+            ApprovalChoice::new(
+                "exact",
+                "allow this exact command in /home/me/projects/demo for this session",
+                &["s"],
+                true,
+            ),
+            ApprovalChoice::new(
+                "prefix",
+                "allow prefix \"printf\" (whole words, every subcommand) in /home/me/projects/demo for this session",
+                &["p"],
+                true,
+            ),
+            ApprovalChoice::new("deny", "deny (or no: reason)", &["n"], false),
+        ]
+    }
+
+    /// A framed approval for `subject`, shaped like polaris_code's.
+    fn framed_approval(subject: &str) -> IOMessage {
+        let choices = scoped_choices();
+        let labels = choices
+            .iter()
+            .map(|choice| format!("{}: {}", choice.keys[0], choice.label))
+            .collect::<Vec<_>>()
+            .join("\n");
+        IOMessage::system_text(format!(
+            "Run command:\n  {subject}\n\nArguments: {{\"command\":{subject:?}}}\n\n{labels}"
+        ))
+        .with_metadata(IO_TYPE, TYPE_CONFIRM)
+        .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
+        .with_metadata(APPROVAL_SUBJECT, subject)
+        .with_metadata(APPROVAL_CONTEXT, "run_command in ~/projects/demo")
+    }
+
+    /// Page through the frame until `needle` is on screen, returning that
+    /// screen. Fails if the bottom is reached without it.
+    fn page_until(panel: &mut ConversationPanel, width: u16, height: u16, needle: &str) -> String {
+        for _ in 0..400 {
+            let screen = draw(panel, width, height).0.join("\n");
+            if screen.contains(needle) {
+                return screen;
+            }
+            assert_eq!(
+                panel.handle_key(key(KeyCode::PageDown)),
+                EventOutcome::Consumed,
+                "the frame stopped scrolling before showing {needle:?}:\n{screen}"
+            );
+        }
+        panic!("{needle:?} never came on screen");
+    }
+
+    /// Must-fix regression: at 80×24 and 80×12 the end of a long command was
+    /// clipped with the answers, and `y` approved it unseen (80×10 is the
+    /// panel inside a 12-row terminal). Now the answers
+    /// stay pinned, the tail is reachable by scrolling, and `y` is refused
+    /// until it has been on screen.
+    #[tokio::test]
+    async fn a_hidden_command_tail_must_be_shown_before_it_can_be_approved() {
+        use polaris::plugins::IOProvider;
+        for (width, height) in [(80, 24), (80, 12), (80, 10)] {
+            let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+            provider
+                .send(framed_approval(&hidden_tail_command()))
+                .await
+                .unwrap();
+            assert!(tick_until_confirm(&mut panel, 32).await);
+
+            let screen = draw(&mut panel, width, height).0.join("\n");
+            assert!(
+                screen.contains("y allow once"),
+                "{width}×{height}: the answer row is pinned on screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("SECURITY_HIDDEN_TAIL"),
+                "{width}×{height}: the tail starts off screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("more rows"),
+                "{width}×{height}: the frame says rows are below:\n{screen}"
+            );
+
+            // `y` before the tail has been shown is refused, keeps the draft
+            // and sends nothing.
+            type_str(&mut panel, "y");
+            panel.handle_key(key(KeyCode::Enter));
+            assert!(
+                panel.pending_confirm.is_some(),
+                "{width}×{height}: an unseen tail cannot be approved"
+            );
+            assert_eq!(panel.composer.text(), "y", "the answer stays in the input");
+            let screen = draw(&mut panel, width, height).0.join("\n");
+            assert!(
+                screen.contains("scroll to the end"),
+                "{width}×{height}: the refusal says why:\n{screen}"
+            );
+            assert!(
+                screen.contains("printf safe;"),
+                "{width}×{height}: with the notice up, a body row still shows:\n{screen}"
+            );
+
+            // Scrolling needs an empty input; the tail then comes into view
+            // with the answers still on screen.
+            panel.composer.clear();
+            let screen = page_until(&mut panel, width, height, "SECURITY_HIDDEN_TAIL");
+            assert!(
+                screen.contains("y allow once"),
+                "{width}×{height}: answers stay pinned at the tail:\n{screen}"
+            );
+            let screen = draw(&mut panel, width, height).0.join("\n");
+            assert!(
+                !screen.contains("scroll to the end"),
+                "{width}×{height}: the refusal comes down once the tail is shown:\n{screen}"
+            );
+
+            type_str(&mut panel, "y");
+            panel.handle_key(key(KeyCode::Enter));
+            assert!(
+                panel.pending_confirm.is_none(),
+                "{width}×{height}: once seen, `y` answers"
+            );
+            let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.metadata.get(CONFIRMED).map(String::as_str),
+                Some(CONFIRMED_TRUE),
+                "{width}×{height}"
+            );
+        }
+    }
+
+    /// Denying never waits for the tail: `n`, `no: reason` and Esc answer at
+    /// once.
+    #[tokio::test]
+    async fn a_framed_approval_can_be_denied_without_reading_it_all() {
+        use polaris::plugins::IOProvider;
+        for answer in ["n", "no: too long to read", "<esc>"] {
+            let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+            provider
+                .send(framed_approval(&hidden_tail_command()))
+                .await
+                .unwrap();
+            assert!(tick_until_confirm(&mut panel, 32).await);
+            draw(&mut panel, 80, 24);
+            if answer == "<esc>" {
+                panel.handle_key(key(KeyCode::Esc));
+            } else {
+                type_str(&mut panel, answer);
+                panel.handle_key(key(KeyCode::Enter));
+            }
+            assert!(panel.pending_confirm.is_none(), "{answer} resolves at once");
+            let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.metadata.get(CONFIRMED).map(String::as_str),
+                Some(CONFIRMED_FALSE),
+                "{answer}"
+            );
+            if answer.starts_with("no:") {
+                assert!(
+                    matches!(&response.content, IOContent::Text(text) if text == answer),
+                    "the reason travels with the denial: {response:?}"
+                );
+            }
+        }
+    }
+
+    /// A command just over six rows at 80×24, and at 80×12 with a pending
+    /// notice: the subject rows, the answers and the notice are all measured
+    /// as wrapped rows, so none of them is cut.
+    #[tokio::test]
+    async fn a_seven_row_command_and_a_notice_fit_at_80_columns() {
+        let subject = (1..=7)
+            .map(|row| format!("echo row{row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (height, notice) in [(24, false), (12, true)] {
+            let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+            panel.inbox.lock().push_back(framed_approval(&subject));
+            panel.drain_inbox();
+            if notice {
+                type_str(&mut panel, "what does it do?");
+                panel.handle_key(key(KeyCode::Enter));
+                assert!(panel.confirm_notice.is_some(), "a prompt left a notice");
+            }
+            let mut screen = draw(&mut panel, 80, height).0.join("\n");
+            assert!(screen.contains("y allow once"), "{height}: {screen}");
+            assert!(
+                screen.contains("for this session · n deny (or no: reason) · ? details"),
+                "{height}: the wrapped answer row is whole:\n{screen}"
+            );
+            if notice {
+                assert!(
+                    screen.contains("waiting on an approval answer"),
+                    "{height}: the notice is pinned too:\n{screen}"
+                );
+                screen = page_until(&mut panel, 80, height, "echo row7");
+            }
+            assert!(screen.contains("echo row1") || notice, "{height}: {screen}");
+            assert!(screen.contains("echo row7"), "{height}: {screen}");
+            assert!(
+                screen.contains("waiting on an approval answer") || !notice,
+                "{height}: the notice outlives scrolling:\n{screen}"
+            );
+        }
+    }
+
+    /// `?` on a command taller than 24 rows shows the whole prompt in the
+    /// frame, reachable by scrolling, with no silent cap.
+    #[tokio::test]
+    async fn approval_details_are_not_capped() {
+        let subject = (1..=40)
+            .map(|row| format!("echo line{row:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(framed_approval(&subject));
+        panel.drain_inbox();
+        panel.handle_key(key(KeyCode::Char('?')));
+        let screen = page_until(&mut panel, 80, 24, "Arguments:");
+        assert!(!screen.contains("more lines"), "{screen}");
+        assert!(!screen.contains("Ctrl-O to expand"), "{screen}");
+        // The JSON arguments repeat the command, so its last line sits at the
+        // very end of the details.
+        page_until(&mut panel, 80, 24, "echo line40\"}");
+    }
+
+    /// A subject past the render bound cannot be reviewed in full, so it can
+    /// only be denied, and the frame says so.
+    #[tokio::test]
+    async fn an_oversized_subject_can_only_be_denied() {
+        let subject = format!("{}printf TAIL", "x".repeat(APPROVAL_RENDER_BYTES + 10));
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(framed_approval(&subject));
+        panel.drain_inbox();
+        let screen = page_until(&mut panel, 80, 24, "21 more bytes not shown");
+        assert!(!screen.contains("printf TAIL"), "{screen}");
+        type_str(&mut panel, "y");
+        panel.handle_key(key(KeyCode::Enter));
+        assert!(
+            panel.pending_confirm.is_some(),
+            "an oversized subject is never approved"
+        );
+        assert!(
+            panel
+                .confirm_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("can only be denied")),
+            "{:?}",
+            panel.confirm_notice
+        );
+    }
+
+    /// The frame's subject, context and labels come from the host and are
+    /// what the user approves from, so terminal controls never reach the
+    /// screen through them.
+    #[tokio::test]
+    async fn framed_approval_text_strips_terminal_controls() {
+        let choices = [
+            ApprovalChoice::new("once", "allow \u{1b}[2Konce\r", &["y"], true),
+            ApprovalChoice::new("deny", "deny\u{202e}", &["n\u{1b}"], false),
+        ];
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(
+            IOMessage::system_text("Run command:\n  rm -rf build")
+                .with_metadata(IO_TYPE, TYPE_CONFIRM)
+                .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
+                .with_metadata(
+                    APPROVAL_SUBJECT,
+                    "echo ok\u{1b}[1A\u{1b}[2K\rrm -rf build \u{202e}txt.exe",
+                )
+                .with_metadata(
+                    APPROVAL_CONTEXT,
+                    "run_command\u{1b}]0;pwned\u{7} in\r ~/demo",
+                ),
+        );
+        panel.drain_inbox();
+        let screen = draw(&mut panel, 100, 20).0.join("\n");
+        for control in ['\u{1b}', '\r', '\u{202e}', '\u{7}'] {
+            assert!(
+                !screen.contains(control),
+                "{control:?} reached the screen:\n{screen}"
+            );
+        }
+        assert!(
+            screen.contains("echo ok[1A[2Krm -rf build txt.exe"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("approve? · run_command]0;pwned in ~/demo"),
+            "{screen}"
+        );
+        assert!(screen.contains("y allow [2Konce · n deny"), "{screen}");
+    }
+
+    /// The footer is measured with the wrapper that draws it. A naive
+    /// `width.div_ceil` count says these answers need two rows at 40
+    /// columns; word wrap needs more, and every word still shows.
+    #[tokio::test]
+    async fn the_approval_footer_is_measured_as_word_wrapped() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.inbox.lock().push_back(framed_approval("ls"));
+        panel.drain_inbox();
+        let (_, footer) = panel.approval_chrome().unwrap();
+        let inner = 38;
+        let naive = footer[0].width().div_ceil(inner);
+        let wrapped = Paragraph::new(footer)
+            .wrap(Wrap { trim: false })
+            .line_count(u16::try_from(inner).unwrap());
+        assert!(
+            wrapped > naive,
+            "word wrap needs more rows: {wrapped} vs {naive}"
+        );
+        let screen = draw(&mut panel, 40, 40).0.join("\n");
+        for word in ["once", "subcommand)", "reason)", "details"] {
+            assert!(screen.contains(word), "{word} was cut:\n{screen}");
+        }
+    }
+
+    /// `?` toggles details only on an empty input with a framed approval
+    /// open; otherwise it is a character like any other.
+    #[tokio::test]
+    async fn question_mark_toggles_details_only_on_an_empty_framed_input() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        // No approval: just typed.
+        panel.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(panel.composer.text(), "?");
+        panel.composer.clear();
+
+        // An approval without a subject: still typed.
+        panel.inbox.lock().push_back(confirm_msg("Run it?"));
+        panel.drain_inbox();
+        panel.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(panel.composer.text(), "?", "no frame, no toggle");
+        assert!(!panel.approval_details);
+        panel.composer.clear();
+
+        // A framed approval with text typed: still typed.
+        panel.inbox.lock().push_back(framed_approval("ls"));
+        panel.drain_inbox();
+        type_str(&mut panel, "why");
+        panel.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(panel.composer.text(), "why?");
+        assert!(!panel.approval_details, "typed text keeps `?` a character");
+        panel.composer.clear();
+
+        // Empty input: toggles on, then off again.
+        panel.handle_key(key(KeyCode::Char('?')));
+        assert!(panel.approval_details);
+        assert!(
+            draw(&mut panel, 100, 30)
+                .0
+                .join("\n")
+                .contains("Arguments:")
+        );
+        panel.handle_key(key(KeyCode::Char('?')));
+        assert!(!panel.approval_details);
+        let screen = draw(&mut panel, 100, 30).0.join("\n");
+        assert!(!screen.contains("Arguments:"), "toggled off: {screen}");
+        assert!(panel.composer.is_empty());
+    }
+
+    /// The frame wraps a subject once per width, not once per frame.
+    #[tokio::test]
+    async fn the_approval_body_is_wrapped_once_per_width() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel
+            .inbox
+            .lock()
+            .push_back(framed_approval(&hidden_tail_command()));
+        panel.drain_inbox();
+        draw(&mut panel, 80, 24);
+        let first = panel
+            .pending_frame_mut()
+            .unwrap()
+            .wrapped
+            .as_ref()
+            .unwrap()
+            .rows
+            .as_ptr();
+        draw(&mut panel, 80, 24);
+        let again = panel
+            .pending_frame_mut()
+            .unwrap()
+            .wrapped
+            .as_ref()
+            .unwrap()
+            .rows
+            .as_ptr();
+        assert_eq!(first, again, "an unchanged width reuses the wrapped rows");
+        draw(&mut panel, 60, 24);
+        assert_eq!(
+            panel
+                .pending_frame_mut()
+                .unwrap()
+                .wrapped
+                .as_ref()
+                .unwrap()
+                .width,
+            58
+        );
+    }
+
+    #[test]
+    fn hard_wrap_keeps_every_character_in_order() {
+        let text = "ab cd  ef\n\nwide 世界!";
+        for width in 1..=12 {
+            let rows = hard_wrap(text, width);
+            assert!(
+                rows.iter()
+                    .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= width.max(2)),
+                "{width}: {rows:?}"
+            );
+            let lines = text.split('\n').count();
+            assert_eq!(
+                rows.concat().len() + lines - 1,
+                text.len(),
+                "{width}: nothing dropped: {rows:?}"
+            );
+        }
+        assert_eq!(hard_wrap("abcdef", 4), ["abcd", "ef"]);
+        assert_eq!(hard_wrap("", 4), [""]);
+    }
+
+    /// A refusal from a queue that still holds the message is reported, not
+    /// swallowed; only a consumed message falls through.
+    #[tokio::test]
+    async fn a_queue_refusal_for_a_waiting_message_is_reported() {
+        struct Stuck;
+        impl TurnInputHandle for Stuck {
+            fn submit(
+                &self,
+                _text: String,
+                mode: TurnInputMode,
+            ) -> Result<TurnInputReceipt, String> {
+                Ok(TurnInputReceipt {
+                    id: 7,
+                    target_run: 1,
+                    mode,
+                })
+            }
+            fn replace(&self, _id: u64, _text: String) -> Result<(), String> {
+                Err("queue unavailable".into())
+            }
+            fn remove(&self, _id: u64) -> Result<(), String> {
+                Err("queue unavailable".into())
+            }
+        }
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.turn_input = Some(Arc::new(Stuck));
+        type_str(&mut panel, "first");
+        panel.handle_key(key(KeyCode::Enter));
+        assert_eq!(panel.handle_key(alt(KeyCode::Up)), EventOutcome::Consumed);
+        assert_eq!(panel.editor_notice.as_deref(), Some("queue unavailable"));
+        assert_eq!(
+            panel.pending_turn_inputs.len(),
+            1,
+            "the message stays queued"
+        );
     }
 }
