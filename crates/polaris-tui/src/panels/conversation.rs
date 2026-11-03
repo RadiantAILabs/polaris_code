@@ -540,6 +540,9 @@ const UNSEEN_TAIL_SHORT: &str = "scroll to the end first (↓ / PgDn)";
 /// What [`UNSEEN_TAIL_NOTICE`] is shown as when the terminal has no room to
 /// draw any of the command: scrolling cannot help there.
 const CRAMPED_NOTICE: &str = "too small to show the command: enlarge the terminal, or deny (n)";
+/// Why a confirming answer is refused while a cluster of the subject is wider
+/// than the frame and can only be drawn as a stand-in.
+const NARROW_NOTICE: &str = "too narrow to show the command: widen the terminal, or deny (n)";
 /// Rows the input takes at its smallest: one row of draft and its borders.
 const COMPOSER_MIN_HEIGHT: usize = 3;
 /// Composer width assumed before the first frame has measured the real one.
@@ -935,6 +938,9 @@ struct WrappedBody {
     /// The row just past the subject (and its omission marker): once this
     /// row's predecessor has been drawn, the whole subject has been.
     subject_end: usize,
+    /// Whether every cluster of the subject fits the width, so that nothing
+    /// was replaced by a stand-in (see [`hard_wrap`]).
+    faithful: bool,
 }
 
 /// [`ApprovalFrame`]'s answers line, measured for one width.
@@ -1076,12 +1082,18 @@ impl ApprovalFrame {
                     .map(|row| Line::styled(row, dim)),
             );
         }
+        use unicode_segmentation::UnicodeSegmentation;
+        let faithful = !self
+            .subject
+            .graphemes(true)
+            .any(|grapheme| cell_width(grapheme) > width);
         WrappedBody {
             width,
             details,
             collapsed,
             rows,
             subject_end,
+            faithful,
         }
     }
 
@@ -1111,6 +1123,11 @@ impl ApprovalFrame {
             return Some(
                 "this command is too long to review here, so it can only be denied (n)".into(),
             );
+        }
+        // A stand-in hides what the command says, so nothing is approved
+        // until a wider terminal shows it as it is.
+        if self.wrapped.as_ref().is_some_and(|body| !body.faithful) {
+            return Some(NARROW_NOTICE.to_string());
         }
         (!self.seen_end).then(|| UNSEEN_TAIL_NOTICE.to_string())
     }
@@ -1272,7 +1289,9 @@ fn cell_width(grapheme: &str) -> usize {
 /// last words are.
 ///
 /// ratatui skips a cluster wider than the whole row, so at one column a
-/// two-column cluster is shown as `�` rather than as nothing.
+/// two-column cluster is shown as `�` rather than as nothing. That is not the
+/// command's text, so a frame whose subject needed one refuses a confirming
+/// answer ([`ApprovalFrame::blocked`]).
 fn hard_wrap(text: &str, width: usize) -> Vec<String> {
     use unicode_segmentation::UnicodeSegmentation;
     let width = width.max(1);
@@ -2507,8 +2526,11 @@ impl ConversationPanel {
         // Nothing is drawn into an area with no columns, so nothing counts as
         // seen there.
         let drawn = viewport > 0 && inner.width > 0;
+        // A row with a stand-in in it is not the command's row, so a frame
+        // that had to use one has not shown the end.
+        let faithful = body.faithful;
         let subject_end_shown =
-            drawn && scroll < body.subject_end && scroll + viewport >= body.subject_end;
+            drawn && faithful && scroll < body.subject_end && scroll + viewport >= body.subject_end;
         let above = scroll;
         let below = total.saturating_sub(scroll + viewport);
         let newly_seen = subject_end_shown && !approval.seen_end;
@@ -2554,6 +2576,10 @@ impl ConversationPanel {
         // The refusal asked for the tail; once it has been shown, the advice
         // is stale and comes down on the next frame.
         if newly_seen && self.confirm_notice.as_deref() == Some(UNSEEN_TAIL_NOTICE) {
+            self.confirm_notice = None;
+        }
+        // Likewise the advice to widen, once the command fits.
+        if faithful && self.confirm_notice.as_deref() == Some(NARROW_NOTICE) {
             self.confirm_notice = None;
         }
     }
@@ -10856,6 +10882,70 @@ mod tests {
         type_str(&mut panel, "y");
         panel.handle_key(key(KeyCode::Enter));
         assert!(panel.pending_confirm.is_none());
+    }
+
+    /// A cluster wider than the frame is drawn as `�`, which is not the
+    /// command's text, so such a command is refused until a resize shows it as
+    /// it is. The verifier's repros: 79 halfwidth marks on one `x` (80 columns
+    /// in a 78-column row, the quoted name being a real 238-byte file name),
+    /// and `漢` at 3 columns.
+    #[tokio::test]
+    async fn a_stand_in_for_a_wide_cluster_is_never_approved() {
+        use polaris::plugins::IOProvider;
+        let marks = format!("rm -rf -- 'x{}'", "\u{ff9e}".repeat(79));
+        for (label, subject, narrow, wide) in [
+            // ratatui measures that one cluster at 159 columns.
+            ("halfwidth marks", marks.as_str(), 80, 200),
+            ("a wide character", "漢", 3, 80),
+        ] {
+            let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+            panel.inbox.lock().push_back(framed_approval(subject));
+            panel.drain_inbox();
+            let screen = draw(&mut panel, narrow, 24).0.join("\n");
+            assert!(
+                screen.contains('\u{fffd}'),
+                "{label}: the stand-in is drawn:\n{screen}"
+            );
+            type_str(&mut panel, "y");
+            panel.handle_key(key(KeyCode::Enter));
+            assert!(
+                panel.pending_confirm.is_some() && nothing_submitted(&panel),
+                "{label}: `y` was accepted with a stand-in on screen"
+            );
+            let screen = draw(&mut panel, narrow, 24).0.join("\n");
+            if narrow >= 40 {
+                assert!(
+                    screen.contains("too narrow to show the command"),
+                    "{label}:\n{screen}"
+                );
+            }
+
+            // Wide enough to draw it as it is, the refusal lifts, and the
+            // command still has to be drawn before it is approved.
+            let screen = draw(&mut panel, wide, 24).0.join("\n");
+            assert!(!screen.contains('\u{fffd}'), "{label}: {screen}");
+            // The advice comes down on the frame after the one that lifts it.
+            let screen = draw(&mut panel, wide, 24).0.join("\n");
+            assert!(
+                !screen.contains("too narrow"),
+                "{label}: the notice comes down:\n{screen}"
+            );
+            type_str(&mut panel, "y");
+            panel.handle_key(key(KeyCode::Enter));
+            assert!(
+                panel.pending_confirm.is_none(),
+                "{label}: shown as it is, `y` answers"
+            );
+            let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.metadata.get(CONFIRMED).map(String::as_str),
+                Some(CONFIRMED_TRUE),
+                "{label}"
+            );
+        }
     }
 
     /// No size panics, however the frame is dressed: with a notice or without,
