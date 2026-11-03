@@ -10,8 +10,8 @@ use polaris::shell::{ShellExecutor, ShellPermission};
 use polaris::system::resource::GlobalResource;
 use polaris::tools::{ToolContext, ToolError, ToolPermission, ToolRegistry};
 use polaris_tui::{
-    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_REQUEST_ID, ApprovalChoice,
-    IO_TYPE_APPROVAL_RESOLVED,
+    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_CONTEXT, APPROVAL_REQUEST_ID, APPROVAL_SUBJECT,
+    ApprovalChoice, IO_TYPE_APPROVAL_RESOLVED,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -23,6 +23,20 @@ use crate::tools::approval::{ApprovalReceipt, call_directory, call_paths};
 use super::rules::{command_permission, simple_prefix};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// `directory` with the user's home shown as `~`, for a prompt line that
+/// should be short enough to read at a glance.
+fn home_relative(directory: &Path) -> String {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| {
+            directory
+                .strip_prefix(&home)
+                .ok()
+                .map(|rest| Path::new("~").join(rest).display().to_string())
+        })
+        .unwrap_or_else(|| directory.display().to_string())
+}
 
 /// A user's refusal is distinct from failure of the approval channel.
 #[derive(Debug)]
@@ -258,25 +272,27 @@ impl ApprovalRequest {
             &["y", "yes", "once"],
             true,
         )];
-        if self.remember
-            && let (Some(command), Some(directory)) = (&self.command, &self.directory)
-        {
+        // The prompt shows the command and its directory once, framed, so the
+        // labels only say how far each answer reaches.
+        if self.remember && self.command.is_some() && self.directory.is_some() {
             choices.push(ApprovalChoice::new(
                 "exact",
-                format!(
-                    "allow exact command {command:?} in {} for this session",
-                    directory.display()
-                ),
+                "allow for session",
                 &["s", "exact"],
                 true,
             ));
             if let Some(prefix) = &self.prefix {
-                choices.push(ApprovalChoice::new("prefix", format!("allow prefix {prefix:?} (whole words, every subcommand) in {} for this session", directory.display()), &["p", "prefix"], true));
+                choices.push(ApprovalChoice::new(
+                    "prefix",
+                    format!("allow prefix {prefix:?} for session"),
+                    &["p", "prefix"],
+                    true,
+                ));
             }
         }
         choices.push(ApprovalChoice::new(
             "deny",
-            "deny (optional: deny: reason)",
+            "deny (or no: reason)",
             &["n", "no", "deny"],
             false,
         ));
@@ -338,14 +354,27 @@ impl ApprovalRequest {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        io.send(
-            IOMessage::system_text(format!("{prompt}\n\n{labels}"))
-                .with_metadata(IO_TYPE, IO_TYPE_CONFIRM)
-                .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
-                .with_metadata(APPROVAL_REQUEST_ID, &self.id),
-        )
-        .await
-        .map_err(ApprovalError::Prompt)?;
+        let mut message = IOMessage::system_text(format!("{prompt}\n\n{labels}"))
+            .with_metadata(IO_TYPE, IO_TYPE_CONFIRM)
+            .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
+            .with_metadata(APPROVAL_REQUEST_ID, &self.id);
+        // A command is the one thing being approved: name it once, verbatim,
+        // so the panel can frame it instead of repeating the whole prompt.
+        if let Some(command) = &self.command {
+            message = message
+                .with_metadata(APPROVAL_SUBJECT, command)
+                .with_metadata(
+                    APPROVAL_CONTEXT,
+                    format!(
+                        "{} in {}",
+                        self.tool,
+                        self.directory
+                            .as_deref()
+                            .map_or_else(|| "<invalid directory>".into(), home_relative)
+                    ),
+                );
+        }
+        io.send(message).await.map_err(ApprovalError::Prompt)?;
         let response = io.receive().await.map_err(ApprovalError::Prompt)?;
         if response
             .metadata

@@ -182,6 +182,13 @@
 //! standard `confirmed` metadata. `deny: reason` returns a denial with the
 //! original text. The panel keeps no command, path or persistence semantics.
 //!
+//! A host may also name the one thing being approved with `approval_subject`
+//! (a command, verbatim) and where with `approval_context` (`run_command in
+//! ~/repo`). The panel then shows the subject once, in a framed block pinned
+//! above the input with a single compact line of answers, keeps the full
+//! prompt out of the transcript, and reveals it inside the frame when `?` is
+//! pressed on an empty input. Without a subject the prompt renders as before.
+//!
 //! The panel decides nothing about *which* actions need approval — that is the
 //! tool's permission, set by the consumer. This is presentation and the answer
 //! protocol only.
@@ -323,7 +330,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -488,6 +495,8 @@ const INTERRUPT_ESCALATION: Duration = Duration::from_millis(1500);
 /// contents. Tall enough for a pasted function, short enough that the
 /// transcript never collapses to nothing.
 const COMPOSER_MAX_ROWS: usize = 10;
+/// Rows of a framed approval's subject shown before the rest folds behind `?`.
+const APPROVAL_SUBJECT_ROWS: usize = 6;
 /// Composer width assumed before the first frame has measured the real one.
 const DEFAULT_COMPOSER_WIDTH: usize = 80;
 /// Braille spinner frames cycled while a step is in flight.
@@ -736,6 +745,12 @@ pub const APPROVAL_CHOICES: &str = "approval_choices";
 pub const APPROVAL_CHOICE: &str = "approval_choice";
 /// Metadata key correlating an approval prompt, its response and its resolution.
 pub const APPROVAL_REQUEST_ID: &str = "approval_request_id";
+/// Metadata key naming, verbatim, the one thing an approval authorizes (a
+/// command). Its presence switches the panel to the framed approval block.
+pub const APPROVAL_SUBJECT: &str = "approval_subject";
+/// Metadata key with a short line saying where the subject applies, shown in
+/// the framed approval block's title (`run_command in ~/repo`).
+pub const APPROVAL_CONTEXT: &str = "approval_context";
 /// [`IO_TYPE`] value closing a resolved approval without soliciting another answer.
 pub const IO_TYPE_APPROVAL_RESOLVED: &str = "approval_resolved";
 
@@ -811,6 +826,13 @@ struct PendingConfirm {
     summary: String,
     /// Generic host-provided answer keys and labels; the panel interprets no tool rules.
     choices: Vec<ApprovalChoice>,
+    /// The host-named thing being approved ([`APPROVAL_SUBJECT`]), framed above
+    /// the input in place of the one-line banner.
+    subject: Option<String>,
+    /// Where the subject applies ([`APPROVAL_CONTEXT`]), titled on the frame.
+    context: Option<String>,
+    /// The full prompt, shown inside the frame on `?`.
+    details: String,
 }
 
 impl PendingConfirm {
@@ -921,6 +943,8 @@ pub struct ConversationPanel {
     /// Transient explanation appended to the approval banner — why the last
     /// submission did not resolve the dialog.
     confirm_notice: Option<String>,
+    /// Whether the framed approval shows the full prompt (`?` toggles it).
+    approval_details: bool,
     /// Why the last submission was refused by the channel; `None` once one
     /// lands. Drives the delivery banner and keeps the draft in the input.
     delivery_failure: Option<DeliveryFailure>,
@@ -1107,6 +1131,7 @@ impl ConversationPanel {
             log_buffer: None,
             pending_confirm: None,
             confirm_notice: None,
+            approval_details: false,
             delivery_failure: None,
             last_interrupt: None,
             interrupt_handle: None,
@@ -1538,12 +1563,20 @@ impl ConversationPanel {
                     if self.pending_confirm.is_none() {
                         self.notify_approval();
                     }
+                    let details = match &message.content {
+                        IOContent::Text(text) => strip_choice_labels(text, &choices),
+                        other => other_body(other),
+                    };
                     self.pending_confirm = Some(PendingConfirm {
                         id: message.metadata.get(APPROVAL_REQUEST_ID).cloned(),
                         summary,
                         choices,
+                        subject: message.metadata.get(APPROVAL_SUBJECT).cloned(),
+                        context: message.metadata.get(APPROVAL_CONTEXT).cloned(),
+                        details,
                     });
                     self.confirm_notice = None;
+                    self.approval_details = false;
                     self.push_transcript(message);
                 }
                 // An assistant message block: deltas sharing an `id` fold
@@ -1834,7 +1867,10 @@ impl ConversationPanel {
     /// what is being approved and exactly which answers resolve it. Returns
     /// `None` — and the row collapses to zero height — when nothing is pending.
     fn confirm_line(&self) -> Option<Line<'static>> {
-        let pending = self.pending_confirm.as_ref()?;
+        let pending = self
+            .pending_confirm
+            .as_ref()
+            .filter(|pending| pending.subject.is_none())?;
         let accent = Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
@@ -1873,6 +1909,85 @@ impl ConversationPanel {
             ));
         }
         Some(Line::from(spans))
+    }
+
+    /// The framed approval block for a host-named subject: its title and
+    /// rows, or `None` when no such approval is open.
+    ///
+    /// The subject is shown once, verbatim and capped at
+    /// [`APPROVAL_SUBJECT_ROWS`]; the answers follow on one line. `?` adds the
+    /// full prompt underneath, bounded the same way a tool body is.
+    fn approval_frame(&self) -> Option<(String, Vec<Line<'static>>)> {
+        let pending = self.pending_confirm.as_ref()?;
+        let subject = pending.subject.as_deref()?;
+        let title = match &pending.context {
+            Some(context) => format!(" approve? · {} ", safe_text(context).replace('\n', " ")),
+            None => " approve? ".to_string(),
+        };
+        let strong = Style::default().add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(Color::DarkGray);
+        let key_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let subject = safe_text(subject);
+        let subject_rows = subject.lines().count();
+        let mut lines = subject
+            .lines()
+            .take(APPROVAL_SUBJECT_ROWS)
+            .map(|row| Line::styled(row.to_string(), strong))
+            .collect::<Vec<_>>();
+        if subject_rows > APPROVAL_SUBJECT_ROWS && !self.approval_details {
+            lines.push(Line::styled(
+                format!(
+                    "… {} more lines · ? shows all",
+                    subject_rows - APPROVAL_SUBJECT_ROWS
+                ),
+                dim,
+            ));
+        }
+        if self.approval_details {
+            lines.push(Line::default());
+            lines.extend(
+                preview_lines(&pending.details, false)
+                    .into_iter()
+                    .map(|mut line| {
+                        line.style = line.style.patch(dim);
+                        line
+                    }),
+            );
+        }
+        let mut answers = Vec::new();
+        for choice in &pending.choices {
+            if !answers.is_empty() {
+                answers.push(Span::styled(" · ", dim));
+            }
+            answers.push(Span::styled(
+                choice.keys.first().cloned().unwrap_or_default(),
+                key_style,
+            ));
+            answers.push(Span::raw(format!(" {}", safe_text(&choice.label))));
+        }
+        if answers.is_empty() {
+            answers.push(Span::styled("y", key_style));
+            answers.push(Span::raw(" run it · "));
+            answers.push(Span::styled("n", key_style));
+            answers.push(Span::raw(" deny"));
+        }
+        answers.push(Span::styled(" · ", dim));
+        answers.push(Span::styled("?", key_style));
+        answers.push(Span::raw(if self.approval_details {
+            " hide details"
+        } else {
+            " details"
+        }));
+        lines.push(Line::from(answers));
+        if let Some(notice) = &self.confirm_notice {
+            lines.push(Line::styled(
+                safe_text(notice),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        Some((title, lines))
     }
 
     /// One-line delivery banner: why the last submission was refused, and
@@ -2240,7 +2355,11 @@ impl ConversationPanel {
         }
         self.pending_confirm = None;
         self.confirm_notice = None;
-        self.push_transcript(IOMessage::user_text(text.to_string()));
+        // Marked as an answer so the transcript does not open a new turn
+        // for it.
+        self.push_transcript(
+            IOMessage::user_text(text.to_string()).with_metadata(CONFIRMED, value),
+        );
         true
     }
 
@@ -2849,6 +2968,36 @@ fn phase_style(phase: &str) -> (&'static str, Color) {
     }
 }
 
+/// The prompt without its trailing `key: label` paragraph when that paragraph
+/// only restates `choices`, which the approval frame already lists.
+fn strip_choice_labels(text: &str, choices: &[ApprovalChoice]) -> String {
+    let Some((prompt, labels)) = text.rsplit_once("\n\n") else {
+        return text.to_string();
+    };
+    let restates = !choices.is_empty()
+        && labels.lines().all(|line| {
+            choices.iter().any(|choice| {
+                line.split_once(": ").is_some_and(|(key, label)| {
+                    choice.keys.first().is_some_and(|first| first == key) && choice.label == label
+                })
+            })
+        });
+    if restates {
+        prompt.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// How many terminal rows `lines` occupy once wrapped to `width` columns.
+fn wrapped_rows(lines: &[Line<'_>], width: usize) -> usize {
+    let width = width.max(1);
+    lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
+        .sum()
+}
+
 /// Shorten `text` to at most `width` columns at a word boundary, marking the
 /// cut with `…`. A single word wider than `width` is cut at the glyph.
 fn clip_words(text: &str, width: usize) -> String {
@@ -2930,6 +3079,14 @@ fn build_message_layout(
         if unknown_message(message) && !expanded {
             continue;
         }
+        // A framed approval shows its subject above the input; the full
+        // prompt would only repeat it, so it stays behind Ctrl-O.
+        if !expanded
+            && message.metadata.get(IO_TYPE).map(String::as_str) == Some(TYPE_CONFIRM)
+            && message.metadata.contains_key(APPROVAL_SUBJECT)
+        {
+            continue;
+        }
         starts.push((message_index, lines.len()));
         // An approval request is the one message labelled by kind rather than
         // source: it carries the command or edit about to run, so it must not
@@ -2971,7 +3128,10 @@ fn build_message_layout(
             IOSource::User => ("you".to_string(), Color::Cyan),
             IOSource::Agent(name) => (name.clone(), Color::Green),
             IOSource::External(name) => (name.clone(), Color::Yellow),
-            IOSource::System => ("system".to_string(), Color::Magenta),
+            // Host chatter (model chosen, region, notices) is context, not
+            // conversation: it reads dim so colour stays with the answer,
+            // approvals and errors.
+            IOSource::System => ("system".to_string(), Color::DarkGray),
         };
         let body = other_body(&message.content);
         // A submitted prompt the agent has not taken yet is queued, not
@@ -3034,17 +3194,47 @@ fn build_message_layout(
                     .insert(0, Span::styled("│ ", Style::default().fg(Color::Red)));
             }
         }
+        if kind.is_none() && message.source == IOSource::System {
+            for line in &mut rendered {
+                line.style = line.style.fg(Color::DarkGray);
+            }
+        }
+        // Each prompt the user sends opens a turn; a blank row above it keeps
+        // turns apart. Attributed to the message itself (an approval answer
+        // is not a new turn), so a one-message rebuild counts the same rows.
+        if message.source == IOSource::User
+            && kind.is_none()
+            && !message.metadata.contains_key(CONFIRMED)
+        {
+            lines.push(Line::default());
+        }
+        // A tool row keeps colour for its state glyph only; the name and
+        // timing are dim so the command or summary beside them reads first.
+        let first_lead = match label.split_once(' ') {
+            Some((glyph, rest)) if kind == Some(TYPE_TOOL) => vec![
+                Span::raw(nest.clone()),
+                Span::styled(
+                    safe_text(glyph),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {} ❯ ", safe_text(rest)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ],
+            _ => vec![Span::styled(
+                prefix.clone(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )],
+        };
         let last = rendered.len().saturating_sub(1);
         for (index, mut line) in rendered.into_iter().enumerate() {
             let lead = if index == 0 {
-                Span::styled(
-                    prefix.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )
+                first_lead.clone()
             } else {
-                Span::raw(indent.clone())
+                vec![Span::raw(indent.clone())]
             };
-            line.spans.insert(0, lead);
+            line.spans.splice(0..0, lead);
             if queued && index == last {
                 line.spans.push(Span::styled(
                     "  · queued",
@@ -3263,6 +3453,14 @@ impl TuiPanel for ConversationPanel {
             banner_lines.push(line);
         }
         let banner_height = u16::try_from(banner_lines.len()).unwrap_or(u16::MAX);
+        // The framed approval sits directly above the input. It may take up
+        // to half the panel; whatever it cannot fit is clipped at the bottom,
+        // where the answers would be, so it is measured before layout.
+        let approval = self.approval_frame();
+        let approval_height = approval.as_ref().map_or(0, |(_, lines)| {
+            let rows = wrapped_rows(lines, usize::from(area.width.saturating_sub(2))) + 2;
+            u16::try_from(rows).unwrap_or(u16::MAX).min(area.height / 2)
+        });
         // The composer grows with its content and then scrolls inside a fixed
         // frame. Its width is known before layout (the area's, less borders),
         // so the wrapped row count — and therefore the height it wants — can be
@@ -3273,7 +3471,10 @@ impl TuiPanel for ConversationPanel {
         // Never grow so far that the transcript is squeezed out: reserve the
         // meta and banner rows, the composer's own borders, and one row of
         // transcript before spending anything on the draft.
-        let reserved = usize::from(meta_height) + usize::from(banner_height) + 3;
+        let reserved = usize::from(meta_height)
+            + usize::from(banner_height)
+            + usize::from(approval_height)
+            + 3;
         let budget = usize::from(area.height).saturating_sub(reserved);
         let max_rows = budget.clamp(1, COMPOSER_MAX_ROWS);
         let visible_rows = composer_rows.len().clamp(1, max_rows);
@@ -3285,6 +3486,7 @@ impl TuiPanel for ConversationPanel {
                 Constraint::Min(1),
                 Constraint::Length(meta_height),
                 Constraint::Length(banner_height),
+                Constraint::Length(approval_height),
                 Constraint::Length(composer_height),
             ])
             .split(area);
@@ -3367,6 +3569,26 @@ impl TuiPanel for ConversationPanel {
             frame.render_widget(Paragraph::new(banner_lines), chunks[2]);
         }
 
+        if let Some((title, lines)) = approval
+            && chunks[3].height > 0
+        {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .border_style(Style::default().fg(Color::Yellow));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(block),
+                chunks[3],
+            );
+        }
+
         // A multi-line draft says so in its title: `Enter` submits the whole
         // thing, and the row count is the only cue that there is more above
         // the fold once the draft outgrows the frame.
@@ -3383,8 +3605,8 @@ impl TuiPanel for ConversationPanel {
             } else {
                 Style::default().fg(Color::DarkGray)
             });
-        let input_inner = input_block.inner(chunks[3]);
-        frame.render_widget(input_block, chunks[3]);
+        let input_inner = input_block.inner(chunks[4]);
+        frame.render_widget(input_block, chunks[4]);
 
         // Keep the caret on screen: scroll only as far as it takes, and never
         // past the last row, so a shrinking draft pulls the view back down.
@@ -3454,6 +3676,21 @@ impl ConversationPanel {
         }
         if let Some(outcome) = self.browse_key(key) {
             return outcome;
+        }
+        // `?` on an empty input opens the framed approval's details. Typed
+        // anywhere else it is just a character.
+        if key.code == KeyCode::Char('?')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self.composer.is_empty()
+            && self
+                .pending_confirm
+                .as_ref()
+                .is_some_and(|pending| pending.subject.is_some())
+        {
+            self.approval_details = !self.approval_details;
+            return EventOutcome::Consumed;
         }
         // An open popup gets first refusal on the keys it claims. Everything
         // it declines is an ordinary edit, after which the popup is
@@ -4773,6 +5010,9 @@ mod tests {
             id: None,
             summary: "approve?".into(),
             choices: Vec::new(),
+            subject: None,
+            context: None,
+            details: String::new(),
         });
         // Even a previously armed escalation must not override navigation.
         panel.last_interrupt = Some(Instant::now());
@@ -5620,18 +5860,19 @@ mod tests {
         panel.handle_key(key(KeyCode::Enter));
 
         let queued: Vec<String> = panel.message_lines().iter().map(line_text).collect();
+        // Row 0 is the blank row that opens the turn.
         assert!(
-            queued[0].contains("· queued"),
+            queued[1].contains("· queued"),
             "a prompt waiting in the channel says so: {queued:?}"
         );
 
         provider.receive().await.unwrap();
         let taken: Vec<String> = panel.message_lines().iter().map(line_text).collect();
         assert!(
-            !taken[0].contains("· queued"),
+            !taken[1].contains("· queued"),
             "the badge clears once the agent takes it: {taken:?}"
         );
-        assert!(taken[0].ends_with("ping"), "and the text is untouched");
+        assert!(taken[1].ends_with("ping"), "and the text is untouched");
     }
 
     #[tokio::test]
@@ -5661,7 +5902,7 @@ mod tests {
 
         let lines: Vec<String> = panel.message_lines().iter().map(line_text).collect();
         assert!(
-            lines[0].contains("· queued"),
+            lines[1].contains("· queued"),
             "the deferred prompt is still queued: {lines:?}"
         );
 
@@ -7037,6 +7278,84 @@ mod tests {
         // because the number would still be climbing.
         assert!(text.contains("1.5s"), "{text}");
         assert!(text.contains('✓'), "{text}");
+    }
+
+    /// Each user prompt opens a turn with a blank row; an approval answer does
+    /// not, and a one-message rebuild counts the same rows as in context.
+    #[tokio::test]
+    async fn turns_are_separated_by_a_blank_row_but_answers_are_not() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        panel.push_transcript(IOMessage::user_text("first"));
+        panel.push_transcript(IOMessage::from_agent("code", IOContent::Text("ok".into())));
+        panel.push_transcript(IOMessage::user_text("y").with_metadata(CONFIRMED, CONFIRMED_TRUE));
+        panel.push_transcript(IOMessage::user_text("second"));
+        let rows = panel
+            .message_lines()
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "",
+                "you ❯ first",
+                "code ❯ ok",
+                "you ❯ y",
+                "",
+                "you ❯ second"
+            ],
+        );
+        let alone = build_message_lines(&VecDeque::from([panel.transcript[3].clone()]), 0, false);
+        assert_eq!(alone.len(), 2);
+    }
+
+    /// A host-named subject is framed once above the input; the raw prompt
+    /// stays out of the transcript and opens with `?`.
+    #[tokio::test]
+    async fn a_named_approval_subject_is_framed_once_with_details_on_demand() {
+        let (_provider, mut panel) = TuiIOProvider::new_with_panel(8);
+        let choices = [
+            ApprovalChoice::new("once", "allow once", &["y"], true),
+            ApprovalChoice::new("exact", "allow for session", &["s"], true),
+            ApprovalChoice::new("deny", "deny (or no: reason)", &["n"], false),
+        ];
+        panel.inbox.lock().push_back(
+            IOMessage::system_text(
+                "Run command:\n  cat notes.txt\n\nArguments: {\"command\":\"cat notes.txt\"}\n\n\
+                 y: allow once\ns: allow for session\nn: deny (or no: reason)",
+            )
+            .with_metadata(IO_TYPE, TYPE_CONFIRM)
+            .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
+            .with_metadata(APPROVAL_SUBJECT, "cat notes.txt")
+            .with_metadata(APPROVAL_CONTEXT, "run_command in ~/demo"),
+        );
+        panel.drain_inbox();
+
+        let screen = draw(&mut panel, 100, 20).0.join("\n");
+        assert_eq!(screen.matches("cat notes.txt").count(), 1, "{screen}");
+        assert!(
+            screen.contains("approve? · run_command in ~/demo"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("y allow once · s allow for session · n deny (or no: reason)"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Arguments"), "{screen}");
+
+        panel.handle_key(key(KeyCode::Char('?')));
+        assert!(panel.composer.is_empty(), "`?` toggles rather than types");
+        let screen = draw(&mut panel, 100, 20).0.join("\n");
+        assert!(screen.contains("Arguments"), "{screen}");
+        assert!(
+            !screen.contains("y: allow once"),
+            "the label list is not repeated in the details: {screen}"
+        );
+
+        // The answer path is unchanged.
+        type_str(&mut panel, "y");
+        panel.handle_key(key(KeyCode::Enter));
+        assert!(panel.pending_confirm.is_none());
     }
 
     /// A host summary folds a long result to one row; Ctrl-O shows the body

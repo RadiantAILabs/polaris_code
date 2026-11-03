@@ -576,9 +576,10 @@ mod tests {
         );
         draw(&mut panel, 60);
         enter(&mut panel);
-        panel.view.jump_to_line(10);
+        // Each prompt is a blank turn separator plus its row.
+        panel.view.jump_to_line(21);
         let before = draw(&mut panel, 60);
-        assert!(before.starts_with("you ❯ message 0011"));
+        assert!(before.starts_with("you ❯ message 0011"), "{before}");
         panel.push_transcript(IOMessage::user_text("another tail"));
         let after = draw(&mut panel, 60);
         assert!(after.starts_with("you ❯ message 0011"));
@@ -649,6 +650,9 @@ mod tests {
             id: None,
             summary: "run command?".into(),
             choices: Vec::new(),
+            subject: None,
+            context: None,
+            details: String::new(),
         });
         enter(&mut panel);
         panel.load_history(false);

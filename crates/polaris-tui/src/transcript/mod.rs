@@ -264,7 +264,9 @@ fn markdown_lines(text: &str, expanded: bool) -> Vec<Line<'static>> {
             Event::Code(body) => push_span(
                 &mut table,
                 &mut spans,
-                Span::styled(body.into_string(), style.fg(Color::Yellow)),
+                // Bold rather than coloured: an answer full of paths and
+                // identifiers should not turn the whole screen yellow.
+                Span::styled(body.into_string(), style.add_modifier(Modifier::BOLD)),
             ),
             Event::SoftBreak | Event::HardBreak => {
                 flush(&mut lines, &mut spans);

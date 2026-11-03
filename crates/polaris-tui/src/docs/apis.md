@@ -25,3 +25,7 @@ protocol, not another framework API. Hosts encode choices using
 [`APPROVAL_CHOICES`](crate::APPROVAL_CHOICES); replies identify the selected scope
 with [`APPROVAL_CHOICE`](crate::APPROVAL_CHOICE). Prompt IDs correlate cancellation
 and responses so a resolved approval cannot answer a later receive.
+[`APPROVAL_SUBJECT`](crate::APPROVAL_SUBJECT) and
+[`APPROVAL_CONTEXT`](crate::APPROVAL_CONTEXT) optionally name the one thing being
+approved and where, which the panel frames above the input instead of repeating
+the whole prompt.

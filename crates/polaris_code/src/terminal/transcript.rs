@@ -448,8 +448,12 @@ pub fn tool_detail(tool_name: &str, args: &serde_json::Value) -> String {
 }
 
 /// How big a result is, in the words a collapsed row uses — or `None` when it
-/// already fits on one row and collapsing it would only hide it.
+/// already fits on one row, or is a diff: an edit's diff is the thing to
+/// review, and the panel already folds a long one.
 fn result_size(result: &str) -> Option<String> {
+    if result.starts_with("--- ") || result.contains("\n--- ") && result.contains("\n+++ ") {
+        return None;
+    }
     let lines = result.trim_end_matches('\n').lines().count();
     if lines > 1 {
         Some(format!("{lines} lines"))
