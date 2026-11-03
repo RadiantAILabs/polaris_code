@@ -1279,14 +1279,14 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     );
 }
 
-/// A prompt typed while an approval is open is neither the answer nor lost:
-/// it waits behind the dialog and becomes the next turn.
+/// While the approval picker is open it takes every key: a prompt typed in a
+/// hurry neither answers the approval (answer keys pressed within 400 ms of
+/// other typing are ignored) nor reaches the input. The approval waits for a
+/// deliberate answer, and only the original prompt becomes a turn.
 #[tokio::test]
-async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
+async fn typing_during_an_approval_neither_answers_it_nor_queues_a_turn() {
     let workspace = workspace();
     let mut host = Host::boot(workspace.path(), "default").await;
-    // The open dialog lists its answer choices under the diff, so it needs more
-    // rows than the default screen to keep the finished edit block in view.
     host.resize(160, 40);
     host.spawn_driver();
 
@@ -1297,34 +1297,26 @@ async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
         "newer line",
     ));
     host.script.push(Reply::Text("Applied.".to_string()));
-    host.script
-        .push(Reply::Text("Second turn answer.".to_string()));
     host.submit("edit it").await;
     host.wait_for("the approval", |screen| screen.contains("approve?"))
         .await;
 
-    host.submit("and then tell me a joke").await;
-    let screen = host
-        .wait_for("the queued notice", |screen| {
-            screen.contains("queued for the next turn")
-        })
-        .await;
+    // Contains `n`, `y` and other answer keys, typed without a pause.
+    host.submit("and then tell me a joke, yes").await;
+    let screen = host.frame().await.join("\n");
     assert!(
         screen.contains("approve?"),
-        "the dialog is still open:\n{screen}"
+        "the picker is still open:\n{screen}"
+    );
+    assert!(
+        !screen.contains("queued for the next turn"),
+        "nothing was queued:\n{screen}"
     );
     assert_eq!(host.workspace_file("notes.txt"), "old line\n");
 
     host.answer('y').await;
-    host.wait_for("the first turn", |screen| {
-        screen.contains("code ❯ Applied.")
-    })
-    .await;
-    host.turn_signal.notify_one();
     let screen = host
-        .wait_for("both turns", |screen| {
-            screen.contains("Second turn answer.")
-        })
+        .wait_for("the turn", |screen| screen.contains("code ❯ Applied."))
         .await;
     assert!(screen.contains("✓ edit_file"), "{screen}");
     assert_eq!(host.workspace_file("notes.txt"), "newer line\n");
@@ -1333,11 +1325,11 @@ async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
     host.pause_driver().await;
     assert_eq!(
         host.user_prompts(&session).await,
-        vec!["edit it".to_string(), "and then tell me a joke".to_string()]
+        vec!["edit it".to_string()]
     );
     assert_eq!(
         host.sessions().session_info(&session).unwrap().turn_number,
-        2
+        1
     );
 }
 
