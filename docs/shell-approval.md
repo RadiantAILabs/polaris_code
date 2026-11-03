@@ -53,8 +53,8 @@ simple prefix; `s` and `p` only where remembering is allowed. `n`, `no`, `deny`
 and `Esc` deny; `no: reason` or `deny: reason` returns the reason to the model.
 
 A command taller than the frame scrolls inside it (`↑` / `↓`, `PgUp` / `PgDn`
-with an empty input), and the panel refuses a confirming answer until the
-command's last row has been on screen. A command longer than 64 KiB cannot be
+with an empty input), and the panel refuses a confirming answer until every row
+of the command has been on screen, and while any part of it is too wide to draw. A command longer than 64 KiB cannot be
 shown in full, so only a denial is accepted for it. `?` adds the full prompt —
 tool, directory and JSON arguments — to the frame. On a terminal too small for
 the labels above, the keys move into the frame's top border (`y s p n · ? details`),

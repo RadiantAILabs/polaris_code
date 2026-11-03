@@ -28,6 +28,8 @@ Requires `polaris-tui` 0.1.2.
 - The `p` (prefix) answer is left out when the prefix is very long, instead of showing an oversized label.
 - Approval labels, the context and the prompt's first line are cut to 2 KiB on arrival (a cut one ends in `…`).
 - On a terminal too small for the full answer labels, the keys move into the approval frame's top border, `?` shows the labels above the command, and a refusal reason shows in the bottom border, so the answers and the rest of the command stay reachable. With no room for any of the command, only a denial is accepted until the terminal is enlarged.
+- A confirming answer is refused while part of the command is too wide to draw (shown as `�`), and a burst of scroll keys between frames can no longer skip rows; a new width starts the read again from the top.
+- A refusal on the smallest terminals shows its reason in the input's title instead of nothing.
 - A refused confirming answer is cleared from the input, so `↓` / `PgDn` work at once.
 - The open details hint is now `? hide` (was `? hide details`).
 - Zero-width spaces, line and paragraph separators and byte-order marks are removed from transcript and approval text, like other invisible controls.

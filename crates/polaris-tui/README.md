@@ -383,8 +383,11 @@ input, instead of printing the whole prompt into the transcript:
 - a subject taller than the frame scrolls inside it: `↑` / `↓` move one row and
   `PgUp` / `PgDn` a page while the input is empty, and the frame's border says
   how many rows are above and below;
-- a confirming answer is refused, with a notice, until the subject's last row
-  has been on screen. Denials (`n`, `no: reason`, `Esc`) always go through;
+- a confirming answer is refused, with a notice, until every row of the subject
+  has been on screen (a scroll moves at most a page past the last drawn frame,
+  and a new width starts the read again from the top), and while any part of it
+  is too wide to draw and shows as `�`. Where the frame has no bottom border, the
+  reason is in the input's title. Denials (`n`, `no: reason`, `Esc`) always go through;
 - a subject longer than 64 KiB cannot be shown in full, so only a denial is
   accepted for it;
 - `?` on an empty input adds the full prompt to the same scrolling frame,
