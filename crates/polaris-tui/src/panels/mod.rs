@@ -13,6 +13,7 @@
 //! | [`sessions`]     | [`SessionsPanelPlugin`]      | Live list of active sessions from [`SessionsAPI`](polaris::sessions::SessionsAPI). |
 //! | [`help`]         | [`HelpPanelPlugin`]          | Static keymap reference. Smallest possible example. |
 
+pub(crate) mod approval_picker;
 pub mod conversation;
 pub mod graph;
 pub mod help;

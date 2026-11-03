@@ -646,12 +646,7 @@ mod tests {
         let (_, panel) = TuiIOProvider::new();
         let mut panel = panel.with_history_source(Arc::new(BrokenHistory));
         panel.push_transcript(IOMessage::user_text("keep me"));
-        panel.pending_confirm = Some(PendingConfirm {
-            id: None,
-            summary: "run command?".into(),
-            choices: Vec::new(),
-            frame: None,
-        });
+        panel.pending_confirm = Some(PendingConfirm::for_test("run command?", Vec::new()));
         enter(&mut panel);
         panel.load_history(false);
         tokio::task::yield_now().await;
