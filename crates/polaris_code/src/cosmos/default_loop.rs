@@ -83,6 +83,9 @@ use polaris_cosmos::topology::{
 use polaris_ontrace::oxigraph::OxigraphStore;
 
 use crate::agents::auto_review::{ReviewHistory, ReviewIntent, ReviewPolicy, ReviewResult};
+use crate::agents::code_agent::tool_calls::{
+    AuthorizedCall, CallDecision, CallLifetime, CallProgress, ToolBatch,
+};
 use crate::agents::code_agent::{PreparedContext, SecretRedactor};
 use crate::agents::context::CompactionRun;
 use crate::agents::permission_rules::{
@@ -286,6 +289,8 @@ pub fn type_explanations() -> Result<TypeExplanationRegistry, CatalogError> {
     registry.bind_resource::<ToolRegistry>(type_key("polaris-code.tool-registry"))?;
     registry.bind_resource::<SecretRedactor>(type_key("polaris-code.secret-redactor"))?;
     registry.bind_resource::<AttemptLedger>(type_key("polaris-code.attempt-ledger"))?;
+    registry.bind_resource::<ToolBatch>(type_key("polaris-code.tool-batch"))?;
+    registry.bind_resource::<CallLifetime>(type_key("polaris-code.call-lifetime"))?;
 
     registry.bind_resource::<PermissionRules>(type_key("polaris-code.permission-rules"))?;
     registry.bind_resource::<SessionGrants>(type_key("polaris-code.session-grants"))?;
@@ -297,6 +302,9 @@ pub fn type_explanations() -> Result<TypeExplanationRegistry, CatalogError> {
     registry.bind_resource::<ReviewIntent>(type_key("polaris-code.review-intent"))?;
     registry.bind_resource::<ReviewHistory>(type_key("polaris-code.review-history"))?;
     registry.bind_output::<ReviewResult>(type_key("polaris-code.review-result"))?;
+    registry.bind_output::<CallProgress>(type_key("polaris-code.call-progress"))?;
+    registry.bind_output::<AuthorizedCall>(type_key("polaris-code.authorized-call"))?;
+    registry.bind_output::<CallDecision>(type_key("polaris-code.call-decision"))?;
 
     // Outputs the loop produces, plus the one free output its error handler
     // reads.
@@ -385,13 +393,15 @@ impl ConversationalHost {
 /// session state. It is still reported from [`ConversationalHost`] with the
 /// rest: a plugin has to install it before the loop can read it, which is the
 /// same claim the other entries make.
-const LOOP_RESOURCES: [(&str, ResourceAccess); 28] = [
+const LOOP_RESOURCES: [(&str, ResourceAccess); 30] = [
     ("polaris-code.review-policy", ResourceAccess::Read),
     ("polaris-code.review-intent", ResourceAccess::Write),
     ("polaris-code.review-history", ResourceAccess::Write),
     ("polaris-code.agent-config", ResourceAccess::Read),
     ("polaris-code.agent-llm", ResourceAccess::Write),
     ("polaris-code.attempt-ledger", ResourceAccess::Write),
+    ("polaris-code.tool-batch", ResourceAccess::Write),
+    ("polaris-code.call-lifetime", ResourceAccess::Write),
     ("polaris-code.agent-loop-state", ResourceAccess::Write),
     ("polaris-code.attachment-store", ResourceAccess::Read),
     ("polaris-code.background-tasks", ResourceAccess::Read),
