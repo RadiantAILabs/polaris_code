@@ -10,8 +10,9 @@
 //! This module is the consumer-side render of that document, applied where the
 //! coding agent turns a tool value into a `tool_result` block. It is a
 //! polaris-code concern and not an upstream one: the JSON is the executor's
-//! honest report, and the trajectory and the host transcript keep it — only the
-//! model's copy is rendered.
+//! honest report, and the trajectory keeps it. The model and host transcript
+//! show rendered text; the host block also carries the bounded JSON document
+//! in its `document` metadata.
 //!
 //! The rendered shape, smallest first:
 //!
