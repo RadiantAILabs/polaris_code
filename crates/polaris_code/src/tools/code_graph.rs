@@ -1816,6 +1816,8 @@ impl ConceptTools {
 /// `ready` starts best-effort background indexing, then derives the Rust-only
 /// concept graph. Unsupported, malformed, or individually failing files are
 /// skipped and logged without delaying agent startup.
+/// [`with_boot_index(false)`](Self::with_boot_index) skips that pass and leaves
+/// the index unstarted (see [`looks_like_project`]).
 ///
 /// # Example
 ///
@@ -1834,6 +1836,7 @@ impl ConceptTools {
 pub struct CodeGraphPlugin {
     working_dir: std::path::PathBuf,
     search_mode: GraphSearchMode,
+    boot_index: bool,
 }
 
 impl CodeGraphPlugin {
@@ -1843,7 +1846,18 @@ impl CodeGraphPlugin {
         Self {
             working_dir: working_dir.into(),
             search_mode: GraphSearchMode::default(),
+            boot_index: true,
         }
+    }
+
+    /// Whether `ready` indexes the whole working directory (the default).
+    ///
+    /// Off, the tools still register and answer that the index was not built,
+    /// and edits still refresh the files they touch.
+    #[must_use]
+    pub fn with_boot_index(mut self, boot_index: bool) -> Self {
+        self.boot_index = boot_index;
+        self
     }
 
     /// Set the graph-search surface (config gate). Controls whether
@@ -1854,6 +1868,53 @@ impl CodeGraphPlugin {
         self.search_mode = mode;
         self
     }
+}
+
+/// Files or directories whose presence marks a directory as a project root.
+const PROJECT_MARKERS: [&str; 16] = [
+    ".git",
+    ".hg",
+    ".jj",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "CMakeLists.txt",
+    "Makefile",
+];
+
+/// Whether `dir` looks like a project worth indexing on startup.
+///
+/// Conservative on purpose: the home directory and the filesystem root never
+/// are (a dotfiles repo can make `~` a git work tree), and otherwise `dir` or
+/// an ancestor below the home directory must carry a [`PROJECT_MARKERS`]
+/// entry. A subdirectory of a repository therefore still counts.
+#[must_use]
+pub fn looks_like_project(dir: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    looks_like_project_under(dir, home.as_deref())
+}
+
+fn looks_like_project_under(dir: &Path, home: Option<&Path>) -> bool {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
+    if dir.parent().is_none() || home.as_deref() == Some(dir.as_path()) {
+        return false;
+    }
+    dir.ancestors()
+        .take_while(|ancestor| ancestor.parent().is_some() && home.as_deref() != Some(*ancestor))
+        .any(|ancestor| {
+            PROJECT_MARKERS
+                .iter()
+                .any(|marker| ancestor.join(marker).exists())
+        })
 }
 
 impl Plugin for CodeGraphPlugin {
@@ -1882,13 +1943,15 @@ impl Plugin for CodeGraphPlugin {
         // they are registered. Announce the pending index here, synchronously,
         // so a query that arrives in between is told the index is on its way
         // rather than that there is no index at all.
-        put_index_facts(
-            &store,
-            &[
-                ("phase", "building".to_string()),
-                ("startedAt", now_nanos().to_string()),
-            ],
-        );
+        if self.boot_index {
+            put_index_facts(
+                &store,
+                &[
+                    ("phase", "building".to_string()),
+                    ("startedAt", now_nanos().to_string()),
+                ],
+            );
+        }
         let config = CodeToolsConfig::new(self.working_dir.clone());
         registry.register_toolset(CodeGraphTools::new(store.clone(), config.clone()));
         // The curated concept queries are the config-gated half of the search gate;
@@ -1899,6 +1962,9 @@ impl Plugin for CodeGraphPlugin {
     }
 
     async fn ready(&self, server: &mut Server) {
+        if !self.boot_index {
+            return;
+        }
         let store = {
             let g = server
                 .get_global::<OxigraphStore>()
@@ -1923,6 +1989,25 @@ impl Plugin for CodeGraphPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_marked_directory_below_home_is_a_project() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("code/repo");
+        let loose = home.join("Downloads");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        // A dotfiles repo makes home itself a work tree.
+        std::fs::create_dir(home.join(".git")).unwrap();
+
+        assert!(looks_like_project_under(&repo, Some(&home)));
+        assert!(looks_like_project_under(&repo.join("src"), Some(&home)));
+        assert!(!looks_like_project_under(&home, Some(&home)));
+        assert!(!looks_like_project_under(&loose, Some(&home)));
+        assert!(!looks_like_project_under(Path::new("/"), Some(&home)));
+    }
 
     /// Index `src` as `lib.rs` and return the tools plus the tempdir they read
     /// from (kept alive so sandboxed file reads in `read_symbol` succeed).
