@@ -45,6 +45,15 @@ pub fn resolve(
         .or_else(|| set(home).map(|dir| dir.join(".config").join("polaris")))
 }
 
+/// The user's home directory, read from the environment so it is the same
+/// directory their shell means by `~`. Empty values count as unset.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 /// Joins `file` onto the user configuration directory.
 pub fn config_file(file: impl AsRef<Path>) -> Option<PathBuf> {
     config_dir().map(|dir| dir.join(file))

@@ -27,15 +27,16 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 /// `directory` with the user's home shown as `~`, for a prompt line that
 /// should be short enough to read at a glance.
 fn home_relative(directory: &Path) -> String {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| {
-            directory
-                .strip_prefix(&home)
-                .ok()
-                .map(|rest| Path::new("~").join(rest).display().to_string())
-        })
-        .unwrap_or_else(|| directory.display().to_string())
+    home_relative_under(directory, crate::config_dir::home_dir().as_deref())
+}
+
+fn home_relative_under(directory: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| directory.strip_prefix(home).ok()) {
+        // Home itself is `~`, not `~/`.
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => Path::new("~").join(rest).display().to_string(),
+        None => directory.display().to_string(),
+    }
 }
 
 /// A user's refusal is distinct from failure of the approval channel.
@@ -268,7 +269,7 @@ impl ApprovalRequest {
     /// Whether the prompt names a command for the front end to frame, so the
     /// tool's own activity row need not repeat it.
     #[must_use]
-    pub fn frames_command(&self) -> bool {
+    pub(crate) fn frames_command(&self) -> bool {
         self.command.is_some()
     }
 
@@ -279,19 +280,29 @@ impl ApprovalRequest {
             &["y", "yes", "once"],
             true,
         )];
-        // The prompt shows the command and its directory once, framed, so the
-        // labels only say how far each answer reaches.
-        if self.remember && self.command.is_some() && self.directory.is_some() {
+        // The prompt frames the command once, so the labels do not repeat it;
+        // they do say how far each answer reaches and where, because that is
+        // what a session grant binds to.
+        if self.remember
+            && self.command.is_some()
+            && let Some(directory) = &self.directory
+        {
             choices.push(ApprovalChoice::new(
                 "exact",
-                "allow for session",
+                format!(
+                    "allow this exact command in {} for this session",
+                    directory.display()
+                ),
                 &["s", "exact"],
                 true,
             ));
             if let Some(prefix) = &self.prefix {
                 choices.push(ApprovalChoice::new(
                     "prefix",
-                    format!("allow prefix {prefix:?} for session"),
+                    format!(
+                        "allow prefix {prefix:?} (whole words, every subcommand) in {} for this session",
+                        directory.display()
+                    ),
                     &["p", "prefix"],
                     true,
                 ));
@@ -1147,6 +1158,110 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("inspect it first")
+        );
+        assert!(!grants.allows(1, "run_command", &json!({"command":"echo ok"}), dir.path()));
+    }
+
+    /// Session answers say how far they reach and where without repeating
+    /// the command the frame already shows: the directory is the one the
+    /// grant binds to, and a prefix grant names its breadth.
+    #[tokio::test]
+    async fn session_labels_state_their_directory_and_breadth() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = ApprovalRequest::new(
+            "run_command",
+            &json!({"command":"cargo test --workspace"}),
+            dir.path(),
+            1,
+            true,
+        );
+        let directory = request
+            .directory
+            .clone()
+            .expect("the call resolves inside the root");
+        let choices = request.choices();
+        let label = |id: &str| {
+            choices
+                .iter()
+                .find(|choice| choice.id == id)
+                .map(|choice| choice.label.clone())
+                .unwrap_or_else(|| panic!("no {id} choice in {choices:?}"))
+        };
+        assert_eq!(
+            label("exact"),
+            format!(
+                "allow this exact command in {} for this session",
+                directory.display()
+            )
+        );
+        assert_eq!(
+            label("prefix"),
+            format!(
+                "allow prefix \"cargo test\" (whole words, every subcommand) in {} for this session",
+                directory.display()
+            )
+        );
+        assert!(
+            choices
+                .iter()
+                .all(|choice| !choice.label.contains("--workspace")),
+            "the command is framed once, not repeated in a label: {choices:?}"
+        );
+        assert_eq!(label("deny"), "deny (or no: reason)");
+    }
+
+    #[test]
+    fn home_relative_abbreviates_only_paths_under_home() {
+        let home = Path::new("/home/ada");
+        for (case, dir, home, shown) in [
+            ("home itself", "/home/ada", Some(home), "~"),
+            (
+                "under home",
+                "/home/ada/code/repo",
+                Some(home),
+                "~/code/repo",
+            ),
+            (
+                "a sibling sharing the prefix",
+                "/home/adam/repo",
+                Some(home),
+                "/home/adam/repo",
+            ),
+            ("outside home", "/srv/repo", Some(home), "/srv/repo"),
+            ("no home", "/home/ada/repo", None, "/home/ada/repo"),
+        ] {
+            assert_eq!(home_relative_under(Path::new(dir), home), shown, "{case}");
+        }
+    }
+
+    /// The deny label offers `no: reason`, so that spelling must carry its
+    /// reason to the model exactly as `deny: reason` does.
+    #[tokio::test]
+    async fn a_no_reason_answer_denies_and_returns_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = ApprovalRequest::new(
+            "run_command",
+            &json!({"command":"echo ok"}),
+            dir.path(),
+            1,
+            false,
+        );
+        let grants = SessionGrants::default();
+        let denied = UserIO::new(Arc::new(Answer {
+            reply: IOMessage::user_text("no: use the test script instead"),
+            prompts: Mutex::new(Vec::new()),
+        }));
+        let error = request
+            .ask(&denied, "Run?".into(), &grants)
+            .await
+            .expect_err("`no: reason` denies");
+        assert!(
+            matches!(error, ApprovalError::Denied { .. }),
+            "a refusal, not a channel failure: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("use the test script instead"),
+            "the reason reaches the model: {error}"
         );
         assert!(!grants.allows(1, "run_command", &json!({"command":"echo ok"}), dir.path()));
     }

@@ -1195,7 +1195,21 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     // A command is framed once above the input with one line of answers;
     // the raw prompt (tool, directory, JSON arguments) waits behind `?`.
     assert!(screen.contains("approve? · run_command in"), "{screen}");
-    assert!(screen.contains("s allow for session"), "{screen}");
+    assert!(
+        screen.contains("s allow this exact command in"),
+        "a session answer says where it applies:\n{screen}"
+    );
+    // The real tool row waits beside the frame without repeating the
+    // command, so it is on screen exactly once.
+    assert!(
+        screen.contains("run_command ❯ awaiting approval"),
+        "the tool row says what it waits on:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("printf 'ran").count(),
+        1,
+        "the command is shown once:\n{screen}"
+    );
     assert!(!screen.contains("Arguments:"), "{screen}");
     host.key(KeyCode::Char('?'), KeyModifiers::NONE);
     let details = host.frame().await.join("\n");
@@ -1727,4 +1741,10 @@ async fn a_narrow_terminal_keeps_the_workflow_readable() {
         "{screen}"
     );
     assert!(screen.contains(STARTUP_MODEL), "{screen}");
+    // Positive control for the narrow assertion above: this session does
+    // report the fact, so its absence at 36 columns was the row dropping it.
+    assert!(
+        screen.contains("cost n/a"),
+        "a wide meta row shows the unpriced cost:\n{screen}"
+    );
 }
