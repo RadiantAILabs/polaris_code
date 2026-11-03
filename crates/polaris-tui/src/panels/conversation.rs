@@ -9837,6 +9837,36 @@ mod tests {
         }
     }
 
+    /// The gate's boundary, one row at a time: on every frame where the
+    /// subject's last row is not drawn `y` is refused, and on the first frame
+    /// that draws it `y` answers. A gate that opened a row early (or late)
+    /// fails here, not at a size that happens to line up.
+    #[tokio::test]
+    async fn the_gate_opens_on_the_frame_that_draws_the_last_row() {
+        let rows = (1..=40)
+            .map(|row| format!("echo row{row:02}"))
+            .chain(["echo LAST_ROW".to_string()])
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (label, subject, needle) in [
+            (
+                "one long line",
+                hidden_tail_command(),
+                "SECURITY_HIDDEN_TAIL",
+            ),
+            ("forty-one lines", rows, "echo LAST_ROW"),
+        ] {
+            for (width, height) in [(80, 24), (80, 12)] {
+                let refused = gate_follows_the_screen(label, &subject, needle, width, height).await;
+                assert!(
+                    refused >= 10,
+                    "{label} {width}×{height}: only {refused} frames refused; the command \
+                     should take many rows to scroll through"
+                );
+            }
+        }
+    }
+
     /// Denying never waits for the tail: `n`, `no: reason` and Esc answer at
     /// once.
     #[tokio::test]
