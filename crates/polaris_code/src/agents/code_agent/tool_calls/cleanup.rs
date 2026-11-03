@@ -39,9 +39,17 @@ pub(crate) fn setup_cleanup(ctx: &mut SystemContext<'_>) {
     let io = Arc::new(SharedIO(OnceLock::new()));
     // Setup owns the context exclusively. Fill the forwarding channel before
     // any system can use it; every receive still reaches the original provider.
-    let original = ctx
-        .insert(UserIO::new(io.clone()))
-        .expect("the session has UserIO");
+    let type_id = std::any::TypeId::of::<UserIO>();
+    let original = match ctx.factory_fn_by_type_id(type_id) {
+        // Topology runs forward a fresh channel from this factory. Keep it
+        // attached when replacing the session's own channel with the wrapper.
+        Some(factory) => ctx
+            .insert_boxed_with_factory(type_id, Box::new(UserIO::new(io.clone())), factory)
+            .and_then(|original| original.downcast::<UserIO>().ok())
+            .map(|original| *original),
+        None => ctx.insert(UserIO::new(io.clone())),
+    }
+    .expect("the session has UserIO");
     assert!(
         io.0.set(original).is_ok(),
         "the forwarding channel is bound once"
