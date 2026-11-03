@@ -315,19 +315,19 @@ pub(crate) async fn authorize_call(
     if let Some(review) = review {
         receipt = review.receipt.clone();
     }
-    let route = match permission {
-        ToolPermission::Deny => AuthorizationRoute::Deny(format!(
+    let route = match (permission, review) {
+        (ToolPermission::Deny, _) => AuthorizationRoute::Deny(format!(
             "Permission denied: tool '{name}' is not allowed ({})",
             authorization.source
         )),
-        ToolPermission::Allow => AuthorizationRoute::Allow,
-        ToolPermission::Confirm if review.is_some_and(|r| r.decision == ReviewDecision::Allow) => {
+        (ToolPermission::Allow, _) => AuthorizationRoute::Allow,
+        (ToolPermission::Confirm, Some(r)) if r.decision == ReviewDecision::Allow => {
             AuthorizationRoute::Allow
         }
-        ToolPermission::Confirm if review.is_some_and(|r| r.decision == ReviewDecision::Deny) => {
-            AuthorizationRoute::Deny(format!("Permission denied: {}", review.unwrap().notice()))
+        (ToolPermission::Confirm, Some(r)) if r.decision == ReviewDecision::Deny => {
+            AuthorizationRoute::Deny(format!("Permission denied: {}", r.notice()))
         }
-        ToolPermission::Confirm => {
+        (ToolPermission::Confirm, _) => {
             let mut prompt = format!(
                 "{}\nDecision source: {}",
                 build_confirm_prompt(name, &tool_call.function.arguments),
@@ -444,7 +444,11 @@ pub(crate) async fn ask_human(
                 .await;
             CallDecision::Allow(Some(answer))
         }
-        Some(Err(reason)) => CallDecision::Deny(reason.to_string()),
+        Some(Err(reason)) => CallDecision::Deny(redact_tool_output(
+            *redactor,
+            &call.call.function.name,
+            reason.to_string(),
+        )),
         None => {
             let reason = match approver.cancel(&call.request, &user_io).await {
                 Ok(()) => "Approval interrupted by user".into(),
@@ -904,11 +908,11 @@ pub(crate) async fn finish_calls(
                 // Re-derive the conceptual-role layer so concept queries track
                 // the edited source too. This rebuilds the whole enrichment graph
                 // each edit; scoping it to re-indexed symbols is deferred.
-                if let Err(e) = enrich(&store) {
-                    tracing::warn!("code graph: enrichment after edit failed: {e}");
+                if let Err(error) = enrich(&store) {
+                    tracing::warn!("code graph: enrichment after edit failed: {error}");
                 }
             }
-            Err(e) => tracing::warn!("code graph: incremental re-index failed: {e}"),
+            Err(error) => tracing::warn!("code graph: incremental re-index failed: {error}"),
         }
     }
 
