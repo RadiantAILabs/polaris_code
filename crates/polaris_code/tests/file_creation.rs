@@ -4,7 +4,7 @@
 //!
 //! Part 1 drives one real coding turn — a scripted `LlmProvider` asks for
 //! `create_file` and a scripted `IOProvider` answers the confirm dialog — through
-//! the binary's own `receive_user_input → act → execute_tools` graph, with the
+//! the binary's own `receive_user_input → act → prepare_calls → tool_calls` graph, with the
 //! same `CodeToolsPlugin` registration and the same per-mode `PolicySnapshot`
 //! `main.rs` installs. The observable effect is a file on disk, so "created" and
 //! "not created" are read from the filesystem rather than inferred from a log

@@ -11,7 +11,7 @@
 //!   permission surface or the settings commands.
 //!
 //! `tests/code_lane_composition.rs` already proves the first two meet at the
-//! `execute_tools` gate. What that cannot see — and what only exists once these
+//! `authorize_call` gate. What that cannot see — and what only exists once these
 //! features are combined — is `prepare_context` in `src/agents/code_agent.rs`,
 //! where a settings snapshot now rewrites the turn's permission policy and its
 //! model *before* the status projection reports on that same turn. Several features

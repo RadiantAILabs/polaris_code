@@ -532,7 +532,7 @@ async fn cancellation_while_act_streams_preserves_the_session() {
 }
 
 #[tokio::test]
-async fn cancellation_while_execute_tools_awaits_preserves_the_session() {
+async fn cancellation_while_execute_call_awaits_preserves_the_session() {
     prove_in_node_stop(StopAt::Tools).await;
 }
 

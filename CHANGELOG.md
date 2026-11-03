@@ -21,6 +21,12 @@ Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.
 - `CodeGraphPlugin::with_boot_index`, `tools::boot_index_wanted(headless, dir)` and `tools::looks_like_project`. An interactive `polaris` run outside a project skips the boot code index and says so; headless runs still index.
 
 ### Changed
+- `CodeAgentPlugin` no longer asks a person on its own. Hosts must add `InteractiveApprovalPlugin` or supply their own `HumanApproval`; otherwise every call that needs a person is denied.
+- `polaris-tui` replaces typed `y`, `n` and `no: reason` approval answers with the picker. Press `Tab` to enter a reason or note.
+- `polaris-ai` moves from 0.7.1 to 0.8.0. Hosts must upgrade their framework dependency too; all public types exposing framework types now use 0.8.0.
+- `ApprovalAnswer` is `#[non_exhaustive]`. Build it with `From<ApprovalScope>` or its constructor instead of a struct literal.
+- `polaris_cosmos` 0.2.0 upgrades to `polaris-ai` 0.8.0, with no source changes.
+- `polaris_ontrace` 0.2.0 upgrades to `polaris-ai` 0.8.0, with no source changes.
 - Tool calls run through a per-call graph loop (`authorize_call`, `ask_human`, `execute_call`, `record_denial`, `advance_call`) with its own iteration bound, instead of one batch step. Read-only batches still run concurrently. Calls left over at the bound get error results.
 - Approval labels state their scope: `allow this exact command in <dir> for this session`, `allow prefix "<prefix>" (whole words, every subcommand) in <dir> for this session`, `deny`.
 - A command too tall for the approval picker scrolls inside it (`PgUp`/`PgDn`, `Shift-↑`/`Shift-↓`), and a confirming answer is refused until its last row has been shown. A command over 64 KiB accepts only a denial.

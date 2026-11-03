@@ -7,7 +7,7 @@
 //! drives the indexer's tools through a registry that has no permission policy
 //! over it. Neither can observe the seam where the two features actually meet.
 //!
-//! That seam is `execute_tools` in `src/agents/code_agent.rs`. For every call it
+//! That seam is `authorize_call` in `src/agents/code_agent/tool_calls.rs`. For every call it
 //! resolves `policy.permission.resolve(name, tool_registry.permission(name))`
 //! and skips execution on `Deny`; a non-denied `edit_file` is the only thing
 //! that pushes onto `edited`, and `edited` is what the post-loop
@@ -75,7 +75,7 @@ fn merged_registry(store: OxigraphStore, config: CodeToolsConfig) -> ToolRegistr
     registry
 }
 
-/// The gate `execute_tools` applies, in the same order: registry default (or
+/// The gate `authorize_call` applies, in the same order: registry default (or
 /// `Deny` when unregistered), then the mode's policy resolution.
 fn gate(registry: &ToolRegistry, mode: &PermissionMode, tool: &str) -> ToolPermission {
     let registry_default = registry.permission(tool).unwrap_or(ToolPermission::Deny);
@@ -156,7 +156,7 @@ async fn the_permission_surface_governs_and_admits_every_indexer_tool() {
     }
 }
 
-/// A denied `edit_file` never reaches the indexer. `execute_tools` pushes onto
+/// A denied `edit_file` never reaches the indexer. `execute_call` pushes onto
 /// `edited` only inside the non-denied branch, so under `Plan` the post-loop
 /// `index_paths` re-index has nothing to do — the source is untouched and the
 /// multi-language facts still describe the original file.
@@ -171,7 +171,7 @@ async fn plan_mode_denies_the_edit_that_would_refresh_the_multi_language_index()
     let mode = PermissionMode::Plan;
     assert_eq!(gate(&registry, &mode, "edit_file"), ToolPermission::Deny);
 
-    // Mirror `execute_tools`: on `Deny` the registry is never asked to execute
+    // Mirror `authorize_call`: on `Deny` the registry is never asked to execute
     // and nothing is appended to `edited`.
     let mut edited: Vec<std::path::PathBuf> = Vec::new();
     if gate(&registry, &mode, "edit_file") != ToolPermission::Deny {
@@ -238,7 +238,7 @@ async fn a_granted_edit_still_drives_the_multi_language_reindex() {
             mode.permission_policy().mode_label()
         );
 
-        // Mirror `execute_tools`: execute, then enqueue the edited path.
+        // Mirror `execute_call`: execute, then enqueue the edited path.
         let mut edited: Vec<std::path::PathBuf> = Vec::new();
         registry
             .execute(
