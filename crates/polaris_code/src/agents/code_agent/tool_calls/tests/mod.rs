@@ -5,7 +5,7 @@ use polaris::models::llm::{AssistantBlock, StopReason, Usage};
 use polaris::plugins::{CONFIRMED, IOError, IOProvider};
 use polaris::sessions::SessionId;
 use polaris::tools::toolset;
-use polaris_tui::APPROVAL_NOTE;
+use polaris_tui::{APPROVAL_NOTE, APPROVAL_SUBJECT};
 use std::sync::Mutex;
 
 struct Choose {
@@ -13,6 +13,8 @@ struct Choose {
     deny: bool,
     note: Option<&'static str>,
     interrupt: Option<CancellationSource>,
+    fail_receive: bool,
+    choice: &'static str,
 }
 impl IOProvider for Choose {
     async fn send(&self, message: IOMessage) -> Result<(), IOError> {
@@ -28,6 +30,9 @@ impl IOProvider for Choose {
         Ok(())
     }
     async fn receive(&self) -> Result<IOMessage, IOError> {
+        if self.fail_receive {
+            return Err(IOError::Closed);
+        }
         if self.interrupt.is_some() {
             return std::future::pending().await;
         }
@@ -36,7 +41,7 @@ impl IOProvider for Choose {
         } else {
             IOMessage::user_text("choose")
                 .with_metadata(CONFIRMED, "true")
-                .with_metadata("approval_choice", "exact")
+                .with_metadata("approval_choice", self.choice)
         };
         if let Some(note) = self.note {
             answer = answer.with_metadata(APPROVAL_NOTE, note);
@@ -57,6 +62,12 @@ impl Fixtures {
         } else {
             Ok(command)
         }
+    }
+    /// Record a file update without touching the disk.
+    #[tool]
+    async fn update_file(&self, path: String, text: String) -> Result<String, ToolError> {
+        self.0.lock().unwrap().push(format!("update {path}"));
+        Ok(format!("updated {path} with {text}"))
     }
     /// Record an independent read.
     #[tool]
@@ -167,7 +178,7 @@ async fn run_with_stop(
         interrupt,
         ReplyControl {
             stop_after,
-            note: None,
+            ..ReplyControl::default()
         },
     )
     .await
@@ -177,6 +188,8 @@ async fn run_with_stop(
 struct ReplyControl {
     stop_after: Option<&'static str>,
     note: Option<&'static str>,
+    prompt_fails: bool,
+    choice: Option<&'static str>,
 }
 
 async fn run_controlled(
@@ -197,6 +210,8 @@ async fn run_controlled(
         deny,
         note: control.note,
         interrupt: interrupt.then(|| cancellation.clone()),
+        fail_receive: control.prompt_fails,
+        choice: control.choice.unwrap_or("exact"),
     });
     let mut server = Server::new();
     server
@@ -229,14 +244,16 @@ async fn run_controlled(
     server.finish().await.unwrap();
     let mut ctx = server.create_context();
     let mut policy = PolicySnapshot::defaults();
-    policy.permission.overrides.insert(
-        "run_command".into(),
-        if confirm {
-            ToolPermission::Confirm
-        } else {
-            ToolPermission::Allow
-        },
-    );
+    for tool in ["run_command", "update_file"] {
+        policy.permission.overrides.insert(
+            tool.into(),
+            if confirm {
+                ToolPermission::Confirm
+            } else {
+                ToolPermission::Allow
+            },
+        );
+    }
     ctx.insert(policy);
     ctx.insert(AgentConfig::new("test/model", root.path().to_path_buf()));
     ctx.insert(ContextManager::default());
@@ -257,6 +274,8 @@ async fn run_controlled(
     let mut graph = Graph::new();
     graph.add_system(seed_response).add_system(seed_reviews);
     build_bounded_tool_calls(&mut graph, bound);
+    let validation = graph.validate();
+    assert!(validation.is_ok(), "{:?}", validation.errors());
     let result = GraphExecutor::new()
         .with_default_max_iterations(2)
         .execute(
@@ -307,6 +326,28 @@ fn results(outcome: &Outcome) -> Vec<(bool, String)> {
                 .collect(),
             _ => Vec::new(),
         })
+        .collect()
+}
+/// Whether the trajectory holds a `human_approval` decision that chose `chose`
+/// and cites every one of `refs`.
+fn human_decision(outcome: &Outcome, chose: &str, refs: &[&str]) -> bool {
+    let refs: String = refs
+        .iter()
+        .map(|reference| format!(" ; <urn:polaris:session:consultedPolicy> \"{reference}\""))
+        .collect();
+    let answer = outcome.store.query(&format!(
+        "ASK {{ GRAPH <{}> {{ ?d <urn:polaris:session:kind> \"human_approval\" ; <urn:polaris:session:chose> \"{chose}\"{refs} }} }}",
+        crate::agents::trajectory::SESSION_GRAPH_IRI,
+    )).unwrap();
+    matches!(answer, oxigraph::sparql::QueryResults::Boolean(true))
+}
+/// The phases that closed or refused activity `id`, in the order they were sent.
+fn closing_phases(messages: &[IOMessage], id: &str) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.metadata.get("id").is_some_and(|value| value == id))
+        .filter_map(|message| message.metadata.get("phase").cloned())
+        .filter(|phase| phase == "ok" || phase == "error" || phase == "denied")
         .collect()
 }
 #[tokio::test]
@@ -377,6 +418,18 @@ async fn an_absent_approver_denies_only_the_call_that_needs_approval() {
             .get(IO_TYPE)
             .is_some_and(|kind| kind == "confirm")
     }));
+    assert!(human_decision(
+        &outcome,
+        "deny",
+        &[
+            "authorization.decision_source=unavailable",
+            "authorization.call_id=call-0"
+        ]
+    ));
+    assert!(
+        !human_decision(&outcome, "deny", &["authorization.decision_source=human"]),
+        "no person was asked"
+    );
 }
 
 #[tokio::test]
@@ -427,7 +480,13 @@ async fn interrupted_approval_resolves_the_prompt_and_closes_every_call() {
     )
     .await;
     assert!(outcome.ran.is_empty());
-    assert_eq!(results(&outcome).len(), 2);
+    assert_eq!(
+        results(&outcome),
+        [
+            (true, "Approval interrupted by user".into()),
+            (true, "not run: turn interrupted".into())
+        ]
+    );
     let messages = outcome.io.messages.lock().unwrap();
     let request = messages
         .iter()
@@ -451,26 +510,25 @@ async fn interrupted_approval_resolves_the_prompt_and_closes_every_call() {
         request.metadata.get("approval_request_id"),
         resolution.metadata.get("approval_request_id")
     );
-    for id in ["call-0", "call-1"] {
+    for (id, phase) in [("call-0", "denied"), ("call-1", "error")] {
         assert_eq!(
-            messages
-                .iter()
-                .filter(
-                    |message| message.metadata.get("id").is_some_and(|value| value == id)
-                        && message
-                            .metadata
-                            .get("phase")
-                            .is_some_and(|phase| phase == "denied" || phase == "error")
-                )
-                .count(),
-            1
+            closing_phases(&messages, id),
+            [phase],
+            "closing phase of {id}"
         );
     }
 }
 
 #[tokio::test]
 async fn interruption_between_nodes_closes_the_activity_and_remaining_results() {
-    for node in ["authorize_call", "ask_human", "execute_call"] {
+    // The stop node, then what call-0 reports: its result and its closing phase.
+    // Call-1 never starts, so it is closed as not run after every stop.
+    let stops = [
+        ("authorize_call", (true, "Interrupted by user"), "error"),
+        ("ask_human", (true, "Interrupted by user"), "error"),
+        ("execute_call", (false, "cargo test"), "ok"),
+    ];
+    for (node, (first_failed, first_text), first_phase) in stops {
         let outcome = run_with_stop(
             vec![command(0, "cargo test"), command(1, "other")],
             true,
@@ -481,26 +539,24 @@ async fn interruption_between_nodes_closes_the_activity_and_remaining_results() 
             Some(node),
         )
         .await;
-        assert_eq!(results(&outcome).len(), 2, "stopped after {node}");
+        assert_eq!(
+            results(&outcome),
+            [
+                (first_failed, first_text.into()),
+                (true, "not run: turn interrupted".into())
+            ],
+            "results after {node}"
+        );
         assert_eq!(outcome.ran.len(), usize::from(node == "execute_call"));
         assert!(
             outcome.tasks.request().is_err(),
             "no live invocation remains after {node}"
         );
         let messages = outcome.io.messages.lock().unwrap();
-        for id in ["call-0", "call-1"] {
+        for (id, phase) in [("call-0", first_phase), ("call-1", "error")] {
             assert_eq!(
-                messages
-                    .iter()
-                    .filter(
-                        |message| message.metadata.get("id").is_some_and(|value| value == id)
-                            && message
-                                .metadata
-                                .get("phase")
-                                .is_some_and(|phase| phase == "ok" || phase == "error")
-                    )
-                    .count(),
-                1,
+                closing_phases(&messages, id),
+                [phase],
                 "one finished activity for {id} after {node}"
             );
         }
@@ -606,6 +662,7 @@ async fn an_approval_note_survives_interruption_before_dispatch() {
         ReplyControl {
             note: Some("Try once"),
             stop_after: Some("ask_human"),
+            ..ReplyControl::default()
         },
     )
     .await;
@@ -640,5 +697,121 @@ async fn approval_notes_use_the_output_redactor_before_recording_or_returning() 
     assert!(matches!(
         answer,
         oxigraph::sparql::QueryResults::Boolean(false)
+    ));
+}
+
+#[tokio::test]
+async fn a_failing_approval_prompt_denies_the_call_and_says_why() {
+    let read = ToolCall::new("read-1", "read_file", serde_json::json!({"path": "ok"}));
+    let outcome = run_controlled(
+        vec![command(0, "cargo test"), read],
+        true,
+        10,
+        true,
+        false,
+        false,
+        ReplyControl {
+            prompt_fails: true,
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        outcome.ran,
+        ["ok"],
+        "only the call that needed approval is lost"
+    );
+    let results = results(&outcome);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0);
+    assert!(
+        results[0].1.contains("Confirmation failed"),
+        "the result says the prompt failed: {}",
+        results[0].1
+    );
+    assert!(!results[1].0);
+    assert!(human_decision(
+        &outcome,
+        "deny",
+        &[
+            "authorization.decision_source=human",
+            "authorization.call_id=call-0"
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn approving_a_non_command_tool_shows_its_detail_and_runs_it() {
+    let update = ToolCall::new(
+        "update-1",
+        "update_file",
+        serde_json::json!({"path": "notes/todo.md", "text": "done"}),
+    );
+    let outcome = run_controlled(
+        vec![command(0, "cargo test"), update],
+        true,
+        10,
+        true,
+        false,
+        false,
+        ReplyControl {
+            choice: Some("once"),
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert_eq!(outcome.ran, ["cargo test", "update notes/todo.md"]);
+    assert_eq!(
+        results(&outcome),
+        [
+            (false, "cargo test".into()),
+            (false, "updated notes/todo.md with done".into())
+        ]
+    );
+    let messages = outcome.io.messages.lock().unwrap();
+    let prompts: Vec<_> = messages
+        .iter()
+        .filter(|message| {
+            message
+                .metadata
+                .get(IO_TYPE)
+                .is_some_and(|kind| kind == "confirm")
+        })
+        .collect();
+    assert_eq!(prompts.len(), 2, "each call is asked once");
+    let IOContent::Text(prompt) = &prompts[1].content else {
+        panic!("the approval prompt is text");
+    };
+    assert!(
+        prompt.contains("update_file") && prompt.contains("notes/todo.md"),
+        "the prompt shows the call: {prompt}"
+    );
+    assert!(prompts[0].metadata.contains_key(APPROVAL_SUBJECT));
+    assert!(
+        !prompts[1].metadata.contains_key(APPROVAL_SUBJECT),
+        "only a command is framed as the subject"
+    );
+    // The prompt frames a command, so its row only waits; any other tool's row
+    // keeps showing what the call does.
+    let waiting = |id: &str| {
+        messages
+            .iter()
+            .find(|message| {
+                message.metadata.get("id").is_some_and(|value| value == id)
+                    && message
+                        .metadata
+                        .get("phase")
+                        .is_some_and(|phase| phase == PHASE_PENDING)
+            })
+            .map(|message| message.content.clone())
+    };
+    assert!(
+        matches!(waiting("call-0"), Some(IOContent::Text(text)) if text == "awaiting approval")
+    );
+    assert!(matches!(waiting("update-1"), Some(IOContent::Text(text)) if text == "notes/todo.md"));
+    assert!(human_decision(
+        &outcome,
+        "allow",
+        &["authorization.scope=once", "authorization.call_id=update-1"]
     ));
 }
