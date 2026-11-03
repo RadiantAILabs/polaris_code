@@ -10,8 +10,8 @@ use polaris::shell::{ShellExecutor, ShellPermission};
 use polaris::system::resource::GlobalResource;
 use polaris::tools::{ToolContext, ToolError, ToolPermission, ToolRegistry};
 use polaris_tui::{
-    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_CONTEXT, APPROVAL_REQUEST_ID, APPROVAL_SUBJECT,
-    ApprovalChoice, IO_TYPE_APPROVAL_RESOLVED,
+    APPROVAL_CHOICE, APPROVAL_CHOICES, APPROVAL_CONTEXT, APPROVAL_NOTE, APPROVAL_REQUEST_ID,
+    APPROVAL_SUBJECT, ApprovalChoice, IO_TYPE_APPROVAL_RESOLVED,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -23,9 +23,6 @@ use crate::tools::approval::{ApprovalReceipt, call_directory, call_paths};
 use super::rules::{command_permission, simple_prefix};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-
-// Mirrors polaris_tui::APPROVAL_NOTE.
-pub(crate) const APPROVAL_NOTE: &str = "approval_note";
 
 fn approval_note(response: &IOMessage) -> Option<String> {
     let text = response.metadata.get(APPROVAL_NOTE)?;

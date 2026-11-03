@@ -1,11 +1,11 @@
 //! Run the production tool graph with deterministic tools.
 use super::*;
-use crate::agents::permission_rules::APPROVAL_NOTE;
 use polaris::graph::{GraphExecutor, cancel::CancellationSource};
 use polaris::models::llm::{AssistantBlock, StopReason, Usage};
 use polaris::plugins::{CONFIRMED, IOError, IOProvider};
 use polaris::sessions::SessionId;
 use polaris::tools::toolset;
+use polaris_tui::APPROVAL_NOTE;
 use std::sync::Mutex;
 
 struct Choose {

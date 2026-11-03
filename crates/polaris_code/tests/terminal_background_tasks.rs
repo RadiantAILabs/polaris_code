@@ -553,8 +553,10 @@ impl Host {
     async fn approve(&mut self) {
         self.frame_when("the approval dialog opens", |s| s.contains("approve?"))
             .await;
-        self.type_text("y");
-        self.key(KeyCode::Enter, KeyModifiers::NONE);
+        // The picker ignores answer keys pressed within 400 ms of other
+        // typing, so pause as a user would before pressing `y`.
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        self.key(KeyCode::Char('y'), KeyModifiers::NONE);
         self.frame_when("the dialog closes on the answer", |s| {
             !s.contains("approve?")
         })
@@ -1722,8 +1724,9 @@ async fn backgrounding_is_gated_exactly_as_the_foreground_command_is() {
         screen.contains("run_in_background"),
         "the dialog names the tool that asked: {screen}"
     );
-    host.type_text("n");
-    host.key(KeyCode::Enter, KeyModifiers::NONE);
+    // Wait out the picker's 400 ms guard against stray keys, then deny.
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    host.key(KeyCode::Char('n'), KeyModifiers::NONE);
     host.drain_turn(driver).await;
 
     assert_eq!(

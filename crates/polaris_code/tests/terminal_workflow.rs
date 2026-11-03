@@ -711,6 +711,15 @@ impl Host {
     }
 
     /// Type a line and submit it.
+    /// Answer an open approval picker with one key, as a user does: after a
+    /// pause, because the picker ignores answer keys pressed within 400 ms of
+    /// other typing.
+    async fn answer(&mut self, key: char) {
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        self.key(KeyCode::Char(key), KeyModifiers::NONE);
+        let _ = self.frame().await;
+    }
+
     async fn submit(&mut self, text: &str) {
         self.type_text(text);
         // Completion sources are asynchronous. Give the panel one runtime
@@ -1173,7 +1182,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
         "nothing runs before the answer"
     );
 
-    host.submit("y").await;
+    host.answer('y').await;
     let screen = host.wait_ready().await;
     assert!(screen.contains("✓ edit_file"), "{screen}");
     assert!(screen.contains("code ❯ Edited."), "{screen}");
@@ -1193,11 +1202,11 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     let screen = host
         .wait_for("the command approval", |screen| screen.contains("approve?"))
         .await;
-    // A command is framed once above the input with wrapped answers;
-    // the raw prompt (tool, directory, JSON arguments) waits behind `?`.
+    // A command is framed once above a numbered list of answers; the raw
+    // prompt (tool, directory, JSON arguments) waits behind `?`.
     assert!(screen.contains("approve? · run_command in"), "{screen}");
     assert!(
-        screen.contains("s allow this exact command in"),
+        screen.contains("2. allow this exact command in"),
         "a session answer says where it applies:\n{screen}"
     );
     // The real tool row waits beside the frame without repeating the
@@ -1215,7 +1224,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     host.key(KeyCode::Char('?'), KeyModifiers::NONE);
     let details = host.frame().await.join("\n");
     assert!(details.contains("Arguments:"), "{details}");
-    host.submit("n").await;
+    host.answer('n').await;
     let screen = host.wait_ready().await;
     assert!(screen.contains("⊘ run_command"), "{screen}");
     assert!(screen.contains("User denied execution"), "{screen}");
@@ -1237,7 +1246,7 @@ async fn edits_and_commands_are_approved_or_denied_through_the_dialog() {
     host.submit("really run it").await;
     host.wait_for("the third approval", |screen| screen.contains("approve?"))
         .await;
-    host.submit("yes").await;
+    host.answer('y').await;
     let screen = host.wait_ready().await;
     assert!(screen.contains("✓ run_command"), "{screen}");
     assert_eq!(
@@ -1306,7 +1315,7 @@ async fn a_prompt_typed_during_an_approval_becomes_the_next_turn() {
     );
     assert_eq!(host.workspace_file("notes.txt"), "old line\n");
 
-    host.submit("y").await;
+    host.answer('y').await;
     host.wait_for("the first turn", |screen| {
         screen.contains("code ❯ Applied.")
     })
@@ -1701,7 +1710,7 @@ async fn interactive_settings_apply_at_the_next_turn_boundary() {
         })
         .await;
     assert!(screen.contains(STARTUP_MODEL), "{screen}");
-    host.submit("y").await;
+    host.answer('y').await;
     host.wait_ready().await;
     assert_eq!(host.workspace_file("notes.txt"), "fresh line\n");
 }

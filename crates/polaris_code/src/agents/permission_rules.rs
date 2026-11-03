@@ -11,8 +11,6 @@ mod rules;
 mod tool_grants;
 
 pub(crate) use crate::tools::approval::{ApprovalReceipt, call_directory};
-#[cfg(test)]
-pub(crate) use approval::APPROVAL_NOTE;
 pub(crate) use approval::ceiling_permission;
 pub use approval::{
     ApprovalAnswer, ApprovalError, ApprovalRequest, ApprovalScope, SessionGrants, ShellApproval,
