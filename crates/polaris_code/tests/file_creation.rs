@@ -375,6 +375,7 @@ impl CodingTurn {
             .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new(
                 data.path().to_str().expect("a UTF-8 temp path"),
             ))))
+            .add_plugins(polaris_code::agents::InteractiveApprovalPlugin)
             .add_plugins(CodeAgentPlugin::new())
             .add_plugins(ScriptedIOPlugin {
                 provider: io.clone(),

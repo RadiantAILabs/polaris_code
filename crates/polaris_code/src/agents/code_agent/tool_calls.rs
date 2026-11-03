@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 
 use super::*;
+use crate::agents::human_approval::HumanApproval;
 use crate::agents::permission_rules::ApprovalReceipt;
 use crate::terminal::background::Invocation;
 
@@ -23,6 +24,7 @@ impl LocalResource for ToolBatch {}
 pub(crate) struct StartedCall {
     activity: ToolActivity,
     invocation: Invocation,
+    call: ToolCall,
 }
 
 // The slot owns the invocation across graph nodes. Clearing it releases the
@@ -31,14 +33,14 @@ pub(crate) struct StartedCall {
 pub(crate) enum CallLifetime {
     #[default]
     Idle,
-    Active(StartedCall),
+    Active(Box<StartedCall>),
 }
 impl LocalResource for CallLifetime {}
 
 impl CallLifetime {
     fn take(&mut self) -> StartedCall {
         match std::mem::take(self) {
-            Self::Active(call) => call,
+            Self::Active(call) => *call,
             Self::Idle => unreachable!("authorization owns the active call"),
         }
     }
@@ -268,10 +270,11 @@ pub(crate) async fn authorize_call(
     )
     .await;
     let invocation = tasks.enter(&tool_call.id, name, live.current_id());
-    *lifetime = CallLifetime::Active(StartedCall {
+    *lifetime = CallLifetime::Active(Box::new(StartedCall {
         activity,
         invocation,
-    });
+        call: tool_call.clone(),
+    }));
     let review = policy
         .uses_reviewer()
         .then(|| {
@@ -366,6 +369,7 @@ pub(crate) async fn settle_authorization(call: Out<AuthorizedCall>) -> CallDecis
 #[system]
 pub(crate) async fn ask_human(
     call: Out<AuthorizedCall>,
+    approver: Option<Res<HumanApproval>>,
     mut lifetime: ResMut<CallLifetime>,
     user_io: Res<UserIO>,
     grants: Res<SessionGrants>,
@@ -376,6 +380,17 @@ pub(crate) async fn ask_human(
 ) -> CallDecision {
     let AuthorizationRoute::Ask(prompt) = &call.route else {
         unreachable!("only asking calls enter ask_human")
+    };
+    let Some(approver) = approver else {
+        let decision = CallDecision::Deny("Permission denied: no approver is registered".into());
+        record_human_decision(
+            &decision,
+            &call,
+            &store,
+            context.turn_marker(),
+            "unavailable",
+        );
+        return decision;
     };
     let active = lifetime.active();
     let waiting = if call.request.frames_command() {
@@ -388,8 +403,8 @@ pub(crate) async fn ask_human(
         .phase(&user_io, PHASE_PENDING, waiting)
         .await;
     active.invocation.awaiting_approval();
-    match cancel
-        .run_until_cancelled(call.request.ask(&user_io, prompt.clone(), &grants))
+    let decision = match cancel
+        .run_until_cancelled(approver.ask(&call.request, &user_io, prompt.clone(), &grants))
         .await
     {
         Some(Ok(scope)) => {
@@ -402,7 +417,7 @@ pub(crate) async fn ask_human(
         }
         Some(Err(reason)) => CallDecision::Deny(reason.to_string()),
         None => {
-            let reason = match call.request.cancel(&user_io).await {
+            let reason = match approver.cancel(&call.request, &user_io).await {
                 Ok(()) => "Approval interrupted by user".into(),
                 Err(error) => {
                     format!("Approval interrupted by user; could not resolve prompt: {error}")
@@ -439,7 +454,38 @@ pub(crate) async fn ask_human(
             .await;
             decision
         }
+    };
+    record_human_decision(&decision, &call, &store, context.turn_marker(), "human");
+    decision
+}
+
+fn record_human_decision(
+    decision: &CallDecision,
+    call: &AuthorizedCall,
+    store: &OxigraphStore,
+    turn: usize,
+    source: &str,
+) {
+    let mut record = Decision::new("human_approval", "deny").with_policy([
+        format!("authorization.decision_source={source}"),
+        format!("authorization.tool={}", call.call.function.name),
+        format!("authorization.call_id={}", call.call.id),
+    ]);
+    record.options = vec!["allow".into(), "deny".into()];
+    match decision {
+        CallDecision::Allow(Some(scope)) => {
+            record.chosen = "allow".into();
+            record.policy_refs.push(format!(
+                "authorization.scope={}",
+                approval_scope_label(*scope)
+            ));
+        }
+        CallDecision::Allow(None) => record.chosen = "allow".into(),
+        CallDecision::Deny(reason) => record
+            .policy_refs
+            .push(format!("authorization.reason={reason}")),
     }
+    record.record(store, turn);
 }
 
 #[system]
@@ -494,6 +540,7 @@ pub(crate) async fn execute_call(
     let StartedCall {
         activity,
         invocation,
+        ..
     } = lifetime.take();
     let tool_call = &call.call;
     let name = &tool_call.function.name;
@@ -874,3 +921,6 @@ fn build_bounded_tool_calls(graph: &mut Graph, bound: usize) {
 
 #[cfg(test)]
 mod tests;
+
+mod cleanup;
+pub(crate) use cleanup::{install_cleanup, setup_cleanup};

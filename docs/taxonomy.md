@@ -70,9 +70,17 @@ control flow.
 `src/tools/web.rs` (`WebToolsPlugin`), `src/progress.rs` (`ProgressMiddlewarePlugin`),
 `src/graph_view.rs` (`GraphViewPlugin`, feeding the Graph tab; see [`graph-tab.md`](graph-tab.md)), `src/terminal/`
 (`CommandRegistry`, `CommandDispatch`, `WorkspaceFiles`, `LiveTranscript`),
-`src/exec/` (`ExecIOPlugin`).
+`src/exec/` (`ExecIOPlugin`), and
+`src/agents/human_approval.rs` (`InteractiveApprovalPlugin`).
 
 The swappable capabilities this app contributes as Polaris plugins:
+
+- **Human approval transport.** `InteractiveApprovalPlugin` publishes the
+  optional global `HumanApproval`, which presents one exact call over the
+  session's `UserIO`. Layer 3 decides whether to ask and records the answer;
+  the transport validates offered scopes, remembers session grants and resolves
+  interrupted prompts. Without an approver, calls that need a person are
+  denied. The composition root installs it for interactive sessions.
 
 - **Toolsets.** Sandboxed file tools (`CodeTools`), the deterministic Rust
   indexer + SPARQL-backed symbol queries (`CodeGraphTools` / `ConceptTools`),

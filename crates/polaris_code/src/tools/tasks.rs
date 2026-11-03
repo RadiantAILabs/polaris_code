@@ -20,7 +20,7 @@
 //! | Need | Existing primitive |
 //! |---|---|
 //! | Start a process and not wait for it | [`ShellExecutor::start`] plus `ShellProcess::detach`, which leaves the process under executor ownership and returns its identity. |
-//! | Stream its output somewhere the host can read | the [`ShellSinkHandle`] `execute_tools` already installs in the tool context — the same `TaskSink` a `Ctrl-T` run uses. |
+//! | Stream its output somewhere the host can read | the [`ShellSinkHandle`] `execute_call` already installs in the tool context — the same `TaskSink` a `Ctrl-T` run uses. |
 //! | Remember the run | [`BackgroundTasks`], the table the chord and the four `/commands` already share. |
 //! | Keep the exit code | [`BackgroundTasks::finished`], written by whichever single waiter the host runs. |
 //! | Stop it | [`ShellExecutor::stop`], the same call `/stop` makes. |
@@ -41,7 +41,7 @@
 //!    `allowed_commands` verdict is identical whichever tool asked for it.
 //! 3. A `Confirm` verdict comes back in the shape `run_command` returns it —
 //!    `{"status": "confirmation_required", …}` — so the unattended
-//!    fail-closed check in `execute_tools` refuses it there rather than this
+//!    fail-closed check in `execute_call` refuses it there rather than this
 //!    tool inventing a second answer.
 //!
 //! # Lifetime

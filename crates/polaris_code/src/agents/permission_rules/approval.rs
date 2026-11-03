@@ -273,7 +273,27 @@ impl ApprovalRequest {
         self.command.is_some()
     }
 
-    fn choices(&self) -> Vec<ApprovalChoice> {
+    /// Tool whose exact arguments the person is being asked to authorize.
+    #[must_use]
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// Complete original arguments, before any human wait.
+    #[must_use]
+    pub fn arguments(&self) -> &Value {
+        &self.args
+    }
+
+    /// Canonical command directory, absent when directory validation failed.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+
+    /// Choices offered for this call under its policy and containment checks.
+    #[must_use]
+    pub fn choices(&self) -> Vec<ApprovalChoice> {
         let mut choices = vec![ApprovalChoice::new(
             "once",
             "allow once",
@@ -349,6 +369,39 @@ impl ApprovalRequest {
         io: &UserIO,
         prompt: String,
         grants: &SessionGrants,
+    ) -> Result<ApprovalScope, ApprovalError> {
+        let scope = self.receive_scope(io, prompt).await?;
+        self.remember_scope(grants, scope)?;
+        Ok(scope)
+    }
+
+    pub(crate) fn remember_scope(
+        &self,
+        grants: &SessionGrants,
+        scope: ApprovalScope,
+    ) -> Result<(), ApprovalError> {
+        let id = match scope {
+            ApprovalScope::Once => "once",
+            ApprovalScope::Exact => "exact",
+            ApprovalScope::Prefix => "prefix",
+        };
+        if !self
+            .choices()
+            .iter()
+            .any(|choice| choice.id == id && choice.confirmed)
+        {
+            return Err(ApprovalError::Denied {
+                reason: "Confirmation selected an unavailable approval scope".into(),
+            });
+        }
+        grants.remember(self, scope);
+        Ok(())
+    }
+
+    pub(crate) async fn receive_scope(
+        &self,
+        io: &UserIO,
+        prompt: String,
     ) -> Result<ApprovalScope, ApprovalError> {
         let choices = self.choices();
         let prompt = if self.command.is_some() {
@@ -446,7 +499,6 @@ impl ApprovalRequest {
             "prefix" => ApprovalScope::Prefix,
             _ => ApprovalScope::Once,
         };
-        grants.remember(self, scope);
         Ok(scope)
     }
 }

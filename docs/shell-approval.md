@@ -6,8 +6,8 @@ depends on the shell plugin and replaces its standard `run_command` registration
 with a receipt-aware tool before the registry freezes. The framework shell plugin
 owns the executor and cleanup; background tools use that same executor.
 
-Authorization belongs to host policy. After approval, the host issues an
-`ApprovalReceipt` and injects it into `ToolContext`. Model JSON cannot mint a
+Authorization belongs to host policy. Before asking, the host binds an
+`ApprovalReceipt`; only an allow decision injects it into `ToolContext`. Model JSON cannot mint a
 receipt. An embedding host can use `ApprovalReceipt::issue` with its own
 validator without installing the coding agent. The validator must compare the
 current rule revision and session generation with those captured by the host.
@@ -70,3 +70,33 @@ widens or narrows it. `APPROVAL_CONTEXT` is a display hint only.
 whole command has been drawn, and accept only a denial for a command over
 64 KiB; that can only make the panel stricter. A front end that ignores both
 keys shows the full prompt, which still names the command and directory.
+
+The agent graph authorizes one call at a time. `prepare_calls` creates a local
+queue; `authorize_call` re-reads session grants and checks a review against the
+original call index and current policy. An allowed call reaches `execute_call`,
+a refusal reaches `record_denial`, and an unresolved confirmation reaches
+`ask_human`. The tool loop has its own iteration bound, independent of
+`--max-turns`. If that bound is reached, every remaining call receives an
+explicit error result. Tool failures remain results, so later calls can run.
+Entirely allowed read-only batches retain their concurrent execution path.
+
+Install `agents::InteractiveApprovalPlugin` to publish the optional global
+`HumanApproval`. `ask_human` reads it as `Option<Res<HumanApproval>>`; without
+an approver, it returns "Permission denied: no approver is registered" and the
+batch continues. Permission modes that allow calls without asking still work.
+An embedding can replace the transport through `HumanApproval::new` and the
+`HumanApprover` contract. The capability validates any returned scope against
+the request's offered choices before recording session grants.
+
+The binary installs the plugin for interactive sessions. `--print` retains
+unattended authorization: explicit launch grants decide which calls may run,
+and other mutations are denied before human input. Its input channel carries
+one prompt and closes; it has no human answer source and no approval plugin.
+
+The shell receipt is bound before the human wait and attached only after an
+allow decision. The activity block shows "awaiting approval" during the wait,
+and the background slot refuses detachment until approval finishes. An
+interrupt resolves the pending request before the next input receive. Human
+answers are recorded as `human_approval` trajectory decisions, with the call
+identity and chosen scope or denial reason, alongside permission and tool-call
+records. Confirmation metadata and denial text use the existing wire format.

@@ -50,7 +50,7 @@
 //! to [`PHASE_BACKGROUND`] and stops updating until the task finishes or is
 //! followed again. The closing update can therefore arrive long after the turn
 //! that opened the block has ended, from
-//! [`background`](super::background) rather than from `execute_tools` — which
+//! [`background`](super::background) rather than from `execute_call` — which
 //! is why [`tool_message`] exists as a free function: the identity is the
 //! provider's `tool_call.id`, not something a live [`ToolActivity`] has to
 //! still be holding.
@@ -349,11 +349,15 @@ impl ToolActivity {
     /// detail plus its size, so it collapses to one row. Failures and denials
     /// keep their body in view: that text is the reason.
     pub async fn finish(self, user_io: &UserIO, phase: &str, result: &str) {
+        let _ = user_io.send(self.finish_message(phase, result)).await;
+    }
+
+    pub(crate) fn finish_message(self, phase: &str, result: &str) -> IOMessage {
         let summary = (phase == PHASE_OK)
             .then(|| result_size(result))
             .flatten()
             .map(|size| self.summary(&size));
-        self.emit(user_io, phase, result, summary.as_deref()).await;
+        self.message(phase, result, summary.as_deref())
     }
 
     /// Close the block with `rendered` as its body, keeping the structured

@@ -22,7 +22,7 @@ The permission model is documented separately in
 ## Where it applies
 
 The seam is the point where a tool result becomes a string, in
-`crates/polaris_code/src/agents/code_agent.rs`: `execute_tools` for a
+`crates/polaris_code/src/agents/code_agent/tool_calls.rs`: `execute_call` for a
 sequential call and `execute_read_only_batch` for a batch of reads run
 concurrently. Both apply [`SecretRedactor`] to every tool result — success
 bodies, error strings, and each live-streamed chunk — *before* the result is

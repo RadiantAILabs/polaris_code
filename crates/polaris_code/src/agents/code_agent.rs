@@ -453,7 +453,7 @@ async fn prepare_context(
 /// Three conditions, and the batch is judged as a whole rather than sliced into
 /// runs:
 ///
-/// 1. **More than one call.** A single call is the sequential loop's own case;
+/// 1. **More than one call.** A single call uses the sequential graph lane;
 ///    routing it here would buy nothing and cost it the streaming and
 ///    backgrounding the loop gives it.
 /// 2. **Every call is read-only.** Read-only-ness is the tool's declared
@@ -1839,6 +1839,7 @@ impl Agent for CodeAgent {
         ctx.insert(AttemptLedger::default());
         ctx.insert(tool_calls::ToolBatch::default());
         ctx.insert(tool_calls::CallLifetime::default());
+        tool_calls::setup_cleanup(ctx);
         // Bind the queue's containment root to the very directory this agent
         // is configured with, so the gate the composer submits through and the
         // sandbox the tools run in can never disagree about what is inside the
@@ -2015,6 +2016,11 @@ where
 ///   `ReviewPolicy::default()`; add it with your own policy to change the
 ///   reviewer model, timeout, output cap or denial cutoff.
 ///
+/// Human input is optional and is never installed by this plugin. Add
+/// [`InteractiveApprovalPlugin`](super::human_approval::InteractiveApprovalPlugin)
+/// to serve attended confirmation requests; without it, calls that need a
+/// person receive an explicit denial and other calls continue.
+///
 /// Both depend on [`ToolPolicyPlugin`](crate::tools::ToolPolicyPlugin), which is
 /// added by default as well, so tool capabilities can publish policy facts the
 /// agent reads.
@@ -2121,6 +2127,7 @@ impl Plugin for CodeAgentPlugin {
                 ))))
             });
         }
+        tool_calls::install_cleanup(server);
         server.register_local(LoopState::default);
         server.register_local(PolicySnapshot::defaults);
         // Process configuration, not session state: one rule set decided at

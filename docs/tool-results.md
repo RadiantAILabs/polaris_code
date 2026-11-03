@@ -91,7 +91,7 @@ most of its bytes on escaped newlines and bookkeeping fields, and buries the
 exit status in the middle. Presenting a result is the consumer's job, so
 [`tools/shell_render.rs`](../crates/polaris_code/src/tools/shell_render.rs)
 renders it at the point where tool values become tool-result blocks
-(`execute_tools` in `agents/code_agent.rs`):
+(`execute_call` in `agents/code_agent/tool_calls.rs`):
 
 ```
 line one

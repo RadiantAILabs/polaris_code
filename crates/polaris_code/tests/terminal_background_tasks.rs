@@ -321,6 +321,7 @@ impl Host {
             .add_plugins(SessionsPlugin::new(Arc::new(FileStore::new(
                 working_dir.join(".polaris/sessions"),
             ))))
+            .add_plugins(polaris_code::agents::InteractiveApprovalPlugin)
             .add_plugins(CodeAgentPlugin::new())
             .add_plugins(HeadlessTuiPlugin);
 

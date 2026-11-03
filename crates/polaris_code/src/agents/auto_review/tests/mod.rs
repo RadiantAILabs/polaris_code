@@ -185,6 +185,7 @@ impl Harness {
             ))
             .add_plugins(crate::tools::approval::ApprovalShellPlugin)
             .add_plugins(crate::tools::TaskToolsPlugin::new(tasks.clone()))
+            .add_plugins(crate::agents::InteractiveApprovalPlugin)
             .add_plugins(rules)
             .add_plugins(AutoReviewPlugin::new(ReviewPolicy {
                 timeout: Duration::from_millis(10),

@@ -40,6 +40,8 @@ const INTERNAL_RESOURCES: &[&str] = &[
     // Per-response tool queue and the active invocation owned by graph nodes.
     "ToolBatch",
     "CallLifetime",
+    // Shared sender and queued terminal closures for interruption cleanup.
+    "ToolCleanup",
     // The published progress middleware chain, read by a host that builds its
     // own `GraphExecutor` so its graph is watched like the agent loop is.
     // Listed here rather than in `src/docs/resources.md`; it belongs in the
