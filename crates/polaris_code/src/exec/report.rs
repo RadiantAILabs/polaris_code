@@ -75,7 +75,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use polaris::plugins::{IO_TYPE, IOMessage};
+use polaris::plugins::{IO_TYPE, IOContent, IOMessage};
 use polaris::sessions::{SessionId, TurnNumber};
 use polaris_cosmos::contracts::{
     CandidateConsideration, CompositionChoiceOrigin, CompositionEvidence, ContentDigest,
@@ -87,6 +87,7 @@ use crate::agents::FailureKind;
 use crate::cosmos::host::TopologyTurn;
 use crate::cosmos::inventory::TopologyInventory;
 use crate::run::{TurnOutcome, TurnReason};
+use crate::terminal::transcript::{META_DOCUMENT, META_SUMMARY};
 use crate::usage::{CeilingStatus, RUN_USAGE_SCHEMA, RunUsage};
 
 /// Which topology ran, and why it beat the alternatives — the same facts
@@ -749,12 +750,39 @@ pub fn usage_message(usage: &RunUsage) -> IOMessage {
 /// the front end reports as a diagnostic on stderr rather than emitting a
 /// malformed line.
 pub fn stream_json_line(message: &IOMessage) -> Result<String, serde_json::Error> {
+    // A finished tool block carries a collapsed summary, and `run_command`
+    // its rendered shell text, for the terminal. The stream keeps the shape it
+    // always had: the executor's document as the body, no display extras.
+    if message.metadata.contains_key(META_SUMMARY) || message.metadata.contains_key(META_DOCUMENT) {
+        let mut message = message.clone();
+        if let Some(document) = message.metadata.remove(META_DOCUMENT) {
+            message.content = IOContent::Text(document);
+        }
+        message.metadata.remove(META_SUMMARY);
+        return serde_json::to_string(&message);
+    }
     serde_json::to_string(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_json_keeps_the_executor_document_as_a_tool_body() {
+        let block = IOMessage::from_agent("code", IOContent::Text("a\nb\n[exit code: 0]".into()))
+            .with_metadata(IO_TYPE, "tool")
+            .with_metadata(META_SUMMARY, "cat x · exit 0 · 2 lines")
+            .with_metadata(META_DOCUMENT, r#"{"status":"executed"}"#);
+        let line: serde_json::Value =
+            serde_json::from_str(&stream_json_line(&block).unwrap()).unwrap();
+        assert_eq!(
+            line["content"]["Text"], r#"{"status":"executed"}"#,
+            "{line}"
+        );
+        assert!(line["metadata"].get(META_SUMMARY).is_none(), "{line}");
+        assert!(line["metadata"].get(META_DOCUMENT).is_none(), "{line}");
+    }
     use crate::agents::TurnFailure;
     use crate::usage::TokenMeter;
     use polaris::graph::RunId;

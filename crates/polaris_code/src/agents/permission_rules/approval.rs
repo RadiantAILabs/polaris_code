@@ -265,6 +265,13 @@ impl ApprovalRequest {
         }
     }
 
+    /// Whether the prompt names a command for the front end to frame, so the
+    /// tool's own activity row need not repeat it.
+    #[must_use]
+    pub fn frames_command(&self) -> bool {
+        self.command.is_some()
+    }
+
     fn choices(&self) -> Vec<ApprovalChoice> {
         let mut choices = vec![ApprovalChoice::new(
             "once",

@@ -1238,8 +1238,9 @@ async fn main() {
     startup_notes.extend(mcp.startup_notes());
     // Indexing `~` (or any folder that is not a project) walks everything
     // under it before the first answer; skip the boot pass there and say how
-    // to get it.
-    let boot_index = polaris_code::tools::looks_like_project(&working_dir);
+    // to get it. Interactive only: a headless run (evals, scripts) is pointed
+    // at its directory on purpose and keeps the index it always had.
+    let boot_index = headless || polaris_code::tools::looks_like_project(&working_dir);
     if !boot_index {
         startup_notes.push(format!(
             "{} doesn't look like a project, so the code index was skipped. \

@@ -656,7 +656,14 @@ pub(crate) async fn execute_tools(
                 }
                 // Waiting on the user is not the tool running: say so, so the
                 // elapsed time on the block isn't read as the tool being slow.
-                activity.phase(&user_io, PHASE_PENDING, &detail).await;
+                // A command the approval frames above the input is not
+                // repeated on its row; the row says what it is waiting on.
+                let waiting = if request.frames_command() {
+                    "awaiting approval"
+                } else {
+                    detail.as_str()
+                };
+                activity.phase(&user_io, PHASE_PENDING, waiting).await;
                 // An unapproved command must not reach the background by the
                 // back door, so the slot says the block is parked and
                 // `BackgroundTasks::request` refuses while it is.
