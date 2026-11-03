@@ -996,16 +996,31 @@ impl Redaction {
 /// [`CodeAgentPlugin`], from [`CodeAgentPlugin::with_redaction`]. The binary
 /// gates it on `POLARIS_CODE_REDACT`; every other host gets it enabled.
 ///
-/// # Consuming system
+/// # Access
 ///
-/// `execute_call` reads it as `Res<SecretRedactor>` and applies it to each
-/// tool result — the one seam every consumer of that result is downstream of.
+/// Read as `Res<SecretRedactor>`. `execute_call` reads it and applies it to
+/// each tool result — the one seam every consumer of that result is downstream
+/// of. Scanning does not change the shared configuration: `scan` works on a
+/// copy and returns the rewritten text.
+///
+/// # Alternatives
+///
+/// _none_ — there is one redaction rule set per server. Turn it off with
+/// [`CodeAgentPlugin::with_redaction`] rather than replacing the resource.
 ///
 /// # Example
 ///
 /// ```
+/// use polaris::system::{param::Res, system};
 /// use polaris_code::agents::code_agent::SecretRedactor;
 ///
+/// #[system]
+/// async fn redact_output(redactor: Res<SecretRedactor>) -> String {
+///     let scan = redactor.scan("ANTHROPIC_API_KEY=sk-ant-api03-0Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm");
+///     scan.text().to_owned()
+/// }
+///
+/// // The same rules, applied directly.
 /// let redactor = SecretRedactor::new(true);
 /// let scan = redactor.scan("ANTHROPIC_API_KEY=sk-ant-api03-0Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm");
 /// assert!(!scan.is_clean());
@@ -1992,6 +2007,9 @@ where
 
 /// Plugin that registers the [`CodeAgent`]'s local resources and persistence.
 ///
+/// Add it to run the reflective coding loop on a server that already has
+/// models, tools and persistence.
+///
 /// # Resources Provided
 ///
 /// | Resource | Scope | Description |
@@ -2000,6 +2018,13 @@ where
 /// | [`LoopState`] | local | Loop termination flag. |
 /// | [`PolicySnapshot`] | local | Per-turn decision policy (defaults in v1). |
 /// | [`SecretRedactor`] | global | Withholds recognisable credentials from every consumer of a tool result. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | `HooksAPI` | Inserted only when no earlier plugin installed it, so the failure hook below can register. |
+/// | `MiddlewareAPI` | Inserted only when no earlier plugin installed it, so the middleware below can register. |
 ///
 /// # Dependencies
 ///
@@ -2024,6 +2049,28 @@ where
 /// Both depend on [`ToolPolicyPlugin`](crate::tools::ToolPolicyPlugin), which is
 /// added by default as well, so tool capabilities can publish policy facts the
 /// agent reads.
+///
+/// # Hooks Registered
+///
+/// An `OnGraphFailure` hook (`polaris_code::tool_batch_cleanup`) closes a tool
+/// batch that an interruption left open, so every `tool_use` gets a result.
+///
+/// # Middleware Registered
+///
+/// Graph-execution middleware (`polaris_code::tool_batch_cleanup`) delivers the
+/// terminal closures that the hook queued, once graph execution has finished.
+///
+/// # Lifecycle
+///
+/// - `build` registers the local resources, the hook and the middleware, and
+///   publishes [`SecretRedactor`].
+/// - `ready` registers the [`ContextManager`] serializer with `PersistenceAPI`
+///   when [`PersistencePlugin`] provides it.
+///
+/// # Extends
+///
+/// - [`PersistencePlugin`]: adds a serializer for [`ContextManager`].
+/// - The shared hook and middleware APIs: adds one hook and one middleware.
 ///
 /// # Example
 ///

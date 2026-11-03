@@ -19,6 +19,11 @@ use super::permission_rules::{ApprovalAnswer, ApprovalError, ApprovalRequest, Se
 /// existing confirmation protocol.
 pub trait HumanApprover: Send + Sync + 'static {
     /// Present the exact request and return its scope and optional note or refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApprovalError::Denied`] when the person refuses, and
+    /// [`ApprovalError::Prompt`] when the prompt channel fails.
     fn ask<'a>(
         &'a self,
         request: &'a ApprovalRequest,
@@ -27,6 +32,11 @@ pub trait HumanApprover: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<ApprovalAnswer, ApprovalError>>;
 
     /// Resolve a prompt whose wait was interrupted, before another input receive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IOError`] when the channel fails before the resolution is
+    /// delivered. A refusal does not apply to cancellation.
     fn cancel<'a>(
         &'a self,
         request: &'a ApprovalRequest,
@@ -35,6 +45,10 @@ pub trait HumanApprover: Send + Sync + 'static {
 }
 
 /// The host's optional human approval capability.
+///
+/// Use it from a system when authorization has left a call needing a person:
+/// it asks for a decision over the session's input channel and resolves a
+/// prompt that was interrupted.
 ///
 /// # Scope
 ///
@@ -50,6 +64,11 @@ pub trait HumanApprover: Send + Sync + 'static {
 ///
 /// Read as `Option<Res<HumanApproval>>`. Absence denies any call that still
 /// needs a person after deterministic authorization and automatic review.
+///
+/// [`Self::ask`] re-checks the scope the transport returns against the choices
+/// the request offered, and may update the supplied [`SessionGrants`]. A
+/// replacement [`HumanApprover`] must be `Send + Sync` and handle its own
+/// shared state.
 ///
 /// # Alternatives
 ///
@@ -69,6 +88,12 @@ pub trait HumanApprover: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct HumanApproval(Arc<dyn HumanApprover>);
 impl GlobalResource for HumanApproval {}
+
+impl std::fmt::Debug for HumanApproval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HumanApproval(..)")
+    }
+}
 
 impl HumanApproval {
     /// Bind a replacement human input transport at assembly time.
@@ -125,6 +150,11 @@ impl HumanApprover for InteractiveApprover {
 
 /// Supplies human approval over each session's existing [`UserIO`] channel.
 ///
+/// Install it when a host runs attended sessions and wants a person to confirm
+/// tool calls over the input channel it already has. Omit it for headless runs.
+/// The approval contract is described in the
+/// [shell approval guide](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/shell-approval.md).
+///
 /// # Resources Provided
 ///
 /// | Resource | Scope | Description |
@@ -133,11 +163,14 @@ impl HumanApprover for InteractiveApprover {
 ///
 /// # APIs Provided
 ///
-/// None.
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | The plugin publishes only the [`HumanApproval`] resource; it provides no API of its own. |
 ///
 /// # Dependencies
 ///
-/// None. The caller supplies the session's `UserIO` and `SessionGrants` when
+/// None. The caller supplies the session's `UserIO` and
+/// [`SessionGrants`](crate::agents::permission_rules::SessionGrants) when
 /// asking. The plugin does not create another input receive boundary.
 ///
 /// # Lifecycle
@@ -215,7 +248,11 @@ mod tests {
                 &grants,
             )
             .await;
-        assert!(matches!(answer, Err(ApprovalError::Denied { .. })));
+        assert!(matches!(
+            answer,
+            Err(ApprovalError::Denied { ref reason })
+                if reason == "Confirmation selected an unavailable approval scope"
+        ));
         assert!(!grants.allows(1, "run_command", &args, dir.path()));
     }
 }
