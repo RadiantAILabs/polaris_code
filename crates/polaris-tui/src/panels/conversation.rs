@@ -3835,12 +3835,13 @@ fn build_message_layout(
             )],
         };
         let last = rendered.len().saturating_sub(1);
+        // Only the first row leads with the label; it is moved there, and
+        // every later row is indented to line up under it.
+        let mut first_lead = Some(first_lead);
         for (index, mut line) in rendered.into_iter().enumerate() {
-            let lead = if index == 0 {
-                first_lead.clone()
-            } else {
-                vec![Span::raw(indent.clone())]
-            };
+            let lead = first_lead
+                .take()
+                .unwrap_or_else(|| vec![Span::raw(indent.clone())]);
             line.spans.splice(0..0, lead);
             if queued && index == last {
                 line.spans.push(Span::styled(
@@ -4642,6 +4643,17 @@ impl Default for ConversationPanelPlugin {
             attachment_source: None,
             placeholder: None,
         }
+    }
+}
+
+/// Names the plugin and the options that are plain data. The rest are host
+/// closures and trait objects, which have no `Debug` of their own.
+impl std::fmt::Debug for ConversationPanelPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConversationPanelPlugin")
+            .field("buffer", &self.buffer)
+            .field("placeholder", &self.placeholder)
+            .finish_non_exhaustive()
     }
 }
 
@@ -7998,7 +8010,11 @@ mod tests {
             ],
         );
         let alone = build_message_lines(&VecDeque::from([panel.transcript[3].clone()]), 0, false);
-        assert_eq!(alone.len(), 2);
+        assert_eq!(
+            alone.iter().map(line_text).collect::<Vec<_>>(),
+            ["", "you ❯ second"],
+            "a lone prompt rebuilds as its blank separator and its own row"
+        );
     }
 
     /// A host-named subject is framed once above the input; the raw prompt
@@ -10453,6 +10469,19 @@ mod tests {
         for word in ["once", "subcommand)", "reason)", "details"] {
             assert!(screen.contains(word), "{word} was cut:\n{screen}");
         }
+    }
+
+    /// The plugin can be printed, which a host's own `Debug` derive or an
+    /// `{:?}` in a failed assertion needs; its closures are left out.
+    #[test]
+    fn the_plugin_prints_without_its_host_closures() {
+        let plugin = ConversationPanelPlugin::default()
+            .with_placeholder("Ask Polaris…")
+            .with_interrupt_handle(|| {});
+        assert_eq!(
+            format!("{plugin:?}"),
+            "ConversationPanelPlugin { buffer: 64, placeholder: Some(\"Ask Polaris…\"), .. }"
+        );
     }
 
     /// The empty input says what it is for and how to reach the transcript.
