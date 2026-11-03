@@ -32,3 +32,34 @@ Approval prompts use `polaris_tui::ApprovalChoice` and the exported metadata key
 `ApprovalError::Denied` from `ApprovalError::Prompt`, preserving provider errors.
 Interrupted prompts are resolved using their `APPROVAL_REQUEST_ID` before the
 next input receive; an answer to a resolved prompt cannot approve a later call.
+
+A command prompt also carries `APPROVAL_SUBJECT` (the command, verbatim) and
+`APPROVAL_CONTEXT` (`run_command in <directory>`, home shown as `~`). The
+conversation panel frames the command once above the input instead of printing
+the whole prompt, with the answers pinned under it:
+
+```
+y allow once
+s allow this exact command in /home/me/repo for this session
+p allow prefix "cargo test" (whole words, every subcommand) in /home/me/repo for this session
+n deny (or no: reason)
+```
+
+The labels state each answer's scope: the exact grant covers that command
+string only, the prefix grant every command that starts with those whole words
+(any subcommand or extra arguments), and both are bound to the named canonical
+directory and end with the session. `p` is offered only when the command has a
+simple prefix; `s` and `p` only where remembering is allowed. `n`, `no`, `deny`
+and `Esc` deny; `no: reason` or `deny: reason` returns the reason to the model.
+
+A command taller than the frame scrolls inside it (`↑` / `↓`, `PgUp` / `PgDn`
+with an empty input), and the panel refuses a confirming answer until the
+command's last row has been on screen. A command longer than 64 KiB cannot be
+shown in full, so only a denial is accepted for it. `?` adds the full prompt —
+tool, directory and JSON arguments — to the frame.
+
+`APPROVAL_SUBJECT` and `APPROVAL_CONTEXT` are display hints only. The reply's
+`confirmed` metadata and `approval_choice` decide the answer, and the grant is
+bound to the tool, arguments, canonical directory, generation and rule revision
+as above; nothing in the hints widens or narrows it. A front end that ignores
+them shows the full prompt, which still names the command and directory.

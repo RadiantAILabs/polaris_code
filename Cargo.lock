@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossterm",
  "futures",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "polaris-tui-examples"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "polaris-ai",
  "polaris-tui",

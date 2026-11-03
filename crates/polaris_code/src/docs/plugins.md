@@ -44,7 +44,7 @@ queries remain Rust-only.
 Its lifecycle is split deliberately. `build` registers the toolsets *and*
 asserts that an index is pending, into a named graph of its own
 (`urn:polaris:graph:code-index`) that a full re-index does not clear; `ready`
-spawns the boot index, which flips that graph to `ready` only once the
+spawns the boot index (unless it was turned off, below), which flips that graph to `ready` only once the
 enrichment pass has run too. Every graph tool reads those facts before it
 answers, so a query that arrives during startup is told to wait rather than
 handed an empty result, and [`terminal::status`](crate::terminal::status) puts
@@ -52,6 +52,14 @@ the same phase on the workspace row. No new resource or API carries this: the
 index's state is asserted into the store both the tools and the agent already
 hold. See [`tools::code_graph`](crate::tools::code_graph) for the freshness half
 and its accepted failure mode.
+
+[`with_boot_index(false)`](crate::tools::CodeGraphPlugin::with_boot_index)
+skips both halves of that startup pass: `build` asserts no pending index and
+`ready` spawns none. The tools still register and answer that the index was not
+built, and edits still refresh the files they touch. The `polaris` binary does
+this for an interactive run whose working directory does not look like a
+project ([`looks_like_project`](crate::tools::looks_like_project)); a headless
+run always indexes.
 
 `InertModelPlugin` (private, `crate::cosmos::compare`) is not part of the
 public plugin surface, so it has no rustdoc page to link: a topology

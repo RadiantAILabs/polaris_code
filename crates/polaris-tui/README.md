@@ -142,7 +142,10 @@ availability, and a count of host-owned tasks running outside the current turn
 (`with_tasks_running`), without owning any of those policies. Unknown budgets and prices
 remain visibly unknown, cumulative billed tokens stay separate, and an
 unavailable report preserves drafts instead of accepting work no driver can
-process.
+process. By default the row shows the state, model, context percentage, cost
+and running-task count; the token tally, session, permissions, workspace and
+full context window appear once `Ctrl-O` expands it. A narrow row drops whole
+facts, least useful first, rather than clipping one mid-word.
 
 ---
 
@@ -247,7 +250,8 @@ it works whether or not your terminal maps Option to Meta.
 | `Enter`                           | Submit the message.             |
 | `Shift+Enter` / `Alt+Enter`       | Insert a newline (see [multi-line prompts](#multi-line-prompts)). |
 | `\` then `Enter`                  | Insert a newline on any terminal. |
-| `Ctrl-O`                          | Reveal hidden messages, expand diff previews, and show the agent-graph timeline. |
+| `Ctrl-O`                          | Reveal hidden messages, expand diff previews and summarised tool output, show a framed approval's full prompt in the transcript, spell out the meta row (token tally, session, permissions, workspace, full context window), and show the agent-graph timeline. |
+| `?` on an empty input             | Show or hide the full prompt inside a framed approval (see [tool approvals](#tool-approvals)). |
 | `Ctrl-R`                          | Search prompt history; repeat to find an older match. |
 | `Ctrl-G`                          | Open the draft in VISUAL/EDITOR; cancel when searching. |
 | `Ctrl-N`                          | Browse the transcript (see [search, navigation, and export](#transcript-search-navigation-and-export)). |
@@ -361,6 +365,29 @@ A plain "yes" typed with no dialog open is just a message, and an answer that
 cannot be delivered leaves the dialog open. Only a stamped, delivered approval
 runs the tool. Which actions need approval is the tool's permission — set by
 the consumer, not by this panel.
+
+A host may also name the one thing being approved. `APPROVAL_SUBJECT` carries
+it verbatim (a command) and `APPROVAL_CONTEXT` says where it applies
+(`run_command in ~/repo`). The panel then frames the subject once, above the
+input, instead of printing the whole prompt into the transcript:
+
+- the answers (`APPROVAL_CHOICES` labels, or `y` / `n`) and any notice sit on
+  the frame's last rows and are never clipped, however long the subject is;
+- a subject taller than the frame scrolls inside it: `↑` / `↓` move one row and
+  `PgUp` / `PgDn` a page while the input is empty, and the frame's border says
+  how many rows are above and below;
+- a confirming answer is refused, with a notice, until the subject's last row
+  has been on screen. Denials (`n`, `no: reason`, `Esc`) always go through;
+- a subject longer than 64 KiB cannot be shown in full, so only a denial is
+  accepted for it;
+- `?` on an empty input adds the full prompt to the same scrolling frame,
+  bounded at 64 KiB with a marker where it was cut. `Ctrl-O` shows the prompt
+  in the transcript.
+
+Both keys are display hints only. The answer is decided by the `confirmed`
+metadata and, where choices were offered, `approval_choice`; nothing in the
+subject or context changes what a reply authorizes. Without a subject the
+prompt renders as before.
 
 ### Notifications
 
@@ -574,7 +601,7 @@ which subset to wire in.
 
 | Plugin                       | What it contributes                                                                                               |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approval dialogs. Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-N` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `with_notifications` opts in to a terminal bell and/or window-title change when an approval opens or a turn ends (see [notifications](#notifications)). `Ctrl-O` reveals hidden messages, expands diff previews, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. |
+| `ConversationPanelPlugin`    | Chat transcript driven by a `TuiIOProvider`. Also registers a `UserIO` factory pointing at the same provider (wrappable with `with_io_decorator`), and answers its `UserIO::confirm` approval dialogs. Presents host-advertised `/` commands and host-sourced `@` file mentions (`with_completion_source`). A host can provide `with_interrupt_handle` so `Ctrl-C` requests interruption during a running turn; host-emitted `interrupting` and `cancelled` messages render the truthful lifecycle. `Ctrl-N` opens searchable transcript browsing, optionally paged back through a host-supplied canonical history (`with_history_source`). `with_notifications` opts in to a terminal bell and/or window-title change when an approval opens or a turn ends (see [notifications](#notifications)). `Ctrl-O` reveals hidden messages, expands diff previews and summarised tool output, spells out the meta row, and adds a per-turn agent-graph node timeline; pair `with_log_buffer` with `LogPanelPlugin::with_buffer` over one shared `LogBuffer` to show each node's captured `tracing` output. A host-supplied `with_attachment_source` turns mentioned paths and the clipboard into removable composer chips whose handles ride the submitted prompt. `with_background_handle` binds `Ctrl-T` to the host's request to background whatever the turn is waiting on — the panel forwards the press and learns nothing back, so the receipt and every refusal are host messages. `with_placeholder` sets the dim hint in the empty input (default `DEFAULT_PLACEHOLDER`, `Send a message…`). Approval prompts may carry `APPROVAL_SUBJECT` / `APPROVAL_CONTEXT` to be framed above the input (see [tool approvals](#tool-approvals)), and a finished `tool` block may carry a one-line `summary` shown until `Ctrl-O`. |
 | `GraphPanelPlugin`           | Live graph of what a host is running, drawn from a `GraphModel` with the executing node highlighted. Publishes the `GraphFeed` global a producer writes to; the panel never sees the host's graph engine. |
 | `LogPanelPlugin`             | Tail of `tracing` events fed by an installed `tracing-subscriber` layer. `without_panel()` keeps the subscriber and the shared `LogBuffer` and contributes no tab, for a host that reads the buffer elsewhere (the conversation panel's `Ctrl-O` node timeline does). |
 | `SessionsPanelPlugin`        | Live list of active sessions read from `SessionsAPI`. Depends on `SessionsPlugin`.                                |
@@ -657,7 +684,7 @@ polaris-tui = { version = "0.1.0", default-features = false }
 ### Rich transcript
 
 Messages tagged `io_type = "message"` or `"error"` render Markdown headings,
-lists, inline code, tables and fenced code. Tool and approval previews retain
+lists, inline code (bold), tables and fenced code. Tool and approval previews retain
 literal text, with diff styling only for identifiable unified diff headers. Errors
 always have a red error label and block marker. Tool blocks show the supplied
 `label` and `phase`; the panel does not interpret tool behavior. Plain messages
@@ -702,6 +729,7 @@ fragments. Folding is opt-in and adds no second protocol — it is the same
 | `parent` | `tool` | The `message` that requested it; the tool renders indented beneath it. |
 | `phase` | `tool` | `pending`, `start`, `ok`, `denied`, `error` — rendered as a glyph. An unrecognised value still renders. |
 | `label`, `elapsed_ms` | `tool` | The invocation's name, and its wall time once it reaches a terminal phase. |
+| `summary` | `tool` | One line shown in place of the body until `Ctrl-O`, so a finished tool with a long result stays one row. Expanded, it heads the body. |
 
 A non-final `message` body is the **delta**, not the accumulated text, so a
 producer forwards its provider's events without buffering the answer. Each tool
@@ -773,7 +801,10 @@ A host may install `ConversationPanelPlugin::with_turn_input_handle` to make the
 run target explicit. Enter queues a follow-up and Ctrl-Enter offers steering to
 the active run at the host's next safe boundary. Each accepted line says which
 run will consume it. Alt-Up recalls the newest unconsumed item into the composer
-for editing; Alt-Backspace removes it. Approval answers never enter this queue,
+for editing; Alt-Backspace removes it. A host that overrides
+`TurnInputHandle::is_pending` lets the panel drop the `queued for run N` badge
+once the host takes a message, after which Alt-Up and Alt-Backspace go back to
+their ordinary editing meaning; the default answers `true` and keeps both. Approval answers never enter this queue,
 and a host that does not install the handle keeps the original `UserIO` delivery
 path unchanged.
 

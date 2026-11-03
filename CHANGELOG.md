@@ -5,6 +5,22 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+Requires `polaris-tui` 0.1.2.
+
+### Added
+- Framed command approvals: `polaris-tui` exports `APPROVAL_SUBJECT` and `APPROVAL_CONTEXT`; a prompt carrying them shows the command once above the input, with the answers pinned under it and the full prompt behind `?`. The keys are display hints only; `confirmed` and `approval_choice` still decide the answer.
+- Collapsed tool output: a finished `tool` block may carry a one-line `summary`, shown in place of the body until `Ctrl-O`. `run_command` blocks show shell text and keep the executor's JSON as `document` metadata; `stream-json` output is unchanged.
+- `ConversationPanelPlugin::with_placeholder` and `DEFAULT_PLACEHOLDER` for the empty input's hint.
+- `TurnInputHandle::is_pending` (defaults to `true`), so the panel can retire `queued for run N` badges on messages the host has taken.
+- `CodeGraphPlugin::with_boot_index` and `tools::looks_like_project`. An interactive `polaris` run outside a project skips the boot code index and says so; headless runs still index.
+
+### Changed
+- Approval labels state their scope: `allow this exact command in <dir> for this session`, `allow prefix "<prefix>" (whole words, every subcommand) in <dir> for this session`, `deny (or no: reason)`.
+- A command too tall for the approval frame scrolls inside it (`↑`/`↓`, `PgUp`/`PgDn`), and a confirming answer is refused until its last row has been shown. A command over 64 KiB accepts only a denial.
+- Default rendering every `polaris-tui` host gets: inline code is bold instead of yellow, a blank row separates turns, system messages and tool names/timings are dim, the empty input shows a placeholder, and the input title no longer repeats `Ctrl-N browse`.
+- The meta row shows state, short model name (`Sonnet 5.5 · Bedrock`), context %, cost and running tasks; token tally, session, permissions, workspace and the full context window move behind `Ctrl-O`. Facts and footer hints are dropped whole, by priority, on narrow terminals instead of being clipped.
+- Successful tool results longer than a line (other than diffs) collapse to a one-line summary; failures, denials and non-zero exits stay expanded.
+
 ## [0.2.0] - 2026-11-02
 
 Requires `polaris-tui` 0.1.1.
