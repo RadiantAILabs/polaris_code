@@ -198,11 +198,17 @@
 //! A subject taller than the frame scrolls (`↑`/`↓`, `PgUp`/`PgDn` on an
 //! empty input), and a confirming answer is refused until the subject's last
 //! row has been *drawn*, counting rows by grapheme cluster as ratatui draws
-//! them. The refused answer leaves the input, so the scroll keys the notice
+//! them. A scroll moves at most a page past the last frame drawn, so a burst
+//! of input between frames cannot skip rows, and a new width starts the read
+//! again from the top. A cluster wider than the frame can only be drawn as a
+//! `�`; the command is refused until the terminal is wide enough to show it.
+//! The refused answer leaves the input, so the scroll keys the notice
 //! names work at once. A frame with no room to draw any of the subject (five
 //! rows, or six beside a meta row, and fewer) refuses every confirming answer
 //! and says to enlarge the terminal; `n` and `Esc` still deny. Below four rows
-//! only the input fits and the frame is not drawn. A subject over 64 KiB cannot be shown
+//! only the input fits and the frame is not drawn; where the frame has no
+//! bottom border for a refusal (under two rows) the reason is in the input's
+//! title. A subject over 64 KiB cannot be shown
 //! in full and can only be denied. Host text drawn on every frame (labels, the
 //! context, the prompt's first line) is bounded to 2 KiB when it arrives, and
 //! a cut one ends in `…`.
@@ -4252,6 +4258,9 @@ impl TuiPanel for ConversationPanel {
             frame.render_widget(Paragraph::new(banner_lines), chunks[2]);
         }
 
+        // Under two rows the approval frame has no bottom border to carry a
+        // refusal, and under one it has no frame at all.
+        let borderless = approval.is_some() && chunks[3].height < 2;
         if let Some(chrome) = approval
             && chunks[3].height > 0
         {
@@ -4265,6 +4274,20 @@ impl TuiPanel for ConversationPanel {
             (true, true) => format!(" › {} lines ", self.composer.text().split('\n').count()),
             (true, false) => " › ".to_string(),
             (false, _) => " input ".to_string(),
+        };
+        // A refusal is never silent: with no room for it in the frame, the
+        // input's title carries it (nothing can be scrolled there either).
+        let title = match self.confirm_notice.as_deref() {
+            Some(notice) if borderless => {
+                let notice = if notice == UNSEEN_TAIL_NOTICE {
+                    CRAMPED_NOTICE
+                } else {
+                    notice
+                };
+                let room = composer_width.saturating_sub(4);
+                format!(" › {} ", clip_words(&safe_text(notice), room))
+            }
+            _ => title,
         };
         let input_block = Block::default()
             .borders(Borders::ALL)
@@ -10959,6 +10982,50 @@ mod tests {
             response.metadata.get(CONFIRMED).map(String::as_str),
             Some(CONFIRMED_FALSE)
         );
+    }
+
+    /// The smallest layouts used to refuse in silence: at 80×4 the frame is
+    /// one row with no bottom border (80×5 with a meta row, the same), and at
+    /// 80×4 with one it is not drawn at all. The reason is then in the input's
+    /// title, and `n` still denies.
+    #[tokio::test]
+    async fn a_refusal_is_never_silent_at_the_smallest_sizes() {
+        use polaris::plugins::IOProvider;
+        for height in 3..=6 {
+            for meta in [false, true] {
+                let (provider, mut panel) = TuiIOProvider::new_with_panel(8);
+                panel.meta_active = meta;
+                panel
+                    .inbox
+                    .lock()
+                    .push_back(framed_approval(&hidden_tail_command()));
+                panel.drain_inbox();
+                draw(&mut panel, 80, height);
+                type_str(&mut panel, "y");
+                panel.handle_key(key(KeyCode::Enter));
+                assert!(
+                    panel.pending_confirm.is_some() && nothing_submitted(&panel),
+                    "80×{height} meta {meta}: nothing was shown, so `y` waits"
+                );
+                let screen = draw(&mut panel, 80, height).0.join("\n");
+                assert!(
+                    screen.contains("too small to show") || screen.contains("scroll to the end"),
+                    "80×{height} meta {meta}: the refusal gave no reason:\n{screen}"
+                );
+
+                type_str(&mut panel, "n");
+                panel.handle_key(key(KeyCode::Enter));
+                assert!(panel.pending_confirm.is_none(), "80×{height} meta {meta}");
+                let response = tokio::time::timeout(Duration::from_secs(5), provider.receive())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    response.metadata.get(CONFIRMED).map(String::as_str),
+                    Some(CONFIRMED_FALSE)
+                );
+            }
+        }
     }
 
     /// A frame with no columns draws nothing, so it cannot count the command
