@@ -57,8 +57,10 @@ with an empty input), and the panel refuses a confirming answer until the
 command's last row has been on screen. A command longer than 64 KiB cannot be
 shown in full, so only a denial is accepted for it. `?` adds the full prompt —
 tool, directory and JSON arguments — to the frame. On a terminal too small for
-the labels above, the footer shows only the keys (`y s p n ?`) and `?` shows the
-full labels; a refusal reason then appears in the frame's border title.
+the labels above, the keys move into the frame's top border (`y s p n · ? details`),
+`?` shows the full labels above the command, and a refusal reason appears in the
+bottom border. With no room for any of the command, only a denial is accepted
+until the terminal is enlarged.
 
 The reply's `confirmed` metadata and `approval_choice` still decide the answer,
 and the grant is bound to the tool, arguments, canonical directory, generation

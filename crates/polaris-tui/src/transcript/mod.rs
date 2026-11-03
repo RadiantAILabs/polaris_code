@@ -33,7 +33,8 @@ pub(crate) fn safe_text(text: &str) -> String {
                 column += spaces;
             }
             ch if ch.is_control()
-                || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') => {}
+                || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}' | '\u{2028}' | '\u{2029}' | '\u{feff}') =>
+                {}
             ch => {
                 result.push(ch);
                 column += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);

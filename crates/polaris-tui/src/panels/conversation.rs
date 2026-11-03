@@ -10421,7 +10421,7 @@ mod tests {
                 .with_metadata(APPROVAL_CHOICES, ApprovalChoice::encode(&choices))
                 .with_metadata(
                     APPROVAL_SUBJECT,
-                    "echo ok\u{1b}[1A\u{1b}[2K\rrm -rf build \u{202e}txt.exe",
+                    "echo ok\u{1b}[1A\u{1b}[2K\rrm -rf build \u{202e}\u{2066}\u{200b}\u{feff}\u{2028}txt.exe",
                 )
                 .with_metadata(
                     APPROVAL_CONTEXT,
@@ -10430,7 +10430,9 @@ mod tests {
         );
         panel.drain_inbox();
         let screen = draw(&mut panel, 100, 20).0.join("\n");
-        for control in ['\u{1b}', '\r', '\u{202e}', '\u{7}'] {
+        for control in [
+            '\u{1b}', '\r', '\u{202e}', '\u{7}', '\u{2066}', '\u{200b}', '\u{feff}', '\u{2028}',
+        ] {
             assert!(
                 !screen.contains(control),
                 "{control:?} reached the screen:\n{screen}"

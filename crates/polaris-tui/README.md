@@ -373,9 +373,13 @@ input, instead of printing the whole prompt into the transcript:
 
 - the answers (`APPROVAL_CHOICES` labels, or `y` / `n`) and any notice sit on
   the frame's last rows, wrapped to the width, however long the subject is. If
-  the terminal is too small for the full labels, the footer collapses to the
-  keys (`y s p n ?`) and `?` shows the labels; a refusal reason then appears in
-  the frame's border title;
+  the terminal is too small for the full labels, the answers move into the
+  frame's top border as keys (`y s p n · ? details`), `?` shows the labels above
+  the command, and a refusal reason appears in the bottom border. A refused
+  answer is cleared from the input. With no room for any of the command, every
+  confirming answer is refused with a notice to enlarge the terminal; `n` and
+  `Esc` still deny. Labels, the context and the prompt's first line are cut to
+  2 KiB on arrival (a cut one ends in `…`);
 - a subject taller than the frame scrolls inside it: `↑` / `↓` move one row and
   `PgUp` / `PgDn` a page while the input is empty, and the frame's border says
   how many rows are above and below;
