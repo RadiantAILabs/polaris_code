@@ -2904,9 +2904,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "persistence_macros"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4934a1bcdc47ff3964fb876d30e42da04b4bc630e38d5ad30663ceb785c59545"
+checksum = "bb3cbfb07ece6412f2c78c3dd41cd2dcafbaded1fb752f731e44737c96226e2e"
 dependencies = [
  "darling 0.23.0",
  "polaris_macro_utils",
@@ -3087,9 +3087,9 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "polaris-ai"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d9be4b7826690bd9819d624fc446e0de66ff5bacee05710ef15a9332da88854"
+checksum = "5c7e5823286e916752e59f2a9e35d21586c864624de47e847456667ba2677556"
 dependencies = [
  "polaris_internal",
  "tracing",
@@ -3126,9 +3126,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_agent"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32830258827bdfa96c6c3aef9d905103cb554d2f827d315cbd671037b7ce3b38"
+checksum = "b93b4876ed0c32d963be2fcd40698ae67f8888a44f20ac6fa3f6b3e7bc820065"
 dependencies = [
  "polaris_graph",
  "polaris_system",
@@ -3137,9 +3137,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_app"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1deab7e2b7ba9b1aa7ed1ab005926000e463fabb9db95607fbf83c46add6704"
+checksum = "c7854015f2b9aa5a59c20974c299de2eee84db2eccc41161ab9bee74f40e2dea"
 dependencies = [
  "axum",
  "hashbrown 0.16.1",
@@ -3199,9 +3199,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_core_plugins"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd4592b81e23b57a072b625d5aa62bc6160a001a88ab5de653564d9a6ea32459"
+checksum = "c15e73286bc708cdbaa801470b2420a60d36415c01012f3a35bee32b7e10dd83"
 dependencies = [
  "chrono",
  "futures-core",
@@ -3233,9 +3233,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_graph"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aecf8bc5236a70f5cd73c7ccec3296f78927f9250484f8a7c0c73f0d31a9a781"
+checksum = "de065f9b54ec78eb0a32dfdefcb2c8b120ec1eeb07887cbb7eb2b8375e512ab8"
 dependencies = [
  "futures",
  "hashbrown 0.17.1",
@@ -3250,9 +3250,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_internal"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8960b01839465ac90a69b4a05ccf541143bd4689706988d69ec876ca3f196bd1"
+checksum = "5bdc3bce21facc5f98e4b5c4c74548991fbd1d91a63c2e4ef627ddb3f863d4d6"
 dependencies = [
  "polaris_agent",
  "polaris_app",
@@ -3268,9 +3268,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_macro_utils"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83cb9d8e15d3a9ec1877416e73fba23f6bcc413e8f9e164d71292213e7848eea"
+checksum = "3c98e0139db793f6ec4e0f947153fde3a42fdf67c48904df4dd6f6203e2c9b79"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3279,9 +3279,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_model_providers"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8de8c5a4a35c6dcb7113ff0367e3e61cca73b06f456e82d2a84c8c467c2c959"
+checksum = "a776add68d6ccfead9c4093a3169baedbba99d77d730abf6320e906588bfafea"
 dependencies = [
  "async-openai",
  "aws-config",
@@ -3307,9 +3307,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_models"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d277fb5ae4c8385155d5424ab3400d20cef96521181a902a28301b16d3f6b0e4"
+checksum = "f0d273467d7af2cbaacd24e3b67166d8501690cfe3ea4110bced0462dcf5f6de"
 dependencies = [
  "base64 0.22.1",
  "futures-core",
@@ -3351,9 +3351,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_sessions"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19b070af2110a1c0a74230d8d4a52870672d1577741022f899058771d4713727"
+checksum = "d5a24beeeb23ec8e07ba45fecbc3e074fe2a50647c6d974f48e0c2f7f6bf1440"
 dependencies = [
  "chrono",
  "hashbrown 0.16.1",
@@ -3372,9 +3372,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_shell"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1d045ea01cd8c490db5935a75152751ce870b2d543f4f04881df28f16bc07a3"
+checksum = "5e58c12e2a1bce67fa3d27966b5a26cf1c7a32bee18d7396bbd49bea86af7c79"
 dependencies = [
  "dirs",
  "libc",
@@ -3391,9 +3391,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_system"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df2b321daf82195dbe46cb55e2401475c6c19a96e2cdca0e8f2cc22c3ef41fd4"
+checksum = "83553a222152045b503db61b1a350369b0ec8b6f0501c9ede67892a380a196e9"
 dependencies = [
  "downcast-rs",
  "hashbrown 0.16.1",
@@ -3406,9 +3406,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_system_macros"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b7e959d3e6a5548cd29e5e8588676428e4d2920decd168c9741bf056a50c631"
+checksum = "472cf9b4c39dff52023cb82c70255fa40fc4fbbf51518bcd5e7c4d291ea916b1"
 dependencies = [
  "polaris_macro_utils",
  "proc-macro2",
@@ -3418,9 +3418,9 @@ dependencies = [
 
 [[package]]
 name = "polaris_tools"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6c6866bbe6503532b3a6122b5ce85622526f1cd877233465fbe5df4e52224f"
+checksum = "40f1f28eb1883f9bc6770a34d28293396c41b0e75987014d8895f158b72acaf0"
 dependencies = [
  "indexmap",
  "polaris_models",
@@ -5055,9 +5055,9 @@ checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tool_macros"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57728f92339034dcc166adeb6c87deb13237ac534bec5ca7b809b68529cc73fc"
+checksum = "741387b6ec9ca3b1ec8ecb23a57599035ef0a019a75d00a884d1744534a37343"
 dependencies = [
  "polaris_macro_utils",
  "proc-macro2",
