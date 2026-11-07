@@ -62,10 +62,23 @@ own policy validator; tools have no dependency on agent permission state.
 
 Where a call works is the same kind of boundary. [`CallRoot`](crate::tools::CallRoot)
 is a tool-context value, not an API or a resource: the agent's tool lanes insert
-the session's working directory for every call, the file tools and the shell
-wrapper read it, and a toolset used without one keeps the directory it was built
-with. A session's shell command patterns (`AgentConfig::command_globs`) are
-checked when each call is authorized, so they too belong to the session and not to
-the server. Neither adds an API: two sessions on one server differ only in the
-`AgentConfig` they were created with. A session with patterns lists them in its
-system prompt and in each refusal, so the model writes commands that match.
+the session's working directory for every call. The file tools (`read_file`,
+`read_span`, `edit_file`, `create_file`, `list_files`, `search`, `glob`),
+`run_command` and `run_in_background` follow it, and a toolset used without one
+keeps the directory it was built with. A background task carries the root it
+started under: `task_output` and `stop_task` called with a root see only tasks
+with that same root, and a host call without one sees all of them. The
+code-graph, memory and MCP tools do not read it and stay server-wide, on the
+directory, index and connections the server's plugins were built on. The root is
+where a shell command starts and what a `working_dir` must stay inside; it is not
+an operating-system sandbox for what the command then does.
+
+A session's shell command patterns
+([`AgentConfig::command_globs`](crate::agents::AgentConfig::command_globs)) are
+checked when each call is authorized, so they too belong to the session and not
+to the server. A session with patterns lists them in its system prompt and in
+each refusal, so the model writes commands that match, and a session with an
+empty list is not offered `task_output` or the other shell tools. Neither adds an
+API: for the tools above, two sessions on one server differ only in the
+`AgentConfig` they were created with, and in the `TokenMeter` when one of them
+carries a spend cap.
