@@ -238,22 +238,35 @@ unattended allow pattern matches. An interactive session refuses a command on
 the list before asking, so no approval or session grant is offered for a
 command that could never run; the confirmed execution path applies the list
 again as a second check. The working-directory sandbox is also built
-identically in every mode. Session command patterns are literal-text globs checked against every simple
-command in a chain, pipe, or newline-separated list. Listed interpreters may
-receive multiline quoted arguments or here documents. A quoted delimiter makes
-the body literal data; an unquoted body is accepted only without dollar signs,
-backticks, or backslashes. Commands after the delimiter are checked separately.
-Command substitutions, braced/arithmetic expansions, line continuations,
-displaced command words, shell control forms,
-and unsupported syntax fail closed. Every parsed command also passes permission
-rules and the executor's policy. Literal scripts use the host's single-use,
-argument-bound receipt so the executor can run syntax its own parser does not
-understand; hard denies, directory validation and cancellation still apply.
-These restrictions describe shell syntax, not interpreter source: allowing
-Python permits Python code to perform the operations its sandbox allows.
-`auto-edit` and unattended grants are intended for environments where the
-operator accepts the process's OS-account access, such as a disposable
-container or VM.
+identically in every mode. Shell patterns are literal-text globs, not a shell
+parser: a broad pattern such as `cargo *` may also match command substitutions
+or other shell syntax with side effects. `auto-edit` and unattended grants,
+including every `--allow-command` pattern, are therefore intended only for
+environments where the operator already accepts the process's full OS-account
+blast radius, such as a disposable container or VM.
+
+A program that embeds the agent can narrow one session further with
+`AgentConfig::command_globs` (see
+[`embedding.md`](../crates/polaris_code/src/docs/embedding.md)). The `polaris`
+binary sets no such list, so none of what follows applies to `--allow-command`
+or to the grants above: they keep the glob match described in the previous
+paragraph, with no parser. For a session that has a list, the patterns are
+literal-text globs checked against every simple command in a chain, pipe, or
+newline-separated list. Listed interpreters may receive multiline quoted
+arguments or here documents. A quoted delimiter makes the body literal data;
+an unquoted body is accepted only without dollar signs, backticks, or
+backslashes. Commands after the delimiter are checked separately. Command
+substitutions, braced/arithmetic expansions, line continuations, displaced
+command words, shell control forms, and unsupported syntax fail closed. Every
+parsed command also passes permission rules and the executor's policy. Literal
+scripts use the host's single-use, argument-bound receipt so the executor can
+run syntax its own parser does not understand; hard denies, directory
+validation and cancellation still apply. A session with a list gets such a
+receipt for every shell call that is allowed. These restrictions describe shell
+syntax, not interpreter source: allowing Python permits Python code to perform
+the operations its sandbox allows. A command list is text matching. It is not
+a file or privilege boundary, and a session that has one still runs with the
+process's OS-account access, so the same environment advice applies.
 
 Secret redaction ([`secret-redaction.md`](secret-redaction.md)) is a separate
 and much weaker thing. It rewrites recognisable credentials out of tool output
