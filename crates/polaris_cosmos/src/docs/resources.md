@@ -37,3 +37,24 @@ provider, access pattern, and a real-shape consuming system per the
   immutable statistics. [`TopologyEvidencePlugin`](crate::evidence::TopologyEvidencePlugin)
   supplies the bounded in-memory default; another plugin may provide the same
   versioned contract around a durable backend.
+
+## Durable flow
+
+Workflow boot wiring supplies these globals before execution. Consumers read them
+with `Res<T>`; the durable books serialize mutations under an internal lock.
+
+| Resource | Purpose |
+|---|---|
+| [`RunHandle`](crate::flow::RunHandle) | Workflow identity and root. |
+| [`RoleBook`](crate::flow::RoleBook) | Resolved role policies. |
+| [`AgentRunner`](crate::flow::AgentRunner) | Replaceable executor for individual calls. |
+| [`StopFlag`](crate::flow::StopFlag) | Cooperative stop broadcast. |
+| [`SpendBook`](crate::flow::SpendBook) | Durable integer reservations and settlements. |
+| [`StepJournal`](crate::flow::StepJournal) | Durable step outputs. |
+| [`RepairCounters`](crate::flow::RepairCounters) | Shared named repair limits. |
+| [`LeaseBook`](crate::flow::LeaseBook) | Shared bounded work allocation. |
+| [`FlowSettings`](crate::flow::FlowSettings) | Asset root, private input root and model identity. |
+| [`PhaseControl`](crate::flow::PhaseControl) | Phase enablement, deadlines, typed statuses and terminal posture. |
+| [`Worklist`](crate::flow::Worklist) | Runtime-selected sequential items and persisted outcomes. |
+| [`EventLog`](crate::flow::EventLog) | Whole-line, flushed pipeline events in their recorded order. |
+| [`CallDeadline`](crate::flow::CallDeadline) | Optional wall limit for admitting new calls. |

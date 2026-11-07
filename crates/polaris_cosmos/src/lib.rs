@@ -38,6 +38,7 @@ pub mod cognition;
 pub mod composition;
 pub mod contracts;
 pub mod evidence;
+pub mod flow;
 pub mod selection;
 pub mod topology;
 
