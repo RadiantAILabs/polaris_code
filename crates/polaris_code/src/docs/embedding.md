@@ -259,9 +259,9 @@ a prompt, a folder, a command list or a budget:
 | A call has its own | Set with | What it does |
 |--------------------|----------|--------------|
 | **Prompt** | [`AgentConfig::with_system_prompt`](crate::agents::AgentConfig::with_system_prompt) | Replaces the built-in system prompt in each request. The project grounding block is still appended. |
-| **Tool folder** | [`AgentConfig::working_dir`](crate::agents::AgentConfig) | The agent's tool lanes put a [`CallRoot`](crate::tools::CallRoot) with this folder on every call. The file tools, `run_command` and `run_in_background` work in it and refuse a path or `working_dir` that leaves it. |
+| **Tool folder** | [`AgentConfig::working_dir`](crate::agents::AgentConfig) | The agent's tool lanes put a [`CallRoot`](crate::tools::CallRoot) with this folder on every call. The file tools (`read_file`, `read_span`, `edit_file`, `create_file`, `list_files`, `search`, `glob`) refuse a path that leaves it. `run_command` and `run_in_background` start in it, and `run_command` refuses a `working_dir` that leaves it. |
 | **Command list** | [`AgentConfig::with_command_globs`](crate::agents::AgentConfig::with_command_globs) | A shell command runs only if every command in it matches a pattern. An empty list gives the session no shell: the shell tools, including `task_output` and `stop_task`, are not offered to the model. A non-empty list is shown to the model in its prompt and in each refusal. |
-| **Output limit** | [`AgentConfig::with_max_output_tokens`](crate::agents::AgentConfig::with_max_output_tokens) | Bounds one reply, and is the output allowance the spend cap reserves for each request. Set it to the limit the model provider was registered with. |
+| **Output limit** | [`AgentConfig::with_max_output_tokens`](crate::agents::AgentConfig::with_max_output_tokens) | Bounds one reply, and is the output allowance the spend cap reserves for each request. Left unset, the request carries no limit from the agent and each reservation assumes the Anthropic fallback of 4096 tokens, whatever the provider. Set it to the limit your model provider was registered with, as `polaris` does. |
 | **Spend cap** | [`TokenMeter::set_task_cost_cap`](crate::usage::TokenMeter::set_task_cost_cap) on a meter of the call's own | Before each request the agent reserves the most it could cost, and ends the call without contacting the model when that does not fit in what is left. [`TokenMeter::task_cost_spent_usd`](crate::usage::TokenMeter::task_cost_spent_usd) reads back what the cap counted as spent. See `docs/run-cost-ceiling.md`. |
 
 Insert the call's own config, its own `UserIO` and its own meter when the
@@ -309,12 +309,18 @@ What a call's folder and command list do **not** cover:
 
 * **Only some tools follow the call's folder.** The file tools, `run_command`
   and `run_in_background` follow the [`CallRoot`](crate::tools::CallRoot).
-  The code-graph, memory and MCP tools stay server-wide: they read and write
-  what the server's own plugins were built on, whichever call uses them. Do not
-  register them on a server whose calls must stay apart.
+  The code-graph, memory and MCP tools stay server-wide: they use the
+  directory, index and connections the server's own plugins were built on,
+  whichever call uses them. Do not register them on a server whose calls must
+  stay apart.
+* **The folder is where a command starts, not an operating-system sandbox.**
+  A shell command that is allowed to run can still read or write any path the
+  process can reach.
 * **Background tasks belong to the folder they started in.** `task_output` and
-  `stop_task` called from a session see only tasks started under that
-  session's folder, never another call's and never the server's.
+  `stop_task` called from a session see only tasks started under the same
+  folder: not another folder's, and not tasks the host started itself. Two
+  sessions on the same folder see each other's tasks. A host call with no
+  `CallRoot` sees all tasks.
 * **The shell executor still applies.** Its allowed directories must include
   each call's folder, and its deny rules apply to every call.
 * **A command list is text matching.** It decides which commands the agent

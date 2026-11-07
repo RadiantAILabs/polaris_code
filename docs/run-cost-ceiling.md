@@ -57,9 +57,15 @@ reserves the most that request could cost (its estimated input plus the full
 output allowance, `AgentConfig::max_output_tokens`) from the meter, replaces
 the reservation with the billed usage when the reply ends, and, if the
 reservation does not fit in what is left, ends the call without contacting the
-model, with a failure whose message begins `cost-cap:`. A call that is dropped
-with a request in flight is charged at the estimate. It applies only to a meter
-that carries a cap; the operator's `--max-cost-usd` and `--max-tokens` set no
+model, with a failure whose message begins `cost-cap:`. When
+`max_output_tokens` is unset, the allowance is the Anthropic fallback of 4096
+tokens, whatever the provider, so an embedder should set it to the limit its
+provider was registered with, as `polaris` does. The reservation is given back
+only when the provider refused the request outright, with an authentication,
+rate-limit or invalid-request error. A request is otherwise charged at its
+estimate, not its billed usage, when the call is dropped with the request in
+flight, when it fails in any other way, and when the reply does not report both
+token counts. The cap applies only to a meter that carries one; the operator's `--max-cost-usd` and `--max-tokens` set no
 such cap, so a run started with them still checks its ceiling only on the turn
 boundary, and a turn in flight is still never aborted by it. The operator
 setting that does install this cap is `POLARIS_CODE_MAX_COST_USD`
