@@ -18,6 +18,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod containment;
+mod durability;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Temp(PathBuf);
 impl Temp {
@@ -37,7 +40,7 @@ impl Temp {
 impl Drop for Temp {
     fn drop(&mut self) {
         fn writable(p: &Path) {
-            if p.is_dir() {
+            if p.is_dir() && !p.is_symlink() {
                 let mut permissions = std::fs::metadata(p).unwrap().permissions();
                 #[cfg(unix)]
                 {
