@@ -218,6 +218,8 @@ struct Task {
     command: String,
     /// Which session started it, so a list can say when it is not this one.
     session: SessionId,
+    /// The call folder that owns this task; None denotes a server task.
+    call_root: Option<crate::tools::CallRoot>,
     /// Which turn of that session started it.
     turn: u32,
     /// When the host observed the run start.
@@ -418,6 +420,8 @@ pub struct TaskView {
     pub command: String,
     /// The session that started it.
     pub session: SessionId,
+    /// The call folder that owns this task; `None` denotes a server task.
+    pub call_root: Option<crate::tools::CallRoot>,
     /// The turn of that session.
     pub turn: u32,
     /// Wall time since the host saw it start.
@@ -666,6 +670,13 @@ impl BackgroundTasks {
             .map(view)
     }
 
+    /// Tag a newly started task before it is handed to a background waiter.
+    pub(crate) fn set_call_root(&self, id: ShellProcessId, root: Option<crate::tools::CallRoot>) {
+        if let Some(task) = self.lock().tasks.iter_mut().find(|task| task.id == id) {
+            task.call_root = root;
+        }
+    }
+
     /// Every tracked run, oldest identity first.
     #[must_use]
     pub fn all(&self) -> Vec<TaskView> {
@@ -795,6 +806,7 @@ fn view(task: &Task) -> TaskView {
         label: task.label.clone(),
         command: task.command.clone(),
         session: task.session.clone(),
+        call_root: task.call_root.clone(),
         turn: task.turn,
         elapsed: task.started.elapsed(),
         remaining: task.remaining(),
@@ -846,6 +858,7 @@ impl Invocation {
             parent: self.parent.clone(),
             label: self.label.clone(),
             session: session.clone(),
+            call_root: None,
             turn,
             deadline,
         }
@@ -901,8 +914,18 @@ pub struct TaskSink {
     parent: Option<String>,
     label: String,
     session: SessionId,
+    call_root: Option<crate::tools::CallRoot>,
     turn: u32,
     deadline: Duration,
+}
+
+impl TaskSink {
+    /// Tag tasks started through this sink with their call folder.
+    #[must_use]
+    pub fn with_call_root(mut self, root: crate::tools::CallRoot) -> Self {
+        self.call_root = Some(root);
+        self
+    }
 }
 
 impl ShellSink for TaskSink {
@@ -920,6 +943,7 @@ impl ShellSink for TaskSink {
                     label: self.label.clone(),
                     command,
                     session: self.session.clone(),
+                    call_root: self.call_root.clone(),
                     turn: self.turn,
                     started: Instant::now(),
                     deadline: self.deadline,

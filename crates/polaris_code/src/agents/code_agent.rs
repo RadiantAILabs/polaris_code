@@ -435,9 +435,12 @@ async fn prepare_context(
     // configured with — they differ the moment `/model` has been used.
     settings.note_served(&model_id);
     // A session configured with no shell commands has no shell: the model is
-    // not offered the tools that would start one.
+    // not offered the tools that start, read or stop shell tasks.
     if config.command_globs.as_ref().is_some_and(Vec::is_empty) {
-        for tool in super::policy::SHELL_EXECUTION_TOOLS {
+        for tool in super::policy::SHELL_EXECUTION_TOOLS
+            .into_iter()
+            .chain([crate::tools::tasks::TASK_OUTPUT])
+        {
             if !policy
                 .tool_palette
                 .denied

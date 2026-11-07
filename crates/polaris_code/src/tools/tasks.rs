@@ -52,11 +52,10 @@
 //! - **the turn that started it ends** — the task keeps running. That is the
 //!   point, and it is why the turn's cancellation observer is deliberately not
 //!   attached to the request: `Ctrl-C` ends the turn, not the task.
-//! - **the session is switched** — the task keeps running and stays readable.
-//!   The transcript-side reconciliation already refuses to write another
-//!   session's history and says so; hiding the task from the model as well
-//!   would manufacture exactly the orphan this surface exists to prevent, so
-//!   `task_output` lists every task this process started.
+//! - **the session is switched** — the task keeps running. Calls carrying a
+//!   [`CallRoot`] can read and stop only tasks started under that same root.
+//!   Host calls without a root can inspect all tasks, including server tasks.
+//!   The terminal commands remain the host's route to tasks from any session.
 //! - **the process exits** — the task dies with it. `ShellPlugin::cleanup`
 //!   calls `ShellExecutor::stop_all`, which signals the whole spawned process
 //!   group on Unix. Nothing started here survives `polaris-code`.
@@ -72,6 +71,7 @@ use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
 use polaris::tools::{ToolError, ToolPermission, ToolRegistry, ToolsPlugin, toolset};
 
+use super::CallRoot;
 use super::approval::ApprovalReceipt;
 
 use crate::terminal::background::{
@@ -138,6 +138,9 @@ impl TaskTools {
         /// Single-use host authorization for these exact arguments.
         #[context]
         approval: Option<ApprovalReceipt>,
+        /// The call folder used when no approval receipt supplies a directory.
+        #[context]
+        call_root: Option<CallRoot>,
     ) -> Result<serde_json::Value, ToolError> {
         let seconds = timeout_secs.unwrap_or(BACKGROUND_DEFAULT_TIMEOUT_SECS);
         let mut request = ShellRequest::new(&command).with_timeout(seconds);
@@ -158,6 +161,9 @@ impl TaskTools {
                 .await
                 .map(ShellStartResponse::Started)
         } else {
+            if let Some(root) = &call_root {
+                request = request.with_working_dir(root.path());
+            }
             self.executor.start(request).await
         };
         let started = match response {
@@ -176,6 +182,7 @@ impl TaskTools {
             }
             Err(other) => return Err(ToolError::execution_error(other.to_string())),
         };
+        self.tasks.set_call_root(started, call_root);
         let Some(task) = self.tasks.background_process(started) else {
             // The executor emits `Started` synchronously before `start`
             // returns, so the table has the run by now unless this host wired
@@ -218,12 +225,13 @@ impl TaskTools {
         /// The task number reported when the task was started. Omit to list all.
         #[default(None::<u64>)]
         task: Option<u64>,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
         match task {
-            None => Ok(self.render_list()),
-            Some(number) => self
-                .render_one(number)
-                .ok_or_else(|| ToolError::parameter_error(self.unknown_task(number))),
+            None => Ok(self.render_list(call_root.as_ref())),
+            Some(number) => self.render_one(number, call_root.as_ref()).ok_or_else(|| {
+                ToolError::parameter_error(self.unknown_task(number, call_root.as_ref()))
+            }),
         }
     }
 
@@ -236,15 +244,26 @@ impl TaskTools {
         &self,
         /// The task number reported when the task was started.
         task: u64,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
-        if let Some(record) = self.tasks.finished_by_number(task) {
+        if let Some(record) = self
+            .tasks
+            .finished_by_number(task)
+            .filter(|record| visible(&record.task, call_root.as_ref()))
+        {
             return Ok(format!(
                 "Task {task} had already ended ({}); nothing to stop.",
                 terminal_phrase(&record)
             ));
         }
-        let Some(view) = self.tasks.by_number(task) else {
-            return Err(ToolError::parameter_error(self.unknown_task(task)));
+        let Some(view) = self
+            .tasks
+            .by_number(task)
+            .filter(|view| visible(view, call_root.as_ref()))
+        else {
+            return Err(ToolError::parameter_error(
+                self.unknown_task(task, call_root.as_ref()),
+            ));
         };
         if self.executor.stop(view.id).await {
             Ok(format!(
@@ -266,21 +285,23 @@ impl TaskTools {
     ///
     /// Names what *is* known, because "there is no task 7" on its own cannot be
     /// told apart from "the read-back ring dropped task 7".
-    fn unknown_task(&self, number: u64) -> String {
+    fn unknown_task(&self, number: u64, call_root: Option<&CallRoot>) -> String {
         let mut known: Vec<String> = self
             .tasks
             .all()
             .iter()
+            .filter(|view| visible(view, call_root))
             .map(|task| task.number.to_string())
             .collect();
         known.extend(
             self.tasks
                 .finished()
                 .iter()
+                .filter(|record| visible(&record.task, call_root))
                 .map(|record| record.task.number.to_string()),
         );
         let preamble = if known.is_empty() {
-            "no background task started in this process has that number".to_string()
+            "no visible background task has that number".to_string()
         } else {
             format!("known task numbers are {}", known.join(", "))
         };
@@ -291,9 +312,19 @@ impl TaskTools {
     }
 
     /// Every task, running and retained, one line each.
-    fn render_list(&self) -> String {
-        let running = self.tasks.all();
-        let finished = self.tasks.finished();
+    fn render_list(&self, call_root: Option<&CallRoot>) -> String {
+        let running: Vec<_> = self
+            .tasks
+            .all()
+            .into_iter()
+            .filter(|view| visible(view, call_root))
+            .collect();
+        let finished: Vec<_> = self
+            .tasks
+            .finished()
+            .into_iter()
+            .filter(|record| visible(&record.task, call_root))
+            .collect();
         if running.is_empty() && finished.is_empty() {
             return "No background tasks. Start one with `run_in_background`.".to_string();
         }
@@ -330,11 +361,18 @@ impl TaskTools {
     }
 
     /// One task in full, whether it is running or retained.
-    fn render_one(&self, number: u64) -> Option<String> {
-        if let Some(record) = self.tasks.finished_by_number(number) {
+    fn render_one(&self, number: u64, call_root: Option<&CallRoot>) -> Option<String> {
+        if let Some(record) = self
+            .tasks
+            .finished_by_number(number)
+            .filter(|record| visible(&record.task, call_root))
+        {
             return Some(render_finished(&record));
         }
-        let view = self.tasks.by_number(number)?;
+        let view = self
+            .tasks
+            .by_number(number)
+            .filter(|view| visible(view, call_root))?;
         let mut body = format!(
             "task {} · {} · stops {}: `{}`\n",
             view.number,
@@ -380,6 +418,11 @@ impl TaskTools {
             None => "gone from the process table".to_string(),
         }
     }
+}
+
+/// Host calls can inspect all tasks; rooted calls see only their own folder.
+fn visible(task: &TaskView, call_root: Option<&CallRoot>) -> bool {
+    call_root.is_none_or(|root| task.call_root.as_ref() == Some(root))
 }
 
 /// One retained task in full: exit status, captured output, honesty clause.

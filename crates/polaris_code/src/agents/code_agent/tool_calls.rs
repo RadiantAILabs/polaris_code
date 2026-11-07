@@ -299,7 +299,7 @@ pub(crate) async fn authorize_call(
     let generation = settings.approval_generation();
     let name = &tool_call.function.name;
     // Resolve afresh so a grant from the preceding call applies immediately.
-    let authorization = shell_approval.resolve_with_patterns(
+    let mut authorization = shell_approval.resolve_with_patterns(
         policy,
         &PermissionCall {
             tool: name,
@@ -314,7 +314,6 @@ pub(crate) async fn authorize_call(
         &grants,
         config.command_globs.as_deref(),
     );
-    let mut authorization = authorization;
     if let Some(reason) = outside_command_globs(&config, name, &tool_call.function.arguments) {
         authorization.permission = ToolPermission::Deny;
         authorization.source = reason;
@@ -649,7 +648,9 @@ pub(crate) async fn execute_call(
         } else {
             tasks.deadline_for(&tool_call.function.arguments)
         };
-        let sink = invocation.sink(&session.session_id, session.turn_number, deadline);
+        let sink = invocation
+            .sink(&session.session_id, session.turn_number, deadline)
+            .with_call_root(CallRoot::new(&config.working_dir));
         // The turn's token reaches this command, and stops reaching it the
         // moment the user backgrounds it: a detached run is no longer part
         // of the turn, so Ctrl-C must not take it with the turn.
