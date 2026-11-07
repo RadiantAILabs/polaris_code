@@ -83,7 +83,10 @@ impl Scenario {
                 if !role_dir.is_dir() {
                     continue;
                 }
-                let name = role_dir.file_name().unwrap().to_string_lossy().to_string();
+                let name = role_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .ok_or_else(|| FlowError::invalid("scenario role folder has no name"))?;
                 let mut files = fs::read_dir(&role_dir)?
                     .map(|e| e.map(|e| e.path()))
                     .collect::<Result<Vec<_>, _>>()?;
