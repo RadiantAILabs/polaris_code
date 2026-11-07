@@ -13,13 +13,29 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+/// Where a step stands in the journal. Only [`Done`](Self::Done) records are
+/// restored by a resumed run; every other state runs the step again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StepStatus {
+    /// The step began and has not finished.
+    Started,
+    /// The step finished and its output is stored.
+    Done,
+    /// The step failed or was interrupted.
+    Failed,
+    /// The step was skipped without running.
+    Skipped,
+}
 /// A durable step output; only `done` records are restored.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StepRecord {
     /// Stable step identity.
     pub key: StepKey,
     /// Completion status.
-    pub status: String,
+    pub status: StepStatus,
     /// UTC start time.
     pub started: String,
     /// UTC completion time.
@@ -41,7 +57,7 @@ pub struct StepRecord {
 /// ```ignore
 /// async fn inspect(journal: Res<StepJournal>) -> bool { journal.get(&StepKey::new("check")).is_some() }
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StepJournal {
     root: PathBuf,
     lock: Arc<Mutex<()>>,
@@ -49,6 +65,10 @@ pub struct StepJournal {
 impl GlobalResource for StepJournal {}
 impl StepJournal {
     /// Opens a journal rooted in a workflow directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the journal directory cannot be created.
     pub fn open(root: &Path) -> FlowResult<Self> {
         std::fs::create_dir_all(root.join(".state/steps"))?;
         Ok(Self {
@@ -64,9 +84,16 @@ impl StepJournal {
     }
     /// Restores only a durably completed output.
     pub fn get(&self, key: &StepKey) -> Option<StepRecord> {
-        self.read(key).ok().flatten().filter(|r| r.status == "done")
+        self.read(key)
+            .ok()
+            .flatten()
+            .filter(|r| r.status == StepStatus::Done)
     }
     /// Reads a record, distinguishing corruption from absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the record exists but cannot be read.
     pub fn read(&self, key: &StepKey) -> FlowResult<Option<StepRecord>> {
         let path = self.path(key)?;
         if !path.exists() {
@@ -75,12 +102,16 @@ impl StepJournal {
         Ok(Some(read_json(&path)?))
     }
     /// Publishes a completed output and appends its digest to the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the record cannot be written.
     pub fn put(&self, key: &StepKey, output: serde_json::Value) -> FlowResult<()> {
-        let _lock = self.lock.lock().unwrap();
+        let _lock = self.lock.guard();
         let now = timestamp();
         let record = StepRecord {
             key: key.clone(),
-            status: "done".into(),
+            status: StepStatus::Done,
             started: self
                 .read(key)?
                 .map_or_else(|| now.clone(), |record| record.started),
@@ -90,14 +121,23 @@ impl StepJournal {
         write_json(&self.path(key)?, &record)?;
         append_json(
             &self.root.join("journal.jsonl"),
-            &serde_json::json!({"ts":now,"key":key,"state":"done","digest":digest(&serde_json::to_vec(&record.output)?)}),
+            &serde_json::json!({"ts":now,"key":key,"state":StepStatus::Done,"digest":digest(&serde_json::to_vec(&record.output)?)}),
         )
     }
     /// Appends a non-completion step edge.
-    pub fn edge(&self, key: &StepKey, state: &str) -> FlowResult<()> {
-        let _lock = self.lock.lock().unwrap();
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the record cannot be written, and
+    /// [`FlowError::Invalid`] for [`StepStatus::Done`], which only
+    /// [`put`](Self::put) records.
+    pub fn edge(&self, key: &StepKey, state: StepStatus) -> FlowResult<()> {
+        if state == StepStatus::Done {
+            return Err(FlowError::invalid("a done step is recorded with put"));
+        }
+        let _lock = self.lock.guard();
         let now = timestamp();
-        let started = if state == "started" {
+        let started = if state == StepStatus::Started {
             now.clone()
         } else {
             self.read(key)?
@@ -107,9 +147,9 @@ impl StepJournal {
             &self.path(key)?,
             &StepRecord {
                 key: key.clone(),
-                status: state.into(),
+                status: state,
                 started,
-                ended: if state == "started" {
+                ended: if state == StepStatus::Started {
                     String::new()
                 } else {
                     now.clone()
@@ -123,8 +163,12 @@ impl StepJournal {
         )
     }
     /// Allocates a fresh numbered workspace on every pass over a step.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the workspace cannot be created.
     pub fn workspace(&self, key: &StepKey) -> FlowResult<PathBuf> {
-        let _lock = self.lock.lock().unwrap();
+        let _lock = self.lock.guard();
         let parent = self.root.join("work").join(relative(key.as_str())?);
         std::fs::create_dir_all(&parent)?;
         let state_path = self.root.join(".state/work_ordinals.json");
@@ -153,14 +197,19 @@ impl StepJournal {
         }
     }
     /// Moves a half-finished workspace into a durable abandoned directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when `path` is outside the work root or cannot
+    /// be moved.
     pub fn abandon(&self, path: &Path) -> FlowResult<()> {
-        let _lock = self.lock.lock().unwrap();
+        let _lock = self.lock.guard();
         if !path.exists() {
             return Ok(());
         }
         let relative = path
             .strip_prefix(self.root.join("work"))
-            .map_err(|_| FlowError("abandoned folder outside work root".into()))?;
+            .map_err(|_| FlowError::invalid("abandoned folder outside work root"))?;
         let dest = self.root.join("work/_abandoned").join(relative);
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
@@ -175,7 +224,16 @@ struct MemoProbe {
     record: Option<StepRecord>,
 }
 /// Wraps a typed output-producing subgraph in a durable completion branch.
+///
 /// Use a distinct key for each loop iteration. The body is ordinary graph wiring.
+/// A key that was already completed returns its stored output on every later
+/// pass, whatever the [`RunMode`](super::RunMode), so a key reused across
+/// iterations repeats the first result instead of running again.
+///
+/// # Panics
+///
+/// Panics when `body` is not a well-formed graph: every node must be reachable
+/// from its entry. An empty body is accepted.
 pub fn memo<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
     key: StepKey,
     body: Graph,
@@ -186,9 +244,9 @@ pub fn memo<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         move |journal, _| {
             let key = key.clone();
             Box::pin(async move {
-                let record = journal.read(&key)?.filter(|r| r.status == "done");
+                let record = journal.read(&key)?.filter(|r| r.status == StepStatus::Done);
                 if record.is_none() {
-                    journal.edge(&key, "started")?;
+                    journal.edge(&key, StepStatus::Started)?;
                 }
                 Ok(MemoProbe { key, record })
             })
@@ -198,6 +256,12 @@ pub fn memo<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
 }
 /// Memoizes a body using the preceding system's runtime `Out<StepKey>`.
 /// This keeps per-item and per-iteration identities in graph data rather than shape.
+/// A key that was already completed returns its stored output, as for [`memo`].
+///
+/// # Panics
+///
+/// Panics when `body` is not a well-formed graph: every node must be reachable
+/// from its entry. An empty body is accepted.
 pub fn memo_current<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
     body: Graph,
 ) -> Graph {
@@ -207,9 +271,9 @@ pub fn memo_current<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'sta
         |(key, journal), _| {
             Box::pin(async move {
                 let key = (*key).clone();
-                let record = journal.read(&key)?.filter(|r| r.status == "done");
+                let record = journal.read(&key)?.filter(|r| r.status == StepStatus::Done);
                 if record.is_none() {
-                    journal.edge(&key, "started")?;
+                    journal.edge(&key, StepStatus::Started)?;
                 }
                 Ok(MemoProbe { key, record })
             })
@@ -229,14 +293,17 @@ fn memo_branch<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
                 "memo.restore",
                 |probe, _| {
                     Box::pin(async move {
-                        serde_json::from_value(probe.record.as_ref().unwrap().output.clone())
+                        let record = probe.record.as_ref().ok_or_else(|| {
+                            SystemError::ExecutionError("memo restore without a record".into())
+                        })?;
+                        serde_json::from_value(record.output.clone())
                             .map_err(|e| SystemError::ExecutionError(e.to_string()))
                     })
                 },
             ));
         },
         |g| {
-            g.append(body).expect("fresh memo body");
+            g.append(body).expect("memo body must be a connected graph");
             g.add_system(super::bind::<
                 (
                     Out<T>,
@@ -250,10 +317,8 @@ fn memo_branch<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
                 "memo.record",
                 |(value, probe, journal, control), _| {
                     Box::pin(async move {
-                        if control.is_some_and(|control| {
-                            control.halt_reason().as_deref() == Some("interrupted")
-                        }) {
-                            journal.edge(&probe.key, "failed")?;
+                        if control.is_some_and(|control| control.interrupted()) {
+                            journal.edge(&probe.key, StepStatus::Failed)?;
                             return Ok((*value).clone());
                         }
                         journal.put(
@@ -271,6 +336,10 @@ fn memo_branch<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
 }
 
 /// Finds the latest numbered invocation for a durable step key.
+///
+/// # Errors
+///
+/// Returns a [`FlowError`] when the work directory of the step cannot be read.
 pub fn latest_workspace(root: &Path, key: &StepKey) -> FlowResult<Option<PathBuf>> {
     let parent = root.join("work").join(relative(key.as_str())?);
     if !parent.exists() {

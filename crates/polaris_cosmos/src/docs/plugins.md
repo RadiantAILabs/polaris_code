@@ -28,3 +28,10 @@ to go the other way — from a downstream goal to the plugins that satisfy it.
   capability using the bounded, process-local in-memory provider. Hosts and
   recorders append typed events explicitly; the plugin starts no task and
   performs no outcome interpretation.
+
+## Durable flow
+
+- [`FlowPlugin`](crate::flow::FlowPlugin) — registers the flow resources a host
+  already built as globals. At `ready()` it charges calls left in flight by an
+  earlier run at their ceiling, and at `cleanup()` it stops phase heartbeat
+  timers.

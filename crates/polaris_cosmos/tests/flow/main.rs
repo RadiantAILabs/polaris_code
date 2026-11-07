@@ -69,7 +69,7 @@ fn role() -> Role {
         prompt: "worker".into(),
         node: "write".into(),
         max_turns: 4,
-        max_usd: toml::Value::String("1".into()),
+        max_usd: UsdAmount::from_micros(1_000_000),
         timeout_seconds: 30,
         max_output_tokens: None,
         shell: vec!["python *".into()],
@@ -79,7 +79,7 @@ fn role() -> Role {
 }
 fn call(step: &str) -> AgentCall {
     AgentCall {
-        step: StepKey::new(step),
+        step: StepKey::new(step).unwrap(),
         role: "worker".into(),
         phase: "alpha".into(),
         stage: StageSpec {
@@ -122,18 +122,20 @@ fn context_with_role(
     ctx.insert_resource(RunHandle {
         run_id: "fixture".into(),
         root: root.into(),
-        mode: "run".into(),
+        mode: RunMode::Run,
     });
     ctx.insert_resource(RoleBook {
         roles: BTreeMap::from([("worker".into(), worker)]),
     });
-    ctx.insert_resource(AgentRunner(runner));
+    ctx.insert_resource(AgentRunner::new(runner));
     ctx.insert_resource(FlowSettings {
         assets: root.join("assets"),
         task_dir: root.join("task"),
         model_id: "fixture-model".into(),
+        ..FlowSettings::default()
     });
-    ctx.insert_resource(SpendBook::open(root, "fixture", limit, BTreeMap::new(), 250_000).unwrap());
+    let shares = BTreeMap::from([("alpha".into(), 1_000_000), ("beta".into(), 1_000_000)]);
+    ctx.insert_resource(SpendBook::open(root, "fixture", limit, shares, 250_000).unwrap());
     ctx.insert_resource(StepJournal::open(root).unwrap());
     ctx.insert_resource(EventLog::open(root, "fixture"));
     ctx.insert_resource(
@@ -379,7 +381,7 @@ async fn every_stop_and_failure_settles_with_expected_status() {
             assert!(
                 ctx.get_resource::<StepJournal>()
                     .unwrap()
-                    .get(&StepKey::new("alpha/call"))
+                    .get(&StepKey::new("alpha/call").unwrap())
                     .is_none()
             );
         }
@@ -433,7 +435,7 @@ async fn stop_flag_wakes_all_waiters_and_interrupts_scripted_delay() {
     .unwrap()
     .with_stop(flag.clone());
     let request = AgentRequest {
-        step: StepKey::new("alpha/stop"),
+        step: StepKey::new("alpha/stop").unwrap(),
         role: "worker".into(),
         workspace: dir.path().into(),
         system_prompt: "role".into(),
@@ -484,7 +486,7 @@ async fn phase_preserves_body_status_applies_policies_and_skips_disabled() {
         assert_eq!(phase_status(&phases.status("alpha").unwrap()).0, expected);
         assert_eq!(phases.halted(), halt);
         assert_eq!(phases.incomplete(), incomplete);
-        let events = lines(&dir.path().join("pipeline_events.jsonl"));
+        let events = lines(&dir.path().join("events.jsonl"));
         assert_eq!(events[0]["event"], "phase_start");
         assert_eq!(events[1]["event"], "phase_end");
         for key in [
@@ -516,9 +518,7 @@ async fn phase_preserves_body_status_applies_policies_and_skips_disabled() {
     )
     .await;
     assert_eq!(
-        lines(&dir.path().join("pipeline_events.jsonl"))
-            .last()
-            .unwrap()["fields"]["status"],
+        lines(&dir.path().join("events.jsonl")).last().unwrap()["fields"]["status"],
         "skipped"
     );
 }
@@ -569,7 +569,7 @@ async fn memo_restores_typed_output_and_never_repeats_a_done_body() {
         let count = body_count.clone();
         async move { count.fetch_add(1, Ordering::SeqCst) + 1 }
     });
-    let graph = memo::<u64>(StepKey::new("alpha/value"), body);
+    let graph = memo::<u64>(StepKey::new("alpha/value").unwrap(), body);
     execute(&graph, &mut ctx).await;
     execute(&graph, &mut ctx).await;
     assert_eq!(*ctx.get_output::<u64>().unwrap(), 1);
@@ -656,9 +656,9 @@ async fn worklist_records_failed_item_then_continues_and_restores() {
     let dir = Temp::new();
     let items = (0..3)
         .map(|i| WorkItem {
-            key: StepKey::new(format!("alpha/item{i}")),
+            key: StepKey::new(format!("alpha/item{i}")).unwrap(),
             value: json!(i),
-            status: "pending".into(),
+            status: WorkItemStatus::Pending,
             note: String::new(),
         })
         .collect();
@@ -670,7 +670,7 @@ async fn worklist_records_failed_item_then_continues_and_restores() {
         "check.item",
         |item, _| {
             Box::pin(async move {
-                let value = item.0.as_ref().unwrap().value.as_u64().unwrap();
+                let value = item.item().unwrap().value.as_u64().unwrap();
                 Ok(if value == 1 {
                     Verdict::Fail("fixture rejected".into())
                 } else {
@@ -683,12 +683,12 @@ async fn worklist_records_failed_item_then_continues_and_restores() {
     let loaded = Worklist::open(&dir.path().join("list.json"), vec![]).unwrap();
     assert!(loaded.take().is_none());
     assert_eq!(
-        loaded
-            .items()
-            .iter()
-            .map(|i| i.status.as_str())
-            .collect::<Vec<_>>(),
-        vec!["done", "failed", "done"]
+        loaded.items().iter().map(|i| i.status).collect::<Vec<_>>(),
+        vec![
+            WorkItemStatus::Done,
+            WorkItemStatus::Failed,
+            WorkItemStatus::Done
+        ]
     );
 }
 #[test]
@@ -730,12 +730,13 @@ fn skill_templates_share_variable_validation_and_use_short_staged_paths() {
     let handle = RunHandle {
         run_id: "fixture".into(),
         root: dir.path().into(),
-        mode: "run".into(),
+        mode: RunMode::Run,
     };
     let settings = FlowSettings {
         assets,
         task_dir: dir.path().join("task"),
         model_id: "fixture-model".into(),
+        ..FlowSettings::default()
     };
     let workspace = dir.path().join("workspace");
     let request = stage(&call, &role, &workspace, 1_000_000, &handle, &settings).unwrap();
@@ -804,9 +805,9 @@ async fn fallible_work_item_is_recorded_before_the_next_item() {
         &dir.path().join("queue.json"),
         (0..3)
             .map(|i| WorkItem {
-                key: StepKey::new(format!("item/{i}")),
+                key: StepKey::new(format!("item/n{i}")).unwrap(),
                 value: json!(i),
-                status: "pending".into(),
+                status: WorkItemStatus::Pending,
                 note: String::new(),
             })
             .collect(),
@@ -819,7 +820,7 @@ async fn fallible_work_item_is_recorded_before_the_next_item() {
         "fallible.item",
         |item, _| {
             Box::pin(async move {
-                if item.0.as_ref().unwrap().value == 1 {
+                if item.item().unwrap().value == 1 {
                     return Err(SystemError::ExecutionError("rejected".into()));
                 }
                 Ok(Verdict::Pass)
@@ -828,11 +829,12 @@ async fn fallible_work_item_is_recorded_before_the_next_item() {
     ));
     execute(&worklist("queue", body), &mut ctx).await;
     assert_eq!(
-        list.items()
-            .iter()
-            .map(|i| i.status.as_str())
-            .collect::<Vec<_>>(),
-        vec!["done", "failed", "done"]
+        list.items().iter().map(|i| i.status).collect::<Vec<_>>(),
+        vec![
+            WorkItemStatus::Done,
+            WorkItemStatus::Failed,
+            WorkItemStatus::Done
+        ]
     );
 }
 
@@ -845,8 +847,8 @@ fn interpolated_json_is_data_and_dotted_step_names_do_not_collide() {
     );
     let dir = Temp::new();
     let journal = StepJournal::open(dir.path()).unwrap();
-    let edit = StepKey::new("alpha/prog.edit");
-    let eval = StepKey::new("alpha/prog.eval");
+    let edit = StepKey::new("alpha/prog.edit").unwrap();
+    let eval = StepKey::new("alpha/prog.eval").unwrap();
     journal.put(&edit, json!("edited")).unwrap();
     journal.put(&eval, json!("evaluated")).unwrap();
     assert_eq!(journal.get(&edit).unwrap().output, "edited");
@@ -960,6 +962,7 @@ async fn dynamic_memo_keys_restore_each_item_when_the_graph_restarts() {
                     "alpha/item{}",
                     index.fetch_add(1, Ordering::SeqCst)
                 ))
+                .unwrap()
             }
         });
         let mut body = Graph::new();
@@ -980,7 +983,7 @@ async fn dynamic_memo_keys_restore_each_item_when_the_graph_restarts() {
     for ordinal in 0..3 {
         assert_eq!(
             journal
-                .get(&StepKey::new(format!("alpha/item{ordinal}")))
+                .get(&StepKey::new(format!("alpha/item{ordinal}")).unwrap())
                 .unwrap()
                 .output,
             json!(ordinal + 1)
@@ -1032,7 +1035,7 @@ async fn interrupted_lane_keeps_its_lease_for_one_completion_after_restart() {
                             started.notify_one();
                             release.notified().await;
                         }
-                        if control.halt_reason().as_deref() == Some("interrupted") {
+                        if control.halt_reason() == Some(HaltReason::Interrupted) {
                             return Ok(Verdict::Fail("interrupted".into()));
                         }
                         completed.fetch_add(1, Ordering::SeqCst);
@@ -1054,13 +1057,8 @@ async fn interrupted_lane_keeps_its_lease_for_one_completion_after_restart() {
 
     let book = LeaseBook::open(dir.path(), 1).unwrap();
     let pending = book.take(0).unwrap();
-    assert_eq!(
-        pending,
-        Some(Lease {
-            global: 1,
-            local: 1
-        })
-    );
+    let pending = pending.expect("the interrupted lease stays pending");
+    assert_eq!((pending.global, pending.local), (1, 1));
     assert_eq!(book.allocated(), 1);
     let mut resumed = interruption_context(
         PhaseControl::open(dir.path(), vec!["alpha".into()], BTreeMap::new()).unwrap(),
@@ -1091,9 +1089,9 @@ async fn interrupted_worklist_keeps_its_active_item_pending_until_restart() {
             ["first", "second"]
                 .into_iter()
                 .map(|name| WorkItem {
-                    key: StepKey::new("alpha").child(name),
+                    key: StepKey::new("alpha").unwrap().child(name).unwrap(),
                     value: Value::Null,
-                    status: "pending".into(),
+                    status: WorkItemStatus::Pending,
                     note: String::new(),
                 })
                 .collect(),
@@ -1114,7 +1112,7 @@ async fn interrupted_worklist_keeps_its_active_item_pending_until_restart() {
                 let visits = visits.clone();
                 let completed = completed.clone();
                 Box::pin(async move {
-                    let key = current.0.as_ref().unwrap().key.clone();
+                    let key = current.item().unwrap().key.clone();
                     let first = {
                         let mut visits = visits.lock().unwrap();
                         visits.push(key.clone());
@@ -1124,7 +1122,7 @@ async fn interrupted_worklist_keeps_its_active_item_pending_until_restart() {
                         started.notify_one();
                         release.notified().await;
                     }
-                    if control.halt_reason().as_deref() == Some("interrupted") {
+                    if control.halt_reason() == Some(HaltReason::Interrupted) {
                         return Ok(Verdict::Fail("interrupted".into()));
                     }
                     completed.lock().unwrap().push(key);
@@ -1139,14 +1137,26 @@ async fn interrupted_worklist_keeps_its_active_item_pending_until_restart() {
         control.interrupt("alpha").unwrap();
         release.notify_one();
     });
-    assert_eq!(*visits.lock().unwrap(), vec![StepKey::new("alpha/first")]);
+    let first = StepKey::new("alpha/first").unwrap();
+    let second = StepKey::new("alpha/second").unwrap();
+    assert_eq!(*visits.lock().unwrap(), vec![first.clone()]);
     assert!(completed.lock().unwrap().is_empty());
-    assert!(context.get_output::<CurrentItem>().unwrap().0.is_none());
+    assert!(
+        context
+            .get_output::<CurrentItem>()
+            .unwrap()
+            .item()
+            .is_none()
+    );
     drop(context);
 
     let list = Worklist::open(&path, Vec::new()).unwrap();
-    assert!(list.items().iter().all(|item| item.status == "pending"));
-    assert_eq!(list.take().unwrap().key, StepKey::new("alpha/first"));
+    assert!(
+        list.items()
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Pending)
+    );
+    assert_eq!(list.take().unwrap().key, first);
     let mut resumed = interruption_context(
         PhaseControl::open(dir.path(), vec!["alpha".into()], BTreeMap::new()).unwrap(),
     );
@@ -1154,17 +1164,14 @@ async fn interrupted_worklist_keeps_its_active_item_pending_until_restart() {
     execute(&graph, &mut resumed).await;
     assert_eq!(
         *visits.lock().unwrap(),
-        vec![
-            StepKey::new("alpha/first"),
-            StepKey::new("alpha/first"),
-            StepKey::new("alpha/second")
-        ]
+        vec![first.clone(), first.clone(), second.clone()]
     );
-    assert_eq!(
-        *completed.lock().unwrap(),
-        vec![StepKey::new("alpha/first"), StepKey::new("alpha/second")]
+    assert_eq!(*completed.lock().unwrap(), vec![first, second]);
+    assert!(
+        list.items()
+            .iter()
+            .all(|item| item.status == WorkItemStatus::Done)
     );
-    assert!(list.items().iter().all(|item| item.status == "done"));
     assert!(list.take().is_none());
 }
 
@@ -1172,7 +1179,7 @@ async fn interrupted_worklist_keeps_its_active_item_pending_until_restart() {
 async fn both_memo_forms_leave_interrupted_outputs_unfinished_until_restart() {
     for dynamic in [false, true] {
         let dir = Temp::new();
-        let key = StepKey::new("alpha/check");
+        let key = StepKey::new("alpha/check").unwrap();
         let attempts = Arc::new(AtomicU64::new(0));
         let mut body = Graph::new();
         let count = attempts.clone();
@@ -1208,7 +1215,10 @@ async fn both_memo_forms_leave_interrupted_outputs_unfinished_until_restart() {
         interrupted.insert_resource(journal.clone());
         execute(&graph, &mut interrupted).await;
         assert!(journal.get(&key).is_none());
-        assert_eq!(journal.read(&key).unwrap().unwrap().status, "failed");
+        assert_eq!(
+            journal.read(&key).unwrap().unwrap().status,
+            StepStatus::Failed
+        );
         drop(interrupted);
         let mut resumed = interruption_context(
             PhaseControl::open(dir.path(), vec!["alpha".into()], BTreeMap::new()).unwrap(),

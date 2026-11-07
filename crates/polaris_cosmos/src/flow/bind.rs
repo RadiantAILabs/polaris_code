@@ -28,6 +28,13 @@ pub struct BoundSystem<P, T, F> {
     func: F,
     marker: PhantomData<fn() -> (P, T)>,
 }
+impl<P, T, F> std::fmt::Debug for BoundSystem<P, T, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundSystem")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
 impl<P, T, F> System for BoundSystem<P, T, F>
 where
     P: SystemParam + Send + Sync + 'static,

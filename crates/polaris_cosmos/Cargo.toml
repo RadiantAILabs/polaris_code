@@ -21,7 +21,9 @@ semicolon_if_nothing_returned = "warn"
 [dependencies]
 async-trait = "0.1"
 toml = "0.8"
-tokio = { workspace = true }
+# Only what the flow blocks use: `sync` and `time` for `Notify` and sleeps, `rt`
+# for spawned tasks and `spawn_blocking`, `macros` for `select!` and `pin!`.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

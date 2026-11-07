@@ -1,6 +1,7 @@
 //! Shared value contracts for workflow graph systems.
+use super::io::{FlowError, FlowResult, dollars, parse_micros, relative};
 use polaris::system::resource::GlobalResource;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -12,27 +13,120 @@ use std::{
 };
 /// Integer millionths of one dollar.
 pub type Micros = u64;
+/// A dollar amount held as exact micro-dollars.
+///
+/// It reads from a TOML or JSON number or string with up to six fractional
+/// digits and writes as a decimal string, so no value passes through a binary
+/// fraction on its way to the ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct UsdAmount(Micros);
+impl UsdAmount {
+    /// Wraps an exact number of micro-dollars.
+    pub const fn from_micros(micros: Micros) -> Self {
+        Self(micros)
+    }
+    /// The amount in micro-dollars.
+    pub const fn micros(self) -> Micros {
+        self.0
+    }
+}
+impl std::str::FromStr for UsdAmount {
+    type Err = FlowError;
+    fn from_str(text: &str) -> Result<Self, FlowError> {
+        parse_micros(text).map(Self)
+    }
+}
+impl std::fmt::Display for UsdAmount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        dollars(self.0).fmt(f)
+    }
+}
+impl Serialize for UsdAmount {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+impl<'de> Deserialize<'de> for UsdAmount {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Amount;
+        impl de::Visitor<'_> for Amount {
+            type Value = UsdAmount;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a dollar amount given as a number or a string")
+            }
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<UsdAmount, E> {
+                text.parse().map_err(E::custom)
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<UsdAmount, E> {
+                self.visit_str(&value.to_string())
+            }
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<UsdAmount, E> {
+                self.visit_str(&value.to_string())
+            }
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<UsdAmount, E> {
+                self.visit_str(&value.to_string())
+            }
+        }
+        deserializer.deserialize_any(Amount)
+    }
+}
 /// Durable, relative step identifier.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-/// Workflow value: `StepKey`.
-pub struct StepKey(pub String);
+///
+/// A key is a `/`-separated relative path. Empty, `.` and `..` segments are
+/// rejected, and so are segments the journal keeps for itself: all-digit
+/// segments name numbered workspaces and `_abandoned` names the abandoned
+/// directory. Deserializing validates the same way.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct StepKey(String);
 impl StepKey {
     /// Creates a key from a relative name.
-    pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlowError::Invalid`] when the name is not a safe relative
+    /// path or contains a reserved segment.
+    pub fn new(key: impl Into<String>) -> FlowResult<Self> {
+        let key = key.into();
+        relative(&key)?;
+        if let Some(segment) = key
+            .split('/')
+            .find(|s| *s == "_abandoned" || s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(FlowError::invalid(format!(
+                "reserved segment `{segment}` in step key: {key}"
+            )));
+        }
+        Ok(Self(key))
     }
     /// Appends a relative segment.
-    pub fn child(&self, seg: &str) -> Self {
-        Self(format!("{}/{seg}", self.0))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlowError::Invalid`] when the extended key is not valid.
+    pub fn child(&self, seg: &str) -> FlowResult<Self> {
+        Self::new(format!("{}/{seg}", self.0))
     }
     /// Borrows the key text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
-impl From<&str> for StepKey {
-    fn from(s: &str) -> Self {
-        Self::new(s)
+impl TryFrom<String> for StepKey {
+    type Error = FlowError;
+    fn try_from(key: String) -> FlowResult<Self> {
+        Self::new(key)
+    }
+}
+impl TryFrom<&str> for StepKey {
+    type Error = FlowError;
+    fn try_from(key: &str) -> FlowResult<Self> {
+        Self::new(key)
+    }
+}
+impl From<StepKey> for String {
+    fn from(key: StepKey) -> Self {
+        key.0
     }
 }
 impl std::fmt::Display for StepKey {
@@ -86,7 +180,7 @@ pub struct ToolGrant {
     /// Commands.
     pub commands: Vec<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Workflow value: `AgentReport`.
 pub struct AgentReport {
     /// Stop.
@@ -100,6 +194,7 @@ pub struct AgentReport {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 /// Workflow value: `StopCause`.
 pub enum StopCause {
     /// Finished outcome.
@@ -115,10 +210,26 @@ pub enum StopCause {
     /// `ModelError` outcome.
     ModelError(String),
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+impl StopCause {
+    /// Ledger status for a measured runner stop.
+    pub(crate) fn ledger_status(&self) -> &'static str {
+        match self {
+            Self::Finished => "completed",
+            Self::TurnCap => "turn_cap",
+            Self::CostCap => "cost_cap",
+            Self::Timeout => "timeout",
+            Self::Interrupted => "interrupted",
+            Self::ModelError(_) => "failed",
+        }
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 /// Workflow value: `Usage`.
 pub struct Usage {
+    /// Name of the service that served the model. When empty, the ledger
+    /// falls back to the provider in its settings.
+    pub provider: String,
     /// Model id.
     pub model_id: String,
     /// Input.
@@ -134,16 +245,28 @@ pub struct Usage {
     /// Micros.
     pub micros: Micros,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Workflow value: `AgentFailure`.
+/// Why a role call failed. Only [`Setup`](Self::Setup) failures happen before
+/// the model is reached, so only they are settled at no cost.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AgentFailure {
-    /// Setup outcome.
+    /// The call could not start; nothing was spent.
     Setup(String),
-    /// Unmeasured outcome.
+    /// The call ran but its cost could not be measured.
     Unmeasured(String),
-    /// Internal outcome.
+    /// The workflow failed to handle the call.
     Internal(String),
 }
+impl std::fmt::Display for AgentFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(why) => write!(f, "agent setup failed: {why}"),
+            Self::Unmeasured(why) => write!(f, "agent cost was not measured: {why}"),
+            Self::Internal(why) => write!(f, "agent call failed: {why}"),
+        }
+    }
+}
+impl std::error::Error for AgentFailure {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Workflow value: `AgentCall`.
 pub struct AgentCall {
@@ -168,7 +291,8 @@ pub struct StageSpec {
     /// Turn prompt.
     pub turn_prompt: Option<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 /// Workflow value: `AgentOutcome`.
 pub enum AgentOutcome {
     /// A completed invocation, including bounded stop outcomes.
@@ -183,7 +307,8 @@ pub enum AgentOutcome {
     /// Skipped outcome.
     Skipped(SkipReason),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 /// Workflow value: `OutputFile`.
 pub struct OutputFile {
     /// Path.
@@ -195,6 +320,7 @@ pub struct OutputFile {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 /// Workflow value: `SkipReason`.
 pub enum SkipReason {
     /// Budget outcome.
@@ -205,7 +331,7 @@ pub enum SkipReason {
     NotApplicable,
 }
 /// Cooperative stop request shared by every call in a workflow.
-#[derive(Clone, Default)]
+///
 /// Workflow value: `StopFlag`.
 ///
 /// # Scope
@@ -223,8 +349,9 @@ pub enum SkipReason {
 /// #[system]
 /// async fn inspect(value:Res<StopFlag>)->bool { value.is_requested() }
 /// ```
+#[derive(Clone, Debug, Default)]
 pub struct StopFlag(Arc<StopState>);
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct StopState {
     set: AtomicBool,
     notify: tokio::sync::Notify,
@@ -254,6 +381,7 @@ impl StopFlag {
 }
 impl GlobalResource for StopFlag {}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 /// Workflow value: `PhaseStatus`.
 pub enum PhaseStatus {
     /// Completed outcome.
@@ -265,7 +393,8 @@ pub enum PhaseStatus {
     /// Skipped outcome.
     Skipped(String),
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 /// Workflow value: `PhasePolicy`.
 pub enum PhasePolicy {
     /// Fatal outcome.
@@ -286,8 +415,9 @@ pub struct Role {
     pub node: String,
     /// Max turns.
     pub max_turns: u32,
-    /// Max usd.
-    pub max_usd: toml::Value,
+    /// The most one call of this role may spend. It reads from a number or a
+    /// string.
+    pub max_usd: UsdAmount,
     /// Timeout seconds.
     pub timeout_seconds: u64,
     /// The most tokens one model reply of this role may hold. A role that
@@ -303,7 +433,7 @@ pub struct Role {
     pub skills: Vec<String>,
 }
 /// Resolved roles shared by all workflow branches.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+///
 /// Workflow value: `RoleBook`.
 ///
 /// # Scope
@@ -321,13 +451,26 @@ pub struct Role {
 /// #[system]
 /// async fn inspect(value:Res<RoleBook>)->usize { value.roles.len() }
 /// ```
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoleBook {
     /// Roles.
     pub roles: BTreeMap<String, Role>,
 }
 impl GlobalResource for RoleBook {}
+/// Whether a workflow starts over or picks up where an earlier run stopped.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RunMode {
+    /// A new run: every step executes.
+    #[default]
+    Run,
+    /// A restart: a step journaled as done is restored instead of run again.
+    /// Steps that were skipped, failed or interrupted run again.
+    Resume,
+}
 /// Identity and paths of the current durable workflow.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
 /// Workflow value: `RunHandle`.
 ///
 /// # Scope
@@ -345,17 +488,18 @@ impl GlobalResource for RoleBook {}
 /// #[system]
 /// async fn inspect(value:Res<RunHandle>)->std::path::PathBuf { value.root.clone() }
 /// ```
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunHandle {
     /// Run id.
     pub run_id: String,
     /// Root.
     pub root: PathBuf,
-    /// Mode.
-    pub mode: String,
+    /// Whether this run is new or resumes an earlier one.
+    pub mode: RunMode,
 }
 impl GlobalResource for RunHandle {}
 /// Injected executor shared by graph systems.
-#[derive(Clone)]
+///
 /// Workflow value: `AgentRunner`.
 ///
 /// # Scope
@@ -371,7 +515,23 @@ impl GlobalResource for RunHandle {}
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::AgentRunner;
 /// #[system]
-/// async fn inspect(value:Res<AgentRunner>)->std::sync::Arc<dyn polaris_cosmos::flow::TaskRunner> { value.0.clone() }
+/// async fn inspect(value:Res<AgentRunner>)->std::sync::Arc<dyn polaris_cosmos::flow::TaskRunner> { value.runner().clone() }
 /// ```
-pub struct AgentRunner(pub Arc<dyn TaskRunner>);
+#[derive(Clone)]
+pub struct AgentRunner(Arc<dyn TaskRunner>);
+impl AgentRunner {
+    /// Wraps the executor that every call in the workflow uses.
+    pub fn new(runner: Arc<dyn TaskRunner>) -> Self {
+        Self(runner)
+    }
+    /// The wrapped executor.
+    pub fn runner(&self) -> &Arc<dyn TaskRunner> {
+        &self.0
+    }
+}
+impl std::fmt::Debug for AgentRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRunner").finish_non_exhaustive()
+    }
+}
 impl GlobalResource for AgentRunner {}

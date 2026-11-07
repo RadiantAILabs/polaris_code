@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 /// Global immutable filesystem and model settings for call staging.
-#[derive(Clone)]
 ///
 /// # Scope
 /// Global because every role call uses the same immutable asset and task roots.
@@ -25,6 +24,7 @@ use std::{
 /// #[system]
 /// async fn inspect(value:Res<FlowSettings>)->std::path::PathBuf { value.task_dir.clone() }
 /// ```
+#[derive(Clone, Debug)]
 pub struct FlowSettings {
     /// Asset root containing prompts and skills.
     pub assets: PathBuf,
@@ -32,10 +32,29 @@ pub struct FlowSettings {
     pub task_dir: PathBuf,
     /// Configured model identity for unmeasured accounting.
     pub model_id: String,
+    /// The largest expected output file, in bytes, that a call may leave behind.
+    /// A bigger file fails the call instead of being read. The default is 64 MiB.
+    pub max_output_bytes: u64,
+}
+impl Default for FlowSettings {
+    fn default() -> Self {
+        Self {
+            assets: PathBuf::new(),
+            task_dir: PathBuf::new(),
+            model_id: String::new(),
+            max_output_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 impl GlobalResource for FlowSettings {}
 /// Renders required placeholders and rejects unused explicit variables.
 /// Standard variables may be omitted by a prompt.
+///
+/// # Errors
+///
+/// Returns [`FlowError::Invalid`] for an unclosed or unknown placeholder and
+/// for an explicit variable the text never uses.
+#[doc(hidden)]
 pub fn render(
     role: &str,
     text: &str,
@@ -54,7 +73,9 @@ fn check_unused(
 ) -> FlowResult<()> {
     for name in vars.keys() {
         if !used.contains(name) {
-            return Err(FlowError(format!("role {role}: unused variable {name}")));
+            return Err(FlowError::invalid(format!(
+                "role {role}: unused variable {name}"
+            )));
         }
     }
     Ok(())
@@ -72,12 +93,14 @@ fn interpolate(
         output.push_str(before);
         let (name, tail) = after
             .split_once("}}")
-            .ok_or_else(|| FlowError(format!("role {role}: unclosed placeholder")))?;
+            .ok_or_else(|| FlowError::invalid(format!("role {role}: unclosed placeholder")))?;
         let name = name.trim();
         let value = vars
             .get(name)
             .or_else(|| standard.get(name))
-            .ok_or_else(|| FlowError(format!("role {role}: missing placeholder {name}")))?;
+            .ok_or_else(|| {
+                FlowError::invalid(format!("role {role}: missing placeholder {name}"))
+            })?;
         used.insert(name.to_owned());
         output.push_str(value);
         rest = tail;
@@ -85,11 +108,34 @@ fn interpolate(
     output.push_str(rest);
     Ok(output)
 }
-/// Copies a file or directory without following any symbolic links.
-pub fn copy_snapshot(source: &Path, dest: &Path, read_only: bool) -> FlowResult<()> {
+/// Copies a file or directory that lives inside one of `roots`, without
+/// following any symbolic links below it.
+///
+/// The source is resolved first, so a symlinked parent directory that leads
+/// outside every root is refused, as is a root that does not exist.
+pub(crate) fn copy_snapshot(
+    source: &Path,
+    dest: &Path,
+    read_only: bool,
+    roots: &[&Path],
+) -> FlowResult<()> {
+    let real = source.canonicalize()?;
+    if !roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| real.starts_with(root))
+    {
+        return Err(FlowError::invalid(format!(
+            "input outside the allowed roots: {}",
+            source.display()
+        )));
+    }
+    copy_tree(source, dest, read_only)
+}
+fn copy_tree(source: &Path, dest: &Path, read_only: bool) -> FlowResult<()> {
     let meta = fs::symlink_metadata(source)?;
     if meta.file_type().is_symlink() {
-        return Err(FlowError(format!(
+        return Err(FlowError::invalid(format!(
             "symlink input refused: {}",
             source.display()
         )));
@@ -98,7 +144,7 @@ pub fn copy_snapshot(source: &Path, dest: &Path, read_only: bool) -> FlowResult<
         fs::create_dir_all(dest)?;
         for entry in fs::read_dir(source)? {
             let entry = entry?;
-            copy_snapshot(&entry.path(), &dest.join(entry.file_name()), read_only)?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()), read_only)?;
         }
     } else if meta.is_file() {
         if let Some(parent) = dest.parent() {
@@ -106,7 +152,7 @@ pub fn copy_snapshot(source: &Path, dest: &Path, read_only: bool) -> FlowResult<
         }
         fs::copy(source, dest)?;
     } else {
-        return Err(FlowError("special file refused during staging".into()));
+        return Err(FlowError::invalid("special file refused during staging"));
     }
     let mut permissions = fs::metadata(dest)?.permissions();
     if read_only {
@@ -124,6 +170,15 @@ pub fn copy_snapshot(source: &Path, dest: &Path, read_only: bool) -> FlowResult<
     Ok(())
 }
 /// Stages one bounded request and persists exactly the prompts sent to the runner.
+///
+/// Inputs may only come from the run root, the task directory or the asset
+/// root; a source that resolves anywhere else is refused.
+///
+/// # Errors
+///
+/// Returns a [`FlowError`] when an input is refused, a prompt or skill cannot be
+/// read or rendered, or the workspace cannot be written.
+#[doc(hidden)]
 pub fn stage(
     call: &AgentCall,
     role: &Role,
@@ -134,11 +189,17 @@ pub fn stage(
 ) -> FlowResult<AgentRequest> {
     fs::create_dir_all(workspace.join("inputs"))?;
     fs::create_dir_all(workspace.join("outputs"))?;
+    let input_roots = [
+        handle.root.as_path(),
+        settings.task_dir.as_path(),
+        settings.assets.as_path(),
+    ];
     for (source, name) in &call.stage.copy_in {
         copy_snapshot(
             source,
             &workspace.join("inputs").join(relative(name)?),
             true,
+            &input_roots,
         )?;
     }
     let standard = BTreeMap::from([
@@ -165,9 +226,9 @@ pub fn stage(
         let rel = relative(skill)?;
         let name = rel
             .file_name()
-            .ok_or_else(|| FlowError("skill needs a filename".into()))?;
+            .ok_or_else(|| FlowError::invalid("skill needs a filename"))?;
         if !staged_names.insert(name.to_owned()) {
-            return Err(FlowError(format!(
+            return Err(FlowError::invalid(format!(
                 "role {}: duplicate staged skill {}",
                 call.role,
                 name.to_string_lossy()
@@ -178,6 +239,7 @@ pub fn stage(
             &settings.assets.join("prompts").join(rel),
             &destination,
             false,
+            &[settings.assets.as_path()],
         )?;
         render_skills(
             &destination,

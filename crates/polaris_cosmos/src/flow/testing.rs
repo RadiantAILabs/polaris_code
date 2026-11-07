@@ -1,7 +1,7 @@
 //! File-backed scripted sessions for offline graph tests.
 use super::{
-    AgentFailure, AgentReport, AgentRequest, StopCause, StopFlag, TaskRunner, Usage, copy_snapshot,
-    io::*,
+    AgentFailure, AgentReport, AgentRequest, StopCause, StopFlag, TaskRunner, Usage, io::*,
+    staging::copy_snapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -47,11 +47,12 @@ impl Scenario {
     fn load_stack(root: &Path, stack: &mut Vec<PathBuf>) -> FlowResult<Self> {
         let root = root.canonicalize()?;
         if stack.contains(&root) {
-            return Err(FlowError("scenario include cycle".into()));
+            return Err(FlowError::invalid("scenario include cycle"));
         }
         stack.push(root.clone());
         let text = fs::read_to_string(root.join("scenario.toml"))?;
-        let doc: toml::Value = toml::from_str(&text).map_err(|e| FlowError(e.to_string()))?;
+        let doc: toml::Value =
+            toml::from_str(&text).map_err(|e| FlowError::invalid(e.to_string()))?;
         let default = doc.get("default");
         let include = doc
             .get("include")
@@ -61,7 +62,7 @@ impl Scenario {
             for include in includes {
                 let path = include
                     .as_str()
-                    .ok_or_else(|| FlowError("scenario include must be a path".into()))?;
+                    .ok_or_else(|| FlowError::invalid("scenario include must be a path"))?;
                 let other = Self::load_stack(&root.join(path), stack)?;
                 scenario.roles.extend(other.roles);
                 scenario.usage = other.usage;
@@ -71,7 +72,7 @@ impl Scenario {
             scenario.usage = usage
                 .clone()
                 .try_into()
-                .map_err(|e| FlowError(e.to_string()))?;
+                .map_err(|e| FlowError::invalid(e.to_string()))?;
         }
         if root.join("roles").exists() {
             let mut roles = fs::read_dir(root.join("roles"))?
@@ -93,7 +94,7 @@ impl Scenario {
                         continue;
                     }
                     let mut entry: ScriptEntry = toml::from_str(&fs::read_to_string(&path)?)
-                        .map_err(|e| FlowError(format!("{}: {e}", path.display())))?;
+                        .map_err(|e| FlowError::invalid(format!("{}: {e}", path.display())))?;
                     let folder = path.with_extension("");
                     if folder.is_dir() {
                         entry.files = Some(folder);
@@ -108,6 +109,7 @@ impl Scenario {
     }
 }
 /// Offline runner which records every request and never calls a model or process.
+#[derive(Debug)]
 pub struct ScriptedRunner {
     scenario: Scenario,
     output: PathBuf,
@@ -159,7 +161,7 @@ impl ScriptedRunner {
 impl TaskRunner for ScriptedRunner {
     async fn run(&self, req: AgentRequest) -> Result<AgentReport, AgentFailure> {
         let selected = {
-            let mut counts = self.counts.lock().unwrap();
+            let mut counts = self.counts.guard();
             let played = !self.stop.is_requested();
             let ordinal = *counts.get(&req.role).unwrap_or(&0);
             let mut line =
@@ -212,10 +214,15 @@ impl TaskRunner for ScriptedRunner {
             });
         }
         if let Some(files) = selected.files {
-            for entry in fs::read_dir(files).map_err(|e| AgentFailure::Internal(e.to_string()))? {
+            for entry in fs::read_dir(&files).map_err(|e| AgentFailure::Internal(e.to_string()))? {
                 let entry = entry.map_err(|e| AgentFailure::Internal(e.to_string()))?;
-                copy_snapshot(&entry.path(), &req.workspace.join(entry.file_name()), false)
-                    .map_err(|e| AgentFailure::Internal(e.to_string()))?;
+                copy_snapshot(
+                    &entry.path(),
+                    &req.workspace.join(entry.file_name()),
+                    false,
+                    &[files.as_path()],
+                )
+                .map_err(|e| AgentFailure::Internal(e.to_string()))?;
             }
         }
         let stop = match selected.stop.as_str() {
