@@ -127,8 +127,9 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
             environment, ("curl", "tar")
         )
         install = str(environment.execs[-1]["command"])
-        self.assertIn("x86_64-unknown-linux-gnu", install)
-        self.assertIn("supports x86_64-unknown-linux-gnu only", install)
+        self.assertIn("x86_64-unknown-linux-musl", install)
+        self.assertNotIn("x86_64-unknown-linux-gnu", install)
+        self.assertIn("supports x86_64-unknown-linux-musl only", install)
         self.assertIn("releases/download/v0.3.0/", install)
         self.assertIn('sha256sum -c "$archive.sha256"', install)
         self.assertLess(install.index("sha256sum -c"), install.index("tar -xzf"))
@@ -262,7 +263,9 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
             ("x86_64", "x86_64", False),
         ):
             with self.subTest(arch=arch, checksum=valid):
-                archive = root / f"polaris-code-0.3.0-{target}-unknown-linux-gnu.tar.gz"
+                archive = (
+                    root / f"polaris-code-0.3.0-{target}-unknown-linux-musl.tar.gz"
+                )
                 binary = b"#!/bin/sh\necho 'polaris 0.3.0'\n"
                 with tarfile.open(archive, "w:gz") as tar:
                     info = tarfile.TarInfo("polaris")
@@ -298,7 +301,7 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(installed.exists(), valid)
                 if arch == "aarch64":
                     self.assertIn(
-                        "supports x86_64-unknown-linux-gnu only", result.stderr
+                        "supports x86_64-unknown-linux-musl only", result.stderr
                     )
                 if valid:
                     self.assertEqual(installed.read_bytes(), binary)

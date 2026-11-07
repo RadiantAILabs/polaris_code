@@ -15,19 +15,22 @@ Pass exactly one of these Harbor agent keywords:
 - `version=MAJOR.MINOR.PATCH`: install a pinned release from
   `https://github.com/RadiantAILabs/polaris_code/releases/download/vMAJOR.MINOR.PATCH/`.
   The adapter accepts the **sandbox's** Linux x86-64 CPU and downloads
-  `polaris-code-<version>-x86_64-unknown-linux-gnu.tar.gz`, verifies the
+  `polaris-code-<version>-x86_64-unknown-linux-musl.tar.gz`, verifies the
   accompanying `.tar.gz.sha256`, then extracts
   the `polaris` executable. Setup requires curl, tar, and sha256sum.
 - `binary=/absolute/path/to/polaris`: upload a local executable built with
   `scripts/build-portable-binary.sh`. Only this artifact is copied; its SHA-256
-  becomes the recorded agent version. This is useful for development and
-  musl-based task images.
+  becomes the recorded agent version. This is useful for development.
 
-Release installation supports Linux x86-64 glibc task images, matching the
+Release installation uses a static Linux x86-64 musl executable on both
+glibc and musl task images, matching the
 [published target](publishing.md#ci-and-binary-releases). Other CPU types fail
-with a message naming `x86_64-unknown-linux-gnu`; use a compatible local binary
+with a message naming `x86_64-unknown-linux-musl`; use a compatible local binary
 for development on other architectures. A release must contain the CLI flags
 below; older executables cannot run this adapter's trajectory export.
+The static archive has no glibc version or dynamic-loader dependency. Keep the
+GNU archive for platforms that deliberately require that build (including
+Homebrew); Harbor installs the musl archive so older task images work too.
 
 ## Model and permissions
 

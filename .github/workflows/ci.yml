@@ -139,6 +139,9 @@ jobs:
           # glibc 2.35 baseline; do not silently raise it with ubuntu-latest.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          # Static executable for task images with older glibc or musl.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
           - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -161,7 +164,13 @@ jobs:
           key: release-${{ matrix.target }}-1.97.0
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release executable
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo +1.97.0 build --release --locked -p polaris_code --bin polaris --target "${{ matrix.target }}"
+      - name: Build portable release executable
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          PORTABLE_TARGET_DIR: ${{ github.workspace }}/target
+        run: scripts/build-portable-binary.sh
       - name: Package release executable
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -183,6 +192,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/polaris-smoke"
           tar -xzf "dist/${archive}" -C "$RUNNER_TEMP/polaris-smoke"
           binary="$RUNNER_TEMP/polaris-smoke/polaris"
+          if [ "$TARGET" = x86_64-unknown-linux-musl ]; then
+            file "$binary"
+            if readelf -d "$binary" | grep -q '(NEEDED)'; then
+              echo "error: portable archive has dynamic library dependencies" >&2
+              exit 1
+            fi
+            if readelf -l "$binary" | grep -q 'INTERP'; then
+              echo "error: portable archive requires a dynamic loader" >&2
+              exit 1
+            fi
+          fi
           test "$("$binary" --version)" = "polaris ${VERSION}"
           "$binary" --help
           "$binary" "$RUNNER_TEMP/polaris-smoke" --list-topologies --output-format json > inventory.json

@@ -141,17 +141,37 @@ The build matrix produces:
 | Archive target | Minimum platform |
 | --- | --- |
 | `aarch64-apple-darwin` | Apple Silicon, macOS Sequoia 15 |
-| `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.35 (Ubuntu 22.04 baseline) |
+| `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.35 (Ubuntu 22.04 baseline; Homebrew) |
+| `x86_64-unknown-linux-musl` | Linux x86-64, static musl executable (Harbor and portable installs) |
 
 Each `polaris-code-<version>-<target>.tar.gz` contains the executable, license,
 README, and its logo assets, with a matching `.tar.gz.sha256` file. Each runner
 extracts its archive and checks the version, help, and JSON topology inventory
-without model credentials. The Linux archive uses glibc; continue using
-`scripts/build-portable-binary.sh` for the static musl benchmark executable.
+without model credentials. The GNU archive retains its glibc baseline. The
+musl archive is built by `scripts/build-portable-binary.sh` in its pinned Rust
+Alpine image; it must have neither dynamic library dependencies nor a dynamic
+loader. The archive smoke test verifies those properties before exercising
+its version, help and topology inventory. Harbor downloads the musl archive:
+benchmark task images can use an older glibc or an unidentified base image.
+Homebrew continues to use the GNU archive.
+
+To build the same portable executable locally, use an empty build directory
+on a volume with room for Rust dependencies:
+
+```bash
+PORTABLE_TARGET_DIR=/path/to/build-target scripts/build-portable-binary.sh
+```
+
+The executable is at
+`<build-target>/x86_64-unknown-linux-musl/release/polaris`. Release builds use
+the application's default features: the Oxigraph store is in memory, and the
+optional `polaris_ontrace/oxigraph-rocksdb` C++ backend is not linked into the
+shipped binary. An all-features Clippy check separately covers that backend;
+it does not change the release archive's feature selection.
 
 Download the archives from the workflow's `polaris-<target>` artifacts within
-14 days. Only after all checks and both builds pass does the workflow generate
-the `homebrew-formula` artifact. For a pushed tag in
+14 days. Only after all checks and all three builds pass does the workflow
+generate the `homebrew-formula` artifact. For a pushed tag in
 `RadiantAILabs/polaris_code`, it also creates a **draft** GitHub release with
 the same archives, checksums, and `polaris-code.rb`. Tags must match the
 application version exactly (`v0.1.1` for application 0.1.1); supporting crate
@@ -171,8 +191,8 @@ and `patchelf` adjusts the installed copy's library search path and optional
 Homebrew glibc loader. When that loader is present, it also runs `patchelf`
 with Homebrew's libraries so the tool can run on the Ubuntu 22.04 baseline.
 The downloaded archive and its checksum stay intact.
-To regenerate it locally after downloading both archives and their checksum
-files:
+To regenerate it locally after downloading both Homebrew archives and their
+checksum files:
 
 ```bash
 python3 scripts/homebrew_formula.py 0.3.0 RadiantAILabs/polaris_code dist

@@ -30,15 +30,15 @@ TRAJECTORY = "trajectory.json"
 
 
 def release_install_command(version: str) -> str:
-    """Download the Linux x86-64 release and verify its checksum."""
+    """Download the static Linux x86-64 release and verify its checksum."""
     version = version.removeprefix("v")
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("version must pin a release, for example 0.3.0 or v0.3.0")
     return f'''set -eu
 [ "$(uname -s)" = Linux ] || {{ echo 'Polaris release installation requires Linux' >&2; exit 1; }}
 case "$(uname -m)" in
-  x86_64|amd64) target=x86_64-unknown-linux-gnu ;;
-  *) echo 'Unsupported CPU: Polaris release installation supports x86_64-unknown-linux-gnu only' >&2; exit 1 ;;
+  x86_64|amd64) target=x86_64-unknown-linux-musl ;;
+  *) echo 'Unsupported CPU: Polaris release installation supports x86_64-unknown-linux-musl only' >&2; exit 1 ;;
 esac
 archive="polaris-code-{version}-$target.tar.gz"
 release_tmp=$(mktemp -d)
