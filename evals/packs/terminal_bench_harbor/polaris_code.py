@@ -8,6 +8,8 @@ Harbor downloads the native ATIF trajectory before populating the run context.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import shlex
 from collections.abc import Sequence
@@ -61,6 +63,37 @@ def _positive_int(name: str, value: int | str | None) -> int | None:
     ):
         raise ValueError(f"{name} must be a positive integer")
     return int(value)
+
+
+def _reported_cost(logs_dir: Path) -> float | None:
+    """Read a known cost from the application's authoritative usage event."""
+    cost = None
+    try:
+        with (logs_dir / "polaris.jsonl").open() as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                    if (
+                        event.get("source") != "System"
+                        or event.get("metadata", {}).get("io_type") != "usage"
+                    ):
+                        continue
+                    usage = json.loads(event["content"]["Text"])
+                    if usage.get("schema") != "polaris-code-run-usage/v1":
+                        continue
+                    value = usage.get("estimated_cost_usd")
+                    if (
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(value)
+                        and value >= 0
+                    ):
+                        cost = float(value)
+                except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+                    continue
+    except OSError:
+        pass
+    return cost
 
 
 class PolarisCode(BaseInstalledAgent):
@@ -214,3 +247,5 @@ class PolarisCode(BaseInstalledAgent):
             context.n_cache_tokens = metrics.total_cached_tokens
             context.n_output_tokens = metrics.total_completion_tokens
             context.cost_usd = metrics.total_cost_usd
+        if context.cost_usd is None:
+            context.cost_usd = _reported_cost(self.logs_dir)

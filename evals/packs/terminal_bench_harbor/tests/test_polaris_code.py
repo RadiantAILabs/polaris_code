@@ -348,3 +348,53 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
             ):
                 self._agent(context_window=100, max_output_tokens=output)
         self._agent(context_window=100, max_output_tokens=98)
+
+    def test_known_cost_comes_from_a_system_usage_event_when_atif_has_no_price(
+        self,
+    ) -> None:
+        import json
+
+        self.logs.mkdir()
+        trajectory = {
+            "schema_version": "ATIF-v1.6",
+            "agent": {"name": "polaris-code", "version": "test"},
+            "steps": [{"step_id": 1, "source": "user", "message": "task"}],
+            "final_metrics": {
+                "total_prompt_tokens": 100,
+                "total_completion_tokens": 20,
+            },
+        }
+        (self.logs / "trajectory.json").write_text(json.dumps(trajectory))
+        for value, expected in (
+            (0.75, 0.75),
+            (0, 0.0),
+            (None, None),
+            (-1, None),
+            (True, None),
+            ("0.75", None),
+            (float("nan"), None),
+        ):
+            with self.subTest(value=value):
+                event = {
+                    "source": "System",
+                    "metadata": {"io_type": "usage"},
+                    "content": {
+                        "Text": json.dumps(
+                            {
+                                "schema": "polaris-code-run-usage/v1",
+                                "estimated_cost_usd": value,
+                            }
+                        )
+                    },
+                }
+                path = self.logs / "polaris.jsonl"
+                path.write_text(json.dumps(event) + "\nnot JSON\n")
+                context = AgentContext()
+                self._agent().populate_context_post_run(context)
+                self.assertEqual(context.cost_usd, expected)
+                self.assertEqual(context.n_input_tokens, 100)
+                event["source"] = {"Agent": "code"}
+                path.write_text(json.dumps(event) + "\n")
+                context = AgentContext()
+                self._agent().populate_context_post_run(context)
+                self.assertIsNone(context.cost_usd)

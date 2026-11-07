@@ -99,7 +99,9 @@ and process failures propagate to Harbor.
 
 After Harbor downloads the agent logs, `populate_context_post_run` validates
 the native ATIF document and fills `AgentContext` with total prompt, completion,
-and cached tokens, plus dollar cost when known. Unknown pricing stays unset.
+and cached tokens, plus dollar cost when known. When ATIF has no price, the
+adapter reads `estimated_cost_usd` from the application's authoritative
+`polaris-code-run-usage/v1` system event in `polaris.jsonl`. Unknown pricing stays unset.
 No trajectory converter is needed. Missing or invalid ATIF emits a warning and
 leaves the context unchanged, preserving the original trial outcome.
 
