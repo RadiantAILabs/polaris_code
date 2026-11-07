@@ -41,6 +41,11 @@ pub struct Scenario {
 }
 impl Scenario {
     /// Loads included scenarios first; this directory's role definitions win.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the directory or its `scenario.toml` cannot
+    /// be read, a scenario file is malformed, or the includes form a cycle.
     pub fn load(root: &Path) -> FlowResult<Self> {
         Self::load_stack(root, &mut Vec::new())
     }
@@ -121,10 +126,22 @@ pub struct ScriptedRunner {
 }
 impl ScriptedRunner {
     /// Creates a runner from a scenario directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the scenario cannot be loaded, as for
+    /// [`Scenario::load`], or the runner cannot be created, as for
+    /// [`new`](Self::new).
     pub fn load(root: &Path, output: &Path) -> FlowResult<Self> {
         Self::new(Scenario::load(root)?, output)
     }
     /// Creates a runner from in-memory entries and restores role ordinals from calls.jsonl.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] when the output directory cannot be created, or
+    /// when an existing `calls.jsonl` cannot be read or holds a line that is not
+    /// JSON.
     pub fn new(scenario: Scenario, output: &Path) -> FlowResult<Self> {
         fs::create_dir_all(output)?;
         let mut counts = BTreeMap::new();

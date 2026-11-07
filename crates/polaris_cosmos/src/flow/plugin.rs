@@ -14,8 +14,15 @@ type Installer = Box<dyn Fn(&mut Server) + Send + Sync>;
 ///
 /// # Resources Provided
 ///
-/// Every resource handed to [`with_resource`](Self::with_resource), as a
-/// global.
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | Each value passed to [`with_resource`](Self::with_resource) | Global | A flow resource the host built, such as [`SpendBook`], [`StepJournal`](super::StepJournal), [`EventLog`], [`PhaseControl`](super::PhaseControl) or [`RunHandle`](super::RunHandle). The plugin builds none itself. |
+///
+/// # APIs Provided
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Systems consume the resources through `Res<T>`; no callable host API is installed. |
 ///
 /// # Dependencies
 ///

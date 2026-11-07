@@ -7,17 +7,36 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-/// Global immutable filesystem and model settings for call staging.
+/// Filesystem roots and model identity for call staging; use
+/// `Res<FlowSettings>` when a system needs the asset root, the task directory or
+/// the output-size limit that every call in the workflow shares.
 ///
 /// # Scope
-/// Global because every role call uses the same immutable asset and task roots.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Every role call uses the same asset root, task directory, model
+/// identity and output limit.
+///
+/// # Provided by
+///
+/// Consumer-supplied. It has no constructor: the host fills in the public
+/// fields, usually with a struct literal that ends in
+/// `..FlowSettings::default()`, and registers the value as a global, directly or
+/// through [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`agent`](fn@super::agent) block reads it.
+///
 /// # Access
-/// Systems read `Res<FlowSettings>`; mutable books serialize updates internally.
+///
+/// `Res<FlowSettings>` only. The value is immutable: it is plain data with no
+/// interior mutability, and nothing changes it after the host registers it.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`RunHandle`](super::RunHandle) holds the run's identity and root, which
+/// change with every run, while these settings stay the same across runs. Use
+/// an ordinary local resource for a setting that only one branch needs.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::FlowSettings;
@@ -26,11 +45,14 @@ use std::{
 /// ```
 #[derive(Clone, Debug)]
 pub struct FlowSettings {
-    /// Asset root containing prompts and skills.
+    /// Asset root containing prompts and skills. A call may also copy inputs
+    /// from it.
     pub assets: PathBuf,
-    /// Frozen task directory exposed as a standard prompt variable.
+    /// Frozen task directory. A call may copy inputs from it, together with the
+    /// run root and the asset root.
     pub task_dir: PathBuf,
-    /// Configured model identity for unmeasured accounting.
+    /// Model identity recorded for a call whose runner reports none and for a
+    /// call whose cost could not be measured.
     pub model_id: String,
     /// The largest expected output file, in bytes, that a call may leave behind.
     /// A bigger file fails the call instead of being read. The default is 64 MiB.

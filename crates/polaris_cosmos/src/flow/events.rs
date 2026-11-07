@@ -12,17 +12,50 @@ use std::{
 const DEFAULT_EVENT_FILE: &str = "events.jsonl";
 /// Status note recorded for a phase that a user interruption ended.
 const INTERRUPTED_NOTE: &str = "interrupted";
-/// Global event sink; concurrent branches append whole, flushed lines under one lock.
+/// Append-only event file; use `Res<EventLog>` when a system must leave a
+/// durable, ordered record of what a workflow did.
+///
+/// Concurrent branches each append whole, flushed lines, so a reader never sees
+/// half a line and lines keep the order in which they were written.
 ///
 /// # Scope
-/// Global because all branches append to one ordered event stream.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** All branches append to one ordered event stream.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`EventLog::open`], optionally
+/// chooses the file with [`with_file_name`](Self::with_file_name), and registers
+/// it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The plugin
+/// also stops its heartbeat timers at cleanup. The [`events()`](fn@super::events)
+/// block and [`phase`](fn@super::phase) write to it.
+///
 /// # Access
-/// Systems read `Res<EventLog>`; mutable books serialize updates internally.
+///
+/// `Res<EventLog>` only. The value is not immutable: `emit` appends through
+/// `&self`. Appends take an `Arc<Mutex<()>>` write lock, and the heartbeat
+/// timers of running phases are tokio tasks kept in a shared set. A clone shares
+/// both, so [`start_phase`](Self::start_phase) needs a Tokio runtime.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// No other flow resource records events. Use `tracing` for process diagnostics
+/// that need no durable record, and [`PhaseControl`] to ask what a phase's
+/// status is rather than to read its history.
+///
+/// # Serialization
+///
+/// Written as JSON Lines to `events.jsonl` under the run root, or to the name
+/// given to [`with_file_name`](Self::with_file_name). Each line is one object
+/// with the keys `event`, `fields`, `phase`, `session_id` (the run id),
+/// `source` (always `"pipeline"`), `timestamp` (UTC) and `worker_index`
+/// (always `0`). `fields` carries whatever the caller passed in. The log is only
+/// appended to: [`open`](Self::open) reads nothing back, so a resumed run adds
+/// to the same file.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::EventLog;
@@ -148,17 +181,50 @@ struct PhaseState {
     started: BTreeMap<String, Instant>,
 }
 
-/// Global phase lifecycle state shared by phase checks and workflow edges.
+/// Phase lifecycle state; use `Res<PhaseControl>` when a system must know
+/// whether a phase is enabled, past its deadline, finished or halted.
+///
+/// It records each phase's typed [`PhaseStatus`], applies the phase's
+/// [`PhasePolicy`] when it finishes, and remembers whether a fatal failure or an
+/// interruption means no later phase may start.
 ///
 /// # Scope
-/// Global because phase checks and workflow edges share lifecycle status.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Phase checks and workflow edges in every branch share one
+/// lifecycle status.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`PhaseControl::open`], giving
+/// the enabled phase names and any per-phase deadlines, and registers it as a
+/// global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`phase`](fn@super::phase) block and [`agent`](fn@super::agent) read it.
+///
 /// # Access
-/// Systems read `Res<PhaseControl>`; mutable books serialize updates internally.
+///
+/// `Res<PhaseControl>` only. The enabled list and the deadlines are fixed when
+/// the value is built. The statuses, the halt state and the phase start times
+/// change through `&self` behind a shared `Arc<Mutex<..>>`, and a status change
+/// is saved to the file as part of the call.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`CallDeadline`] bounds the whole workflow's wall-clock time for admitting
+/// new calls, while a deadline here bounds one phase and starts with
+/// [`start`](Self::start). Use both when a workflow needs a total limit and a
+/// limit per phase.
+///
+/// # Serialization
+///
+/// Phase statuses are saved as JSON in `pipeline_state.json` under the run root,
+/// a map from phase name to [`PhaseStatus`]. [`open`](Self::open) restores them.
+/// The halt state, the incomplete flag and the phase start times are not saved,
+/// so a resumed run starts with no halt, no incomplete flag and no running phase
+/// clock.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::PhaseControl;
@@ -328,17 +394,38 @@ pub fn phase_status(status: &PhaseStatus) -> (&'static str, &str) {
     }
 }
 
-/// Global wall-clock boundary for starting new calls.
+/// Wall-clock limit for starting new calls; use `Res<CallDeadline>` when a
+/// system must stop admitting role calls once a workflow has run long enough.
+///
+/// A call already running is not cut short. With no limit the deadline never
+/// expires.
 ///
 /// # Scope
-/// Global because every role call shares the same wall-clock boundary.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Every role call shares the same wall-clock boundary.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`CallDeadline::new`], or with
+/// [`CallDeadline::with_elapsed`] to carry time spent before a restart, and
+/// registers it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`agent`](fn@super::agent) block reads it when one is registered.
+///
 /// # Access
-/// Systems read `Res<CallDeadline>`; mutable books serialize updates internally.
+///
+/// `Res<CallDeadline>` only. The value is immutable: it holds a start `Instant`
+/// and an optional limit, and has no interior mutability. `expired` compares the
+/// clock with them on each call.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`PhaseControl`] holds per-phase deadlines that start with each phase. Use it
+/// for a limit on one phase, and this resource for a limit on the whole
+/// workflow.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::CallDeadline;
