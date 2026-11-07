@@ -12,3 +12,8 @@ lifecycle, composition policy, and a provider+consumer example per the
 > CI.
 
 > This crate currently defines no APIs.
+
+The [`flow`](crate::flow) module's graph builders are ordinary functions that
+return a `Graph`, not APIs. The
+[integration guide](https://github.com/RadiantAILabs/polaris_code/blob/main/crates/polaris_cosmos/docs/reference/guide.md#durable-agent-workflows)
+lists them with the resources each one reads.

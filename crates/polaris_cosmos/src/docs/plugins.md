@@ -28,3 +28,13 @@ to go the other way — from a downstream goal to the plugins that satisfy it.
   capability using the bounded, process-local in-memory provider. Hosts and
   recorders append typed events explicitly; the plugin starts no task and
   performs no outcome interpretation.
+
+## Durable flow
+
+- [`FlowPlugin`](crate::flow::FlowPlugin) — registers, as globals, the
+  [flow resources](crate::docs::resources) a host already built; it builds none
+  itself and adds no policy. When a [`SpendBook`](crate::flow::SpendBook) was
+  supplied, `ready()` charges every call an earlier run left in flight at its
+  ceiling. When an [`EventLog`](crate::flow::EventLog) was supplied, `cleanup()`
+  stops its phase heartbeat timers. Reach for it when a flow runs inside a
+  Polaris server; hosts that wire resources by hand can still do so.

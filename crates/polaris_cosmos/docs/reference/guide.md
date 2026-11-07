@@ -24,6 +24,7 @@ selected model or memory surface needs server lifecycle integration.
 | Choose one registration | `selection::deterministic` | Complete immutable `SelectionInputs` and an explained decision |
 | Record ordered evidence | `evidence::TopologyEvidence` | Replaceable provider contract; bounded in-memory default |
 | Capture later statistics | `TopologyEvidence::capture_statistics` | Content-addressed contextual snapshot |
+| Run a durable, budgeted, resumable multi-step agent workflow | `flow::agent`, `flow::phase`, `flow::repair_loop`, `flow::lease_loop`, `flow::worklist`, `flow::memo` and `flow::FlowPlugin` | Native branches and loops, global resources read through `Res<T>`, and typed outputs through `Out<T>`; see [Durable agent workflows](#durable-agent-workflows) |
 
 See the [cognitive-model guide](./cognitive-models.md) for model contracts and
 the rest of this guide for the topology-runtime sequence.
@@ -344,6 +345,72 @@ boundary used by the default provider. Production pack plugins should use only
 the complete path; a missing type explanation is an assembly error, not a
 runtime exclusion.
 
+## Durable agent workflows
+
+The `flow` module builds bounded, budgeted, resumable multi-step agent workflows
+from ordinary Polaris graph constructors. They are plain Rust functions that
+return a `Graph`, not framework `API` handles, so `src/docs/apis.md` stays
+empty. Control flow stays in the graph: each `agent` call is an inspectable
+subgraph, and loops, branches and phases are graph nodes, not code hidden inside
+one system. The module is the durable-state and spend-control substrate for such
+workflows; it makes no choice of cognitive model. See the
+[taxonomy](../taxonomy.md) for where it sits among the Cosmos layers.
+
+### Assemble a flow
+
+1. Pick one run root. Every durable file of the run lives under it, and one
+   process owns it: the `SpendBook` takes no file lock.
+2. Open the resources the graph reads with their constructors (`SpendBook::open`,
+   `StepJournal::open`, `RepairCounters::open`, `LeaseBook::open`,
+   `Worklist::open`, `EventLog::open`, `PhaseControl::open`, `RoleBook::load`).
+   Fill `RunHandle` and `FlowSettings` as struct literals, build a
+   `CallDeadline` with `CallDeadline::new` if the workflow has a wall limit, and
+   wrap the executor with `AgentRunner::new`. The
+   [resource catalog](../../src/docs/resources.md) lists all thirteen.
+3. Register them as globals. Either call `Server::insert_global` for each, or
+   hand each one to `FlowPlugin::with_resource`. The plugin also charges calls
+   that an earlier run left in flight at their ceiling when the server becomes
+   ready, and stops phase heartbeat timers at cleanup. Without the plugin, call
+   `SpendBook::recover_abandoned` yourself on a resumed run.
+4. Build the graph from the surfaces in the table below. Set `RunHandle::mode`
+   to `RunMode::Resume` to continue an earlier run.
+
+### Resume
+
+Only an `agent` call that ran to a stop is journaled as done, and only a run in
+`RunMode::Resume` restores it instead of calling the runner again. Skipped,
+failed and interrupted calls run again. `memo` restores any step the journal
+holds as done, whatever the mode. A step key that is already done is restored on
+every later pass, so give each pass that must run its own key.
+
+### Surfaces
+
+| Native surface | Resources it reads | Consumer contract |
+|---|---|---|
+| `flow::agent`, `flow::agent_roles` | `RunHandle`, `FlowSettings`, `RoleBook`, `SpendBook`, `StepJournal`, `PhaseControl`, `EventLog`, `AgentRunner`; `CallDeadline` when registered | Build one bounded role-call subgraph and inspect its declared roles. Expected failures are `AgentOutcome` values, so parallel siblings always finish and settle. |
+| `flow::phase`, `flow::phase_status` | `PhaseControl`, `EventLog`; `StepJournal` and `RunHandle` when registered | Wrap a body with enablement, events and a failure policy; project its recorded status. |
+| `flow::memo`, `flow::memo_current` | `StepJournal`; `PhaseControl` when registered | Restore typed completed outputs by a fixed or runtime step key. |
+| `flow::repair_loop`, `flow::counter` | `RepairCounters`; `EventLog` when registered | Compose check and repair edges over a shared durable cap; `counter` emits a `CounterValue`. |
+| `flow::lease_loop` | `LeaseBook`; `PhaseControl` when registered | Compose fixed-width lanes that share numbered leases. |
+| `flow::rounds` | none | Compose rounds of a body separated by barriers. |
+| `flow::worklist` | `Worklist`; `PhaseControl` when registered | Drain persisted, runtime-selected items and keep each failed item's outcome. |
+| `flow::budget`, `flow::events` | `SpendBook`, `EventLog` | Add an allowance check (emits a `BudgetCheck`) and lifecycle events as ordinary systems. |
+| `flow::bind` | whatever the closure's parameters name | Capture immutable node policy while deriving typed system access. |
+| `flow::FlowPlugin` | none | Register the resources a host built and settle spend left over from an earlier run. |
+| `flow::TaskRunner`, `flow::AgentRunner` | none | The replaceable executor boundary for one isolated agent session. |
+| `flow::testing::ScriptedRunner`, `flow::testing::Scenario` | none | Replace the executor with an offline, file-backed scenario. |
+| `flow::RoleBook::load`, `flow::Role::max_micros` | none | Merge role fragments and read exact role ceilings. |
+| `flow::SpendBook::with_ledger`, `flow::LedgerSettings`, `flow::SpendSummary` | none | Stamp the agent, provider and cost basis on every ledger line, and summarize settled spend by model and phase. |
+| `flow::UsdAmount`, `flow::parse_micros`, `flow::dollars` | none | Convert exact decimal money at serialization boundaries. |
+| `flow::latest_workspace` | none | Resolve a durable step key to its latest numbered invocation folder. |
+
+States are enums, not strings. Match `HaltReason`, `StepStatus`,
+`WorkItemStatus`, `RunMode`, `PhaseStatus`, `AgentOutcome` and `SkipReason`
+instead of comparing text. Reservation faults come back as `ReserveError`, and
+only its `Refused` variant means the budget is spent. `SpendSummary` groups
+settled spend into `SpendBucket`s. Fallible calls return `FlowResult`, and
+`FlowError` keeps the underlying I/O or JSON error as its source.
+
 ## World-model patterns
 
 This crate does not include a world-model backend. A world model is meant to be
@@ -371,6 +438,9 @@ Every backend, layout, channel, and policy remains a point on an open axis.
   composition policy, and add it to `src/docs/apis.md`.
 - **Resource:** follow the [Resource Documentation Standard](./resources.md),
   document scope and access, and add it to `src/docs/resources.md`.
+- **Flow block:** a graph builder in `flow` is a plain function, not an API.
+  Document the resources it reads in its rustdoc, and add it to the table in
+  [Durable agent workflows](#durable-agent-workflows).
 
 Use the [taxonomy](../taxonomy.md) to decide whether logic belongs in Polaris
 graph mechanics, Cosmos cognition, or a domain embodiment.
