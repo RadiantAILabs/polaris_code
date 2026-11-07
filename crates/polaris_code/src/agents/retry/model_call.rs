@@ -59,7 +59,7 @@ use crate::agents::state::LoopState;
 use crate::agents::trajectory::Decision;
 use crate::terminal::status;
 use crate::terminal::transcript::{LiveTranscript, OUTCOME_COMPLETE, OUTCOME_ERROR, forward};
-use crate::usage::{CostPermit, TokenMeter};
+use crate::usage::{ChargeOnDrop, TokenMeter};
 
 /// How a turn ends when an interrupt reaches a model call.
 const INTERRUPTED: &str = "turn interrupted";
@@ -134,38 +134,6 @@ pub(crate) struct AttemptFailure {
     error: GenerationError,
     kind: FailureKind,
     commitment: Commitment,
-}
-
-/// The cost reserved for one request, from the moment it is reserved until the
-/// reply ends.
-///
-/// With no spend cap on the meter nothing is reserved and the guard holds
-/// nothing. A guard that is dropped while it still holds the reservation was
-/// dropped with the request in flight (an interrupt, a cancelled call): the
-/// provider may bill a request nobody is waiting for any more, so the estimate
-/// is charged rather than released.
-struct Reserved(Option<CostPermit>);
-
-impl Reserved {
-    /// Replace the reservation with the billed usage. Usage the provider did
-    /// not report is charged at the estimate.
-    fn settle(&mut self, usage: &Usage) {
-        if let Some(permit) = self.0.take() {
-            permit.settle(usage);
-        }
-    }
-
-    /// Return the reservation unspent: the provider refused the request before
-    /// it produced anything, so nothing was billed.
-    fn release(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for Reserved {
-    fn drop(&mut self) {
-        self.settle(&Usage::default());
-    }
 }
 
 /// The tools the model is offered this turn: the registry's exposed tools
@@ -345,7 +313,7 @@ pub(crate) async fn act(
         &request,
         max_output.unwrap_or(DEFAULT_MAX_TOKENS).get(),
     ) {
-        Ok(permit) => Reserved(permit),
+        Ok(permit) => ChargeOnDrop::new(permit),
         Err(reason) => {
             tracing::warn!(%reason, "act: spend cap reached; the model is not called");
             return Ok(AttemptOutcome::GaveUp(TurnFailure::new(
@@ -366,7 +334,7 @@ pub(crate) async fn act(
     let last_cache_read = Arc::new(AtomicU64::new(0));
     let last_cache_creation = Arc::new(AtomicU64::new(0));
     let committed = Arc::new(AtomicBool::new(false));
-    // Whether the provider reported any usage, so that a spend-cap
+    // Whether the provider reported both token counts, so that a spend-cap
     // reservation is settled from it and not from the estimate.
     let usage_seen = Arc::new(AtomicBool::new(false));
     // A fresh transcript block per attempt. A retry that has shown nothing
@@ -395,8 +363,11 @@ pub(crate) async fn act(
                 Err(error) => {
                     // A request the provider refused before it produced
                     // anything billed nothing, so its reservation goes back.
-                    // One that timed out may still have been processed.
-                    if !matches!(failure::classify(&error), FailureKind::Timeout) {
+                    // Other failures may still have been processed and billed.
+                    if matches!(
+                        failure::classify(&error),
+                        FailureKind::Auth | FailureKind::RateLimit | FailureKind::InvalidRequest
+                    ) {
                         reserved.release();
                     }
                     return Err(error);
@@ -427,9 +398,15 @@ pub(crate) async fn act(
                             _ => None,
                         };
                         if let Some(usage) = usage {
-                            usage_seen.store(true, Ordering::Relaxed);
-                            let in_now = usage.input_tokens.unwrap_or(0);
-                            let out_now = usage.output_tokens.unwrap_or(0);
+                            if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+                                usage_seen.store(true, Ordering::Relaxed);
+                            }
+                            let in_now = usage
+                                .input_tokens
+                                .unwrap_or_else(|| last_in.load(Ordering::Relaxed));
+                            let out_now = usage
+                                .output_tokens
+                                .unwrap_or_else(|| last_out.load(Ordering::Relaxed));
                             let (in_delta, out_delta) = token_increment(
                                 last_in.swap(in_now, Ordering::Relaxed),
                                 last_out.swap(out_now, Ordering::Relaxed),

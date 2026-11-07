@@ -1092,14 +1092,14 @@ async fn main() {
     }
 
     // `POLARIS_CODE_MAX_OUTPUT_TOKENS` sets the `max_tokens` every request
-    // carries. Resolved once here and handed to two places that must agree:
-    // `AnthropicPlugin`, which sends it, and the non-interactive report, which
-    // states it. One local, so they cannot drift.
+    // carries. Resolved once here for the provider, the agent reservation,
+    // and the non-interactive report, so they agree on the output allowance.
     let max_output_tokens = cli.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let max_turns = cli.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
     let agent_config = AgentConfig::new(model_id, working_dir.clone())
         .with_graph_search(graph_search)
-        .with_prompt_cache(prompt_cache);
+        .with_prompt_cache(prompt_cache)
+        .with_max_output_tokens(max_output_tokens);
     // Everything this run writes that is not the user's work goes under one
     // directory, and that directory is invisible to git. Otherwise the agent's
     // own transcript rides along in whatever is built from the working tree —

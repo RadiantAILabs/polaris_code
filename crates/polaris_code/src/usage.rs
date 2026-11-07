@@ -232,7 +232,12 @@ impl CostPermit {
             actual_usd = actual,
             "Settled model call cost"
         );
-        let mut state = self.meter.inner.cost_cap.lock().expect("cost cap poisoned");
+        let mut state = self
+            .meter
+            .inner
+            .cost_cap
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         if let Some(state) = state.as_mut() {
             state.reserved -= self.reserved;
             state.spent += actual;
@@ -261,7 +266,12 @@ impl CostPermit {
 impl Drop for CostPermit {
     fn drop(&mut self) {
         if !self.settled {
-            let mut state = self.meter.inner.cost_cap.lock().expect("cost cap poisoned");
+            let mut state = self
+                .meter
+                .inner
+                .cost_cap
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             if let Some(state) = state.as_mut() {
                 state.reserved -= self.reserved;
             }
@@ -286,6 +296,11 @@ impl ChargeOnDrop {
     #[must_use]
     pub fn new(permit: Option<CostPermit>) -> Self {
         Self(permit)
+    }
+
+    /// Release the reservation when the provider refused the request without billing it.
+    pub fn release(&mut self) {
+        self.0 = None;
     }
 
     /// Replace the reservation with the provider's billed usage. Usage the
@@ -470,6 +485,9 @@ impl TokenMeter {
     /// caller that reports what a task cost reads this as well and takes the
     /// larger figure. Reservations for requests still in flight are not
     /// included.
+    ///
+    /// # Panics
+    /// Panics if the cost-cap lock is poisoned.
     #[must_use]
     pub fn task_cost_spent_usd(&self) -> Option<f64> {
         self.inner
@@ -1678,6 +1696,41 @@ mod tests {
             meter.reserve_model_call("claude-sonnet-5", 1, 800).is_err(),
             "the cancelled call's estimate was released instead of charged"
         );
+    }
+
+    #[test]
+    fn a_refused_sent_call_releases_its_reservation_once() {
+        let meter = test_meter();
+        meter.set_task_cost_cap(0.01).unwrap();
+        let mut sent =
+            ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        sent.release();
+        sent.release();
+        drop(sent);
+        assert_eq!(meter.task_cost_spent_usd(), Some(0.0));
+        assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_ok());
+    }
+
+    #[test]
+    fn dropping_cost_guards_recovers_a_poisoned_lock() {
+        for sent in [false, true] {
+            let meter = test_meter();
+            meter.set_task_cost_cap(0.01).unwrap();
+            let permit = meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = meter.inner.cost_cap.lock().unwrap();
+                panic!("poison the cost-cap lock");
+            }));
+            if sent {
+                drop(ChargeOnDrop::new(permit));
+            } else {
+                drop(permit);
+            }
+            let state = meter.inner.cost_cap.lock().unwrap_err().into_inner();
+            let state = state.as_ref().unwrap();
+            assert_eq!(state.reserved, 0.0);
+            assert_eq!(state.spent > 0.0, sent);
+        }
     }
 
     #[test]

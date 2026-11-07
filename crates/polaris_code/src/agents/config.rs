@@ -14,6 +14,7 @@ use crate::tools::GraphSearchMode;
 /// `setup` reads it to build [`super::ProjectContext`] and to scope path-based
 /// grounding).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AgentConfig {
     /// Model identifier (e.g. `anthropic/claude-sonnet-5`).
     pub model_id: String,
@@ -39,8 +40,8 @@ pub struct AgentConfig {
     /// reserved for each request when the session's meter carries a spend cap
     /// (see [`crate::usage::TokenMeter::set_task_cost_cap`]), and it is passed
     /// to the provider as the request's output limit. `None` reserves the
-    /// provider's default allowance and leaves the request's limit to the
-    /// provider.
+    /// Anthropic fallback allowance (4096 tokens), regardless of provider,
+    /// and leaves the request's limit to the provider.
     ///
     /// Set it to the limit the model provider was registered with: a provider
     /// registered with a larger ceiling than the value reserved here can
