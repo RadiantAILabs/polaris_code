@@ -47,7 +47,9 @@ Flag an ISSUE only when the trigger applies and the section is missing.
 > explanations, configuration identity, and author priors, while its snapshot
 > digest is independent of pack insertion order. For
 > an interior-mutable durable Global, follow `polaris_ontrace`'s
-> `KnowledgeGraph`; use its `OxigraphStore` for an exemplar with a strong
+> `KnowledgeGraph` or, in this crate, [`SpendBook`](../../src/flow/budget.rs)
+> (persisted state, a compiled example, and a stated single-writer rule); use
+> its `OxigraphStore` for an exemplar with a strong
 > `# Alternatives` cross-link and `TraceLine` for a per-session Local input.
 
 ## Anti-Patterns

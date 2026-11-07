@@ -501,8 +501,8 @@ pub struct Role {
 ///
 /// Each TOML fragment read by [`load`](Self::load) holds one `[roles.<name>]`
 /// table per role. [`write`](Self::write) saves the merged book to one TOML file
-/// in the same shape, so a later `load` of that file gives the same roles. The
-/// run root does not keep a copy of it.
+/// in the same shape, so a later `load` of a directory holding that file gives
+/// the same roles. The run root does not keep a copy of it.
 ///
 /// # Example system
 ///

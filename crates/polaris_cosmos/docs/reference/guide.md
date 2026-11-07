@@ -407,7 +407,9 @@ every later pass, so give each pass that must run its own key.
 States are enums, not strings. Match `HaltReason`, `StepStatus`,
 `WorkItemStatus`, `RunMode`, `PhaseStatus`, `AgentOutcome` and `SkipReason`
 instead of comparing text. Reservation faults come back as `ReserveError`, and
-only its `Refused` variant means the budget is spent.
+only its `Refused` variant means the budget is spent. `SpendSummary` groups
+settled spend into `SpendBucket`s. Fallible calls return `FlowResult`, and
+`FlowError` keeps the underlying I/O or JSON error as its source.
 
 ## World-model patterns
 
