@@ -370,14 +370,18 @@ fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
 /// instead, and refuse a path that leaves it (`..`, an absolute path, a
 /// symlink out); the shell wrapper
 /// ([`ApprovalShellTool`](crate::tools::approval::ApprovalShellTool)) starts
-/// the command there and refuses a `working_dir` outside it. With no
-/// `CallRoot` the directory the toolset was built with applies, which is how
-/// the `polaris` binary runs.
+/// the command there and refuses a `working_dir` outside it. `run_in_background`
+/// also starts there. With no `CallRoot` the directory the toolset was built
+/// with applies.
 ///
 /// The agent's two tool lanes insert one for every call, holding the session's
 /// [`AgentConfig::working_dir`](crate::agents::AgentConfig::working_dir), so
-/// two sessions on one server work in their own directories. JSON arguments
-/// cannot create a context value, so a model cannot choose its own root.
+/// the file tools (`read_file`, `read_span`, `edit_file`, `create_file`,
+/// `list_files`, `search`, `glob`), `run_command`, and `run_in_background` use
+/// that directory. Background tasks are tagged with that root; `task_output`
+/// and `stop_task` can access only tasks with the same root when one is supplied.
+/// Code-graph, memory, and MCP tools remain server-wide. JSON arguments cannot
+/// create a context value, so a model cannot choose its own root.
 ///
 /// # Scope
 ///
@@ -395,7 +399,7 @@ fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
 ///
 /// A server that runs one working directory builds its toolset on it
 /// ([`CodeToolsConfig::new`]) and needs no `CallRoot`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallRoot(PathBuf);
 
 impl CallRoot {
@@ -587,10 +591,10 @@ impl CodeTools {
         new_string: String,
         /// Replace every occurrence instead of requiring a unique match.
         /// Defaults to false.
-        replace_all: Option<bool>,
+        #[default(false)]
+        replace_all: bool,
         #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
-        let replace_all = replace_all.unwrap_or(false);
         if old_string == new_string {
             return Err(ToolError::execution_error(format!(
                 "edit_file '{path}': old_string and new_string are identical"
@@ -781,7 +785,7 @@ impl CodeTools {
     /// bounded; when a bound applies the tool says so on a trailing `…` line.
     /// For Rust symbols prefer `find_definition` / `find_references` — they
     /// resolve by symbol rather than by text.
-    #[allow(
+    #[expect(
         clippy::too_many_arguments,
         reason = "the model-visible parameters are the tool's schema; the context value is not one of them"
     )]
@@ -1143,7 +1147,13 @@ mod tests {
 
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
         let out = tools
-            .edit_file("a.txt".into(), "world".into(), "polaris".into(), None, None)
+            .edit_file(
+                "a.txt".into(),
+                "world".into(),
+                "polaris".into(),
+                false,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1160,7 +1170,7 @@ mod tests {
 
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
         let err = tools
-            .edit_file("a.txt".into(), "x".into(), "y".into(), None, None)
+            .edit_file("a.txt".into(), "x".into(), "y".into(), false, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not unique"));
@@ -1255,7 +1265,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             let edit = tools
-                .edit_file(path.into(), "a".into(), "b".into(), None, None)
+                .edit_file(path.into(), "a".into(), "b".into(), false, None)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -1555,7 +1565,7 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             tools
-                .edit_file("src/missing.rs".into(), "a".into(), "b".into(), None, None)
+                .edit_file("src/missing.rs".into(), "a".into(), "b".into(), false, None)
                 .await
                 .unwrap_err()
                 .to_string(),
@@ -1581,14 +1591,14 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let ambiguous = tools
-            .edit_file("a.txt".into(), "x".into(), "y".into(), None, None)
+            .edit_file("a.txt".into(), "x".into(), "y".into(), false, None)
             .await
             .unwrap_err()
             .to_string();
         assert!(ambiguous.contains("a.txt"), "got: {ambiguous}");
 
         let absent = tools
-            .edit_file("a.txt".into(), "zzz".into(), "y".into(), None, None)
+            .edit_file("a.txt".into(), "zzz".into(), "y".into(), false, None)
             .await
             .unwrap_err()
             .to_string();

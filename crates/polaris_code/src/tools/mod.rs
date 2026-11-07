@@ -17,6 +17,7 @@
 pub mod approval;
 pub mod code;
 pub mod code_graph;
+#[doc(hidden)]
 pub mod command_check;
 pub mod fileset;
 pub mod mcp;

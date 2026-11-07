@@ -1,4 +1,6 @@
 //! Compare framework and session command checks for JSON lines on stdin.
+//! Run with `cargo +1.97.0 run -p polaris_code --example check_commands`; input
+//! is `{ "patterns": ["cat *"], "command": "cat file" }`; output has `old`, `new`, `parts`.
 use polaris::shell::{ShellConfig, ShellExecutor, ShellPermission};
 use polaris_code::tools::command_check::checked_commands;
 use std::io::{self, BufRead};

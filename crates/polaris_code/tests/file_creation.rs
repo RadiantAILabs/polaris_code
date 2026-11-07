@@ -731,6 +731,24 @@ async fn edit_file_cannot_address_a_path_that_does_not_exist() {
 #[tokio::test]
 async fn edit_file_does_not_require_replace_all() {
     let tools = FileTools::build().await;
+    let definitions = tools.registry().definitions();
+    let edit = definitions
+        .iter()
+        .find(|tool| tool.name == "edit_file")
+        .unwrap();
+    assert_eq!(
+        edit.parameters["properties"]["replace_all"]["type"],
+        "boolean"
+    );
+    assert!(
+        !edit.parameters["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("replace_all")),
+        "replace_all should default to false: {}",
+        edit.parameters
+    );
+
     tools
         .create("note.txt", "a one")
         .await
