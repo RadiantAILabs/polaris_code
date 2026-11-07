@@ -683,8 +683,8 @@ impl ShellApproval {
                     })
             });
             if let Some(parts) = &parts {
+                let mut args = call.args.clone();
                 for part in parts {
-                    let mut args = call.args.clone();
                     args["command"] = Value::String(part.clone());
                     let part_call = super::PermissionCall {
                         args: &args,
@@ -1364,15 +1364,18 @@ mod tests {
         };
         assert_eq!(
             resolve(&policy, "echo first\necho second"),
-            ToolPermission::Allow
+            ToolPermission::Allow,
+            "unattended grants and executor allow both newline-separated commands"
         );
         assert_eq!(
             resolve(&policy, "echo first\necho forbidden"),
-            ToolPermission::Deny
+            ToolPermission::Deny,
+            "the executor denies echo forbidden after a newline"
         );
         assert_eq!(
             resolve(&policy, "echo first\ntouch denied-file"),
-            ToolPermission::Deny
+            ToolPermission::Deny,
+            "the executor denies touch denied-file after a newline"
         );
         for disposition in ["deny", "ask"] {
             let rules_path = dir.path().join("rules.toml");
@@ -1384,11 +1387,13 @@ mod tests {
             ));
             assert_eq!(
                 resolve(&policy, "echo first\necho restricted"),
-                ToolPermission::Deny
+                ToolPermission::Deny,
+                "the {disposition} rule for echo restricted applies after a newline in unattended mode"
             );
             assert_eq!(
                 resolve(&policy, "echo <<'END'\ndata\nEND\necho restricted"),
-                ToolPermission::Deny
+                ToolPermission::Deny,
+                "the {disposition} rule for echo restricted applies after a heredoc in unattended mode"
             );
         }
         assert_eq!(
@@ -1396,15 +1401,132 @@ mod tests {
                 &PermissionMode::Plan.permission_policy(),
                 "echo first\necho second"
             ),
-            ToolPermission::Deny
+            ToolPermission::Deny,
+            "plan mode denies shell execution even when both commands match session patterns"
         );
         assert_eq!(
             resolve(
                 &PermissionMode::Confirm.permission_policy(),
                 "echo first\necho second"
             ),
-            ToolPermission::Confirm
+            ToolPermission::Confirm,
+            "confirm mode still requires approval when both commands match session patterns"
         );
+    }
+
+    #[test]
+    fn session_patterns_do_not_cover_commands_the_executor_requires_approval_for() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ShellExecutor::new(
+            ShellConfig::new()
+                .with_working_dir(dir.path())
+                .with_allowed_commands(vec!["echo *".into()]),
+        );
+        let patterns = vec!["echo *".into(), "touch *".into()];
+        let command = "echo first\ntouch second";
+        assert_eq!(
+            crate::tools::command_check::checked_commands(command, &patterns),
+            Some(vec!["echo first".into(), "touch second".into()])
+        );
+        assert_eq!(
+            executor.check_permission("echo first"),
+            ShellPermission::Allow
+        );
+        assert_eq!(
+            executor.check_permission("touch second"),
+            ShellPermission::Confirm
+        );
+        let shell = ShellApproval::new(Some(executor));
+        let grants = SessionGrants::default();
+        let args = json!({"command": command});
+        for tool in ["run_command", "run_in_background"] {
+            for (mode, expected) in [
+                (PermissionMode::Confirm, ToolPermission::Confirm),
+                (
+                    PermissionMode::Unattended(UnattendedGrants {
+                        edit_file: false,
+                        run_command_patterns: patterns.clone(),
+                    }),
+                    ToolPermission::Deny,
+                ),
+            ] {
+                let mut policy = mode.permission_policy();
+                policy.overrides.insert(tool.into(), ToolPermission::Allow);
+                let call = super::super::PermissionCall {
+                    tool,
+                    args: &args,
+                    registry_default: ToolPermission::Allow,
+                    root: dir.path(),
+                    generation: 0,
+                    ceiling: None,
+                };
+                assert_eq!(
+                    policy.resolve_call(&call, &grants).permission,
+                    ToolPermission::Allow,
+                    "{tool} in {mode:?}: deterministic policy allows the command before executor restrictions"
+                );
+                let decision =
+                    shell.resolve_with_patterns(&policy, &call, &grants, Some(&patterns));
+                assert_eq!(
+                    decision.permission, expected,
+                    "{tool} in {mode:?}: the executor's unapproved part prevents coverage"
+                );
+                assert_eq!(
+                    decision.source, "shell syntax or command policy requires exact approval",
+                    "{tool} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_commands_without_an_executor_preserve_the_policy_decision() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let shell = ShellApproval::default();
+        let grants = SessionGrants::default();
+        let patterns = vec!["echo *".into()];
+        let args = json!({"command": "echo first\necho second"});
+        assert_eq!(shell.permission(&args), None);
+        for tool in ["run_command", "run_in_background"] {
+            for (mode, expected) in [
+                (PermissionMode::Confirm, ToolPermission::Confirm),
+                (
+                    PermissionMode::Unattended(UnattendedGrants {
+                        edit_file: false,
+                        run_command_patterns: patterns.clone(),
+                    }),
+                    ToolPermission::Allow,
+                ),
+                (PermissionMode::Plan, ToolPermission::Deny),
+            ] {
+                let policy = mode.permission_policy();
+                let call = super::super::PermissionCall {
+                    tool,
+                    args: &args,
+                    registry_default: ToolPermission::Allow,
+                    root: dir.path(),
+                    generation: 0,
+                    ceiling: None,
+                };
+                let original = policy.resolve_call(&call, &grants);
+                let decision =
+                    shell.resolve_with_patterns(&policy, &call, &grants, Some(&patterns));
+                assert_eq!(
+                    decision.permission, expected,
+                    "{tool} in {mode:?}: no executor supplies additional restrictions"
+                );
+                assert_eq!(
+                    decision.source, original.source,
+                    "{tool} in {mode:?}: the policy remains the decision source"
+                );
+                assert_eq!(
+                    decision.remember, original.remember,
+                    "{tool} in {mode:?}: session approval scope is unchanged"
+                );
+            }
+        }
     }
 
     #[tokio::test]
