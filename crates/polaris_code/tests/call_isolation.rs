@@ -40,12 +40,14 @@ use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
 use polaris::tools::{Tool, ToolContext, ToolsPlugin, Toolset};
 use polaris_code::agents::{
-    AgentConfig, CodeAgent, CodeAgentPlugin, PermissionMode, PolicySnapshot, UnattendedGrants,
+    AgentConfig, CodeAgent, CodeAgentPlugin, FailureKind, PermissionMode, PolicySnapshot,
+    UnattendedGrants,
 };
 use polaris_code::exec::ExecIOProvider;
 use polaris_code::run::{self, TurnOutcome, TurnReason};
+use polaris_code::terminal::background::BackgroundTasks;
 use polaris_code::tools::approval::{ApprovalShellPlugin, ApprovalShellTool};
-use polaris_code::tools::{CallRoot, CodeTools, CodeToolsConfig, CodeToolsPlugin};
+use polaris_code::tools::{CallRoot, CodeTools, CodeToolsConfig, CodeToolsPlugin, TaskToolsPlugin};
 use polaris_code::usage::TokenMeter;
 use polaris_ontrace::oxigraph::OxigraphPlugin;
 use serde_json::json;
@@ -81,6 +83,10 @@ enum Reply {
     Stall { entered: Arc<Notify> },
     /// The provider refuses the request.
     Refuse,
+    /// The request may have been processed before opening the stream failed.
+    OpenError(GenerationError),
+    /// A stream with usage events supplied by the test.
+    Events(Vec<StreamEvent>),
 }
 
 fn tool(name: &'static str, arguments: serde_json::Value) -> Reply {
@@ -181,7 +187,7 @@ impl LlmProvider for ScriptedProvider {
             .lock()
             .unwrap()
             .iter_mut()
-            .find(|(needle, _)| system.contains(needle.as_str()))
+            .find(|(needle, replies)| system.contains(needle.as_str()) && !replies.is_empty())
             .and_then(|(_, replies)| replies.pop_front())
             .expect("a scripted reply is left for this request");
         let stream: LlmStream = match reply {
@@ -245,6 +251,8 @@ impl LlmProvider for ScriptedProvider {
             })
             .chain(futures_util::stream::pending())
             .boxed(),
+            Reply::OpenError(error) => return Err(error),
+            Reply::Events(events) => futures_util::stream::iter(events.into_iter().map(Ok)).boxed(),
             Reply::Refuse => {
                 return Err(GenerationError::Auth("scripted refusal".into()));
             }
@@ -290,6 +298,7 @@ struct Rig {
     /// The server's own meter. A call carries a meter of its own, so this one
     /// must stay at zero.
     global_meter: TokenMeter,
+    tasks: BackgroundTasks,
 }
 
 async fn rig() -> Rig {
@@ -299,6 +308,7 @@ async fn rig() -> Rig {
     let provider = ScriptedProvider::default();
     let global_meter = TokenMeter::new().with_pricing_store(PriceStore::builtin());
 
+    let tasks = BackgroundTasks::detached(Duration::from_secs(20));
     let mut server = Server::new();
     server.insert_global(global_meter.clone());
     let shell = ShellConfig::new()
@@ -324,6 +334,7 @@ async fn rig() -> Rig {
         )))
         .add_plugins(ShellPlugin::new(shell))
         .add_plugins(ApprovalShellPlugin)
+        .add_plugins(TaskToolsPlugin::new(tasks.clone()))
         .add_plugins(OxigraphPlugin::in_memory())
         .add_plugins(PersistencePlugin)
         .add_plugins(SessionsPlugin::new(Arc::new(InMemoryStore::new())))
@@ -341,6 +352,7 @@ async fn rig() -> Rig {
         server_root,
         parent,
         global_meter,
+        tasks,
     }
 }
 
@@ -438,6 +450,7 @@ async fn start(rig: &Rig, call: &Call) -> Started {
     }
     let user_io = UserIO::new(io.clone());
     let init_meter = meter.clone();
+    let tasks = rig.tasks.clone();
     let id = SessionId::new();
     rig.sessions
         .create_session_with_executor(
@@ -449,6 +462,7 @@ async fn start(rig: &Rig, call: &Call) -> Started {
                 ctx.insert(config);
                 ctx.insert(user_io);
                 ctx.insert(init_meter);
+                ctx.insert(tasks);
             },
         )
         .expect("the session is created");
@@ -486,6 +500,14 @@ impl Started {
 
 async fn run_call(rig: &Rig, call: &Call) -> (TurnOutcome, TokenMeter) {
     start(rig, call).await.drive(rig).await
+}
+
+fn assert_completed(outcome: &TurnOutcome) {
+    assert!(
+        matches!(outcome.reason, TurnReason::Completed),
+        "expected completion: {:?}",
+        outcome.reason
+    );
 }
 
 fn failure_message(outcome: &TurnOutcome) -> String {
@@ -542,8 +564,8 @@ async fn two_sessions_on_one_server_each_use_only_their_own_folder() {
     let beta_session = start(&rig, &beta_call).await;
     let ((alpha_out, _), (beta_out, _)) =
         tokio::join!(alpha_session.drive(&rig), beta_session.drive(&rig));
-    assert!(matches!(alpha_out.reason, TurnReason::Completed));
-    assert!(matches!(beta_out.reason, TurnReason::Completed));
+    assert_completed(&alpha_out);
+    assert_completed(&beta_out);
 
     let alpha_seen = rig.provider.requests_for(&key(&alpha));
     let beta_seen = rig.provider.requests_for(&key(&beta));
@@ -551,10 +573,22 @@ async fn two_sessions_on_one_server_each_use_only_their_own_folder() {
     let beta_last = &beta_seen.last().expect("beta made requests").messages;
 
     // What each one read, listed and searched is its own.
-    assert!(alpha_last.contains("alpha-only.txt") && alpha_last.contains("alpha-secret-contents"));
-    assert!(beta_last.contains("beta-only.txt") && beta_last.contains("beta-secret-contents"));
-    assert!(!alpha_last.contains("beta-only") && !alpha_last.contains("beta-secret"));
-    assert!(!beta_last.contains("alpha-only") && !beta_last.contains("alpha-secret"));
+    assert!(
+        alpha_last.contains("alpha-only.txt") && alpha_last.contains("alpha-secret-contents"),
+        "alpha did not read its file: {alpha_last}"
+    );
+    assert!(
+        beta_last.contains("beta-only.txt") && beta_last.contains("beta-secret-contents"),
+        "beta did not read its file: {beta_last}"
+    );
+    assert!(
+        !alpha_last.contains("beta-only") && !alpha_last.contains("beta-secret"),
+        "alpha saw beta data: {alpha_last}"
+    );
+    assert!(
+        !beta_last.contains("alpha-only") && !beta_last.contains("alpha-secret"),
+        "beta saw alpha data: {beta_last}"
+    );
     // Neither saw the folder the server's toolset was built on.
     assert!(!alpha_last.contains("SERVER-ROOT-MARKER"));
     assert!(!beta_last.contains("SERVER-ROOT-MARKER"));
@@ -612,7 +646,7 @@ async fn a_path_that_leaves_the_folder_is_refused() {
         ],
     );
     let (outcome, _) = run_call(&rig, &Call::new(&folder).edit()).await;
-    assert!(matches!(outcome.reason, TurnReason::Completed));
+    assert_completed(&outcome);
 
     let last = rig.provider.requests().pop().unwrap().messages;
     assert_eq!(
@@ -652,7 +686,7 @@ async fn the_shell_starts_in_the_folder_and_refuses_a_working_dir_outside_it() {
         ],
     );
     let (outcome, _) = run_call(&rig, &Call::new(&folder).globs(&["pwd"])).await;
-    assert!(matches!(outcome.reason, TurnReason::Completed));
+    assert_completed(&outcome);
 
     let last = rig.provider.requests().pop().unwrap().messages;
     assert!(
@@ -798,7 +832,7 @@ async fn a_command_outside_the_calls_patterns_is_refused_and_one_inside_runs() {
         ],
     );
     let (outcome, _) = run_call(&rig, &Call::new(&folder).globs(&["echo *"])).await;
-    assert!(matches!(outcome.reason, TurnReason::Completed));
+    assert_completed(&outcome);
 
     assert!(folder.join("inside.txt").exists(), "a matching command ran");
     for refused in ["outside.txt", "chained.txt", "substituted.txt"] {
@@ -827,13 +861,16 @@ async fn a_command_outside_the_calls_patterns_is_refused_and_one_inside_runs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn literal_scripts_reach_the_executor_only_after_all_commands_pass() {
+    std::process::Command::new("python3")
+        .output()
+        .expect("install python3 for literal-script tests");
     let rig = rig().await;
     let folder = rig.folder("scripts");
     let commands = [
         "cat >literal.txt <<'EOF'\n$(touch hidden.txt)\nEOF\ncat literal.txt",
         "python3 - <<'PY'\nfrom pathlib import Path\nPath('heredoc.txt').write_text('ok')\nPY",
         "python3 -c \"from pathlib import Path\nPath('multiline.txt').write_text('ok')\"",
-        "cat literal.txt | head -1",
+        "cat literal.txt | head -1 >pipeline.txt",
         "cat >refused.txt <<EOF\n$(touch expanded.txt)\nEOF",
         "cat literal.txt <<'EOF'\ndata\nEOF\ntouch after.txt",
         "cat literal.txt\nrm -rf literal.txt",
@@ -856,9 +893,13 @@ async fn literal_scripts_reach_the_executor_only_after_all_commands_pass() {
         &Call::new(&folder).globs(&["cat *", "python3 *", "head *", "rm *"]),
     )
     .await;
-    assert!(matches!(outcome.reason, TurnReason::Completed));
+    assert_completed(&outcome);
     assert_eq!(
         std::fs::read_to_string(folder.join("literal.txt")).unwrap(),
+        "$(touch hidden.txt)\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("pipeline.txt")).unwrap(),
         "$(touch hidden.txt)\n"
     );
     for name in ["heredoc.txt", "multiline.txt"] {
@@ -887,7 +928,12 @@ async fn a_call_with_no_patterns_has_no_shell_tool_in_the_request() {
 
     let without = &rig.provider.requests_for(&none.display().to_string())[0].tools;
     let with = &rig.provider.requests_for(&some.display().to_string())[0].tools;
-    for shell_tool in ["run_command", "run_in_background", "stop_task"] {
+    for shell_tool in [
+        "run_command",
+        "run_in_background",
+        "stop_task",
+        "task_output",
+    ] {
         assert!(
             !without.iter().any(|name| name == shell_tool),
             "{shell_tool} must not be offered to a call with no command patterns: {without:?}"
@@ -895,6 +941,172 @@ async fn a_call_with_no_patterns_has_no_shell_tool_in_the_request() {
     }
     assert!(without.iter().any(|name| name == "read_file"));
     assert!(with.iter().any(|name| name == "run_command"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_calls_with_empty_patterns_or_invalid_commands_are_denied() {
+    for (patterns, arguments) in [
+        (vec![], json!({"command":"touch forbidden.txt"})),
+        (vec!["*"], json!({})),
+        (vec!["*"], json!({"command":42})),
+    ] {
+        for name in ["run_command", "run_in_background"] {
+            let rig = rig().await;
+            let folder = rig.folder("denied-command");
+            rig.provider
+                .script("", vec![tool(name, arguments.clone()), text("done")]);
+            let (outcome, _) = run_call(&rig, &Call::new(&folder).globs(&patterns)).await;
+            assert_completed(&outcome);
+            let requests = rig.provider.requests();
+            let messages = &requests.last().unwrap().messages;
+            assert!(
+                messages.contains("outside this session's command patterns"),
+                "{name} {arguments}: {messages}"
+            );
+            assert!(!folder.join("forbidden.txt").exists(), "{name} {arguments}");
+            assert!(rig.tasks.all().is_empty(), "a denied call started a task");
+        }
+    }
+}
+
+/// Wait for the host's single collector to retain a background result.
+async fn wait_for_finished(tasks: &BackgroundTasks, number: u64) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while tasks.finished_by_number(number).is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the background task finished and its result was collected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_commands_use_the_call_folder_with_and_without_patterns() {
+    for globs in [None, Some(vec!["pwd *".to_string()])] {
+        let rig = rig().await;
+        let folder = rig.folder("background-root");
+        rig.provider.script(
+            "",
+            vec![
+                tool(
+                    "run_in_background",
+                    json!({"command":"pwd >background.txt"}),
+                ),
+                text("done"),
+            ],
+        );
+        let mut call = Call::new(&folder);
+        call.globs = globs;
+        let (outcome, _) = run_call(&rig, &call).await;
+        assert_completed(&outcome);
+        let records = rig.tasks.all();
+        let finished = rig.tasks.finished();
+        let task = records
+            .first()
+            .or_else(|| finished.first().map(|record| &record.task))
+            .expect("the background task was tracked");
+        assert_eq!(task.call_root, Some(CallRoot::new(&folder)));
+        wait_for_finished(&rig.tasks, task.number).await;
+        assert_eq!(
+            std::fs::read_to_string(folder.join("background.txt"))
+                .unwrap()
+                .trim(),
+            folder.to_str().unwrap()
+        );
+        assert!(!rig.server_root.path().join("background.txt").exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_cannot_list_read_or_stop_another_roots_background_task() {
+    let rig = rig().await;
+    let owner = rig.folder("owner");
+    let other = rig.folder("other");
+    let key = |folder: &Path| format!("Working directory: {}", folder.display());
+    rig.provider.script(
+        &key(&owner),
+        vec![
+            tool(
+                "run_in_background",
+                json!({"command":"echo owner-secret; sleep 3600"}),
+            ),
+            text("started"),
+        ],
+    );
+    let (outcome, _) = run_call(&rig, &Call::new(&owner)).await;
+    assert_completed(&outcome);
+    let task = rig
+        .tasks
+        .all()
+        .into_iter()
+        .next()
+        .expect("owner's task is still running");
+    rig.provider.script(
+        &key(&other),
+        vec![
+            tool("task_output", json!({})),
+            tool("task_output", json!({"task":task.number})),
+            tool("stop_task", json!({"task":task.number})),
+            text("done"),
+        ],
+    );
+    let (outcome, _) = run_call(&rig, &Call::new(&other)).await;
+    assert_completed(&outcome);
+    let messages = &rig
+        .provider
+        .requests_for(&key(&other))
+        .last()
+        .unwrap()
+        .messages
+        .clone();
+    assert!(messages.contains("No background tasks"), "{messages}");
+    assert_eq!(
+        messages.matches("no visible background task").count(),
+        2,
+        "{messages}"
+    );
+    assert!(!messages.contains("owner-secret"), "{messages}");
+    let executor = rig._server.get_global::<ShellExecutor>().unwrap().clone();
+    assert_eq!(
+        executor.process(task.id).unwrap().state,
+        polaris::shell::ShellProcessState::Running,
+        "the foreign stop must not terminate the task"
+    );
+
+    // An owner can still read and stop its task after its original session ended.
+    rig.provider.script(
+        &key(&owner),
+        vec![
+            tool("task_output", json!({"task":task.number})),
+            tool("stop_task", json!({"task":task.number})),
+            text("done"),
+        ],
+    );
+    let (outcome, _) = run_call(&rig, &Call::new(&owner)).await;
+    assert_completed(&outcome);
+    wait_for_finished(&rig.tasks, task.number).await;
+    // The retained record has the same visibility rule as a running task.
+    rig.provider.script(
+        &key(&other),
+        vec![
+            tool("task_output", json!({})),
+            tool("task_output", json!({"task":task.number})),
+            tool("stop_task", json!({"task":task.number})),
+            text("done"),
+        ],
+    );
+    let (outcome, _) = run_call(&rig, &Call::new(&other)).await;
+    assert_completed(&outcome);
+    let requests = rig.provider.requests_for(&key(&other));
+    let messages = &requests.last().unwrap().messages;
+    assert!(messages.contains("No background tasks"), "{messages}");
+    assert_eq!(
+        messages.matches("no visible background task").count(),
+        2,
+        "{messages}"
+    );
+    assert!(!messages.contains("owner-secret"), "{messages}");
+    executor.stop_all().await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -968,7 +1180,7 @@ async fn with_no_role_prompt_the_request_is_the_one_the_agent_always_sent() {
     let folder = rig.folder("plain");
     rig.provider.script("", vec![text("done")]);
     let (outcome, _) = run_call(&rig, &Call::new(&folder)).await;
-    assert!(matches!(outcome.reason, TurnReason::Completed));
+    assert_completed(&outcome);
 
     let seen = rig.provider.requests().pop().unwrap();
     assert!(seen.system.starts_with(BUILT_IN_PROMPT_START));
@@ -1108,7 +1320,7 @@ async fn a_cap_that_admits_every_request_changes_nothing_and_the_meter_matches_t
     let (free_out, free_meter) = run_call(&rig, &Call::new(&free).max_output(4_000)).await;
 
     for (outcome, meter) in [(&capped_out, &capped_meter), (&free_out, &free_meter)] {
-        assert!(matches!(outcome.reason, TurnReason::Completed));
+        assert_completed(outcome);
         assert_eq!(outcome.final_text.as_deref(), Some("finished"));
         assert_eq!(
             meter.input_tokens(),
@@ -1135,11 +1347,79 @@ async fn a_request_refused_by_the_provider_gives_its_reservation_back() {
     let folder = rig.folder("refused");
     rig.provider.script("", vec![Reply::Refuse]);
     let (outcome, meter) = run_call(&rig, &Call::new(&folder).cap(0.065).max_output(4_000)).await;
-    assert!(matches!(outcome.reason, TurnReason::Failed(_)));
+    assert_eq!(rig.provider.requests().len(), 1, "the provider was called");
+    let message = failure_message(&outcome);
+    assert!(!message.starts_with("cost-cap:"), "{message}");
+    let TurnReason::Failed(failure) = &outcome.reason else {
+        unreachable!()
+    };
+    assert_eq!(failure.kind, FailureKind::Auth);
     assert!(
         probe_fits(&meter, 3_000),
         "nothing was billed, so the whole cap is still there"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncertain_provider_failures_keep_the_reservation_charged() {
+    for error in [
+        GenerationError::Http("connection reset".into()),
+        GenerationError::InvalidResponse("malformed response".into()),
+    ] {
+        let rig = rig().await;
+        let folder = rig.folder("uncertain-failure");
+        rig.provider.script("", vec![Reply::OpenError(error)]);
+        // A retry cannot fit once the uncertain first request is charged.
+        let (outcome, meter) =
+            run_call(&rig, &Call::new(&folder).cap(0.065).max_output(4_000)).await;
+        assert_eq!(rig.provider.requests().len(), 1);
+        assert!(
+            matches!(outcome.reason, TurnReason::Failed(_)),
+            "{:?}",
+            outcome.reason
+        );
+        assert!(
+            !probe_fits(&meter, 3_000),
+            "the possibly billed request must keep its charge"
+        );
+        assert!(meter.task_cost_spent_usd().unwrap() >= 0.04);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn absent_or_incomplete_usage_keeps_the_reservation_estimate() {
+    for usage in [
+        Usage::default(),
+        Usage {
+            input_tokens: Some(1),
+            ..Default::default()
+        },
+        Usage {
+            output_tokens: Some(1),
+            ..Default::default()
+        },
+    ] {
+        let rig = rig().await;
+        let folder = rig.folder("missing-usage");
+        rig.provider.script(
+            "",
+            vec![Reply::Events(vec![StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                usage,
+                id: None,
+                model: None,
+            }])],
+        );
+        let (outcome, meter) =
+            run_call(&rig, &Call::new(&folder).cap(0.065).max_output(4_000)).await;
+        assert_completed(&outcome);
+        assert_eq!(rig.provider.requests().len(), 1);
+        assert!(
+            !probe_fits(&meter, 3_000),
+            "incomplete usage must not settle the reservation at zero"
+        );
+        assert!(meter.task_cost_spent_usd().unwrap() >= 0.04);
+    }
 }
 
 /// Whether one more small request still fits under the meter's cap. A probe
