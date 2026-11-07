@@ -61,7 +61,11 @@ model, with a failure whose message begins `cost-cap:`. A call that is dropped
 with a request in flight is charged at the estimate. It applies only to a meter
 that carries a cap; the operator's `--max-cost-usd` and `--max-tokens` set no
 such cap, so a run started with them still checks its ceiling only on the turn
-boundary, and a turn in flight is still never aborted by it.
+boundary, and a turn in flight is still never aborted by it. The operator
+setting that does install this cap is `POLARIS_CODE_MAX_COST_USD`
+([`configuration.md`](configuration.md)): it puts the same limit, as
+[`TaskCostLimit`](../crates/polaris_code/src/docs/resources.md), on the fresh
+meter of each coding task the topology host runs.
 
 ## Exit status
 

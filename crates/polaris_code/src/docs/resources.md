@@ -131,3 +131,5 @@ credential source names remain immutable launch inputs owned by the binary.
 [`ApprovalReceipt`](crate::tools::approval::ApprovalReceipt) is per-invocation
 `ToolContext`, rather than an ECS resource. The host supplies policy validation;
 foreground and background tools consume the same lower-layer contract.
+[`CallRoot`](crate::tools::CallRoot), the folder one tool call works in, is
+likewise per-invocation `ToolContext` and not a resource.
