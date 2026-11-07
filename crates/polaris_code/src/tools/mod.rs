@@ -17,6 +17,7 @@
 pub mod approval;
 pub mod code;
 pub mod code_graph;
+pub mod command_check;
 pub mod fileset;
 pub mod mcp;
 pub mod memory;
@@ -25,7 +26,7 @@ pub(crate) mod shell_render;
 pub mod tasks;
 pub mod web;
 
-pub use code::{CodeTools, CodeToolsConfig, CodeToolsPlugin, FILE_WRITE_TOOLS};
+pub use code::{CallRoot, CodeTools, CodeToolsConfig, CodeToolsPlugin, FILE_WRITE_TOOLS};
 pub use code_graph::{
     CODE_GRAPH_IRI, CodeGraphPlugin, CodeGraphTools, CodeIndexState, CodeIndexer, ConceptTools,
     ENRICHED_GRAPH_IRI, GraphSearchMode, IndexPhase, ROLES, boot_index_wanted, code_index_state,

@@ -726,6 +726,28 @@ async fn edit_file_cannot_address_a_path_that_does_not_exist() {
     assert!(tools.read("missing.txt").is_none());
 }
 
+/// A model that leaves out `replace_all` gets the default, one unique
+/// replacement, and not a parameter error that costs it a turn.
+#[tokio::test]
+async fn edit_file_does_not_require_replace_all() {
+    let tools = FileTools::build().await;
+    tools
+        .create("note.txt", "a one")
+        .await
+        .expect("the file is created");
+
+    tools
+        .registry()
+        .execute(
+            "edit_file",
+            &json!({ "path": "note.txt", "old_string": "a", "new_string": "b" }),
+        )
+        .await
+        .expect("the edit does not need replace_all");
+
+    assert_eq!(tools.read("note.txt").as_deref(), Some("b one"));
+}
+
 /// The composition root registers the creating tool on the same footing as
 /// the editing one: present, advertised to the model with its two parameters,
 /// and confirming by default.

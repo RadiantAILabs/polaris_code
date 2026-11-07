@@ -59,3 +59,13 @@ with exact arguments, directory binding, host policy validation and single use.
 [`ApprovalShellTool`](crate::tools::approval::ApprovalShellTool) consumes it inside
 registered `run_command` execution. Alternative hosts can issue receipts with their
 own policy validator; tools have no dependency on agent permission state.
+
+Where a call works is the same kind of boundary. [`CallRoot`](crate::tools::CallRoot)
+is a tool-context value, not an API or a resource: the agent's tool lanes insert
+the session's working directory for every call, the file tools and the shell
+wrapper read it, and a toolset used without one keeps the directory it was built
+with. A session's shell command patterns (`AgentConfig::command_globs`) are
+checked when each call is authorized, so they too belong to the session and not to
+the server. Neither adds an API: two sessions on one server differ only in the
+`AgentConfig` they were created with. A session with patterns lists them in its
+system prompt and in each refusal, so the model writes commands that match.

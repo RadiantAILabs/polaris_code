@@ -334,26 +334,81 @@ impl CodeToolsConfig {
     /// resolved* path is validated against the sandbox root — `..` segments in a
     /// non-existent leaf can't slip past the check.
     pub fn resolve_path(&self, path: &str) -> Option<PathBuf> {
-        let working_dir = self.working_dir.canonicalize().ok()?;
-        let resolved = self.working_dir.join(path);
-        if let Ok(canonical) = resolved.canonicalize() {
-            return canonical.starts_with(&working_dir).then_some(canonical);
+        resolve_within(&self.working_dir, path)
+    }
+}
+
+/// Resolve `path` against `root`, returning `None` if the result escapes it.
+fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
+    let working_dir = root.canonicalize().ok()?;
+    let resolved = root.join(path);
+    if let Ok(canonical) = resolved.canonicalize() {
+        return canonical.starts_with(&working_dir).then_some(canonical);
+    }
+    // The path doesn't exist yet. Peel off trailing components until an
+    // existing ancestor canonicalizes, then rebuild the real path from it.
+    let mut tail = Vec::new();
+    let mut current = resolved.as_path();
+    loop {
+        if let Ok(base) = current.canonicalize() {
+            let mut candidate = base;
+            candidate.extend(tail.iter().rev());
+            return candidate.starts_with(&working_dir).then_some(candidate);
         }
-        // The path doesn't exist yet. Peel off trailing components until an
-        // existing ancestor canonicalizes, then rebuild the real path from it.
-        let mut tail = Vec::new();
-        let mut current = resolved.as_path();
-        loop {
-            if let Ok(base) = current.canonicalize() {
-                let mut candidate = base;
-                candidate.extend(tail.iter().rev());
-                return candidate.starts_with(&working_dir).then_some(candidate);
-            }
-            // `file_name()` is `None` for a `..`/`.`-terminated component, which
-            // we refuse to resolve through rather than guess past.
-            tail.push(current.file_name()?.to_owned());
-            current = current.parent()?;
-        }
+        // `file_name()` is `None` for a `..`/`.`-terminated component, which
+        // we refuse to resolve through rather than guess past.
+        tail.push(current.file_name()?.to_owned());
+        current = current.parent()?;
+    }
+}
+
+/// The directory one tool invocation works in, supplied through the
+/// invocation's [`ToolContext`](polaris::tools::ToolContext).
+///
+/// A toolset is built on one directory for the whole server. When an
+/// invocation carries a `CallRoot`, the file tools resolve paths against it
+/// instead, and refuse a path that leaves it (`..`, an absolute path, a
+/// symlink out); the shell wrapper
+/// ([`ApprovalShellTool`](crate::tools::approval::ApprovalShellTool)) starts
+/// the command there and refuses a `working_dir` outside it. With no
+/// `CallRoot` the directory the toolset was built with applies, which is how
+/// the `polaris` binary runs.
+///
+/// The agent's two tool lanes insert one for every call, holding the session's
+/// [`AgentConfig::working_dir`](crate::agents::AgentConfig::working_dir), so
+/// two sessions on one server work in their own directories. JSON arguments
+/// cannot create a context value, so a model cannot choose its own root.
+///
+/// # Scope
+///
+/// Local to one tool invocation.
+///
+/// # Provided By
+///
+/// The agent's tool lanes, from the session's `AgentConfig`.
+///
+/// # Access
+///
+/// Read by the toolset as an optional `#[context]` parameter.
+///
+/// # Alternatives
+///
+/// A server that runs one working directory builds its toolset on it
+/// ([`CodeToolsConfig::new`]) and needs no `CallRoot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRoot(PathBuf);
+
+impl CallRoot {
+    /// A root at `dir`.
+    #[must_use]
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self(dir.into())
+    }
+
+    /// The directory.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -368,19 +423,26 @@ impl CodeTools {
         Self { config }
     }
 
-    fn resolve(&self, path: &str) -> Result<PathBuf, ToolError> {
-        self.config
-            .resolve_path(path)
+    /// The directory this invocation works in: its [`CallRoot`] when it has
+    /// one, otherwise the directory the toolset was built with.
+    fn root_of<'a>(&'a self, call: &'a Option<CallRoot>) -> &'a Path {
+        call.as_ref()
+            .map_or(self.config.working_dir.as_path(), CallRoot::path)
+    }
+
+    fn resolve(&self, call: &Option<CallRoot>, path: &str) -> Result<PathBuf, ToolError> {
+        resolve_within(self.root_of(call), path)
             .ok_or_else(|| ToolError::execution_error(format!("path '{path}' escapes sandbox")))
     }
 
     /// The canonical sandbox root, which the walking tools report paths
     /// relative to and read ignore files from.
-    fn sandbox_root(&self) -> Result<PathBuf, ToolError> {
-        self.config.working_dir.canonicalize().map_err(|err| {
+    fn sandbox_root(&self, call: &Option<CallRoot>) -> Result<PathBuf, ToolError> {
+        let working_dir = self.root_of(call);
+        working_dir.canonicalize().map_err(|err| {
             ToolError::execution_error(format!(
                 "working directory '{}' is unreadable: {err}",
-                self.config.working_dir.display()
+                working_dir.display()
             ))
         })
     }
@@ -394,8 +456,9 @@ impl CodeTools {
         &self,
         /// Directory path relative to the working directory.
         path: String,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
-        let resolved = self.resolve(&path)?;
+        let resolved = self.resolve(&call_root, &path)?;
         let mut entries = tokio::fs::read_dir(&resolved)
             .await
             .map_err(|err| io_failure("list_files", &path, &err))?;
@@ -438,8 +501,9 @@ impl CodeTools {
         /// Maximum number of lines to return. Omit for the rest of the file.
         #[default(None::<usize>)]
         limit: Option<usize>,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
-        let resolved = self.resolve(&path)?;
+        let resolved = self.resolve(&call_root, &path)?;
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|err| io_failure("read_file", &path, &err))?;
@@ -479,6 +543,7 @@ impl CodeTools {
         start: usize,
         /// Last line to return (1-based, inclusive).
         end: usize,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
         if start == 0 {
             return Err(ToolError::execution_error(format!(
@@ -490,7 +555,7 @@ impl CodeTools {
                 "read_span '{path}': end must be >= start (got {start}-{end})"
             )));
         }
-        let resolved = self.resolve(&path)?;
+        let resolved = self.resolve(&call_root, &path)?;
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|err| io_failure("read_span", &path, &err))?;
@@ -521,14 +586,17 @@ impl CodeTools {
         /// Replacement text.
         new_string: String,
         /// Replace every occurrence instead of requiring a unique match.
-        replace_all: bool,
+        /// Defaults to false.
+        replace_all: Option<bool>,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
+        let replace_all = replace_all.unwrap_or(false);
         if old_string == new_string {
             return Err(ToolError::execution_error(format!(
                 "edit_file '{path}': old_string and new_string are identical"
             )));
         }
-        let resolved = self.resolve(&path)?;
+        let resolved = self.resolve(&call_root, &path)?;
         let original = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|err| io_failure("edit_file", &path, &err))?;
@@ -616,8 +684,9 @@ impl CodeTools {
         path: String,
         /// The complete content of the new file.
         content: String,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
-        let resolved = self.resolve(&path)?;
+        let resolved = self.resolve(&call_root, &path)?;
         // `symlink_metadata` sees a dangling link too, so a link at the path
         // is refused rather than followed and created through.
         if tokio::fs::symlink_metadata(&resolved).await.is_ok() {
@@ -637,8 +706,7 @@ impl CodeTools {
                 .await
                 .map_err(|err| ToolError::execution_error(format!("{path}: {err}")))?;
             let root = self
-                .config
-                .working_dir
+                .root_of(&call_root)
                 .canonicalize()
                 .map_err(|err| ToolError::execution_error(err.to_string()))?;
             if !real_parent.starts_with(&root) {
@@ -713,6 +781,10 @@ impl CodeTools {
     /// bounded; when a bound applies the tool says so on a trailing `…` line.
     /// For Rust symbols prefer `find_definition` / `find_references` — they
     /// resolve by symbol rather than by text.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the model-visible parameters are the tool's schema; the context value is not one of them"
+    )]
     #[tool]
     async fn search(
         &self,
@@ -739,10 +811,11 @@ impl CodeTools {
         /// Also search what the repository's `.gitignore` rules exclude.
         #[default(false)]
         include_ignored: bool,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
         let target = path.unwrap_or_else(|| ".".to_string());
-        let root = self.resolve(&target)?;
-        let sandbox = self.sandbox_root()?;
+        let root = self.resolve(&call_root, &target)?;
+        let sandbox = self.sandbox_root(&call_root)?;
         let matcher = compile_matcher(&pattern, literal, case_insensitive)?;
         let selector = glob
             .as_deref()
@@ -800,10 +873,11 @@ impl CodeTools {
         /// Also list what the repository's `.gitignore` rules exclude.
         #[default(false)]
         include_ignored: bool,
+        #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
         let target = path.unwrap_or_else(|| ".".to_string());
-        let root = self.resolve(&target)?;
-        let sandbox = self.sandbox_root()?;
+        let root = self.resolve(&call_root, &target)?;
+        let sandbox = self.sandbox_root(&call_root)?;
         let selector = PathGlob::compile(&pattern).map_err(ToolError::execution_error)?;
 
         tokio::task::spawn_blocking(move || {
@@ -1069,7 +1143,7 @@ mod tests {
 
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
         let out = tools
-            .edit_file("a.txt".into(), "world".into(), "polaris".into(), false)
+            .edit_file("a.txt".into(), "world".into(), "polaris".into(), None, None)
             .await
             .unwrap();
 
@@ -1086,7 +1160,7 @@ mod tests {
 
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
         let err = tools
-            .edit_file("a.txt".into(), "x".into(), "y".into(), false)
+            .edit_file("a.txt".into(), "x".into(), "y".into(), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not unique"));
@@ -1098,7 +1172,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let out = tools
-            .create_file("notes.md".into(), "# notes\n\nbody\n".into())
+            .create_file("notes.md".into(), "# notes\n\nbody\n".into(), None)
             .await
             .unwrap();
 
@@ -1123,7 +1197,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         tools
-            .create_file("a/b/c.txt".into(), "deep\n".into())
+            .create_file("a/b/c.txt".into(), "deep\n".into(), None)
             .await
             .unwrap();
 
@@ -1149,7 +1223,7 @@ mod tests {
 
         for path in ["keep.txt", "dir", "dangling"] {
             let err = tools
-                .create_file(path.into(), "x".into())
+                .create_file(path.into(), "x".into(), None)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -1176,12 +1250,12 @@ mod tests {
             "/etc/polaris-escape",
         ] {
             let create = tools
-                .create_file(path.into(), "x".into())
+                .create_file(path.into(), "x".into(), None)
                 .await
                 .unwrap_err()
                 .to_string();
             let edit = tools
-                .edit_file(path.into(), "a".into(), "b".into(), false)
+                .edit_file(path.into(), "a".into(), "b".into(), None, None)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -1201,7 +1275,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let err = tools
-            .create_file("out/new.txt".into(), "x".into())
+            .create_file("out/new.txt".into(), "x".into(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -1226,7 +1300,7 @@ mod tests {
             .unwrap();
 
         tools
-            .create_file("new.txt".into(), "created\n".into())
+            .create_file("new.txt".into(), "created\n".into(), None)
             .await
             .unwrap();
 
@@ -1258,7 +1332,10 @@ mod tests {
             .unwrap();
 
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
-        let out = tools.read_file("big.txt".into(), None, None).await.unwrap();
+        let out = tools
+            .read_file("big.txt".into(), None, None, None)
+            .await
+            .unwrap();
         assert!(out.contains("truncated at"), "expected truncation marker");
         assert!(out.len() < MAX_READ_BYTES * 2);
     }
@@ -1271,7 +1348,7 @@ mod tests {
             .unwrap();
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
-        let out = tools.read_span("a.rs".into(), 2, 3).await.unwrap();
+        let out = tools.read_span("a.rs".into(), 2, 3, None).await.unwrap();
         assert!(out.contains("2\ttwo"), "got: {out}");
         assert!(out.contains("3\tthree"), "got: {out}");
         assert!(!out.contains("one"), "range must exclude line 1: {out}");
@@ -1287,7 +1364,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
         assert!(
             tools
-                .read_span("a.rs".into(), 3, 1)
+                .read_span("a.rs".into(), 3, 1, None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1305,7 +1382,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let out = tools
-            .read_file("a.txt".into(), Some(4), Some(2))
+            .read_file("a.txt".into(), Some(4), Some(2), None)
             .await
             .unwrap();
         assert!(out.contains("4\tline4"), "got: {out}");
@@ -1323,7 +1400,10 @@ mod tests {
             .await
             .unwrap();
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
-        let out = tools.read_file("a.txt".into(), None, None).await.unwrap();
+        let out = tools
+            .read_file("a.txt".into(), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(out, "alpha\nbeta\n");
     }
 
@@ -1360,7 +1440,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let head = tools
-            .read_file("long.txt".into(), None, None)
+            .read_file("long.txt".into(), None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1387,7 +1467,7 @@ mod tests {
             "the next offset must not already be in the result"
         );
         let rest = tools
-            .read_file("long.txt".into(), Some(offset), Some(1))
+            .read_file("long.txt".into(), Some(offset), Some(1), None)
             .await
             .unwrap();
         assert!(
@@ -1403,7 +1483,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let page = tools
-            .read_file("long.txt".into(), Some(10), Some(5))
+            .read_file("long.txt".into(), Some(10), Some(5), None)
             .await
             .unwrap();
         assert!(
@@ -1415,7 +1495,7 @@ mod tests {
         // A window that reaches the end says nothing extra — silence means
         // "that was all of it", so the footer stays informative.
         let tail = tools
-            .read_file("long.txt".into(), Some(4999), None)
+            .read_file("long.txt".into(), Some(4999), None, None)
             .await
             .unwrap();
         assert!(!tail.contains("offset="), "no footer at EOF: {tail}");
@@ -1437,7 +1517,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let window = tools
-            .read_file("wide.rs".into(), Some(100), Some(60))
+            .read_file("wide.rs".into(), Some(100), Some(60), None)
             .await
             .unwrap();
         // Comparison cost: a fixed six-column gutter, a tab, the line, a
@@ -1465,22 +1545,22 @@ mod tests {
 
         for message in [
             tools
-                .read_file("src/missing.rs".into(), None, None)
+                .read_file("src/missing.rs".into(), None, None, None)
                 .await
                 .unwrap_err()
                 .to_string(),
             tools
-                .read_span("src/missing.rs".into(), 1, 5)
+                .read_span("src/missing.rs".into(), 1, 5, None)
                 .await
                 .unwrap_err()
                 .to_string(),
             tools
-                .edit_file("src/missing.rs".into(), "a".into(), "b".into(), false)
+                .edit_file("src/missing.rs".into(), "a".into(), "b".into(), None, None)
                 .await
                 .unwrap_err()
                 .to_string(),
             tools
-                .list_files("src/missing".into())
+                .list_files("src/missing".into(), None)
                 .await
                 .unwrap_err()
                 .to_string(),
@@ -1501,14 +1581,14 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let ambiguous = tools
-            .edit_file("a.txt".into(), "x".into(), "y".into(), false)
+            .edit_file("a.txt".into(), "x".into(), "y".into(), None, None)
             .await
             .unwrap_err()
             .to_string();
         assert!(ambiguous.contains("a.txt"), "got: {ambiguous}");
 
         let absent = tools
-            .edit_file("a.txt".into(), "zzz".into(), "y".into(), false)
+            .edit_file("a.txt".into(), "zzz".into(), "y".into(), None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -1525,7 +1605,7 @@ mod tests {
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
 
         let out = tools
-            .search("needle".into(), None, None, true, false, false)
+            .search("needle".into(), None, None, true, false, false, None)
             .await
             .unwrap();
         let footer = out.lines().last().unwrap();
@@ -1552,6 +1632,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1620,7 +1701,7 @@ mod tests {
             .await
             .unwrap();
         let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
-        let out = tools.read_span("a.rs".into(), 10, 12).await.unwrap();
+        let out = tools.read_span("a.rs".into(), 10, 12, None).await.unwrap();
         // An empty range says how long the file actually is, so the retry is
         // a corrected range rather than another guess.
         assert!(out.contains("a.rs has 2 lines"), "got: {out}");

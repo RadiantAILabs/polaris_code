@@ -50,6 +50,19 @@ inconsistent, which is the failure mode this design exists to avoid.
 
 The session is saved exactly as for any other ending, before the process exits.
 
+A program that embeds the agent can also put a spend cap on one call's own meter
+(`TokenMeter::set_task_cost_cap`). That cap works inside the turn, and it is a
+different mechanism from the ceiling above: before each model request the agent
+reserves the most that request could cost (its estimated input plus the full
+output allowance, `AgentConfig::max_output_tokens`) from the meter, replaces
+the reservation with the billed usage when the reply ends, and, if the
+reservation does not fit in what is left, ends the call without contacting the
+model, with a failure whose message begins `cost-cap:`. A call that is dropped
+with a request in flight is charged at the estimate. It applies only to a meter
+that carries a cap; the operator's `--max-cost-usd` and `--max-tokens` set no
+such cap, so a run started with them still checks its ceiling only on the turn
+boundary, and a turn in flight is still never aborted by it.
+
 ## Exit status
 
 | Code | Meaning |

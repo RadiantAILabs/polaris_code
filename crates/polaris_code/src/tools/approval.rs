@@ -19,6 +19,8 @@ use polaris::tools::{Tool, ToolContext, ToolError, ToolRegistry};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::CallRoot;
+
 /// Single-use authorization for exact tool arguments and a canonical directory.
 ///
 /// Only trusted Rust host code can issue this context value. The validator must
@@ -178,7 +180,29 @@ impl Tool for ApprovalShellTool {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, ToolError>> + Send + 'a>>
     {
         Box::pin(async move {
+            // A call that carries its own root runs there: the command's
+            // default directory is that root, and a directory the model names
+            // must stay inside it. With no root the executor's own working
+            // directory and sandbox apply, as they always did.
+            let call_root = match context.get::<CallRoot>() {
+                None => None,
+                Some(root) => match call_directory(&args, root.path()) {
+                    Some(directory) => Some(directory),
+                    None => {
+                        return Err(ToolError::permission_denied(
+                            "working_dir is outside this call's folder",
+                        ));
+                    }
+                },
+            };
             let Some(receipt) = context.get::<ApprovalReceipt>() else {
+                let mut args = args;
+                if let (Some(directory), Some(object)) = (call_root, args.as_object_mut()) {
+                    object.insert(
+                        "working_dir".into(),
+                        Value::String(directory.to_string_lossy().into_owned()),
+                    );
+                }
                 return self.ordinary.execute(args, context).await;
             };
             let decoded: ForegroundArgs = serde_json::from_value(args.clone())

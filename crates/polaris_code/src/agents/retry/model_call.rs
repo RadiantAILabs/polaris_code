@@ -35,18 +35,23 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use polaris::graph::RunCancellation;
-use polaris::models::llm::{GenerationError, LlmResponse, Message, StreamEvent, StreamEventExt};
+use polaris::models::anthropic::DEFAULT_MAX_TOKENS;
+use polaris::models::llm::{
+    CacheControl, GenerationError, LlmRequest, LlmResponse, Message, StreamEvent, StreamEventExt,
+    Usage,
+};
 use polaris::plugins::{IO_TYPE, IOContent, IOMessage, UserIO};
 use polaris::prelude::Out;
 use polaris::system::param::{Res, ResMut};
 use polaris::system::prelude::SystemError;
 use polaris::system::resource::LocalResource;
 use polaris::system::system;
-use polaris::tools::{LlmRequestBuilderExt, ToolRegistry};
+use polaris::tools::ToolRegistry;
 use polaris_ontrace::oxigraph::OxigraphStore;
 
 use super::{Commitment, RetryStep, guard_idle, jitter, within};
 use crate::agents::code_agent::{AgentLlm, PreparedContext};
+use crate::agents::config::AgentConfig;
 use crate::agents::context::ContextManager;
 use crate::agents::failure::{self, Attempts, FailureKind, TurnFailure};
 use crate::agents::policy::{PolicySnapshot, ToolPalettePolicy};
@@ -54,7 +59,7 @@ use crate::agents::state::LoopState;
 use crate::agents::trajectory::Decision;
 use crate::terminal::status;
 use crate::terminal::transcript::{LiveTranscript, OUTCOME_COMPLETE, OUTCOME_ERROR, forward};
-use crate::usage::TokenMeter;
+use crate::usage::{CostPermit, TokenMeter};
 
 /// How a turn ends when an interrupt reaches a model call.
 const INTERRUPTED: &str = "turn interrupted";
@@ -129,6 +134,38 @@ pub(crate) struct AttemptFailure {
     error: GenerationError,
     kind: FailureKind,
     commitment: Commitment,
+}
+
+/// The cost reserved for one request, from the moment it is reserved until the
+/// reply ends.
+///
+/// With no spend cap on the meter nothing is reserved and the guard holds
+/// nothing. A guard that is dropped while it still holds the reservation was
+/// dropped with the request in flight (an interrupt, a cancelled call): the
+/// provider may bill a request nobody is waiting for any more, so the estimate
+/// is charged rather than released.
+struct Reserved(Option<CostPermit>);
+
+impl Reserved {
+    /// Replace the reservation with the billed usage. Usage the provider did
+    /// not report is charged at the estimate.
+    fn settle(&mut self, usage: &Usage) {
+        if let Some(permit) = self.0.take() {
+            permit.settle(usage);
+        }
+    }
+
+    /// Return the reservation unspent: the provider refused the request before
+    /// it produced anything, so nothing was billed.
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        self.settle(&Usage::default());
+    }
 }
 
 /// The tools the model is offered this turn: the registry's exposed tools
@@ -238,6 +275,21 @@ pub(crate) async fn begin_model_call(mut ledger: ResMut<AttemptLedger>) {
 ///
 /// A failure is an [`AttemptOutcome::Failed`], not an error: the retry stage
 /// decides what it means. Only an interrupt is an error, and it ends the turn.
+///
+/// # Spend cap
+///
+/// When the call's [`TokenMeter`] carries a spend cap
+/// ([`TokenMeter::set_task_cost_cap`]), every attempt first reserves the most
+/// the request could cost: its estimated input plus the full output allowance
+/// ([`AgentConfig::max_output_tokens`]), priced from the meter's table. A
+/// reservation that does not fit in what is left of the cap ends the call
+/// without contacting the model, as [`AttemptOutcome::GaveUp`] with a failure
+/// whose message begins `cost-cap:`; that outcome skips the retry stage, so
+/// the refusal is never retried. When the reply ends, the reservation is
+/// replaced by the usage the provider billed; a request the provider refused
+/// before it produced anything gives its reservation back, and a call dropped
+/// with the request in flight is charged at the estimate. A meter with no cap
+/// reserves nothing and the attempt behaves as it always did.
 #[system]
 pub(crate) async fn act(
     prepared: Out<PreparedContext>,
@@ -249,10 +301,28 @@ pub(crate) async fn act(
     mut live: ResMut<LiveTranscript>,
     cancel: Res<RunCancellation>,
     mut ledger: ResMut<AttemptLedger>,
+    config: Res<AgentConfig>,
 ) -> Result<AttemptOutcome, SystemError> {
     ledger.next_attempt();
     let attempt_timeout = policy.retry.attempt_timeout;
-    let messages = prepared.messages.clone();
+    let tools = tool_registry.definitions_for(|name| policy.tool_palette.includes(name));
+    let max_output = config.max_output_tokens;
+    let mut cache = if prepared.cache_prefix {
+        CacheControl::prefix()
+    } else {
+        CacheControl::default()
+    };
+    cache = cache.with_breakpoints(prepared.cache_breakpoints.iter().copied());
+    // The one request this attempt sends. The reservation below prices this
+    // exact value, so what is reserved is what goes out.
+    let request = LlmRequest {
+        system: Some(prepared.system_prompt.clone()),
+        messages: prepared.messages.clone(),
+        tools: (!tools.is_empty()).then_some(tools),
+        max_output_tokens: max_output,
+        cache,
+        ..LlmRequest::default()
+    };
 
     // An empty palette is a legitimate pure-reasoning turn (the model is sent
     // no tools), but it is always intentional — log it so it is never silent,
@@ -267,6 +337,24 @@ pub(crate) async fn act(
     // closure; the binary reads it on exit to print a cost summary.
     let meter = TokenMeter::clone(&meter);
 
+    // A meter that carries a spend cap makes every attempt reserve the most it
+    // could cost before anything is sent. Without a cap `reserve_request`
+    // answers `None` and this attempt is exactly what it was before.
+    let mut reserved = match meter.reserve_request(
+        &prepared.model_id,
+        &request,
+        max_output.unwrap_or(DEFAULT_MAX_TOKENS).get(),
+    ) {
+        Ok(permit) => Reserved(permit),
+        Err(reason) => {
+            tracing::warn!(%reason, "act: spend cap reached; the model is not called");
+            return Ok(AttemptOutcome::GaveUp(TurnFailure::new(
+                FailureKind::Other,
+                reason,
+            )));
+        }
+    };
+
     // Per-attempt live token accounting. Each `MessageDelta`/`MessageStop`
     // carries *cumulative* usage; we forward the *increment* since the last
     // emission, because the conversation panel adds deltas into its running
@@ -278,6 +366,9 @@ pub(crate) async fn act(
     let last_cache_read = Arc::new(AtomicU64::new(0));
     let last_cache_creation = Arc::new(AtomicU64::new(0));
     let committed = Arc::new(AtomicBool::new(false));
+    // Whether the provider reported any usage, so that a spend-cap
+    // reservation is settled from it and not from the estimate.
+    let usage_seen = Arc::new(AtomicBool::new(false));
     // A fresh transcript block per attempt. A retry that has shown nothing
     // reuses nothing; a retry after visible text cannot happen at all
     // (emitting a delta marks the attempt committed, below), so one block
@@ -291,24 +382,26 @@ pub(crate) async fn act(
     let user_io_ref: &UserIO = &user_io;
     let result = cancel
         .run_until_cancelled(async {
-            // Cache-aware projection: the strategy decides whether to
-            // cache the stable prefix (system + tools) and where to place the
-            // rolling/stable conversation breakpoints; we forward those onto the
-            // request so the provider emits `cache_control`.
-            let mut builder = llm
-                .builder()
-                .with_registry_filtered(&tool_registry, |name| policy.tool_palette.includes(name))
-                .system(prepared.system_prompt.clone())
-                .messages(messages);
-            if prepared.cache_prefix {
-                builder = builder.cache_prefix();
-            }
-            builder = builder.cache_breakpoints(prepared.cache_breakpoints.clone());
+            // The request carries the cache-aware projection: the strategy
+            // decided whether to cache the stable prefix (system + tools) and
+            // where to place the rolling/stable conversation breakpoints, so
+            // the provider emits `cache_control`.
             meter.record_model_turn();
             // A provider that goes quiet must not hold the turn for ever:
             // both the wait for the response and every gap between its
             // events are bounded, and expiry is a transient failure.
-            let stream = within(attempt_timeout, builder.stream()).await?;
+            let stream = match within(attempt_timeout, llm.stream(request)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // A request the provider refused before it produced
+                    // anything billed nothing, so its reservation goes back.
+                    // One that timed out may still have been processed.
+                    if !matches!(failure::classify(&error), FailureKind::Timeout) {
+                        reserved.release();
+                    }
+                    return Err(error);
+                }
+            };
 
             // Emit token increments as usage events arrive, then hand the
             // (still complete) event stream to the collector for assembly.
@@ -320,6 +413,7 @@ pub(crate) async fn act(
                     let last_cache_read = last_cache_read.clone();
                     let last_cache_creation = last_cache_creation.clone();
                     let committed = committed.clone();
+                    let usage_seen = usage_seen.clone();
                     let meter = meter.clone();
                     async move {
                         // Forward the model's text as it arrives; anything
@@ -333,6 +427,7 @@ pub(crate) async fn act(
                             _ => None,
                         };
                         if let Some(usage) = usage {
+                            usage_seen.store(true, Ordering::Relaxed);
                             let in_now = usage.input_tokens.unwrap_or(0);
                             let out_now = usage.output_tokens.unwrap_or(0);
                             let (in_delta, out_delta) = token_increment(
@@ -376,9 +471,25 @@ pub(crate) async fn act(
         .await;
 
     let Some(result) = result else {
+        // Interrupted with the request in flight: `reserved` is dropped here
+        // and charges its estimate.
         live.close(&user_io, "", OUTCOME_ERROR).await;
         return Err(SystemError::ExecutionError(INTERRUPTED.into()));
     };
+
+    // The reply has ended, whatever it came to. Replace the reservation with
+    // what the provider billed; with no usage reported it stays at the estimate.
+    if usage_seen.load(Ordering::Relaxed) {
+        reserved.settle(&Usage {
+            input_tokens: Some(last_in.load(Ordering::Relaxed)),
+            output_tokens: Some(last_out.load(Ordering::Relaxed)),
+            cache_read_tokens: Some(last_cache_read.load(Ordering::Relaxed)),
+            cache_creation_tokens: Some(last_cache_creation.load(Ordering::Relaxed)),
+            ..Usage::default()
+        });
+    } else {
+        reserved.settle(&Usage::default());
+    }
 
     Ok(match result {
         Ok(response) => {

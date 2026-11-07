@@ -1,5 +1,13 @@
 //! Tool batches execute one call per graph iteration. Authorization, human
 //! input and dispatch have separate nodes; the batch owns only its queue and ledger.
+//!
+//! A session's shell command patterns ([`AgentConfig::command_globs`]) are
+//! enforced in the authorization node, per call, next to the permission rules:
+//! a command that matches none of them is refused for that call. They are read
+//! from the session's own configuration, so two sessions on one server can hold
+//! different patterns. File tools and the shell wrapper resolve paths against
+//! the session's folder, which both tool lanes put into the tool context as a
+//! [`CallRoot`](crate::tools::CallRoot).
 
 use std::collections::VecDeque;
 
@@ -216,11 +224,45 @@ pub(crate) async fn dispatch_read_only_batch(
             &tasks,
             *redactor,
             turn,
+            &config.working_dir,
         )
         .await;
         batch.calls.clear();
     }
     batch.progress()
+}
+
+/// Whether a shell call falls outside the session's command patterns, and if
+/// so why.
+///
+/// This is where a session's [`AgentConfig::command_globs`] are enforced: when
+/// each call is authorized, from the session's own configuration, so sessions
+/// on one server hold different lists. A session with no list (`None`) is not
+/// narrowed here. Only the two tools that start a command carry one; a command
+/// is accepted only when every parsed command matches a pattern. Literal
+/// interpreter input is excluded from the shell parse; unsupported constructs
+/// fail closed. The execution receipt binds this decision to the exact call.
+fn outside_command_globs(
+    config: &AgentConfig,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    let globs = config.command_globs.as_ref()?;
+    if tool != "run_command" && tool != RUN_IN_BACKGROUND {
+        return None;
+    }
+    let allowed = args
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| {
+            crate::tools::command_check::checked_commands(command, globs).is_some()
+        });
+    (!allowed).then(|| {
+        format!(
+            "the command is outside this session's command patterns. {}",
+            super::command_patterns_note(globs)
+        )
+    })
 }
 
 #[system]
@@ -257,7 +299,7 @@ pub(crate) async fn authorize_call(
     let generation = settings.approval_generation();
     let name = &tool_call.function.name;
     // Resolve afresh so a grant from the preceding call applies immediately.
-    let authorization = shell_approval.resolve(
+    let authorization = shell_approval.resolve_with_patterns(
         policy,
         &PermissionCall {
             tool: name,
@@ -270,7 +312,14 @@ pub(crate) async fn authorize_call(
             ceiling: settings.permission_ceiling(),
         },
         &grants,
+        config.command_globs.as_deref(),
     );
+    let mut authorization = authorization;
+    if let Some(reason) = outside_command_globs(&config, name, &tool_call.function.arguments) {
+        authorization.permission = ToolPermission::Deny;
+        authorization.source = reason;
+        authorization.remember = false;
+    }
     let permission = authorization.permission;
     let request = ApprovalRequest::new(
         name,
@@ -314,6 +363,9 @@ pub(crate) async fn authorize_call(
         .flatten();
     if let Some(review) = review {
         receipt = review.receipt.clone();
+    }
+    if permission == ToolPermission::Allow && config.command_globs.is_some() && receipt.is_none() {
+        receipt = shell_approval.receipt_for(&request, &rules, &settings);
     }
     let route = match (permission, review) {
         (ToolPermission::Deny, _) => AuthorizationRoute::Deny(format!(
@@ -604,7 +656,8 @@ pub(crate) async fn execute_call(
         let (detached_tx, detached_rx) = tokio::sync::watch::channel(false);
         let mut tool_context = ToolContext::new()
             .with(ShellSinkHandle::new(sink))
-            .with(detachable_cancel(&cancel, detached_rx));
+            .with(detachable_cancel(&cancel, detached_rx))
+            .with(CallRoot::new(&config.working_dir));
         if let Some(receipt) = receipt {
             tool_context = tool_context.with(receipt);
         }

@@ -581,7 +581,11 @@ mod approval_tests {
             0,
             Duration::from_secs(5),
         );
-        let args = json!({"command":"printf x >> marker; echo \"$(pwd)\"", "timeout_secs":5});
+        let command = "cat >> marker <<'EOF'\nx\nEOF";
+        assert!(
+            crate::tools::command_check::checked_commands(command, &["cat *".into()]).is_some()
+        );
+        let args = json!({"command":command, "timeout_secs":5});
         let context = ToolContext::new().with(ShellSinkHandle::new(sink));
         assert_eq!(
             registry
@@ -623,7 +627,7 @@ mod approval_tests {
         .unwrap();
         assert_eq!(
             std::fs::read(directory.path().join("marker")).unwrap(),
-            b"x"
+            b"x\n"
         );
         executor.stop_all().await;
     }
