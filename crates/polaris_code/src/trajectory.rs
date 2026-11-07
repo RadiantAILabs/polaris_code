@@ -18,6 +18,7 @@ use polaris::models::llm::{
 };
 use polaris::system::resource::GlobalResource;
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// A process-scoped handle to one unattended run's ATIF destination.
 ///
@@ -124,7 +125,7 @@ impl RunTrajectory {
                 "schema_version": "ATIF-v1.7",
                 "session_id": session_id,
                 "agent": {"name": "polaris", "version": env!("CARGO_PKG_VERSION"), "model_name": model},
-                "steps": [{"step_id": 1, "source": "user", "message": instruction}],
+                "steps": [{"step_id": 1, "timestamp": timestamp(), "source": "user", "message": instruction}],
                 "extra": {"status": "running"},
             }),
             failure: None,
@@ -185,7 +186,7 @@ impl RunTrajectory {
             let steps = document["steps"].as_array_mut().expect("steps array");
             index = steps.len();
             let mut step = json!({
-                "step_id": index + 1, "source": "agent", "model_name": model,
+                "step_id": index + 1, "timestamp": timestamp(), "source": "agent", "model_name": model,
                 "message": "", "extra": {"request": request, "status": "in_flight"},
             });
             // Read from the serialized request so the ATIF representation uses
@@ -213,10 +214,11 @@ impl RunTrajectory {
                     AssistantBlock::Reasoning(block) => {
                         reasoning.push_str(&block.reasoning.join(""))
                     }
-                    AssistantBlock::ToolCall(call) => calls.push(json!({
-                        "tool_call_id": call.id, "function_name": call.function.name,
-                        "arguments": call.function.arguments,
-                    })),
+                    AssistantBlock::ToolCall(call) => calls.push(tool_call(
+                        &call.id,
+                        &call.function.name,
+                        call.function.arguments.clone(),
+                    )),
                     _ => {}
                 }
             }
@@ -274,6 +276,23 @@ impl RunTrajectory {
             self.tool_results(content);
         }
     }
+}
+
+// ATIF requires an object even when the model supplied invalid scalar/array
+// arguments. Retain that call and its exact native arguments for auditing.
+fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
+    let object = if arguments.is_object() {
+        arguments.clone()
+    } else {
+        json!({"_native_arguments": arguments})
+    };
+    json!({"tool_call_id": id, "function_name": name, "arguments": object, "extra": {"native_arguments": arguments}})
+}
+
+fn timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("UTC timestamp is representable as RFC 3339")
 }
 
 fn metrics(usage: &Usage) -> Value {
@@ -348,23 +367,39 @@ impl StreamCapture {
                     ContentBlockStartData::Text => text.push_str(content),
                     ContentBlockStartData::Reasoning => reasoning.push_str(content),
                     ContentBlockStartData::ToolCall { id, name, .. } => {
-                        if let Ok(arguments @ Value::Object(_)) = serde_json::from_str::<Value>(if content.is_empty() { "{}" } else { content }) {
-                            calls.push(json!({"tool_call_id": id, "function_name": name, "arguments": arguments}));
+                        if let Ok(arguments) =
+                            serde_json::from_str::<Value>(if content.is_empty() {
+                                "{}"
+                            } else {
+                                content
+                            })
+                        {
+                            calls.push(tool_call(id, name, arguments));
                         }
                     }
                 }
             }
             step["message"] = json!(text);
-            if !reasoning.is_empty() { step["reasoning_content"] = json!(reasoning); }
-            if !calls.is_empty() { step["tool_calls"] = json!(calls); }
+            if !reasoning.is_empty() {
+                step["reasoning_content"] = json!(reasoning);
+            }
+            if !calls.is_empty() {
+                step["tool_calls"] = json!(calls);
+            }
             for event in self.events.iter().rev() {
-                if let StreamEvent::MessageStop { usage, .. } | StreamEvent::MessageDelta { usage } = event {
+                if let StreamEvent::MessageStop { usage, .. }
+                | StreamEvent::MessageDelta { usage } = event
+                {
                     step["metrics"] = metrics(usage);
                     break;
                 }
             }
             step["extra"]["stream_events"] = json!(self.events);
-            step["extra"]["status"] = json!(if self.completed { "completed" } else { "partial" });
+            step["extra"]["status"] = json!(if self.completed {
+                "completed"
+            } else {
+                "partial"
+            });
         });
     }
 }
@@ -426,6 +461,15 @@ mod tests {
         let value = document(&path);
         assert_eq!(value["schema_version"], "ATIF-v1.7");
         assert_eq!(value["steps"][0]["message"], "Fix it");
+        let timestamps = value["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| {
+                OffsetDateTime::parse(step["timestamp"].as_str().unwrap(), &Rfc3339).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
         let step = &value["steps"][1];
         assert_eq!(step["extra"]["request"], json!(request));
         assert_eq!(step["extra"]["response"], json!(response));
@@ -492,6 +536,14 @@ mod tests {
         assert_eq!(step["tool_calls"][0]["arguments"]["path"], "a.rs");
         assert_eq!(step["extra"]["stream_events"], json!(events));
         assert_eq!(step["extra"]["status"], "partial");
+    }
+
+    #[test]
+    fn malformed_tool_arguments_stay_visible_without_invalidating_atif() {
+        let call = tool_call("call", "read_file", json!([1, 2]));
+        assert!(call["arguments"].is_object());
+        assert_eq!(call["arguments"]["_native_arguments"], json!([1, 2]));
+        assert_eq!(call["extra"]["native_arguments"], json!([1, 2]));
     }
 
     #[test]

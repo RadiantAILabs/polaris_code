@@ -91,7 +91,8 @@ On Unix it is created and replaced with mode `0600` because it contains task
 content, complete model prompts and model outputs.
 
 The initial user instruction is followed by one agent step per provider call,
-including retries and auxiliary calls. Each step includes text, returned
+including retries and auxiliary calls. Each step carries its actual UTC
+ISO-8601 start timestamp and includes text, returned
 reasoning, tool calls, linked observations and native token metrics. Failed
 or interrupted calls remain visible. Every step's `extra.request` holds the
 complete serialized framework request, including system prompt, projected
@@ -99,6 +100,8 @@ messages, tools, effort and output allowance. Non-streaming replies are in
 `extra.response`; streaming replies retain every native framework event in
 `extra.stream_events`, including reasoning signatures, identifiers and usage.
 Tool observations retain the full native result in `extra.native_result`.
+A tool call with non-object arguments remains visible through an
+`arguments._native_arguments` wrapper and exact `extra.native_arguments` value.
 Tool outputs use the agent's normal redaction path. Provider credentials,
 HTTP headers and provider configuration are never exported.
 
