@@ -7,10 +7,13 @@ with a receipt-aware tool before the registry freezes. The framework shell plugi
 owns the executor and cleanup; background tools use that same executor.
 
 Authorization belongs to host policy. Before asking, the host binds an
-`ApprovalReceipt`; only an allow decision injects it into `ToolContext`. Model JSON cannot mint a
-receipt. An embedding host can use `ApprovalReceipt::issue` with its own
-validator without installing the coding agent. The validator must compare the
-current rule revision and session generation with those captured by the host.
+`ApprovalReceipt`; only an allow decision injects it into `ToolContext`. A
+session with `AgentConfig::command_globs` also gets a receipt for every allowed
+shell call, whether or not the call was asked about; see
+[permission modes](permission-modes.md). Model JSON cannot mint a receipt. An
+embedding host can use `ApprovalReceipt::issue` with its own validator without
+installing the coding agent. The validator must compare the current rule
+revision and session generation with those captured by the host.
 
 A receipt binds the tool name, complete original arguments, canonical workspace
 root and canonical command directory. The host supplies the directory displayed

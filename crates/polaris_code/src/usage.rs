@@ -232,7 +232,12 @@ impl CostPermit {
             actual_usd = actual,
             "Settled model call cost"
         );
-        let mut state = self.meter.inner.cost_cap.lock().expect("cost cap poisoned");
+        let mut state = self
+            .meter
+            .inner
+            .cost_cap
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         if let Some(state) = state.as_mut() {
             state.reserved -= self.reserved;
             state.spent += actual;
@@ -261,7 +266,12 @@ impl CostPermit {
 impl Drop for CostPermit {
     fn drop(&mut self) {
         if !self.settled {
-            let mut state = self.meter.inner.cost_cap.lock().expect("cost cap poisoned");
+            let mut state = self
+                .meter
+                .inner
+                .cost_cap
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             if let Some(state) = state.as_mut() {
                 state.reserved -= self.reserved;
             }
@@ -286,6 +296,11 @@ impl ChargeOnDrop {
     #[must_use]
     pub fn new(permit: Option<CostPermit>) -> Self {
         Self(permit)
+    }
+
+    /// Release the reservation when the provider refused the request without billing it.
+    pub fn release(&mut self) {
+        self.0 = None;
     }
 
     /// Replace the reservation with the provider's billed usage. Usage the
@@ -459,6 +474,28 @@ impl TokenMeter {
             .lock()
             .expect("cost cap poisoned")
             .is_some()
+    }
+
+    /// Dollars the task spend limit counts as spent, or `None` when no limit
+    /// is set.
+    ///
+    /// This is the billed cost of every request that finished, plus the
+    /// estimate of every request that was cut off while in flight (see
+    /// [`ChargeOnDrop`]). The token counters hold only the first part, so a
+    /// caller that reports what a task cost reads this as well and takes the
+    /// larger figure. Reservations for requests still in flight are not
+    /// included.
+    ///
+    /// # Panics
+    /// Panics if the cost-cap lock is poisoned.
+    #[must_use]
+    pub fn task_cost_spent_usd(&self) -> Option<f64> {
+        self.inner
+            .cost_cap
+            .lock()
+            .expect("cost cap poisoned")
+            .as_ref()
+            .map(|state| state.spent)
     }
 
     /// Add a full-price usage increment (uncached input and output tokens billed
@@ -1662,6 +1699,41 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_sent_call_releases_its_reservation_once() {
+        let meter = test_meter();
+        meter.set_task_cost_cap(0.01).unwrap();
+        let mut sent =
+            ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        sent.release();
+        sent.release();
+        drop(sent);
+        assert_eq!(meter.task_cost_spent_usd(), Some(0.0));
+        assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_ok());
+    }
+
+    #[test]
+    fn dropping_cost_guards_recovers_a_poisoned_lock() {
+        for sent in [false, true] {
+            let meter = test_meter();
+            meter.set_task_cost_cap(0.01).unwrap();
+            let permit = meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = meter.inner.cost_cap.lock().unwrap();
+                panic!("poison the cost-cap lock");
+            }));
+            if sent {
+                drop(ChargeOnDrop::new(permit));
+            } else {
+                drop(permit);
+            }
+            let state = meter.inner.cost_cap.lock().unwrap_err().into_inner();
+            let state = state.as_ref().unwrap();
+            assert_eq!(state.reserved, 0.0);
+            assert_eq!(state.spent > 0.0, sent);
+        }
+    }
+
+    #[test]
     fn a_settled_sent_call_is_charged_its_billed_usage_once() {
         let meter = test_meter();
         meter.set_task_cost_cap(0.01).unwrap();
@@ -1676,6 +1748,37 @@ mod tests {
         // must not charge the estimate on top of it.
         drop(sent);
         assert!(meter.reserve_model_call("claude-sonnet-5", 1, 800).is_ok());
+    }
+
+    #[test]
+    fn the_spent_figure_counts_a_cut_off_call_at_its_estimate_and_a_settled_one_as_billed() {
+        let meter = test_meter();
+        assert_eq!(meter.task_cost_spent_usd(), None, "no limit, no figure");
+        meter.set_task_cost_cap(10.0).unwrap();
+        assert_eq!(meter.task_cost_spent_usd(), Some(0.0));
+
+        let mut billed =
+            ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        assert_eq!(
+            meter.task_cost_spent_usd(),
+            Some(0.0),
+            "a request in flight is a reservation, not spend"
+        );
+        billed.settle(&polaris::models::llm::Usage {
+            input_tokens: Some(100_000),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        let after_billed = meter.task_cost_spent_usd().unwrap();
+        assert!(after_billed > 0.0);
+
+        let cut_off =
+            ChargeOnDrop::new(meter.reserve_model_call("claude-sonnet-5", 1, 800).unwrap());
+        drop(cut_off);
+        assert!(
+            meter.task_cost_spent_usd().unwrap() > after_billed,
+            "the cut-off request's estimate was added to the spend"
+        );
     }
 
     #[test]

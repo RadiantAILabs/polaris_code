@@ -1558,6 +1558,7 @@ async fn sample_task() -> TaskView {
         label: "run_command".into(),
         command: "cargo test".into(),
         session: SessionId::from_string("main"),
+        call_root: None,
         turn: 1,
         elapsed: Duration::from_secs(60),
         remaining: Duration::from_secs(60),

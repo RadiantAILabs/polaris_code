@@ -50,6 +50,29 @@ inconsistent, which is the failure mode this design exists to avoid.
 
 The session is saved exactly as for any other ending, before the process exits.
 
+A program that embeds the agent can also put a spend cap on one call's own meter
+(`TokenMeter::set_task_cost_cap`). That cap works inside the turn, and it is a
+different mechanism from the ceiling above: before each model request the agent
+reserves the most that request could cost (its estimated input plus the full
+output allowance, `AgentConfig::max_output_tokens`) from the meter, replaces
+the reservation with the billed usage when the reply ends, and, if the
+reservation does not fit in what is left, ends the call without contacting the
+model, with a failure whose message begins `cost-cap:`. When
+`max_output_tokens` is unset, the allowance is the Anthropic fallback of 4096
+tokens, whatever the provider, so an embedder should set it to the limit its
+provider was registered with, as `polaris` does. The reservation is given back
+only when the provider refused the request outright, with an authentication,
+rate-limit or invalid-request error. A request is otherwise charged at its
+estimate, not its billed usage, when the call is dropped with the request in
+flight, when it fails in any other way, and when the reply does not report both
+token counts. The cap applies only to a meter that carries one; the operator's `--max-cost-usd` and `--max-tokens` set no
+such cap, so a run started with them still checks its ceiling only on the turn
+boundary, and a turn in flight is still never aborted by it. The operator
+setting that does install this cap is `POLARIS_CODE_MAX_COST_USD`
+([`configuration.md`](configuration.md)): it puts the same limit, as
+[`TaskCostLimit`](../crates/polaris_code/src/docs/resources.md), on the fresh
+meter of each coding task the topology host runs.
+
 ## Exit status
 
 | Code | Meaning |

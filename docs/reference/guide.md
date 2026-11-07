@@ -6,9 +6,9 @@ the catalog answers "what does this plugin do?", this guide answers "I want to
 do X — what do I register or extend?".
 
 `polaris_code` is a coding agent first, so most of this guide is aimed at
-contributors extending the agent. The exception is the last row: a program that
-only wants to *drive* a turn — an eval runner, a test harness, a second front
-end — starts at the [embedding
+contributors extending the agent. The exception is the last two rows: a program
+that only wants to *drive* a turn — an eval runner, a test harness, a second
+front end — starts at the [embedding
 guide](../../crates/polaris_code/src/docs/embedding.md) instead, and needs
 none of the rest.
 
@@ -44,5 +44,6 @@ none of the rest.
 | **Track token usage / cost** | read `TokenMeter` (global) | Consumer-facing; `summary(model_id)` formats the session total + estimated cost. |
 | **Read what a headless run spent, from a script** | `--output-format json` and read `usage`, or `stream-json` and read the closing `io_type = "usage"` message | One versioned shape, `polaris-code-run-usage/v1`, built by `TokenMeter::snapshot` and emitted by `exec::usage_message`: four token tiers, estimated USD, model id and price-table identity. The mid-stream `io_type = "tokens"` deltas are a display signal, not the accounting. See [headless usage accounting](../headless-usage-accounting.md). |
 | **Drive a turn from your own program (embed the agent)** | compose the plugins yourself, create a session with an `AgentConfig`, call `run::drive_turn` | There is no `Harness` type, no builder and no `init()` — the entry point is the run surface plus the plugins you choose. Read [`src/docs/embedding.md`](../../crates/polaris_code/src/docs/embedding.md) for what you must supply, what the outcome hands back, and what an embedder **cannot** do (notably: `PolicySnapshot::defaults()` is not a safe posture). Runnable: `examples/embed_turn.rs`; proved: `tests/embedding_entry_point.rs`. |
+| **Run several isolated agent calls on one server** | one session per call: `AgentConfig::{system_prompt, command_globs, max_output_tokens}` (`with_system_prompt`, `with_command_globs`, `with_max_output_tokens`), a `TokenMeter` of the call's own with `set_task_cost_cap`, and `tools::CallRoot` | Each call gets its own prompt, command list, output limit, spend cap and tool folder. The folder is `AgentConfig::working_dir`, which the agent passes to its tools as a `CallRoot`; the file tools, `run_command` and `run_in_background` follow it. The code-graph, memory and MCP tools stay server-wide. A command list is text matching, not a file or privilege boundary. Read [`src/docs/embedding.md`](../../crates/polaris_code/src/docs/embedding.md#running-several-isolated-calls-on-one-server); proved: `tests/call_isolation.rs`. |
 
 For the full boot wiring, see `crates/polaris_code/src/main.rs`.

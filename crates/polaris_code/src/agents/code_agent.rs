@@ -70,7 +70,8 @@ use crate::terminal::transcript::{
 use crate::terminal::{ContainedPrompt, SessionSettings, TurnPrompt, TurnSteering};
 use crate::tools::shell_render::{render_run_command, run_command_outcome, run_command_succeeded};
 use crate::tools::{
-    CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, code_index_state, enrich, tool_is_read_only,
+    CallRoot, CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, code_index_state, enrich,
+    tool_is_read_only,
 };
 use crate::usage::TokenMeter;
 
@@ -109,6 +110,48 @@ impl Deref for AgentLlm {
 }
 
 impl LocalResource for AgentLlm {}
+
+/// The system prompt a session sends: its role text, or the built-in prompt when
+/// the session was configured with none, followed by the project grounding
+/// block.
+///
+/// A session limited to shell command patterns is told which ones, so its first
+/// command can be one that runs.
+fn system_prompt_for(config: &AgentConfig, project: &ProjectContext) -> String {
+    let base = config.system_prompt.as_deref().unwrap_or(SYSTEM_PROMPT);
+    let mut prompt = format!("{base}\n\n{}", project.system_prompt());
+    if let Some(globs) = config.command_globs.as_deref().filter(|g| !g.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&command_patterns_note(globs));
+    }
+    prompt
+}
+
+/// What a model needs to know to write a shell command its session accepts.
+///
+/// A command runs only when it, and every command in a chain or pipe, matches
+/// one of the session's patterns. A pattern with an argument slot does not
+/// match the bare program name, and each call starts in the working folder, so
+/// a `cd` has nothing to carry over.
+fn command_patterns_note(globs: &[String]) -> String {
+    let list = globs
+        .iter()
+        .map(|glob| format!("`{glob}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Shell commands: this session accepts only commands that match one of these \
+         patterns: {list}. Chains, pipes and newline-separated commands are accepted \
+         only when every command matches. Listed interpreters accept multiline quoted \
+         arguments and scripts through a quoted-delimiter heredoc (for example \
+         `python3 - <<'PY'`). Unquoted heredoc bodies must contain no dollar signs, \
+         backticks or backslashes. Commands after the delimiter are checked too. Command \
+         substitutions, complex expansions, displaced command words and unsupported shell syntax are refused. A pattern \
+         with an argument slot needs an argument unless a bare-program pattern is \
+         also listed. Each call starts in the working folder; a listed `cd` affects \
+         only its own call."
+    )
+}
 
 /// Assembled per-iteration context: the effective system prompt, the projected
 /// message window to send this turn, and the turn marker.
@@ -391,8 +434,25 @@ async fn prepare_context(
     // the model that served this turn rather than the one the session was
     // configured with — they differ the moment `/model` has been used.
     settings.note_served(&model_id);
+    // A session configured with no shell commands has no shell: the model is
+    // not offered the tools that start, read or stop shell tasks.
+    if config.command_globs.as_ref().is_some_and(Vec::is_empty) {
+        for tool in super::policy::SHELL_EXECUTION_TOOLS
+            .into_iter()
+            .chain([crate::tools::tasks::TASK_OUTPUT])
+        {
+            if !policy
+                .tool_palette
+                .denied
+                .iter()
+                .any(|denied| denied == tool)
+            {
+                policy.tool_palette.denied.push(tool.to_string());
+            }
+        }
+    }
     let turn = context.turn_marker();
-    let system_prompt = format!("{SYSTEM_PROMPT}\n\n{}", project.system_prompt());
+    let system_prompt = system_prompt_for(&config, &project);
 
     let total = context.messages.len();
     let projected = context.project(&policy.retrieval);
@@ -507,10 +567,11 @@ fn batch_runs_concurrently(calls: &[&ToolCall], permissions: &[ToolPermission]) 
 /// the drop hold real results — so the batch reports exactly what completed and
 /// marks the rest interrupted, and every `tool_use` still gets its pair.
 ///
-/// The invocations run with a bare [`ToolContext`]. The only `#[context]`
-/// values this host supplies are the shell sink and the detachable cancellation
-/// observer, and the only tool that declares them is `run_command`, which is
-/// not read-only and therefore never reaches this lane.
+/// The invocations run with a [`ToolContext`] that carries the session's
+/// [`CallRoot`] and nothing else. The other `#[context]` values this host
+/// supplies are the shell sink and the detachable cancellation observer, and
+/// the only tool that declares them is `run_command`, which is not read-only
+/// and therefore never reaches this lane.
 #[allow(
     clippy::too_many_arguments,
     reason = "the system's own resources, passed through rather than gathered into a struct \
@@ -528,6 +589,7 @@ async fn execute_read_only_batch(
     tasks: &BackgroundTasks,
     redactor: SecretRedactor,
     turn: usize,
+    root: &std::path::Path,
 ) -> Result<(), SystemError> {
     // Every call in this batch resolved to `Allow`; reify that in request order
     // before anything runs, so the trajectory reads identically whichever lane
@@ -564,7 +626,7 @@ async fn execute_read_only_batch(
         invocations.push(tasks.enter(&call.id, name, live.current_id()));
     }
 
-    let tool_context = ToolContext::new();
+    let tool_context = ToolContext::new().with(CallRoot::new(root));
     let mut outcomes: Vec<Option<Result<serde_json::Value, ToolError>>> =
         calls.iter().map(|_| None).collect();
     // Boxed to a concrete type: an iterator of opaque borrowing futures fed
@@ -1542,7 +1604,7 @@ const DIFF_CONTEXT: usize = 3;
 /// Once detachment wins, the future parks forever — a backgrounded command is
 /// no longer part of any turn, and the one cooperative stop signal stops
 /// applying to it. Ending it from then on is `/stop`, which is
-/// [`ShellExecutor::stop`](polaris::shell::ShellExecutor::stop) on that process
+/// [`polaris::shell::ShellExecutor::stop`] on that process
 /// and nothing routed through turn cancellation.
 fn detachable_cancel(
     cancel: &RunCancellation,
@@ -1733,7 +1795,7 @@ async fn recover(
 
     // Keep the same project grounding the loop's `prepare_context` injects, so a
     // recovery turn doesn't silently lose git/project context.
-    let system_prompt = format!("{SYSTEM_PROMPT}\n\n{}", project.system_prompt());
+    let system_prompt = system_prompt_for(&config, &project);
     // The window a normal turn would send, not the whole canonical history: a
     // recovery after a context overflow must not be larger than the request
     // that overflowed.
