@@ -332,13 +332,8 @@ async fn answer_question(
                 .execute(&call.function.name, &call.function.arguments)
                 .await
             {
-                Ok(v) => UserBlock::tool_result(
-                    call.id.clone(),
-                    ToolResultContent::Text(render_tool_value(&v)),
-                ),
-                Err(err) => {
-                    UserBlock::tool_error(call.id.clone(), ToolResultContent::Text(err.to_string()))
-                }
+                Ok(v) => call.result(ToolResultContent::Text(render_tool_value(&v))),
+                Err(err) => call.error(ToolResultContent::Text(err.to_string())),
             };
             tool_results.push(block);
         }
