@@ -32,8 +32,9 @@ below; older executables cannot run this adapter's trajectory export.
 ## Model and permissions
 
 Register `evals.packs.terminal_bench_harbor.polaris_code:PolarisCode` as a
-custom Harbor agent. Run Harbor from the repository root, or put that root on
-`PYTHONPATH`. Pass the provider key through Harbor's agent environment. For a
+custom Harbor agent. Put the repository root on `PYTHONPATH` when invoking Harbor, for example
+`PYTHONPATH="$PWD" /path/to/venv/bin/harbor run --config job.yaml`
+from the repository root. Pass the provider key through Harbor's agent environment. For a
 Chat Completions endpoint, set `OPENAI_API_KEY` and `OPENAI_BASE_URL`, select
 `provider=openai-chat`, and use Harbor model
 `openai-chat/<remote-model-id>`. The application strips this prefix once;
