@@ -351,18 +351,14 @@ async fn local_tools(
         .is_none()
     {
         context.push(Message::User {
-            content: vec![UserBlock::tool_error(
-                &call.id,
-                ToolResultContent::Text("[Request interrupted by user for tool use]".into()),
-            )],
+            content: vec![call.error(ToolResultContent::Text(
+                "[Request interrupted by user for tool use]".into(),
+            ))],
         });
         return Err(SystemError::ExecutionError("interrupted tools".into()));
     }
     context.push(Message::User {
-        content: vec![UserBlock::tool_error(
-            &call.id,
-            ToolResultContent::Text("completed".into()),
-        )],
+        content: vec![call.error(ToolResultContent::Text("completed".into()))],
     });
     Ok(())
 }

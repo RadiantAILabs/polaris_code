@@ -80,6 +80,7 @@ pub mod cosmos;
 pub mod credentials;
 pub mod exec;
 pub mod graph_view;
+pub mod model_run;
 pub mod progress;
 pub mod project_trust;
 pub mod providers;
@@ -89,6 +90,7 @@ pub mod state;
 pub mod tabs;
 pub mod terminal;
 pub mod tools;
+pub mod trajectory;
 pub mod usage;
 
 /// Discoverability catalogs — indexes of every plugin, API, and

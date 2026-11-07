@@ -130,6 +130,8 @@ const KEYS: &[Key] = &[
     Key::with_flag("max_tokens", "POLARIS_CODE_MAX_TOKENS"),
     Key::with_flag("max_turns", "POLARIS_CODE_MAX_TURNS"),
     Key::with_flag("max_output_tokens", "POLARIS_CODE_MAX_OUTPUT_TOKENS"),
+    Key::with_flag("context_window", "POLARIS_CODE_CONTEXT_WINDOW"),
+    Key::with_flag("reasoning_effort", "POLARIS_CODE_REASONING_EFFORT"),
 ];
 
 fn command() -> clap::Command {
@@ -642,7 +644,7 @@ fn setting_text(key: &str, item: &Item) -> Option<String> {
     }
     if matches!(
         key,
-        "max_cost_usd" | "max_tokens" | "max_turns" | "max_output_tokens"
+        "max_cost_usd" | "max_tokens" | "max_turns" | "max_output_tokens" | "context_window"
     ) {
         return item
             .as_integer()
@@ -655,7 +657,9 @@ fn setting_text(key: &str, item: &Item) -> Option<String> {
 fn validate(key: &str, value: &str) -> Result<(), String> {
     match key {
         "max_turns" => super::resolve_max_turns(Some(value)).map(|_| ()),
-        "max_output_tokens" => super::resolve_max_output_tokens(Some(value)).map(|_| ()),
+        "max_output_tokens" | "context_window" => {
+            super::resolve_max_output_tokens(Some(value)).map(|_| ())
+        }
         "max_cost_usd" => {
             let value = value.parse::<f64>().map_err(|err| err.to_string())?;
             polaris_code::usage::RunCeiling::from_limits(Some(value), None)
@@ -797,6 +801,30 @@ mod tests {
                 .unwrap()
                 .contains("profile `missing`")
         );
+    }
+
+    #[test]
+    fn model_limits_and_effort_follow_file_environment_and_flag_precedence() {
+        let fixture = Fixture::new();
+        fixture.project(
+            "provider = 'openai-chat'\ncontext_window = 32768\nreasoning_effort = 'high'\n",
+        );
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.context_window.unwrap().get(), 32768);
+        assert_eq!(cli.reasoning_effort.unwrap().to_string(), "high");
+        let (cli, _) = fixture
+            .load(
+                &["--reasoning-effort", "max", "--context-window", "65536"],
+                &[
+                    ("POLARIS_CODE_REASONING_EFFORT", "low"),
+                    ("POLARIS_CODE_CONTEXT_WINDOW", "16384"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(cli.context_window.unwrap().get(), 65536);
+        assert_eq!(cli.reasoning_effort.unwrap().to_string(), "max");
+        fixture.project("dangerously_skip_permissions = true\n");
+        assert!(fixture.load(&[], &[]).is_err());
     }
 
     #[test]

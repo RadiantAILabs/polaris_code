@@ -26,6 +26,7 @@ pub(crate) struct ToolBatch {
     edited: Vec<std::path::PathBuf>,
     completed: usize,
     interrupted: bool,
+    trajectory: Option<crate::trajectory::RunTrajectory>,
 }
 impl LocalResource for ToolBatch {}
 
@@ -109,7 +110,11 @@ impl CallDecision {
     }
 
     fn push_result(&self, batch: &mut ToolBatch, block: UserBlock) {
-        batch.results.push(with_approval_note(block, self.note()));
+        let block = with_approval_note(block, self.note());
+        if let Some(trace) = &batch.trajectory {
+            trace.tool_results(std::slice::from_ref(&block));
+        }
+        batch.results.push(block);
     }
 
     fn record(&self, call: &AuthorizedCall, store: &OxigraphStore, turn: usize) {
@@ -145,8 +150,10 @@ fn with_approval_note(mut block: UserBlock, note: Option<&str>) -> UserBlock {
 pub(crate) async fn prepare_calls(
     decision: Out<LlmResponse>,
     mut batch: ResMut<ToolBatch>,
+    context: Res<ContextManager>,
 ) -> CallProgress {
     *batch = ToolBatch {
+        trajectory: context.trajectory(),
         calls: decision
             .tool_calls()
             .into_iter()
@@ -328,7 +335,7 @@ pub(crate) async fn authorize_call(
         authorization.remember,
     );
     // Bind before any human wait; only the allow path attaches this receipt.
-    let mut receipt = (!policy.is_unattended())
+    let mut receipt = (!policy.is_unattended() || shell_approval.unrestricted())
         .then(|| shell_approval.receipt_for(&request, &rules, &settings))
         .flatten();
     let detail = tool_detail(name, &tool_call.function.arguments);
@@ -522,10 +529,9 @@ pub(crate) async fn ask_human(
                 "denied",
                 &reason,
             );
-            batch.results.push(UserBlock::tool_error(
-                &call.call.id,
-                ToolResultContent::Text(reason),
-            ));
+            batch
+                .results
+                .push(call.call.error(ToolResultContent::Text(reason)));
             *lifetime = CallLifetime::Idle;
             batch.interrupted = true;
             finish_pending(
@@ -602,10 +608,9 @@ pub(crate) async fn record_denial(
         "denied",
         reason,
     );
-    batch.results.push(UserBlock::tool_error(
-        &tool_call.id,
-        ToolResultContent::Text(reason.clone()),
-    ));
+    batch
+        .results
+        .push(tool_call.error(ToolResultContent::Text(reason.clone())));
 }
 
 #[system]
@@ -709,10 +714,7 @@ pub(crate) async fn execute_call(
                 "interrupted",
                 &output,
             );
-            decision.push_result(
-                &mut batch,
-                UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output)),
-            );
+            decision.push_result(&mut batch, tool_call.error(ToolResultContent::Text(output)));
             *lifetime = CallLifetime::Idle;
             batch.interrupted = true;
             finish_pending(
@@ -756,10 +758,8 @@ pub(crate) async fn execute_call(
                         "error",
                         &reason,
                     );
-                    decision.push_result(
-                        &mut batch,
-                        UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason)),
-                    );
+                    decision
+                        .push_result(&mut batch, tool_call.error(ToolResultContent::Text(reason)));
                     return;
                 }
             };
@@ -776,10 +776,7 @@ pub(crate) async fn execute_call(
             tasks.report_backgrounded(task.number);
             decision.push_result(
                 &mut batch,
-                UserBlock::tool_result(
-                    &tool_call.id,
-                    ToolResultContent::Text(background_receipt(&task)),
-                ),
+                tool_call.result(ToolResultContent::Text(background_receipt(&task))),
             );
             return;
         };
@@ -803,10 +800,8 @@ pub(crate) async fn execute_call(
                         "denied",
                         &reason,
                     );
-                    decision.push_result(
-                        &mut batch,
-                        UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(reason)),
-                    );
+                    decision
+                        .push_result(&mut batch, tool_call.error(ToolResultContent::Text(reason)));
                     return;
                 }
                 // Every toolset in this crate answers with the string it
@@ -867,7 +862,7 @@ pub(crate) async fn execute_call(
                 {
                     batch.edited.push(config.working_dir.join(rel));
                 }
-                UserBlock::tool_result(&tool_call.id, ToolResultContent::Text(output))
+                tool_call.result(ToolResultContent::Text(output))
             }
             Err(err) => {
                 // A failure message carries tool output too — a command's
@@ -882,7 +877,7 @@ pub(crate) async fn execute_call(
                     "error",
                     &output,
                 );
-                UserBlock::tool_error(&tool_call.id, ToolResultContent::Text(output))
+                tool_call.error(ToolResultContent::Text(output))
             }
         }
     };
@@ -919,10 +914,9 @@ async fn finish_pending(
             "error",
             reason,
         );
-        batch.results.push(UserBlock::tool_error(
-            &call.id,
-            ToolResultContent::Text(reason.into()),
-        ));
+        batch
+            .results
+            .push(call.error(ToolResultContent::Text(reason.into())));
     }
     if !batch.results.is_empty() {
         context.push(Message::User {

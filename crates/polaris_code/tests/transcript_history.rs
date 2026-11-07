@@ -97,7 +97,8 @@ async fn pages_preserve_identical_prompts_order_and_full_tool_results() {
         ],
     });
     messages.push(Message::User {
-        content: vec![UserBlock::tool_result(
+        content: vec![UserBlock::tool_result_with_call_id(
+            "tool-1",
             "tool-1",
             ToolResultContent::Text(text.clone()),
         )],

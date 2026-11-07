@@ -169,9 +169,16 @@ Interactive sessions ask before edits and commands. Unattended runs require
 explicit per-run grants to write files or execute commands. See
 [permission modes](docs/permission-modes.md) for the available settings.
 
+For a disposable container, `--dangerously-skip-permissions` with `-p` grants
+file edits and arbitrary shell commands without prompts. It is CLI-only and
+removes shell command denials and syntax checks. Use container isolation to
+protect the host. [Unattended runs](docs/unattended-runs.md) documents this mode,
+Chat Completions endpoints, explicit model limits, reasoning effort and native
+ATIF trajectory export.
+
 ### Choose a provider
 
-Select a provider with `--provider anthropic|openai|bedrock` or the
+Select a provider with `--provider anthropic|openai|openai-chat|bedrock` or the
 `POLARIS_CODE_PROVIDER` environment variable. OpenAI uses `OPENAI_API_KEY`, and
 `OPENAI_BASE_URL` points it at an OpenAI-compatible server (Ollama, LM Studio,
 vLLM, a gateway). Bedrock uses the AWS SDK credential chain:
@@ -212,8 +219,8 @@ whether `POLARIS_CONFIG_DIR` selected it. See
 Put defaults in `config.toml` (yours) or `polaris.toml` (the project's). The
 accepted keys are `provider`, `model`, `models`, `region`, `permission_mode`
 (`confirm`, `auto-edit`, `auto`, or `plan`), `permission_ceiling`,
-`max_cost_usd`, `max_tokens`, `max_turns`, and `max_output_tokens`. Flags and
-environment variables win over both files.
+`max_cost_usd`, `max_tokens`, `max_turns`, `max_output_tokens`, `context_window`,
+and `reasoning_effort`. Flags and environment variables win over both files.
 
 Two options are flags or environment variables only: `--notify` /
 `POLARIS_CODE_NOTIFY` (`off`, `approval`, or `all`; when the terminal bell and

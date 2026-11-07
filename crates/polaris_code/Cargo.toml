@@ -19,7 +19,7 @@ missing_docs = "warn"
 doc_markdown = "warn"
 
 [dependencies]
-polaris = { workspace = true, features = ["anthropic", "openai", "bedrock", "tiktoken", "file-store"] }
+polaris = { workspace = true, features = ["anthropic", "openai", "chat-completions", "bedrock", "tiktoken", "file-store"] }
 # Domain-neutral cognition contracts; the coding embodiment lives in `src/cosmos/`.
 polaris_cosmos.workspace = true
 polaris-tui.workspace = true

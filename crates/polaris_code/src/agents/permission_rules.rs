@@ -92,6 +92,7 @@ pub struct PermissionRulesPlugin {
     settings: Option<Arc<OnceLock<SessionSettings>>>,
     tools: RunToolGrants,
     trust: Option<ProjectTrust>,
+    unrestricted_shell: bool,
 }
 
 impl std::fmt::Debug for PermissionRulesPlugin {
@@ -118,6 +119,14 @@ impl PermissionRulesPlugin {
     #[must_use]
     pub fn with_tool_grants(mut self, tools: RunToolGrants) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Authorize arbitrary shell syntax in explicitly unrestricted unattended
+    /// containers. Tool directory checks and explicit permission rules remain.
+    #[must_use]
+    pub fn with_unrestricted_shell(mut self, enabled: bool) -> Self {
+        self.unrestricted_shell = enabled;
         self
     }
 
@@ -173,11 +182,12 @@ impl Plugin for PermissionRulesPlugin {
             rules = rules.with_project_trust(trust.clone());
         }
         let grants = SessionGrants::default();
-        let shell = ShellApproval::new(
+        let mut shell = ShellApproval::new(
             server
                 .get_global::<ShellExecutor>()
                 .map(|value| value.clone()),
         );
+        shell.unrestricted = self.unrestricted_shell;
         if let Some(commands) = &self.commands {
             let rules = rules.clone();
             let grants = grants.clone();

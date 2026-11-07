@@ -285,11 +285,10 @@ fn provider_valid(mut messages: Vec<Message>) -> Vec<Message> {
         messages.push(Message::User {
             content: pending
                 .into_iter()
-                .map(|id| {
-                    UserBlock::tool_error(
-                        &id,
-                        ToolResultContent::Text("Interrupted before the tool completed".into()),
-                    )
+                .map(|call| {
+                    call.error(ToolResultContent::Text(
+                        "Interrupted before the tool completed".into(),
+                    ))
                 })
                 .collect(),
         });
@@ -298,13 +297,13 @@ fn provider_valid(mut messages: Vec<Message>) -> Vec<Message> {
 }
 
 /// Tool calls whose results have not arrived within this span.
-fn pending_tool_calls(messages: &[Message]) -> Vec<String> {
+fn pending_tool_calls(messages: &[Message]) -> Vec<polaris::models::llm::ToolCall> {
     let mut pending = Vec::new();
     for message in messages {
         match message {
             Message::Assistant { content, .. } => pending.extend(content.iter().filter_map(|b| {
                 if let AssistantBlock::ToolCall(call) = b {
-                    Some(call.id.clone())
+                    Some(call.clone())
                 } else {
                     None
                 }
@@ -317,7 +316,7 @@ fn pending_tool_calls(messages: &[Message]) -> Vec<String> {
                         None
                     }
                 }) {
-                    pending.retain(|id| id != &result.id);
+                    pending.retain(|call| call.id != result.id);
                 }
             }
         }
@@ -489,6 +488,8 @@ pub struct ContextManager {
     /// The projection behavior behind [`project`](Self::project).
     #[serde(skip, default = "default_strategy")]
     strategy: Arc<dyn ContextStrategy>,
+    #[serde(skip)]
+    trajectory: Option<crate::trajectory::RunTrajectory>,
 }
 
 impl Default for ContextManager {
@@ -500,6 +501,7 @@ impl Default for ContextManager {
             last_summary_attempt: None,
             last_prompt_tokens: None,
             last_window_chars: None,
+            trajectory: None,
             strategy: default_strategy(),
         }
     }
@@ -539,8 +541,19 @@ impl ContextManager {
         }
     }
 
+    pub(crate) fn trajectory(&self) -> Option<crate::trajectory::RunTrajectory> {
+        self.trajectory.clone()
+    }
+
+    pub(crate) fn set_trajectory(&mut self, trajectory: Option<crate::trajectory::RunTrajectory>) {
+        self.trajectory = trajectory;
+    }
+
     /// Append a message to the history.
     pub fn push(&mut self, message: Message) {
+        if let Some(trajectory) = &self.trajectory {
+            trajectory.message(&message);
+        }
         self.messages.push(message);
     }
 
@@ -1084,7 +1097,8 @@ mod tests {
             ))],
         };
         let result = Message::User {
-            content: vec![UserBlock::tool_result(
+            content: vec![UserBlock::tool_result_with_call_id(
+                id,
                 id,
                 ToolResultContent::Text("ok".into()),
             )],
@@ -1176,7 +1190,8 @@ mod tests {
     /// A user message carrying a single tool result with a `chars`-long body.
     fn big_tool_result(id: &str, chars: usize) -> Message {
         Message::User {
-            content: vec![UserBlock::tool_result(
+            content: vec![UserBlock::tool_result_with_call_id(
+                id,
                 id,
                 ToolResultContent::Text("x".repeat(chars)),
             )],

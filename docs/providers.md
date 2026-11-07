@@ -10,12 +10,22 @@ arm in each of a few `match`es.
 | --- | --- | --- |
 | `anthropic` (default) | `ANTHROPIC_API_KEY`, or a key saved by `polaris login` | `anthropic/<model>` |
 | `openai` | `OPENAI_API_KEY` or a saved key; optionally `OPENAI_BASE_URL` | `openai/<model>` |
+| `openai-chat` | `OPENAI_API_KEY` or a saved key; optionally `OPENAI_BASE_URL` | `openai-chat/<exact remote model id>` |
 | `bedrock` | AWS credentials through the SDK's default chain, and a region | `aws.bedrock/<id>` |
 
 `polaris --list-models` shows what each offers, whether its credentials are
 present, and the built-in price of each model. It needs no key and starts nothing.
 With `--output-format json` or `stream-json`, it emits one object with
 `schema: "polaris.models.v1"` and a `providers` array.
+
+`openai` uses the Responses API. Select `openai-chat` for Chat Completions at
+an OpenAI-compatible endpoint. The latter accepts arbitrary `--model` ids
+without a catalog declaration; an optional `openai-chat/` prefix is stripped
+once, preserving vendor slashes and routing suffixes. It reads `OPENAI_BASE_URL`
+explicitly and appends `/chat/completions`. Both use `OPENAI_API_KEY`; a local
+server that requires no authentication may use a non-empty placeholder key.
+See [unattended runs](unattended-runs.md) for a complete invocation, reasoning
+effort, and context/output limits for models outside the built-in catalog.
 
 ## Saving credentials: `polaris login`
 
@@ -74,8 +84,8 @@ interactive and headless paths share one function (`providers::prepare`).
 
 | Provider | Stops when | The message names |
 | --- | --- | --- |
-| `anthropic`, `openai` | no variable and no stored key; a stored file others can read | `polaris login`, the variable, where to get a key, the other providers, `.env` |
-| `openai` | `OPENAI_BASE_URL` is not an `http` or `https` address | the value (credentials removed) |
+| `anthropic`, `openai`, `openai-chat` | no variable and no stored key; a stored file others can read | `polaris login`, the variable, where to get a key, the other providers, `.env` |
+| `openai`, `openai-chat` | `OPENAI_BASE_URL` is not an `http` or `https` address | the value (credentials removed) |
 | `anthropic` | `ANTHROPIC_BASE_URL` is set | why it is refused (below) |
 | `bedrock` | no region | `--region`, `AWS_REGION`, the AWS profile, `polaris login bedrock` |
 | `bedrock` | the credential chain yields nothing (20 s limit) | what the SDK tried and said; `AWS_PROFILE`, `aws sso login`, access keys |

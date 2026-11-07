@@ -47,6 +47,9 @@ pub struct AgentConfig {
     /// registered with a larger ceiling than the value reserved here can
     /// produce more than was reserved.
     pub max_output_tokens: Option<NonZeroU32>,
+    /// Explicit model context window, including the reserved output allowance.
+    /// `None` keeps the built-in retrieval policy. Applies to this session.
+    pub context_window: Option<NonZeroU32>,
     /// The shell commands this session may run, as command patterns (`*`
     /// matches any text, `?` one character). `None` leaves shell commands to
     /// the permission mode and the server's shell policy alone, as they always
@@ -72,6 +75,7 @@ impl AgentConfig {
             prompt_cache: true,
             system_prompt: None,
             max_output_tokens: None,
+            context_window: None,
             command_globs: None,
         }
     }
@@ -98,6 +102,14 @@ impl AgentConfig {
     #[must_use]
     pub fn with_max_output_tokens(mut self, tokens: NonZeroU32) -> Self {
         self.max_output_tokens = Some(tokens);
+        self
+    }
+
+    /// Declare this session's model input-plus-output capacity. The host must
+    /// reserve a smaller output allowance before context projection can fit.
+    #[must_use]
+    pub fn with_context_window(mut self, tokens: NonZeroU32) -> Self {
+        self.context_window = Some(tokens);
         self
     }
 

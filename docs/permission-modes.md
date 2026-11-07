@@ -57,6 +57,13 @@ documented `-p "add a README"` example needs nothing more; each repeated
 allowlist. An unmatched command is refused rather than returned as a
 confirmation request.
 
+`--dangerously-skip-permissions` is an explicit CLI-only exception for `-p`
+inside disposable containers. It grants file edits and arbitrary shell syntax,
+removing shell command denials and opaque-syntax checks while retaining tool
+path containment, directory validation, explicit permission-rule denials and
+normal journaling/redaction. It cannot be configured or enabled by a prompt.
+See [unattended runs](unattended-runs.md) for the complete trust boundary.
+
 ## The permission ceiling
 
 The modes above answer "what is this session allowed to do now". A *ceiling*
@@ -233,7 +240,8 @@ is in force and which posture it starts in; the `/permission` popup then
 advertises only the postures that can actually be entered and names the ceiling
 that narrowed the list, and `/permission` with no argument repeats it.
 
-The shell deny list remains authoritative in every mode, even when an
+Except with the explicit container flag above, the shell deny list remains
+authoritative in every mode, even when an
 unattended allow pattern matches. An interactive session refuses a command on
 the list before asking, so no approval or session grant is offered for a
 command that could never run; the confirmed execution path applies the list

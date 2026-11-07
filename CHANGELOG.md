@@ -6,6 +6,12 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 ## [Unreleased]
 
 ### Added
+- `--provider openai-chat` for OpenAI-compatible Chat Completions endpoints, including arbitrary vendor model ids.
+- `--reasoning-effort` / `POLARIS_CODE_REASONING_EFFORT` / `reasoning_effort` pins effort on every model request, including auxiliary calls. The experimental Bedrock variable is retired with a startup migration error.
+- `--context-window` / `POLARIS_CODE_CONTEXT_WINDOW` / `context_window` sizes projection and compaction after reserving output and prompt overhead.
+- CLI-only `--dangerously-skip-permissions`, requiring `-p`, permits edits and arbitrary shell commands without prompts in disposable containers. It removes the normal 100-iteration cap unless `--max-turns` is set. Ordinary unattended runs retain explicit grants and their iteration default.
+- CLI-only `--trajectory-path` exports complete model requests, reasoning, tool calls, redacted results and native usage as durable ATIF JSON. `ModelRunPlugin` and `RunTrajectory` expose the reusable provider policy and recording contracts.
+- Tool results preserve both provider identifiers through execution, errors, cancellation and repaired history.
 - `polaris_cosmos::flow`: graph blocks for durable, budgeted, resumable agent workflows. The builders are `agent` (one role call: replay, admit, reserve, stage, run, settle, collect), `phase`, `memo`, `memo_current`, `repair_loop`, `lease_loop`, `rounds`, `worklist`, `counter`, `budget`, `events` and `bind`. They read thirteen global resources: `RunHandle`, `RoleBook`, `AgentRunner`, `StopFlag`, `SpendBook`, `StepJournal`, `RepairCounters`, `LeaseBook`, `FlowSettings`, `PhaseControl`, `Worklist`, `EventLog` and `CallDeadline`. Every durable file lives under one run root, and one process owns it.
 - Resume: a run with `RunMode::Resume` restores only calls journaled as done. Skipped, failed and interrupted calls run again.
 - `FlowPlugin`: registers the flow resources a host built (`with_resource`), charges calls left in flight by an earlier run at their ceiling when the server is ready, and stops phase heartbeat timers at cleanup. Hosts that wire resources by hand keep working.

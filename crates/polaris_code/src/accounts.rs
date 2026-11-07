@@ -282,7 +282,7 @@ pub async fn run(
                         .to_string(),
                 )),
                 Provider::Bedrock => login_bedrock(io, setup).await,
-                Provider::Anthropic | Provider::OpenAi => {
+                Provider::Anthropic | Provider::OpenAi | Provider::OpenAiChat => {
                     login_with_key(provider, with_api_key, io, setup)
                 }
             }
@@ -1013,7 +1013,7 @@ mod tests {
             assert!(said.contains("2) OpenAI"), "{said}");
             assert!(said.contains("3) Amazon Bedrock"), "{said}");
         }
-        for bad in ["0", "4", "gemini", ""] {
+        for bad in ["0", "5", "gemini", ""] {
             let mut io = Script::default();
             io.answers.push_back(bad.to_string());
             let error = pick_provider(&mut io).expect_err(bad);

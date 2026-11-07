@@ -677,7 +677,7 @@ async fn execute_read_only_batch(
                 tracing::info!("Observation: {output}");
                 activity.finish(user_io, PHASE_OK, &output).await;
                 record_tool_call(store, turn, name, &call.function.arguments, "ok", &output);
-                UserBlock::tool_result(&call.id, ToolResultContent::Text(output))
+                call.result(ToolResultContent::Text(output))
             }
             Some(Err(err)) => {
                 let output = redact_tool_output(redactor, name, err.to_string());
@@ -690,7 +690,7 @@ async fn execute_read_only_batch(
                     "error",
                     &output,
                 );
-                UserBlock::tool_error(&call.id, ToolResultContent::Text(output))
+                call.error(ToolResultContent::Text(output))
             }
             None => {
                 let output = "Interrupted by user".to_string();
@@ -703,7 +703,7 @@ async fn execute_read_only_batch(
                     "interrupted",
                     &output,
                 );
-                UserBlock::tool_error(&call.id, ToolResultContent::Text(output))
+                call.error(ToolResultContent::Text(output))
             }
         };
         result_blocks.push(block);
@@ -1905,13 +1905,29 @@ impl Agent for CodeAgent {
             .llm(&config.model_id)
             .map_err(SetupError::new)?;
         ctx.insert(AgentLlm(llm));
+        let trajectory = ctx
+            .get_resource::<crate::trajectory::RunTrajectory>()
+            .ok()
+            .map(|trace| trace.clone());
+        if let Ok(mut context) = ctx.get_resource_mut::<ContextManager>() {
+            context.set_trajectory(trajectory);
+        }
 
         // Build per-session project grounding and the policy snapshot. These are
         // synchronous to keep `setup` non-async; ProjectContext shells out, so we
         // block on a short-lived runtime handle.
         let project = futures_block_on(ProjectContext::discover(&config.working_dir));
         ctx.insert(project);
-        ctx.insert(PolicySnapshot::defaults());
+        let mut policy = PolicySnapshot::defaults();
+        if let Some(window) = config.context_window {
+            policy.retrieval.apply_model_limits(
+                window,
+                config
+                    .max_output_tokens
+                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS),
+            );
+        }
+        ctx.insert(policy);
         ctx.insert(LiveTranscript::default());
         ctx.insert(AttemptLedger::default());
         ctx.insert(tool_calls::ToolBatch::default());

@@ -619,7 +619,10 @@ impl ApprovalRequest {
 /// }
 /// ```
 #[derive(Debug, Clone, Default)]
-pub struct ShellApproval(Arc<OnceLock<ShellExecutor>>);
+pub struct ShellApproval {
+    executor: Arc<OnceLock<ShellExecutor>>,
+    pub(super) unrestricted: bool,
+}
 
 impl GlobalResource for ShellApproval {}
 
@@ -633,17 +636,21 @@ impl ShellApproval {
     }
 
     pub(super) fn bind(&self, executor: ShellExecutor) {
-        let _ = self.0.set(executor);
+        let _ = self.executor.set(executor);
     }
 
     /// Shell's hard deny/opaque-syntax verdict, when shell capability is installed.
     #[must_use]
     pub fn permission(&self, args: &Value) -> Option<ShellPermission> {
-        self.0.get().and_then(|executor| {
+        self.executor.get().and_then(|executor| {
             args.get("command")
                 .and_then(Value::as_str)
                 .map(|command| executor.check_permission(command))
         })
+    }
+
+    pub(crate) fn unrestricted(&self) -> bool {
+        self.unrestricted
     }
 
     /// Apply shell hard denies and opaque-syntax checks after deterministic
@@ -705,8 +712,11 @@ impl ShellApproval {
                 decision.remember = false;
                 return decision;
             }
+            if self.unrestricted && policy.is_unattended() {
+                return decision;
+            }
             let projected = parts.as_ref().and_then(|parts| {
-                self.0.get().map(|executor| {
+                self.executor.get().map(|executor| {
                     parts
                         .iter()
                         .map(|part| {
@@ -776,7 +786,7 @@ impl ShellApproval {
         rules: &super::PermissionRules,
         settings: &crate::terminal::SessionSettings,
     ) -> Option<ApprovalReceipt> {
-        if self.0.get().is_none()
+        if self.executor.get().is_none()
             || !matches!(request.tool.as_str(), "run_command" | "run_in_background")
         {
             return None;
@@ -1330,6 +1340,69 @@ mod tests {
             &args,
             dir.path()
         ));
+    }
+
+    #[tokio::test]
+    async fn unrestricted_unattended_shell_executes_opaque_syntax_with_a_bound_receipt() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, _, registry) = shell(dir.path());
+        let settings = SessionSettings::new(
+            "fake/model",
+            PermissionMode::Unattended(UnattendedGrants {
+                edit_file: true,
+                run_command_patterns: vec!["*".into()],
+            }),
+            &crate::config::ModelCatalog::pinned("fake/model"),
+        );
+        let policy = settings.snapshot().permission_mode.permission_policy();
+        let args = json!({"command": r#"for n in 1 2; do echo "$(printf %s "$n")"; done"#});
+        let call = super::super::PermissionCall {
+            tool: "run_command",
+            args: &args,
+            registry_default: ToolPermission::Confirm,
+            root: dir.path(),
+            generation: settings.approval_generation(),
+            ceiling: None,
+        };
+        let grants = SessionGrants::default();
+        assert_eq!(
+            shell.resolve(&policy, &call, &grants).permission,
+            ToolPermission::Deny
+        );
+        shell.unrestricted = true;
+        assert_eq!(
+            shell.resolve(&policy, &call, &grants).permission,
+            ToolPermission::Allow
+        );
+        let receipt = shell
+            .receipt(
+                "run_command",
+                &args,
+                dir.path(),
+                &super::super::PermissionRules::default(),
+                &settings,
+            )
+            .unwrap();
+        let run = shell.spawn(
+            &registry,
+            "run_command",
+            args.clone(),
+            ToolContext::new()
+                .with(crate::tools::CallRoot::new(dir.path()))
+                .with(receipt),
+        );
+        let result = run.await.unwrap().unwrap();
+        assert!(result.to_string().contains("1\\n2"), "{result:?}");
+        let outside = json!({"command": "echo hi", "working_dir": "/"});
+        let outside_call = super::super::PermissionCall {
+            args: &outside,
+            ..call
+        };
+        assert_eq!(
+            shell.resolve(&policy, &outside_call, &grants).permission,
+            ToolPermission::Deny
+        );
     }
 
     #[test]

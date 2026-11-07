@@ -3327,14 +3327,8 @@ impl LiveModelStep {
                         }
                     }
                     results.push(match outcome {
-                        Ok(content) => UserBlock::tool_result(
-                            tool_call.id.clone(),
-                            ToolResultContent::Text(content),
-                        ),
-                        Err(error) => UserBlock::tool_error(
-                            tool_call.id.clone(),
-                            ToolResultContent::Text(error),
-                        ),
+                        Ok(content) => tool_call.result(ToolResultContent::Text(content)),
+                        Err(error) => tool_call.error(ToolResultContent::Text(error)),
                     });
                 }
                 if let Some(index) = last_write_result {
@@ -5146,8 +5140,9 @@ mod tests {
     #[test]
     fn warm_continuation_keeps_old_autotest_feedback_short() {
         let mut messages = vec![Message::User {
-            content: vec![UserBlock::tool_result(
-                "edit-1".to_owned(),
+            content: vec![UserBlock::tool_result_with_call_id(
+                "edit-1",
+                "edit-1",
                 ToolResultContent::Text(format!(
                     "edited\nAutotest (related subset): {}",
                     "x".repeat(900)
@@ -5163,8 +5158,9 @@ mod tests {
     #[test]
     fn warm_continuation_preserves_an_autotest_not_run_message() {
         let mut messages = vec![Message::User {
-            content: vec![UserBlock::tool_result(
-                "edit-1".to_owned(),
+            content: vec![UserBlock::tool_result_with_call_id(
+                "edit-1",
+                "edit-1",
                 ToolResultContent::Text("edited\nAutotest not run: no allowed runner".to_owned()),
             )],
         }];
@@ -5567,7 +5563,8 @@ mod tests {
                 ))],
             },
             Message::User {
-                content: vec![UserBlock::tool_result(
+                content: vec![UserBlock::tool_result_with_call_id(
+                    "run-1",
                     "run-1",
                     ToolResultContent::Text("exit 0: 1".to_owned()),
                 )],

@@ -176,7 +176,8 @@ fn history() -> Vec<Message> {
             ))],
         });
         messages.push(Message::User {
-            content: vec![UserBlock::tool_result(
+            content: vec![UserBlock::tool_result_with_call_id(
+                &id,
                 &id,
                 ToolResultContent::Text("observed parser behavior ".repeat(200)),
             )],
