@@ -656,22 +656,89 @@ impl ShellApproval {
         call: &super::PermissionCall<'_>,
         grants: &SessionGrants,
     ) -> super::AuthorizationDecision {
+        self.resolve_with_patterns(policy, call, grants, None)
+    }
+
+    /// Resolve a call with an additional session allow list. A complete local
+    /// parse may cover literal scripts that the framework cannot decompose;
+    /// every projected command must also pass the installed executor's policy.
+    pub(crate) fn resolve_with_patterns(
+        &self,
+        policy: &crate::agents::PermissionPolicy,
+        call: &super::PermissionCall<'_>,
+        grants: &SessionGrants,
+        patterns: Option<&[String]>,
+    ) -> super::AuthorizationDecision {
         let mut decision = policy.resolve_call(call, grants);
         if matches!(call.tool, "run_command" | "run_in_background") {
+            // Apply restrictive rules to every parsed command as well as to
+            // the original text. A newline or heredoc must not hide a deny or
+            // ask rule from the framework's older chain splitter.
+            let parts = patterns.and_then(|patterns| {
+                call.args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .and_then(|command| {
+                        crate::tools::command_check::checked_commands(command, patterns)
+                    })
+            });
+            if let Some(parts) = &parts {
+                let mut args = call.args.clone();
+                for part in parts {
+                    args["command"] = Value::String(part.clone());
+                    let part_call = super::PermissionCall {
+                        args: &args,
+                        ..*call
+                    };
+                    let part_decision = policy.resolve_call(&part_call, grants);
+                    if part_decision.permission == ToolPermission::Deny
+                        || (part_decision.permission == ToolPermission::Confirm
+                            && decision.permission == ToolPermission::Allow)
+                    {
+                        decision = part_decision;
+                    }
+                }
+            }
             if call_directory(call.args, call.root).is_none() {
                 decision.permission = ToolPermission::Deny;
                 decision.source = "shell directory is invalid or outside the workspace".into();
                 decision.remember = false;
                 return decision;
             }
-            match self.permission(call.args) {
+            let projected = parts.as_ref().and_then(|parts| {
+                self.0.get().map(|executor| {
+                    parts
+                        .iter()
+                        .map(|part| {
+                            crate::tools::command_check::part_permission(part, executor.config())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            });
+            let permission = if projected
+                .as_ref()
+                .is_some_and(|parts| parts.contains(&ShellPermission::Deny))
+            {
+                Some(ShellPermission::Deny)
+            } else {
+                self.permission(call.args)
+            };
+            let covered = projected.as_ref().is_some_and(|parts| {
+                !parts.is_empty()
+                    && parts
+                        .iter()
+                        .all(|permission| *permission == ShellPermission::Allow)
+            });
+            match permission {
                 Some(ShellPermission::Deny) => {
                     decision.permission = ToolPermission::Deny;
                     decision.source = "this command is on the shell's deny list".into();
                     decision.remember = false;
                 }
                 Some(ShellPermission::Confirm)
-                    if decision.permission == ToolPermission::Allow && !decision.session_grant =>
+                    if decision.permission == ToolPermission::Allow
+                        && !decision.session_grant
+                        && !covered =>
                 {
                     decision.permission = if policy.is_unattended() {
                         ToolPermission::Deny
@@ -1263,6 +1330,203 @@ mod tests {
             &args,
             dir.path()
         ));
+    }
+
+    #[test]
+    fn parsed_lists_preserve_rules_executor_denies_and_mode_ceilings() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, _, _) = shell(dir.path());
+        let patterns = vec!["echo *".into(), "touch *".into()];
+        let mut policy = PermissionMode::Unattended(UnattendedGrants {
+            edit_file: true,
+            run_command_patterns: patterns.clone(),
+        })
+        .permission_policy();
+        let grants = SessionGrants::default();
+        let resolve = |policy: &crate::agents::PermissionPolicy, command: &str| {
+            let args = json!({"command":command});
+            shell
+                .resolve_with_patterns(
+                    policy,
+                    &super::super::PermissionCall {
+                        tool: "run_command",
+                        args: &args,
+                        registry_default: ToolPermission::Confirm,
+                        root: dir.path(),
+                        generation: 0,
+                        ceiling: None,
+                    },
+                    &grants,
+                    Some(&patterns),
+                )
+                .permission
+        };
+        assert_eq!(
+            resolve(&policy, "echo first\necho second"),
+            ToolPermission::Allow,
+            "unattended grants and executor allow both newline-separated commands"
+        );
+        assert_eq!(
+            resolve(&policy, "echo first\necho forbidden"),
+            ToolPermission::Deny,
+            "the executor denies echo forbidden after a newline"
+        );
+        assert_eq!(
+            resolve(&policy, "echo first\ntouch denied-file"),
+            ToolPermission::Deny,
+            "the executor denies touch denied-file after a newline"
+        );
+        for disposition in ["deny", "ask"] {
+            let rules_path = dir.path().join("rules.toml");
+            std::fs::write(&rules_path, format!("[[rules]]\ntool = 'run_command'\ndecision = '{disposition}'\ncommand = 'echo restricted'\n")).unwrap();
+            policy.rules = Some(super::super::PermissionRules::from_paths(
+                dir.path(),
+                Some(&rules_path),
+                None,
+            ));
+            assert_eq!(
+                resolve(&policy, "echo first\necho restricted"),
+                ToolPermission::Deny,
+                "the {disposition} rule for echo restricted applies after a newline in unattended mode"
+            );
+            assert_eq!(
+                resolve(&policy, "echo <<'END'\ndata\nEND\necho restricted"),
+                ToolPermission::Deny,
+                "the {disposition} rule for echo restricted applies after a heredoc in unattended mode"
+            );
+        }
+        assert_eq!(
+            resolve(
+                &PermissionMode::Plan.permission_policy(),
+                "echo first\necho second"
+            ),
+            ToolPermission::Deny,
+            "plan mode denies shell execution even when both commands match session patterns"
+        );
+        assert_eq!(
+            resolve(
+                &PermissionMode::Confirm.permission_policy(),
+                "echo first\necho second"
+            ),
+            ToolPermission::Confirm,
+            "confirm mode still requires approval when both commands match session patterns"
+        );
+    }
+
+    #[test]
+    fn session_patterns_do_not_cover_commands_the_executor_requires_approval_for() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ShellExecutor::new(
+            ShellConfig::new()
+                .with_working_dir(dir.path())
+                .with_allowed_commands(vec!["echo *".into()]),
+        );
+        let patterns = vec!["echo *".into(), "touch *".into()];
+        let command = "echo first\ntouch second";
+        assert_eq!(
+            crate::tools::command_check::checked_commands(command, &patterns),
+            Some(vec!["echo first".into(), "touch second".into()])
+        );
+        assert_eq!(
+            executor.check_permission("echo first"),
+            ShellPermission::Allow
+        );
+        assert_eq!(
+            executor.check_permission("touch second"),
+            ShellPermission::Confirm
+        );
+        let shell = ShellApproval::new(Some(executor));
+        let grants = SessionGrants::default();
+        let args = json!({"command": command});
+        for tool in ["run_command", "run_in_background"] {
+            for (mode, expected) in [
+                (PermissionMode::Confirm, ToolPermission::Confirm),
+                (
+                    PermissionMode::Unattended(UnattendedGrants {
+                        edit_file: false,
+                        run_command_patterns: patterns.clone(),
+                    }),
+                    ToolPermission::Deny,
+                ),
+            ] {
+                let mut policy = mode.permission_policy();
+                policy.overrides.insert(tool.into(), ToolPermission::Allow);
+                let call = super::super::PermissionCall {
+                    tool,
+                    args: &args,
+                    registry_default: ToolPermission::Allow,
+                    root: dir.path(),
+                    generation: 0,
+                    ceiling: None,
+                };
+                assert_eq!(
+                    policy.resolve_call(&call, &grants).permission,
+                    ToolPermission::Allow,
+                    "{tool} in {mode:?}: deterministic policy allows the command before executor restrictions"
+                );
+                let decision =
+                    shell.resolve_with_patterns(&policy, &call, &grants, Some(&patterns));
+                assert_eq!(
+                    decision.permission, expected,
+                    "{tool} in {mode:?}: the executor's unapproved part prevents coverage"
+                );
+                assert_eq!(
+                    decision.source, "shell syntax or command policy requires exact approval",
+                    "{tool} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_commands_without_an_executor_preserve_the_policy_decision() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let shell = ShellApproval::default();
+        let grants = SessionGrants::default();
+        let patterns = vec!["echo *".into()];
+        let args = json!({"command": "echo first\necho second"});
+        assert_eq!(shell.permission(&args), None);
+        for tool in ["run_command", "run_in_background"] {
+            for (mode, expected) in [
+                (PermissionMode::Confirm, ToolPermission::Confirm),
+                (
+                    PermissionMode::Unattended(UnattendedGrants {
+                        edit_file: false,
+                        run_command_patterns: patterns.clone(),
+                    }),
+                    ToolPermission::Allow,
+                ),
+                (PermissionMode::Plan, ToolPermission::Deny),
+            ] {
+                let policy = mode.permission_policy();
+                let call = super::super::PermissionCall {
+                    tool,
+                    args: &args,
+                    registry_default: ToolPermission::Allow,
+                    root: dir.path(),
+                    generation: 0,
+                    ceiling: None,
+                };
+                let original = policy.resolve_call(&call, &grants);
+                let decision =
+                    shell.resolve_with_patterns(&policy, &call, &grants, Some(&patterns));
+                assert_eq!(
+                    decision.permission, expected,
+                    "{tool} in {mode:?}: no executor supplies additional restrictions"
+                );
+                assert_eq!(
+                    decision.source, original.source,
+                    "{tool} in {mode:?}: the policy remains the decision source"
+                );
+                assert_eq!(
+                    decision.remember, original.remember,
+                    "{tool} in {mode:?}: session approval scope is unchanged"
+                );
+            }
+        }
     }
 
     #[tokio::test]
