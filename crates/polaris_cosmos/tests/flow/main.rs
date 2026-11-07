@@ -18,6 +18,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod blocks;
+mod containment;
+mod durability;
+mod loaders;
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Temp(PathBuf);
 impl Temp {
@@ -37,7 +42,7 @@ impl Temp {
 impl Drop for Temp {
     fn drop(&mut self) {
         fn writable(p: &Path) {
-            if p.is_dir() {
+            if p.is_dir() && !p.is_symlink() {
                 let mut permissions = std::fs::metadata(p).unwrap().permissions();
                 #[cfg(unix)]
                 {
@@ -153,6 +158,8 @@ fn agent_graph(call: AgentCall) -> Graph {
     graph
 }
 async fn execute(graph: &Graph, ctx: &mut SystemContext<'_>) -> polaris::graph::ExecutionResult {
+    let validation = graph.validate();
+    assert!(validation.is_ok(), "invalid graph: {validation}");
     GraphExecutor::new()
         .execute(graph, ctx, None, None)
         .await
@@ -230,7 +237,14 @@ async fn agent_stages_exact_requests_collects_and_numbers_folders() {
     let result = execute(&graph, &mut ctx).await;
     let requests = lines(&dir.path().join("calls/calls.jsonl"));
     assert_eq!(requests.len(), 2);
-    assert_ne!(requests[0]["workspace"], requests[1]["workspace"]);
+    assert_eq!(
+        requests[0]["workspace"],
+        dir.path().join("work/alpha/write/001").to_str().unwrap()
+    );
+    assert_eq!(
+        requests[1]["workspace"],
+        dir.path().join("work/alpha/write/002").to_str().unwrap()
+    );
     assert_eq!(requests[0]["step"], "alpha/write");
     let workspace = PathBuf::from(requests[0]["workspace"].as_str().unwrap());
     assert_eq!(
@@ -247,17 +261,18 @@ async fn agent_stages_exact_requests_collects_and_numbers_folders() {
             .permissions()
             .readonly()
     );
-    assert!(
-        requests[0]["system_prompt"]
-            .as_str()
-            .unwrap()
-            .contains("inputs/private")
+    assert_eq!(
+        requests[0]["system_prompt"],
+        "Use private in inputs/private."
     );
+    assert_eq!(requests[0]["turn_prompt"], "Write outputs/result.json");
     let outcome = result.output::<AgentOutcome>().unwrap();
     match outcome {
         AgentOutcome::Ran { outputs, .. } => {
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].sha256, digest(b"{\"ok\":true}"));
+            assert_eq!(outputs[0].path, "outputs/result.json");
+            assert_eq!(outputs[0].bytes, 11);
         }
         other => panic!("{other:?}"),
     };
@@ -369,15 +384,14 @@ async fn every_stop_and_failure_settles_with_expected_status() {
         );
         let mut ctx = context(dir.path(), runner, 10_000_000);
         execute(&agent_graph(call("alpha/call")), &mut ctx).await;
-        assert_eq!(
-            lines(&dir.path().join("metrics/cost_events.jsonl"))[0]["status"],
-            status
-        );
-        assert_eq!(
-            lines(&dir.path().join("metrics/cost_events.jsonl"))[0]["total_cost_usd"],
-            "0.100000"
-        );
+        let ledger = lines(&dir.path().join("metrics/cost_events.jsonl"));
+        let settlement = ledger
+            .first()
+            .unwrap_or_else(|| panic!("{stop}: expected a settlement"));
+        assert_eq!(settlement["status"], status, "stop {stop}");
+        assert_eq!(settlement["total_cost_usd"], "0.100000", "stop {stop}");
         if stop == "interrupted" {
+            assert!(ctx.get_resource::<PhaseControl>().unwrap().interrupted());
             assert!(
                 ctx.get_resource::<StepJournal>()
                     .unwrap()
@@ -405,12 +419,24 @@ async fn every_stop_and_failure_settles_with_expected_status() {
         let mut ctx = context(dir.path(), runner, 10_000_000);
         let result = execute(&agent_graph(call("alpha/fail")), &mut ctx).await;
         let ledger = lines(&dir.path().join("metrics/cost_events.jsonl"));
-        assert_eq!(ledger[0]["status"], "failed");
-        assert_eq!(ledger[0]["total_cost_usd"], cost);
-        assert!(matches!(
-            result.output::<AgentOutcome>().unwrap(),
-            AgentOutcome::Failed(_)
-        ));
+        let settlement = ledger
+            .first()
+            .unwrap_or_else(|| panic!("{failure}: expected a settlement"));
+        assert_eq!(settlement["status"], "failed", "failure {failure}");
+        assert_eq!(settlement["total_cost_usd"], cost, "failure {failure}");
+        let outcome = result.output::<AgentOutcome>().unwrap();
+        assert!(
+            match (failure, outcome) {
+                ("setup", AgentOutcome::Failed(AgentFailure::Setup(note))) =>
+                    note == "scripted setup failure",
+                ("unmeasured", AgentOutcome::Failed(AgentFailure::Unmeasured(note))) =>
+                    note == "scripted unmeasured failure",
+                ("internal", AgentOutcome::Failed(AgentFailure::Internal(note))) =>
+                    note == "scripted internal failure",
+                _ => false,
+            },
+            "failure {failure}: {outcome:?}"
+        );
     }
 }
 #[tokio::test]
@@ -450,7 +476,13 @@ async fn stop_flag_wakes_all_waiters_and_interrupts_scripted_delay() {
     };
     let start = Instant::now();
     let (run, ()) = tokio::join!(runner.run(request.clone()), async {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lines(&dir.path().join("calls.jsonl")).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner should record its active request");
         flag.request();
     });
     assert_eq!(run.unwrap().stop, StopCause::Interrupted);
@@ -462,6 +494,7 @@ async fn stop_flag_wakes_all_waiters_and_interrupts_scripted_delay() {
         StopCause::Interrupted
     );
     let calls = lines(&dir.path().join("calls.jsonl"));
+    assert_eq!(calls[0]["played"], true);
     assert_eq!(calls[1]["played"], false);
 }
 #[system]
@@ -483,12 +516,23 @@ async fn phase_preserves_body_status_applies_policies_and_skips_disabled() {
         body.add_system(failure);
         execute(&phase("alpha", policy, body), &mut ctx).await;
         let phases = ctx.get_resource::<PhaseControl>().unwrap();
-        assert_eq!(phase_status(&phases.status("alpha").unwrap()).0, expected);
-        assert_eq!(phases.halted(), halt);
-        assert_eq!(phases.incomplete(), incomplete);
+        assert_eq!(
+            phase_status(&phases.status("alpha").unwrap()).0,
+            expected,
+            "policy {policy:?}"
+        );
+        assert_eq!(phases.halted(), halt, "policy {policy:?}");
+        assert_eq!(phases.incomplete(), incomplete, "policy {policy:?}");
         let events = lines(&dir.path().join("events.jsonl"));
-        assert_eq!(events[0]["event"], "phase_start");
-        assert_eq!(events[1]["event"], "phase_end");
+        assert_eq!(events[0]["event"], "phase_start", "policy {policy:?}");
+        assert_eq!(events[0]["fields"]["current"], 1, "policy {policy:?}");
+        assert_eq!(events[0]["fields"]["total"], 2, "policy {policy:?}");
+        assert_eq!(
+            events[1]["fields"]["return_code"],
+            if halt || incomplete { 1 } else { 0 },
+            "policy {policy:?}"
+        );
+        assert_eq!(events[1]["event"], "phase_end", "policy {policy:?}");
         for key in [
             "event",
             "fields",
@@ -498,7 +542,10 @@ async fn phase_preserves_body_status_applies_policies_and_skips_disabled() {
             "timestamp",
             "worker_index",
         ] {
-            assert!(events[0].get(key).is_some());
+            assert!(
+                events[0].get(key).is_some(),
+                "policy {policy:?}, missing {key}"
+            );
         }
     }
     let dir = Temp::new();
@@ -583,16 +630,28 @@ async fn shared_counter_caps_two_repair_loops_and_survives_restart() {
     let mut ctx = SystemContext::new();
     ctx.insert_resource(counters);
     let repaired = Arc::new(AtomicU64::new(0));
+    let checks = Arc::new(std::sync::Mutex::new([0; 2]));
+    let repairs = Arc::new(std::sync::Mutex::new([0; 2]));
     let mut graph = Graph::new();
     for index in 0..2 {
         let mut check = Graph::new();
-        check.add_system(|| async { Verdict::Fail("again".into()) });
+        let checked = checks.clone();
+        check.add_system(move || {
+            let checked = checked.clone();
+            async move {
+                checked.lock().unwrap()[index] += 1;
+                Verdict::Fail("again".into())
+            }
+        });
         let count = repaired.clone();
+        let per_loop = repairs.clone();
         let mut repair = Graph::new();
         repair.add_system(move || {
             let count = count.clone();
+            let per_loop = per_loop.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
+                per_loop.lock().unwrap()[index] += 1;
             }
         });
         graph
@@ -606,6 +665,8 @@ async fn shared_counter_caps_two_repair_loops_and_survives_restart() {
     }
     execute(&graph, &mut ctx).await;
     assert_eq!(repaired.load(Ordering::SeqCst), 2);
+    assert_eq!(*checks.lock().unwrap(), [3, 1]);
+    assert_eq!(*repairs.lock().unwrap(), [2, 0]);
     assert_eq!(
         RepairCounters::open(dir.path(), BTreeMap::from([("shared".into(), 2)]))
             .unwrap()
@@ -682,6 +743,7 @@ async fn worklist_records_failed_item_then_continues_and_restores() {
     execute(&worklist("queue", body), &mut ctx).await;
     let loaded = Worklist::open(&dir.path().join("list.json"), vec![]).unwrap();
     assert!(loaded.take().is_none());
+    assert_eq!(loaded.items()[1].note, "fixture rejected");
     assert_eq!(
         loaded.items().iter().map(|i| i.status).collect::<Vec<_>>(),
         vec![
@@ -702,7 +764,7 @@ fn strict_prompt_renderer_names_missing_and_unused_variables() {
         render("worker", "{{MISSING}}", &vars, &BTreeMap::new())
             .unwrap_err()
             .to_string()
-            .contains("worker")
+            .contains("role worker: missing placeholder MISSING")
     );
     assert!(
         render("worker", "plain", &vars, &BTreeMap::new())
@@ -793,6 +855,11 @@ async fn fallible_lane_is_acknowledged_and_its_sibling_drains_remaining_leases()
         .await
         .unwrap();
     assert_eq!(finished.load(Ordering::SeqCst), 3);
+    let verdict = (*ctx.get_output::<Verdict>().unwrap()).clone();
+    assert!(
+        matches!(&verdict, Verdict::Fail(note) if note.contains("lane failed")),
+        "{verdict:?}"
+    );
     let book = ctx.get_resource::<LeaseBook>().unwrap();
     assert_eq!(book.allocated(), 4);
     assert!(book.take(0).unwrap().is_none());
@@ -816,10 +883,15 @@ async fn fallible_work_item_is_recorded_before_the_next_item() {
     let mut ctx = SystemContext::new();
     ctx.insert_resource(list.clone());
     let mut body = Graph::new();
-    body.add_system(bind::<Out<CurrentItem>, Verdict, _>(
+    body.add_system(bind::<(Out<CurrentItem>, Res<Worklist>), Verdict, _>(
         "fallible.item",
-        |item, _| {
+        |(item, list), _| {
             Box::pin(async move {
+                if item.item().unwrap().value == 2 {
+                    let previous = &list.items()[1];
+                    assert_eq!(previous.status, WorkItemStatus::Failed);
+                    assert!(previous.note.contains("rejected"), "{}", previous.note);
+                }
                 if item.item().unwrap().value == 1 {
                     return Err(SystemError::ExecutionError("rejected".into()));
                 }
@@ -912,7 +984,7 @@ async fn phase_deadline_bounds_the_next_role_timeout_and_maps_its_status() {
     let runner = Arc::new(
         ScriptedRunner::new(
             scenario(ScriptEntry {
-                delay_ms: 200,
+                delay_ms: 30_000,
                 ..ScriptEntry::default()
             }),
             &dir.path().join("calls"),
@@ -924,7 +996,7 @@ async fn phase_deadline_bounds_the_next_role_timeout_and_maps_its_status() {
         PhaseControl::open(
             dir.path(),
             vec!["alpha".into()],
-            BTreeMap::from([("alpha".into(), Duration::from_millis(20))]),
+            BTreeMap::from([("alpha".into(), Duration::from_secs(2))]),
         )
         .unwrap(),
     );
@@ -934,16 +1006,22 @@ async fn phase_deadline_bounds_the_next_role_timeout_and_maps_its_status() {
         agent_graph(call("alpha/deadline")),
     );
     execute(&graph, &mut ctx).await;
+    let ledger = lines(&dir.path().join("metrics/cost_events.jsonl"));
     assert_eq!(
-        lines(&dir.path().join("metrics/cost_events.jsonl"))[0]["status"],
+        ledger.first().expect("deadline call should settle")["status"],
         "timeout"
     );
     assert_eq!(
         ctx.get_resource::<PhaseControl>().unwrap().status("alpha"),
         Some(PhaseStatus::Degraded("phase deadline".into()))
     );
-    let request = &lines(&dir.path().join("calls/calls.jsonl"))[0];
-    assert!(request["limits"]["timeout"]["nanos"].as_u64().unwrap() <= 20_000_000);
+    let calls = lines(&dir.path().join("calls/calls.jsonl"));
+    let request = calls.first().expect("deadline call should reach runner");
+    let timeout: Duration = serde_json::from_value(request["limits"]["timeout"].clone()).unwrap();
+    assert!(
+        timeout > Duration::ZERO && timeout <= Duration::from_secs(2),
+        "timeout {timeout:?}"
+    );
 }
 
 #[tokio::test]
