@@ -7,6 +7,7 @@
 use polaris::shell::{ShellConfig, ShellPermission};
 
 /// Return the checked shell commands, excluding here-document data.
+/// `None` means refused; `Some` holds the parsed commands that all match the allow list.
 ///
 /// Every returned part must match an allow pattern using the framework's byte
 /// wildcard dialect (`*` and `?`). Newlines in quoted arguments are preserved.
@@ -16,8 +17,14 @@ use polaris::shell::{ShellConfig, ShellPermission};
 /// including inside quoted arguments, delimiters, and here-document data.
 /// Command words must be literal, leading assignments/redirections, shell
 /// control forms, substitutions, and line continuations are refused.
+/// Commands exceeding [`ShellConfig::max_command_length`]'s default byte limit
+/// are refused before parsing.
 #[must_use]
 pub fn checked_commands(command: &str, patterns: &[String]) -> Option<Vec<String>> {
+    // Bound parsing and pattern matching by the executor's default byte limit.
+    if command.len() > ShellConfig::default().max_command_length {
+        return None;
+    }
     let parts = decompose(command)?;
     (!parts.is_empty()
         && parts
@@ -304,6 +311,63 @@ mod tests {
         ] {
             assert!(check(command), "{command}");
         }
+    }
+
+    #[test]
+    fn chains_pipes_and_quoted_newlines_return_exact_command_parts() {
+        let patterns = vec![
+            "cd *".into(),
+            "python3 *".into(),
+            "cat *".into(),
+            "head *".into(),
+        ];
+        for (command, expected) in [
+            (
+                "cd x && python3 run.py | head -20",
+                vec!["cd x", "python3 run.py", "head -20"],
+            ),
+            (
+                "cat a; cat b || cat c & cat d",
+                vec!["cat a", "cat b", "cat c", "cat d"],
+            ),
+            ("cat a 2>&1 | head -10", vec!["cat a 2>&1", "head -10"]),
+            (
+                "python3 -c \"import json\nprint('hello')\"",
+                vec!["python3 -c \"import json\nprint('hello')\""],
+            ),
+            (
+                "python3 -c 'print(1)\nprint(2)'\ncat output.txt",
+                vec!["python3 -c 'print(1)\nprint(2)'", "cat output.txt"],
+            ),
+        ] {
+            assert_eq!(
+                checked_commands(command, &patterns),
+                Some(expected.into_iter().map(str::to_owned).collect()),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_commands_above_the_executor_default_byte_limit() {
+        let limit = ShellConfig::default().max_command_length;
+        let patterns = vec!["cat *".into()];
+        let command = format!("cat {}", "x".repeat(limit - 4));
+        assert_eq!(
+            checked_commands(&command, &patterns),
+            Some(vec![command.clone()]),
+            "the byte limit is inclusive"
+        );
+        assert!(
+            checked_commands(&format!("{command}x"), &patterns).is_none(),
+            "one byte over the limit is refused"
+        );
+        let multibyte = format!("cat {}", "é".repeat((limit - 4) / 2 + 1));
+        assert!(multibyte.chars().count() < limit);
+        assert!(
+            checked_commands(&multibyte, &patterns).is_none(),
+            "the limit counts bytes, not characters"
+        );
     }
     #[test]
     fn refuses_opaque_or_unlisted_commands() {
