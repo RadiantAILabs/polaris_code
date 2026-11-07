@@ -28,7 +28,7 @@ TRAJECTORY = "trajectory.json"
 
 
 def release_install_command(version: str) -> str:
-    """Download the Linux release for the sandbox CPU and verify its checksum."""
+    """Download the Linux x86-64 release and verify its checksum."""
     version = version.removeprefix("v")
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("version must pin a release, for example 0.3.0 or v0.3.0")
@@ -36,8 +36,7 @@ def release_install_command(version: str) -> str:
 [ "$(uname -s)" = Linux ] || {{ echo 'Polaris release installation requires Linux' >&2; exit 1; }}
 case "$(uname -m)" in
   x86_64|amd64) target=x86_64-unknown-linux-gnu ;;
-  aarch64|arm64) target=aarch64-unknown-linux-gnu ;;
-  *) echo 'Unsupported Polaris release architecture' >&2; exit 1 ;;
+  *) echo 'Unsupported CPU: Polaris release installation supports x86_64-unknown-linux-gnu only' >&2; exit 1 ;;
 esac
 archive="polaris-code-{version}-$target.tar.gz"
 release_tmp=$(mktemp -d)
@@ -117,6 +116,14 @@ class PolarisCode(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._context_window = _positive_int("context_window", context_window)
         self._max_output_tokens = _positive_int("max_output_tokens", max_output_tokens)
+        if (
+            self._context_window is not None
+            and self._max_output_tokens is not None
+            and self._context_window <= self._max_output_tokens + 1
+        ):
+            raise ValueError(
+                "context_window must exceed max_output_tokens by at least two tokens"
+            )
         self._unattended = parse_bool_env_value(unattended, name="unattended")
         super().__init__(logs_dir, *args, version=version, **kwargs)
 

@@ -113,7 +113,7 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(PolarisCode(self.logs, version="v0.3.0").version(), "0.3.0")
         self.assertTrue(self._agent().version().startswith("sha256:"))
 
-    async def test_release_setup_downloads_checksums_for_both_linux_architectures(
+    async def test_release_setup_downloads_checksums_for_linux_x86_64(
         self,
     ) -> None:
         from unittest.mock import AsyncMock
@@ -128,7 +128,7 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
         )
         install = str(environment.execs[-1]["command"])
         self.assertIn("x86_64-unknown-linux-gnu", install)
-        self.assertIn("aarch64-unknown-linux-gnu", install)
+        self.assertIn("supports x86_64-unknown-linux-gnu only", install)
         self.assertIn("releases/download/v0.3.0/", install)
         self.assertIn('sha256sum -c "$archive.sha256"', install)
         self.assertLess(install.index("sha256sum -c"), install.index("tar -xzf"))
@@ -234,7 +234,9 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.n_input_tokens, 7)
             self.assertIsNone(context.cost_usd)
 
-    def test_release_script_installs_each_cpu_and_refuses_bad_checksums(self) -> None:
+    def test_release_script_installs_x86_64_and_refuses_other_cpus_or_bad_checksums(
+        self,
+    ) -> None:
         import hashlib
         import io
         import os
@@ -256,7 +258,7 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
             tool.chmod(0o755)
         for arch, target, valid in (
             ("x86_64", "x86_64", True),
-            ("aarch64", "aarch64", True),
+            ("aarch64", "aarch64", False),
             ("x86_64", "x86_64", False),
         ):
             with self.subTest(arch=arch, checksum=valid):
@@ -294,5 +296,55 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
                 self.assertEqual(installed.exists(), valid)
+                if arch == "aarch64":
+                    self.assertIn(
+                        "supports x86_64-unknown-linux-gnu only", result.stderr
+                    )
                 if valid:
                     self.assertEqual(installed.read_bytes(), binary)
+
+    async def test_nonzero_process_exit_is_not_hidden_by_log_redirection(self) -> None:
+        from harbor.agents.installed.base import NonZeroAgentExitCodeError
+
+        class FailedEnvironment(RecordingEnvironment):
+            async def exec(self, **kwargs: object) -> SimpleNamespace:
+                self.execs.append(kwargs)
+                return SimpleNamespace(return_code=42, stdout="", stderr="")
+
+        environment = FailedEnvironment()
+        with self.assertRaises(NonZeroAgentExitCodeError):
+            await self._agent().run("task", environment, AgentContext())  # type: ignore[arg-type]
+
+    async def test_native_model_credentials_are_not_resolved_from_the_host(
+        self,
+    ) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(
+            "os.environ",
+            {
+                "HF_TOKEN": "worker-write-fixture",
+                "HUGGINGFACE_API_KEY": "worker-write-fixture",
+            },
+        ):
+            agent = PolarisCode(
+                self.logs,
+                binary=self.binary,
+                model_name="openai-chat/org/model:provider",
+                provider="openai-chat",
+                extra_env={"OPENAI_API_KEY": "inference-fixture"},
+            )
+            self.assertEqual(agent.model_connection.env, {})
+            environment = RecordingEnvironment()
+            await agent.run("task", environment, AgentContext())  # type: ignore[arg-type]
+        self.assertNotIn("worker-write-fixture", str(environment.execs))
+        self.assertNotIn("inference-fixture", str(environment.execs))
+
+    def test_context_window_leaves_room_for_input(self) -> None:
+        for output in (99, 100, 101):
+            with (
+                self.subTest(output=output),
+                self.assertRaisesRegex(ValueError, "context_window must exceed"),
+            ):
+                self._agent(context_window=100, max_output_tokens=output)
+        self._agent(context_window=100, max_output_tokens=98)

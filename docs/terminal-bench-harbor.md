@@ -14,22 +14,20 @@ Pass exactly one of these Harbor agent keywords:
 
 - `version=MAJOR.MINOR.PATCH`: install a pinned release from
   `https://github.com/RadiantAILabs/polaris_code/releases/download/vMAJOR.MINOR.PATCH/`.
-  The adapter selects `polaris-code-<version>-x86_64-unknown-linux-gnu.tar.gz`
-  or `polaris-code-<version>-aarch64-unknown-linux-gnu.tar.gz` using the
-  **sandbox's** CPU, verifies the accompanying `.tar.gz.sha256`, then extracts
+  The adapter accepts the **sandbox's** Linux x86-64 CPU and downloads
+  `polaris-code-<version>-x86_64-unknown-linux-gnu.tar.gz`, verifies the
+  accompanying `.tar.gz.sha256`, then extracts
   the `polaris` executable. Setup requires curl, tar, and sha256sum.
 - `binary=/absolute/path/to/polaris`: upload a local executable built with
   `scripts/build-portable-binary.sh`. Only this artifact is copied; its SHA-256
   becomes the recorded agent version. This is useful for development and
   musl-based task images.
 
-Release installation requires a Linux glibc task image and published archives
-for its CPU. Check the chosen release's assets before launching: the current
-release matrix documents Linux x86-64 only
-([publishing.md](publishing.md#ci-and-binary-releases)). Linux arm64 URLs are
-supported by the adapter but need a corresponding published archive. A release
-must also contain the CLI flags below; older executables cannot run this
-adapter's trajectory export.
+Release installation supports Linux x86-64 glibc task images, matching the
+[published target](publishing.md#ci-and-binary-releases). Other CPU types fail
+with a message naming `x86_64-unknown-linux-gnu`; use a compatible local binary
+for development on other architectures. A release must contain the CLI flags
+below; older executables cannot run this adapter's trajectory export.
 
 ## Model and permissions
 
@@ -49,7 +47,7 @@ The adapter accepts these agent keywords in addition to `version` or `binary`:
 | `base_url` | Optional endpoint override, supplied as `OPENAI_BASE_URL`. |
 | `reasoning_effort` | Native `--reasoning-effort`; name it explicitly for comparable evaluations. |
 | `context_window` | Positive context-window override for an unfamiliar model. |
-| `max_output_tokens` | Positive model reply limit. |
+| `max_output_tokens` | Positive per-request ceiling; must be at least two tokens below `context_window`. |
 | `unattended` | Explicit opt-in to `--dangerously-skip-permissions` inside a disposable environment; default `false`. |
 | `allow_command` | Explicit shell-policy pattern or sequence of patterns when unattended mode is off. |
 | `graph_search` | `curated`, `freeform`, or `both` (default). |
@@ -74,6 +72,12 @@ agents:
 ```
 
 For a released build, replace `binary` with `version` pinned to that release.
+Polaris sends a fixed output ceiling on each request. For a strict route that
+rejects input plus output allowance beyond the window, cap the output at
+`min(model output limit, context_window // 4)`. Use that cap also when the
+advertised output limit equals the entire context window, which leaves no
+input room. The history budget is `floor(0.8 * (context_window - output cap))`;
+cheap elision starts at half that budget and summarization at three quarters.
 The key is never placed in an argument, generated configuration, or release
 URL. Harbor scopes the environment to the agent. The adapter does not read a
 host credential file or resolve keys from the model's provider prefix.
@@ -105,8 +109,8 @@ destination must be fresh; the executable refuses to overwrite existing files.
 ## Adapter tests
 
 The tests require Harbor but do not require a container, inference credentials,
-or a model. They exercise both CPU archive paths with local release fixtures,
-checksum rejection, CLI options, quoting, permissions, and native ATIF usage.
+or a model. They exercise the x86-64 archive path with a local release fixture,
+unsupported-CPU and checksum rejection, CLI options, quoting, permissions, and native ATIF usage.
 
 ```bash
 uv venv /tmp/polaris-harbor
