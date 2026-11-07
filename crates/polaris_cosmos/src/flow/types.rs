@@ -168,7 +168,8 @@ pub struct AgentLimits {
     /// Most the call may cost, in micro-dollars. This is the amount reserved in
     /// the [`SpendBook`](super::SpendBook) for the call.
     pub max_micros: Micros,
-    /// Wall-clock limit for the whole call.
+    /// Wall-clock limit for the whole call. It is the role's timeout, cut down
+    /// to the time left in the phase when the phase has a deadline.
     pub timeout: Duration,
     /// The most tokens one model reply of the call may hold. `None` leaves
     /// the runner's own setting in force.

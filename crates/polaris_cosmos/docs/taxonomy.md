@@ -15,6 +15,7 @@ philosophy these layers serve, see the shared [philosophy](./philosophy.md).
 | Systems, graphs, signatures, execution, resources, hooks, and lifecycle | `polaris` |
 | Domain-neutral topology identities, contract/catalog types, discovery, and selection policy | `polaris_cosmos` |
 | Domain-neutral reasoning models, memory, learning, credit, and adaptation policy | `polaris_cosmos` |
+| Domain-neutral durable workflow blocks: bounded agent calls, phases, loops, spend, step journal, and resume | `polaris_cosmos` (`flow`) |
 | Embodiment-specific contracts, concrete topology registrations, domain actions, observations, tools, verifiers, and environment integration | Embodiments such as `polaris_code` |
 
 The boundary follows a portability test: if logic remains meaningful when
@@ -200,6 +201,32 @@ the embodiment and provider/model-family bucket from `RunOpened`. They are
 selection evidence, not agent memory `W`; a later consolidation policy may
 choose to project them into `W` once that separate contract exists.
 
+## Durable agent workflows
+
+The `flow` module supplies reusable blocks for a bounded, resumable agent
+workflow: a role-call subgraph (`agent`), phases, check-and-repair loops, lease
+and work-item loops, memoized steps, and the durable resources they share. Those
+resources hold money (`SpendBook`), step output (`StepJournal`), counters,
+leases, a worklist, events and phase state. Like the topology catalog, it is a
+construction substrate over values of `G`. It is not agent memory `W`, and it
+holds no cognitive hypothesis: it fixes what a call, a phase and a spend ceiling
+mean, not how an agent should reason.
+
+| Concept | Meaning | Lifetime and owner |
+|---|---|---|
+| **Block** | A graph builder such as `agent` or `repair_loop`; an ordinary function returning a `Graph`, not an `API` | Cosmos Layer 1 substrate; holds no state of its own |
+| **Flow resource** | A durable global such as `SpendBook` or `StepJournal` | Opened by the host's Layer 3 wiring; its files live under one run root and a resumed run restores them |
+| **`TaskRunner`** | The executor of one isolated role call, wrapped by `AgentRunner` | A replaceable point on the call-execution axis; the embodiment supplies the live one, and `ScriptedRunner` is the offline point |
+| **`FlowPlugin`** | Registers the resources a host built and settles spend left in flight by an earlier run | Layer 3 lifecycle surface |
+
+The embodiment test applies. Calls, spend, journaling, phases, loops, and events
+stay meaningful whether the task edits code or moves a robot, so they live in
+Cosmos. The model session, its tools, and the prompt assets belong to the
+embodiment, which supplies them through `TaskRunner`, `RoleBook`, and
+`FlowSettings`. `ToolGrant`, `Role::shell`, and `Role::skills` still use
+coding-agent vocabulary. By the same test they belong to the embodiment, and a
+later change should move them out of the module.
+
 ## Cognitive and world-model axes
 
 The broader design remains an open basis of independently settable axes:
@@ -217,6 +244,7 @@ The broader design remains an open basis of independently settable axes:
 | Consolidate | Observation and feedback write policy | Cosmos |
 | Rewire | Memory-and-feedback-to-schema proposal | Cosmos |
 | Gate | Accept, reject, defer, or veto an update | Cosmos model/policy |
+| Call execution | Offline scripted session through live model sessions | Cosmos `flow` block over a host `TaskRunner` |
 | Trigger and termination | Event, cadence, budget, or learned stopping | Cosmos model/policy |
 | Credit | Join actions to delayed outcomes | Cosmos |
 | Verification | Domain-neutral role and protocol | Cosmos contract; embodiment signal |
@@ -263,3 +291,4 @@ contract claims come from the Layer 3 embodiment.
 | Does it choose among registered topologies? | Layer 2 selector graph or policy; do not hide cognition in a catalog method |
 | Does it fill generic model ports with task-specific systems and payloads? | Embodiment; contribute the resulting concrete registration at Layer 3 |
 | Does it package a selected model for a long-lived host? | Layer 3 plugin or adapter |
+| Does it run, budget, journal, or resume a bounded agent call without naming a domain? | Cosmos `flow`; the live runner, tools, and prompts stay in the embodiment |
