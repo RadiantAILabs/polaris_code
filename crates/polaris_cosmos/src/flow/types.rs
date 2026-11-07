@@ -141,31 +141,35 @@ pub trait TaskRunner: Send + Sync {
     async fn run(&self, req: AgentRequest) -> Result<AgentReport, AgentFailure>;
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Workflow value: `AgentRequest`.
+/// One role call handed to a [`TaskRunner`]: the prompts, the workspace, the
+/// limits and the tool grants it runs with.
 pub struct AgentRequest {
-    /// Step.
+    /// Durable step the call belongs to.
     pub step: StepKey,
-    /// Role.
+    /// Name of the role, a key of the [`RoleBook`].
     pub role: String,
-    /// Workspace.
+    /// Directory the call works in. It holds the `inputs/` the call may read and
+    /// the `outputs/` it writes.
     pub workspace: PathBuf,
-    /// System prompt.
+    /// Rendered system prompt.
     pub system_prompt: String,
-    /// Turn prompt.
+    /// Rendered prompt of the first turn.
     pub turn_prompt: String,
-    /// Limits.
+    /// Ceilings the runner must keep the call within.
     pub limits: AgentLimits,
-    /// Grants.
+    /// Tools the call may use.
     pub grants: ToolGrant,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Workflow value: `AgentLimits`.
+/// Ceilings a runner keeps one call within.
 pub struct AgentLimits {
-    /// Max turns.
+    /// Most model turns the call may take.
     pub max_turns: u32,
-    /// Max micros.
+    /// Most the call may cost, in micro-dollars. This is the amount reserved in
+    /// the [`SpendBook`](super::SpendBook) for the call.
     pub max_micros: Micros,
-    /// Timeout.
+    /// Wall-clock limit for the whole call. It is the role's timeout, cut down
+    /// to the time left in the phase when the phase has a deadline.
     pub timeout: Duration,
     /// The most tokens one model reply of the call may hold. `None` leaves
     /// the runner's own setting in force.
@@ -173,41 +177,41 @@ pub struct AgentLimits {
     pub max_output_tokens: Option<u32>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-/// Workflow value: `ToolGrant`.
+/// The tools a call may use.
 pub struct ToolGrant {
-    /// Edit.
+    /// Whether the call may edit files.
     pub edit: bool,
-    /// Commands.
+    /// Shell commands the call may run.
     pub commands: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-/// Workflow value: `AgentReport`.
+/// What a runner measured for a call that ran to a stop.
 pub struct AgentReport {
-    /// Stop.
+    /// Why the call stopped.
     pub stop: StopCause,
-    /// Usage.
+    /// Measured usage and cost.
     pub usage: Usage,
-    /// Final text.
+    /// The model's last reply.
     pub final_text: String,
-    /// Transcript.
+    /// Path of the saved transcript, when the runner kept one.
     pub transcript: Option<PathBuf>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-/// Workflow value: `StopCause`.
+/// Why a call that reached the model stopped.
 pub enum StopCause {
-    /// Finished outcome.
+    /// The model finished on its own.
     Finished,
-    /// `TurnCap` outcome.
+    /// The call reached its turn limit.
     TurnCap,
-    /// `CostCap` outcome.
+    /// The call reached its cost ceiling.
     CostCap,
-    /// Timeout outcome.
+    /// The call reached its wall-clock limit.
     Timeout,
-    /// Interrupted outcome.
+    /// A user interruption ended the call.
     Interrupted,
-    /// `ModelError` outcome.
+    /// The model service failed; carries the error text.
     ModelError(String),
 }
 impl StopCause {
@@ -225,24 +229,25 @@ impl StopCause {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-/// Workflow value: `Usage`.
+/// Tokens, requests and cost measured for one call.
 pub struct Usage {
     /// Name of the service that served the model. When empty, the ledger
     /// falls back to the provider in its settings.
     pub provider: String,
-    /// Model id.
+    /// Identifier of the model that served the call.
     pub model_id: String,
-    /// Input.
+    /// Input tokens.
     pub input: u64,
-    /// Output.
+    /// Output tokens.
     pub output: u64,
-    /// Cache read.
+    /// Input tokens read from the prompt cache.
     pub cache_read: u64,
-    /// Cache write.
+    /// Input tokens written to the prompt cache.
     pub cache_write: u64,
-    /// Requests.
+    /// Number of model requests the call made.
     pub requests: u32,
-    /// Micros.
+    /// Cost of the call in micro-dollars, millionths of a dollar. The
+    /// [`SpendBook`](super::SpendBook) settles this amount.
     pub micros: Micros,
 }
 /// Why a role call failed. Only [`Setup`](Self::Setup) failures happen before
@@ -268,32 +273,38 @@ impl std::fmt::Display for AgentFailure {
 }
 impl std::error::Error for AgentFailure {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Workflow value: `AgentCall`.
+/// One role call a graph asks the [`agent`](fn@super::agent) block to make.
 pub struct AgentCall {
-    /// Step.
+    /// Durable step the call is recorded under.
     pub step: StepKey,
-    /// Role.
+    /// Name of the role, a key of the [`RoleBook`].
     pub role: String,
-    /// Phase.
+    /// Phase the call is checked against and charged to.
     pub phase: String,
-    /// Stage.
+    /// What to put in the call's workspace before it runs.
     pub stage: StageSpec,
-    /// Expect.
+    /// Paths, relative to the call's workspace, of the files the call should
+    /// write. Each one that exists afterwards is hashed and returned in
+    /// [`AgentOutcome::Ran`]; one that is missing is left out.
     pub expect: Vec<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-/// Workflow value: `StageSpec`.
+/// What a call's workspace holds before the call runs.
 pub struct StageSpec {
-    /// Copy in.
+    /// Files or directories to copy in, as pairs of source path and name under
+    /// the workspace's `inputs/`. A source must lie inside the run root, the task
+    /// directory or the asset root.
     pub copy_in: Vec<(PathBuf, String)>,
-    /// Vars.
+    /// Values for the `{{name}}` placeholders of the prompts. A variable that no
+    /// prompt uses is an error.
     pub vars: BTreeMap<String, String>,
-    /// Turn prompt.
+    /// Prompt of the first turn. When absent, a default asks the model to do the
+    /// task in its instructions and write results to `outputs/`.
     pub turn_prompt: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-/// Workflow value: `AgentOutcome`.
+/// How one role call ended.
 pub enum AgentOutcome {
     /// A completed invocation, including bounded stop outcomes.
     Ran {
@@ -302,47 +313,70 @@ pub enum AgentOutcome {
         /// Expected ordinary files collected after settlement.
         outputs: Vec<OutputFile>,
     },
-    /// Failed outcome.
+    /// The call failed; carries the failure.
     Failed(AgentFailure),
-    /// Skipped outcome.
+    /// The call was not made; carries the reason.
     Skipped(SkipReason),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-/// Workflow value: `OutputFile`.
+/// An expected output file a call left behind.
 pub struct OutputFile {
-    /// Path.
+    /// Path relative to the call's workspace, as listed in
+    /// [`AgentCall::expect`].
     pub path: String,
-    /// Sha256.
+    /// Hex SHA-256 digest of the file contents.
     pub sha256: String,
-    /// Bytes.
+    /// Size of the file in bytes.
     pub bytes: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-/// Workflow value: `SkipReason`.
+/// Why a call was not made.
 pub enum SkipReason {
-    /// Budget outcome.
+    /// The phase allowance could not cover the minimum grant, or the
+    /// [`CallDeadline`](super::CallDeadline) has passed.
     Budget,
-    /// Disabled outcome.
+    /// The phase is halted or past its deadline.
     Disabled,
-    /// `NotApplicable` outcome.
+    /// The call does not apply to this run. No block in this module produces
+    /// it; a host's own systems may.
     NotApplicable,
 }
-/// Cooperative stop request shared by every call in a workflow.
+/// Cooperative stop request; use `Res<StopFlag>` when a system or runner should
+/// end its work early once a stop has been asked for, or wake the moment one is.
 ///
-/// Workflow value: `StopFlag`.
+/// No block in this module reads the flag. The host raises it, for example on an
+/// interrupt signal, and a [`TaskRunner`] or the host's own systems watch it.
 ///
 /// # Scope
-/// Global because the same stop request is observed by every call.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Every call in the workflow observes the same stop request.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host creates it with `StopFlag::default()` and
+/// registers it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). It hands a
+/// clone to the runner that must observe it, as
+/// [`ScriptedRunner::with_stop`](super::ScriptedRunner::with_stop) does.
+///
 /// # Access
-/// Systems read `Res<StopFlag>`; mutable books serialize updates internally.
+///
+/// `Res<StopFlag>` only. The value is not immutable: `request` raises the flag
+/// through a shared reference. A clone shares one `Arc` that holds an atomic
+/// flag and a `tokio::sync::Notify`, so every clone sees the request and every
+/// waiter wakes. There is no lock, and a raised flag cannot be lowered.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`PhaseControl`](super::PhaseControl) records an interruption that the graph
+/// blocks honor: [`agent`](fn@super::agent) starts no new call once a phase is
+/// halted. This flag only tells running code to stop.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::StopFlag;
@@ -382,69 +416,96 @@ impl StopFlag {
 impl GlobalResource for StopFlag {}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-/// Workflow value: `PhaseStatus`.
+/// How a phase ended.
 pub enum PhaseStatus {
-    /// Completed outcome.
+    /// The phase finished without a failure.
     Completed,
-    /// Degraded outcome.
+    /// The phase failed, but its policy let the workflow go on; carries the
+    /// failure note.
     Degraded(String),
-    /// Failed outcome.
+    /// The phase failed; carries the failure note.
     Failed(String),
-    /// Skipped outcome.
+    /// The phase did not run; carries the reason.
     Skipped(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-/// Workflow value: `PhasePolicy`.
+/// What a phase failure means for the rest of the workflow.
 pub enum PhasePolicy {
-    /// Fatal outcome.
+    /// A failure halts the workflow: no later phase starts.
     Fatal,
-    /// Degrade outcome.
+    /// A failure is recorded as `Degraded` and the workflow goes on.
     Degrade,
-    /// Incomplete outcome.
+    /// A failure is recorded as `Failed`, the workflow goes on, and the run is
+    /// marked incomplete.
     Incomplete,
 }
 /// A role's immutable prompt and execution policy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// Workflow value: `Role`.
 pub struct Role {
-    /// Prompt.
+    /// Prompt file of the role, relative to the `prompts` folder of the asset
+    /// root and without its `.md` extension.
     pub prompt: String,
-    /// Node.
+    /// Name of the execution node the role runs on. The flow blocks never read
+    /// it; it is there for a host's runner to interpret.
     pub node: String,
-    /// Max turns.
+    /// Most model turns one call of this role may take.
     pub max_turns: u32,
-    /// The most one call of this role may spend. It reads from a number or a
-    /// string.
+    /// The most one call of this role may spend, in dollars. It reads from a
+    /// number or a string, and [`max_micros`](Self::max_micros) gives the exact
+    /// micro-dollar amount.
     pub max_usd: UsdAmount,
-    /// Timeout seconds.
+    /// Wall-clock limit of one call of this role, in seconds.
     pub timeout_seconds: u64,
     /// The most tokens one model reply of this role may hold. A role that
     /// writes long files in one reply sets it above the runner's default;
     /// when absent, the runner's own setting applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// Shell.
+    /// Shell commands a call of this role may run.
     pub shell: Vec<String>,
-    /// Read only.
+    /// Whether a call of this role may not edit files.
     pub read_only: bool,
-    /// Skills.
+    /// Skill paths, relative to the `prompts` folder of the asset root. Each is
+    /// copied into the call's workspace under `skills/`, by its file name.
     pub skills: Vec<String>,
 }
-/// Resolved roles shared by all workflow branches.
-///
-/// Workflow value: `RoleBook`.
+/// Resolved role policies; use `Res<RoleBook>` when a system needs a role's
+/// prompt, limits, spend ceiling or tool grants by name.
 ///
 /// # Scope
-/// Global because all role calls use the same resolved policies.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Every role call in the workflow uses the same resolved policies.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`RoleBook::load`], which merges a
+/// directory of TOML role fragments, or fills the public `roles` map itself, and
+/// registers it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`agent`](fn@super::agent) block reads it.
+///
 /// # Access
-/// Systems read `Res<RoleBook>`; mutable books serialize updates internally.
+///
+/// `Res<RoleBook>` only. The value is immutable: it is a plain map of roles with
+/// no interior mutability, and nothing changes it after the host registers it.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`FlowSettings`](super::FlowSettings) holds the settings that are the same
+/// for every role, such as the asset root. Use an ordinary local resource when
+/// one branch needs a different role set.
+///
+/// # Serialization
+///
+/// Each TOML fragment read by [`load`](Self::load) holds one `[roles.<name>]`
+/// table per role. [`write`](Self::write) saves the merged book to one TOML file
+/// in the same shape, so a later `load` of a directory holding that file gives
+/// the same roles. The run root does not keep a copy of it.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::RoleBook;
@@ -453,7 +514,7 @@ pub struct Role {
 /// ```
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoleBook {
-    /// Roles.
+    /// Roles by name.
     pub roles: BTreeMap<String, Role>,
 }
 impl GlobalResource for RoleBook {}
@@ -469,19 +530,34 @@ pub enum RunMode {
     /// Steps that were skipped, failed or interrupted run again.
     Resume,
 }
-/// Identity and paths of the current durable workflow.
-///
-/// Workflow value: `RunHandle`.
+/// Identity and root of the current run; use `Res<RunHandle>` when a system
+/// needs the run id, the run root that holds the durable files, or whether the
+/// run resumes an earlier one.
 ///
 /// # Scope
-/// Global because every branch writes inside the same durable run.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Every branch writes inside the same durable run.
+///
+/// # Provided by
+///
+/// Consumer-supplied. It has no constructor: the host fills in the public fields
+/// with a struct literal and registers the value as a global, directly or
+/// through [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`agent`](fn@super::agent) block reads it.
+///
 /// # Access
-/// Systems read `Res<RunHandle>`; mutable books serialize updates internally.
+///
+/// `Res<RunHandle>` only. The value is immutable: it is plain data with no
+/// interior mutability, and nothing changes it after the host registers it.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`FlowSettings`](super::FlowSettings) holds what stays the same across runs,
+/// while this holds what belongs to one run. Use an ordinary local resource for
+/// state that only one branch needs.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::RunHandle;
@@ -490,27 +566,55 @@ pub enum RunMode {
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunHandle {
-    /// Run id.
+    /// Identifier of the run.
     pub run_id: String,
-    /// Root.
+    /// Run root: the directory that holds every durable file of the run.
     pub root: PathBuf,
-    /// Whether this run is new or resumes an earlier one.
+    /// Whether this run starts over or resumes an earlier one. An
+    /// [`agent`](fn@super::agent) call restores a step the journal records as
+    /// done only in a resumed run.
     pub mode: RunMode,
 }
 impl GlobalResource for RunHandle {}
-/// Injected executor shared by graph systems.
+/// The executor that runs one role call; use `Res<AgentRunner>` when a system
+/// must start an isolated agent session for a call.
 ///
-/// Workflow value: `AgentRunner`.
+/// The [`agent`](fn@super::agent) block calls it once per call. It wraps any
+/// [`TaskRunner`], so the same graph runs against a real model session or an
+/// offline script.
 ///
 /// # Scope
-/// Global because concurrent graph branches share one replaceable executor.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Concurrent graph branches share one replaceable executor.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host wraps its own `Arc<dyn TaskRunner>` with
+/// [`AgentRunner::new`] and registers the value as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource).
+///
 /// # Access
-/// Systems read `Res<AgentRunner>`; mutable books serialize updates internally.
+///
+/// `Res<AgentRunner>` only. The wrapper is immutable and holds a shared
+/// `Arc<dyn TaskRunner>`. [`TaskRunner::run`] takes `&self`, so any state a
+/// runner keeps lives inside the runner, behind its own synchronization.
+///
+/// # Axis
+///
+/// The executor axis: how one role call runs, from an offline scripted session
+/// to a live model session. This resource holds whichever point the host
+/// chooses. Nothing is registered by default; the trivial point is
+/// [`ScriptedRunner`](super::ScriptedRunner), which never calls a model.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`ScriptedRunner`](super::ScriptedRunner), loaded from a
+/// [`Scenario`](super::Scenario), replaces a live runner in offline tests, so a
+/// graph can be exercised without a model, a process or any spend. Any other
+/// [`TaskRunner`] implementation can take its place the same way.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::AgentRunner;

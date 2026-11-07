@@ -40,21 +40,27 @@ provider, access pattern, and a real-shape consuming system per the
 
 ## Durable flow
 
-Workflow boot wiring supplies these globals before execution. Consumers read them
-with `Res<T>`; the durable books serialize mutations under an internal lock.
+All thirteen are global and consumer-supplied: the host builds each one and
+registers it as a global, directly or through
+[`FlowPlugin`](crate::flow::FlowPlugin), which also settles spend left in flight
+by an earlier run. Systems read them with `Res<T>`. The durable books change
+through `&self` under an internal lock and save before memory takes the change;
+`RunHandle`, `RoleBook`, `FlowSettings` and `CallDeadline` are immutable. Seven
+of them persist files under the run root: `SpendBook`, `StepJournal`,
+`RepairCounters`, `LeaseBook`, `Worklist`, `PhaseControl` and `EventLog`.
 
-| Resource | Purpose |
-|---|---|
-| [`RunHandle`](crate::flow::RunHandle) | Workflow identity and root. |
-| [`RoleBook`](crate::flow::RoleBook) | Resolved role policies. |
-| [`AgentRunner`](crate::flow::AgentRunner) | Replaceable executor for individual calls. |
-| [`StopFlag`](crate::flow::StopFlag) | Cooperative stop broadcast. |
-| [`SpendBook`](crate::flow::SpendBook) | Durable integer reservations and settlements. |
-| [`StepJournal`](crate::flow::StepJournal) | Durable step outputs. |
-| [`RepairCounters`](crate::flow::RepairCounters) | Shared named repair limits. |
-| [`LeaseBook`](crate::flow::LeaseBook) | Shared bounded work allocation. |
-| [`FlowSettings`](crate::flow::FlowSettings) | Asset root, private input root and model identity. |
-| [`PhaseControl`](crate::flow::PhaseControl) | Phase enablement, deadlines, typed statuses and terminal posture. |
-| [`Worklist`](crate::flow::Worklist) | Runtime-selected sequential items and persisted outcomes. |
-| [`EventLog`](crate::flow::EventLog) | Whole-line, flushed pipeline events in their recorded order. |
-| [`CallDeadline`](crate::flow::CallDeadline) | Optional wall limit for admitting new calls. |
+| Resource | Purpose | Built with |
+|---|---|---|
+| [`RunHandle`](crate::flow::RunHandle) | Run id, run root and whether the run resumes an earlier one. | Struct literal |
+| [`RoleBook`](crate::flow::RoleBook) | Role prompts, limits, spend ceilings and tool grants by name. | `RoleBook::load` |
+| [`AgentRunner`](crate::flow::AgentRunner) | Replaceable executor for one role call; the scripted runner is the offline point. | `AgentRunner::new` |
+| [`StopFlag`](crate::flow::StopFlag) | Cooperative stop broadcast for runners and systems; no flow block reads it. | `StopFlag::default` |
+| [`SpendBook`](crate::flow::SpendBook) | Durable integer reservations and settlements, with a cost ledger. | `SpendBook::open` |
+| [`StepJournal`](crate::flow::StepJournal) | Durable step outputs and numbered workspaces; restores finished steps. | `StepJournal::open` |
+| [`RepairCounters`](crate::flow::RepairCounters) | Shared named repair caps that survive a restart. | `RepairCounters::open` |
+| [`LeaseBook`](crate::flow::LeaseBook) | Shared cap of numbered work units across parallel lanes. | `LeaseBook::open` |
+| [`FlowSettings`](crate::flow::FlowSettings) | Asset root, task directory, model identity and the output-size cap. | Struct literal |
+| [`PhaseControl`](crate::flow::PhaseControl) | Phase enablement, deadlines, typed statuses and the halt state. | `PhaseControl::open` |
+| [`Worklist`](crate::flow::Worklist) | Runtime-selected sequential items and persisted outcomes. | `Worklist::open` |
+| [`EventLog`](crate::flow::EventLog) | Whole-line, flushed JSON-lines events in their recorded order. | `EventLog::open` |
+| [`CallDeadline`](crate::flow::CallDeadline) | Optional wall-clock limit for admitting new calls. | `CallDeadline::new` |

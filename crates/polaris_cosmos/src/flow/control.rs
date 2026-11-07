@@ -12,17 +12,49 @@ struct CounterState {
     limits: BTreeMap<String, u32>,
     used: BTreeMap<String, u32>,
 }
-/// Global named counters; every edge naming a counter consumes the same cap.
+/// Named counters that survive a restart; use `Res<RepairCounters>` when
+/// several check-and-repair edges must spend one shared attempt cap.
+///
+/// Every edge that names a counter consumes the same cap, so a repair cannot be
+/// retried past it by taking another path through the graph.
 ///
 /// # Scope
-/// Global because several repair edges consume the same named cap.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** Several repair edges, possibly in parallel branches, consume the
+/// same named cap.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`RepairCounters::open`] and
+/// registers it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`counter()`](fn@super::counter) block and [`repair_loop`](super::repair_loop)
+/// read it.
+///
 /// # Access
-/// Systems read `Res<RepairCounters>`; mutable books serialize updates internally.
+///
+/// `Res<RepairCounters>` only. The value is not immutable: `consume` and
+/// `reset` change counts through `&self`. A clone shares one
+/// `Arc<Mutex<..>>` of the counts, so every clone sees every change, and a
+/// change is saved to the file before the in-memory counts take it.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`SpendBook`](super::SpendBook) bounds money and [`LeaseBook`] bounds
+/// the total units of work shared by a fixed set of lanes. Use an ordinary local
+/// resource instead when branches need independent counts that do not have to
+/// survive a restart.
+///
+/// # Serialization
+///
+/// Saved as JSON in `.state/counters.json` under the run root, holding the
+/// `limits` and the `used` count of each name. [`open`](Self::open) reads that
+/// file when it exists, keeps the consumed counts, and takes the limits the host
+/// passes in over the saved ones. Each `reset` and `consume` rewrites the file,
+/// so a resumed run continues with the units already used.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::RepairCounters;
@@ -129,17 +161,47 @@ struct LeaseState {
     local: BTreeMap<usize, u32>,
     in_flight: BTreeMap<usize, Lease>,
 }
-/// Global durable allocator shared by a fixed set of graph lanes.
+/// Durable allocator of numbered work units; use `Res<LeaseBook>` when a fixed
+/// set of parallel lanes must share one total cap and each unit must be handed
+/// out once, even across a restart.
+///
+/// Each lane takes a [`Lease`] carrying a global and a lane-local ordinal. A
+/// lease stays in flight until the lane finishes it, so a restart gives the same
+/// lane the same lease again.
 ///
 /// # Scope
-/// Global because all lanes share one total work cap.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** All lanes draw from one total work cap.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`LeaseBook::open`] and registers
+/// it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`lease_loop`](super::lease_loop) block reads it.
+///
 /// # Access
-/// Systems read `Res<LeaseBook>`; mutable books serialize updates internally.
+///
+/// `Res<LeaseBook>` only. The value is not immutable: `take` and `finish`
+/// change the allocation through `&self`. A clone shares one `Arc<Mutex<..>>`,
+/// and a change is saved to the file before the in-memory state takes it.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`RepairCounters`] caps named attempts that any edge may consume, and
+/// [`Worklist`] hands out items chosen at run time rather than numbered units.
+/// Use an ordinary local resource when each lane needs its own independent
+/// budget.
+///
+/// # Serialization
+///
+/// Saved as JSON in `.state/leases.json` under the run root: the total, the next
+/// ordinal, each lane's local count and the lease each lane holds in flight.
+/// [`open`](Self::open) reads it when it exists. It may raise the total and
+/// keeps the earlier leases, and it refuses to lower the total.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::LeaseBook;
@@ -257,22 +319,53 @@ pub struct WorkItem {
     pub key: StepKey,
     /// Domain-owned payload.
     pub value: serde_json::Value,
-    /// Whether the item is pending, done or failed.
+    /// Where the item stands. [`Worklist::take`] returns only `Pending` items,
+    /// and a restart returns a pending item again.
     pub status: WorkItemStatus,
-    /// Failure detail when present.
+    /// Failure detail, recorded when the item finishes as `Failed`.
     pub note: String,
 }
-/// Global persisted sequential queue; failed items remain visible and do not block later ones.
+/// Persisted sequential queue; use `Res<Worklist>` when a workflow drains a list
+/// of items chosen at run time and must keep each item's outcome across a
+/// restart.
+///
+/// A failed item stays in the queue with its note and does not block the items
+/// after it.
 ///
 /// # Scope
-/// Global because items and recorded outcomes belong to one durable queue.
-/// # Provided By
-/// Workflow boot wiring through the documented constructor or initializer.
+///
+/// **Global.** The items and their recorded outcomes belong to one durable
+/// queue.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`Worklist::open`] and registers
+/// it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`worklist`](super::worklist) block reads it.
+///
 /// # Access
-/// Systems read `Res<Worklist>`; mutable books serialize updates internally.
+///
+/// `Res<Worklist>` only. The value is not immutable: `replace`, `extend` and
+/// `finish` change the queue through `&self`. A clone shares one
+/// `Arc<Mutex<..>>`, and a change is saved to the file before the in-memory
+/// queue takes it.
+///
 /// # Alternatives
-/// Use a local resource when branches need independent state.
-/// # Example
+///
+/// [`LeaseBook`] allocates numbered units across parallel lanes instead of
+/// named items in order. Use an ordinary local resource when the items need not
+/// survive a restart.
+///
+/// # Serialization
+///
+/// Saved as a JSON array of [`WorkItem`] at the path given to
+/// [`open`](Self::open). `open` uses the items passed in only when that file does
+/// not exist yet, so the queue is initialized once; afterwards it restores the
+/// saved items with their statuses and notes. Each change rewrites the file.
+///
+/// # Example system
+///
 /// ```
 /// use polaris::system::{system,param::Res};
 /// use polaris_cosmos::flow::Worklist;

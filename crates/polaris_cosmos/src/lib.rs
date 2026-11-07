@@ -30,9 +30,13 @@
 //! points, the [`evidence`] provider contract, and the shared [`contracts`]
 //! vocabulary. The [`composition`] module turns a planner's gate-expression
 //! plan into a native graph, built from an embodiment's own catalogue of
-//! reusable blocks. Hosts still own pristine contexts and actual graph
-//! execution. This crate does not provide a world-model backend or any
-//! callable Polaris APIs.
+//! reusable blocks. The [`flow`] module adds graph blocks for bounded,
+//! resumable agent workflows (role calls, phases, repair and lease loops,
+//! memoized steps), the durable resources they share, an offline test runner, and
+//! [`flow::FlowPlugin`], which registers the resources a host built. Hosts still
+//! own pristine contexts and actual graph execution. This crate does not provide
+//! a world-model backend or any callable Polaris APIs; the `flow` builders are
+//! ordinary functions that return a graph.
 
 pub mod cognition;
 pub mod composition;

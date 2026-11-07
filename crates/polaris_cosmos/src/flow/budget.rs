@@ -168,19 +168,77 @@ pub struct SpendSummary {
     /// How the costs were obtained, from the ledger settings.
     pub cost_basis: String,
 }
-/// Global durable money book; use it when concurrent calls share a ceiling.
+/// Durable money book; use `Res<SpendBook>` when concurrent calls share one
+/// spending ceiling and a restart must not forget what was spent or promised.
+///
+/// A call reserves its ceiling before it runs and settles what it really cost
+/// afterwards. Money held by calls still in flight counts against the allowance,
+/// so parallel branches cannot overspend together. Each phase may spend a fixed
+/// share of the total limit.
 ///
 /// # Scope
-/// Global because all branches spend from one budget.
-/// # Provided By
-/// Workflow boot wiring through `SpendBook::open`.
+///
+/// **Global.** All branches spend from one budget.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`SpendBook::open`], optionally
+/// stamps the ledger fields with [`with_ledger`](Self::with_ledger), and
+/// registers it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The plugin
+/// also settles calls left in flight by an earlier run when the server becomes
+/// ready. The [`agent`](fn@super::agent) block reserves and settles through it,
+/// and [`budget()`](fn@super::budget) reads it.
+///
 /// # Access
-/// `Res<SpendBook>`; mutations serialize under an internal mutex and persist first.
+///
+/// `Res<SpendBook>` only. The value is not immutable: `reserve`, `settle` and
+/// `release` change the book through `&self`. A clone shares one
+/// `Arc<Mutex<..>>`, and every change is saved to the files before the
+/// in-memory book takes it, so memory never runs ahead of the files.
+///
+/// One process owns a run root. The book takes no file lock, so two processes
+/// opening the same root can overwrite each other's state.
+///
 /// # Alternatives
-/// No accounting is appropriate only for workflows that cannot incur cost.
-/// # Example
-/// ```ignore
-/// async fn remaining(book: Res<SpendBook>) -> u64 { book.remaining("phase") }
+///
+/// There is no other money resource. A workflow whose calls cost nothing can
+/// leave the book out, but then it cannot use the [`agent`](fn@super::agent)
+/// block, which needs one. [`RepairCounters`](super::RepairCounters) and
+/// [`LeaseBook`](super::LeaseBook) bound attempts and units of work, not money.
+///
+/// # Serialization
+///
+/// Two files under the run root:
+///
+/// - `metrics/spend_state.json` holds the limit, the settled total, every
+///   reservation still in flight and every settlement, as JSON.
+/// - `metrics/cost_events.jsonl` has one line per settled call, stamped with the
+///   fields of [`LedgerSettings`].
+///
+/// [`open`](Self::open) restores the state file and keeps the spend. It may
+/// raise the limit and refuses to lower it. A settlement saved in the state but
+/// missing from the ledger, such as after a crash between the two writes, is
+/// appended again, and a torn last ledger line is cut off first. Reservations
+/// found at `open` belong to calls that did not survive the restart;
+/// [`recover_abandoned`](Self::recover_abandoned) charges them at their ceiling.
+///
+/// # Example system
+///
+/// ```
+/// use polaris::system::{param::Res, system, system::SystemError};
+/// use polaris_cosmos::flow::{SpendBook, StopCause, Usage};
+///
+/// /// Holds a ceiling for one call, then settles what the call cost.
+/// #[system]
+/// async fn spend_one_call(book: Res<SpendBook>) -> Result<u64, SystemError> {
+///     let hold = book
+///         .reserve("build", "worker", 500_000)
+///         .map_err(|error| SystemError::ExecutionError(error.to_string()))?;
+///     let usage = Usage { micros: 120_000, ..Usage::default() };
+///     book.settle(&hold, &usage, StopCause::Finished)?;
+///     Ok(book.remaining("build"))
+/// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct SpendBook {

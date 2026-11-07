@@ -5,6 +5,17 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Added
+- `polaris_cosmos::flow`: graph blocks for durable, budgeted, resumable agent workflows. The builders are `agent` (one role call: replay, admit, reserve, stage, run, settle, collect), `phase`, `memo`, `memo_current`, `repair_loop`, `lease_loop`, `rounds`, `worklist`, `counter`, `budget`, `events` and `bind`. They read thirteen global resources: `RunHandle`, `RoleBook`, `AgentRunner`, `StopFlag`, `SpendBook`, `StepJournal`, `RepairCounters`, `LeaseBook`, `FlowSettings`, `PhaseControl`, `Worklist`, `EventLog` and `CallDeadline`. Every durable file lives under one run root, and one process owns it.
+- Resume: a run with `RunMode::Resume` restores only calls journaled as done. Skipped, failed and interrupted calls run again.
+- `FlowPlugin`: registers the flow resources a host built (`with_resource`), charges calls left in flight by an earlier run at their ceiling when the server is ready, and stops phase heartbeat timers at cleanup. Hosts that wire resources by hand keep working.
+- `flow::testing::ScriptedRunner` and `Scenario`: an offline, file-backed `TaskRunner` for tests.
+- Host settings with neutral defaults, not constants: `LedgerSettings` (schema version, agent, provider and cost basis, set with `SpendBook::with_ledger`), the event log file name (`EventLog::with_file_name`, default `events.jsonl`), `FlowSettings::max_output_bytes` (default 64 MiB), and the enabled phase list of `PhaseControl::open` (a phase not in it does not run).
+- Typed values in place of strings: `UsdAmount`, `RunMode`, `HaltReason`, `StepStatus`, `WorkItemStatus`, `ReserveError`, `SpendSummary`, and a `FlowError` enum that keeps the underlying I/O or JSON error. A persist fault while reserving is `ReserveError::Persist`, not a spent budget.
+
+### Changed
+- `polaris_cosmos` now depends on `async-trait` 0.1, `toml` 0.8 and `tokio` 1 (features `macros`, `rt`, `sync`, `time`). The single `polaris-ai` is unchanged.
+
 ## [0.3.0] - 2026-11-03
 
 Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.

@@ -31,7 +31,10 @@ to go the other way — from a downstream goal to the plugins that satisfy it.
 
 ## Durable flow
 
-- [`FlowPlugin`](crate::flow::FlowPlugin) — registers the flow resources a host
-  already built as globals. At `ready()` it charges calls left in flight by an
-  earlier run at their ceiling, and at `cleanup()` it stops phase heartbeat
-  timers.
+- [`FlowPlugin`](crate::flow::FlowPlugin) — registers, as globals, the
+  [flow resources](crate::docs::resources) a host already built; it builds none
+  itself and adds no policy. When a [`SpendBook`](crate::flow::SpendBook) was
+  supplied, `ready()` charges every call an earlier run left in flight at its
+  ceiling. When an [`EventLog`](crate::flow::EventLog) was supplied, `cleanup()`
+  stops its phase heartbeat timers. Reach for it when a flow runs inside a
+  Polaris server; hosts that wire resources by hand can still do so.

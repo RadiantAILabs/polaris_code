@@ -43,19 +43,69 @@ pub struct StepRecord {
     /// Serialized typed output.
     pub output: serde_json::Value,
 }
-/// Global durable completion journal shared by graph branches.
+/// Durable record of finished steps; use `Res<StepJournal>` when a system must
+/// reuse the output of a step that already finished, so a restarted workflow
+/// does not repeat it.
+///
+/// [`memo`] and [`memo_current`] build on it: they restore a finished step's
+/// typed output and record a new one. It also hands out the numbered workspace
+/// folder of each pass over a step.
 ///
 /// # Scope
-/// Global because branches share durable step keys.
-/// # Provided By
-/// Workflow boot wiring using `StepJournal::open`.
+///
+/// **Global.** Parallel branches share one set of durable step keys.
+///
+/// # Provided by
+///
+/// Consumer-supplied. The host builds it with [`StepJournal::open`] and
+/// registers it as a global, directly or through
+/// [`FlowPlugin::with_resource`](super::FlowPlugin::with_resource). The
+/// [`agent`](fn@super::agent), [`memo`] and [`memo_current`] blocks read it.
+///
 /// # Access
-/// `Res<StepJournal>`; writes and folder allocation hold an internal mutex.
+///
+/// `Res<StepJournal>` only. The value holds no step state in memory, so a clone
+/// is as good as the original. `put`, `edge`, `workspace` and `abandon` change
+/// files through `&self` and take one shared `Arc<Mutex<()>>` while they do, so
+/// parallel branches never interleave their writes.
+///
 /// # Alternatives
-/// Unmemoized systems run every time.
-/// # Example
-/// ```ignore
-/// async fn inspect(journal: Res<StepJournal>) -> bool { journal.get(&StepKey::new("check")).is_some() }
+///
+/// A system that is not memoized runs every time, which is right for work that
+/// is cheap or must repeat. [`SpendBook`](super::SpendBook) is the resource
+/// for money rather than for step output.
+///
+/// # Serialization
+///
+/// Everything is kept under the run root:
+///
+/// - `.state/steps/<key>.json` holds the [`StepRecord`] of each step: its
+///   [`StepStatus`], times and typed output as JSON.
+/// - `journal.jsonl` gets one line per step edge, with the step's output digest
+///   when it finished.
+/// - `.state/work_ordinals.json` holds the last workspace number of each step,
+///   and the workspaces themselves are `work/<key>/<NNN>`.
+///
+/// [`open`](Self::open) reads nothing back. [`get`](Self::get) restores only a
+/// record whose status is `Done`; a step that started, failed or was skipped
+/// runs again.
+///
+/// # Example system
+///
+/// ```
+/// use polaris::system::{param::Res, system, system::SystemError};
+/// use polaris_cosmos::flow::{StepJournal, StepKey};
+///
+/// /// Reuses the saved plan after a restart, or records it the first time.
+/// #[system]
+/// async fn plan_once(journal: Res<StepJournal>) -> Result<u64, SystemError> {
+///     let key = StepKey::new("plan")?;
+///     if let Some(done) = journal.get(&key) {
+///         return Ok(done.output.as_u64().unwrap_or_default());
+///     }
+///     journal.put(&key, serde_json::json!(7))?;
+///     Ok(7)
+/// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct StepJournal {

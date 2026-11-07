@@ -12,6 +12,23 @@
 //! settles and collects through graph branches.
 //! The existing Cosmos composition catalogue and its admission rules are
 //! independent of these native builders.
+//!
+//! # Assembly
+//!
+//! A host opens the resources its graph reads, such as [`SpendBook`],
+//! [`StepJournal`] and [`EventLog`], and registers them as globals, either by
+//! hand or with [`FlowPlugin`]. It supplies the executor as an [`AgentRunner`]
+//! around its own [`TaskRunner`]; [`testing`] holds an offline one. The
+//! [flow section of the integration guide][guide] lists every graph builder and
+//! the resources it reads, and the [taxonomy][taxonomy] says where the module
+//! sits among the Cosmos layers.
+//!
+//! Every durable file lives under one run root. Only a call that ran to a stop
+//! is journaled as done, and only a run started with [`RunMode::Resume`]
+//! restores it; skipped, failed and interrupted calls run again.
+//!
+//! [guide]: https://github.com/RadiantAILabs/polaris_code/blob/main/crates/polaris_cosmos/docs/reference/guide.md
+//! [taxonomy]: https://github.com/RadiantAILabs/polaris_code/blob/main/crates/polaris_cosmos/docs/taxonomy.md
 mod agent;
 mod bind;
 mod budget;
@@ -107,6 +124,9 @@ pub fn budget(phase: &str, need: Micros) -> polaris::graph::Graph {
     graph
 }
 /// Emits one lifecycle event as an ordinary graph system.
+///
+/// The block writes `event`, the optional `phase` and `fields` to the
+/// [`EventLog`], and fails the system when the line cannot be written.
 pub fn events(
     event: &str,
     phase: Option<&str>,

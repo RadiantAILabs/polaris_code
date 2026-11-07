@@ -55,9 +55,17 @@ The crate provides:
   checks, and a materializer that builds native graphs.
 - Evidence in `evidence`: an append-only store, contextual statistics, gate-plan
   outcome indexing, and `TopologyEvidencePlugin`.
+- Durable agent workflows in `flow`: graph blocks (`agent`, `phase`,
+  `repair_loop`, `lease_loop`, `worklist`, `memo`), thirteen durable global
+  resources (spend, step journal, counters, leases, worklist, events, phase
+  state, settings, and the run, role, runner, stop and deadline values), an
+  offline `testing` runner, and `FlowPlugin`, which registers the resources a
+  host built and settles spend left in flight by an earlier run. The state it
+  keeps is per-run workflow state under one run root, not agent memory `W`.
 
 This crate does not provide a world-model backend, durable memory
-implementations, credit, or rewire, and it publishes no `API`s.
+implementations, credit, or rewire, and it publishes no `API`s: the `flow`
+builders are ordinary functions that return a `Graph`.
 
 ## Critical: single `polaris-ai`
 
@@ -130,11 +138,30 @@ src/
     store.rs                      # evidence store boundary + in-memory store
     gate_plan.rs                  # gate-plan records and outcome index
     plugin.rs                     # `TopologyEvidencePlugin`
+  flow.rs                         # durable agent-workflow public surface,
+                                  #   `counter`, `budget` and `events` blocks
+  flow/
+    agent.rs                      # role-call subgraph (replay, admit, reserve,
+                                  #   stage, run, settle, collect)
+    bind.rs                       # systems with typed access and captured policy
+    budget.rs                     # `SpendBook`, reservations, spend ledger
+    control.rs                    # `RepairCounters`, `LeaseBook`, `Worklist`
+    events.rs                     # `EventLog`, `PhaseControl`, `CallDeadline`
+    io.rs                         # atomic writes, containment, `FlowError`
+    journal.rs                    # `StepJournal`, `memo`, `memo_current`
+    loops.rs                      # `repair_loop`, `lease_loop`, `worklist`, `rounds`
+    phase.rs                      # `phase` enablement, events, failure policy
+    plugin.rs                     # `FlowPlugin`
+    roles.rs                      # `RoleBook` loading
+    staging.rs                    # `FlowSettings`, prompt rendering, input staging
+    testing.rs                    # `ScriptedRunner`, `Scenario`
+    types.rs                      # shared values, `StopFlag`, `RunHandle`,
+                                  #   `AgentRunner`, `TaskRunner`
   lib.rs                          # crate root + discoverability catalogs
   docs/
     models.md                     # cognitive-model catalog
     plugins.md                    # plugin catalog
-    apis.md                       # API catalog (currently empty)
+    apis.md                       # API catalog (currently empty; points at `flow`)
     resources.md                  # resource catalog
 docs/
   philosophy.md                   # shared-reference pointer
@@ -159,6 +186,7 @@ tests/
   block_description.rs            # block descriptions
   runtime_composition_contract.rs # runtime composition contract
   evidence_*.rs                   # evidence store and plugin
+  flow/                           # durable agent-workflow behaviour
   gate_plan_evidence.rs           # gate-plan evidence records
   upstream_typed_system_erasure.rs # typed system erasure
   fixtures/                       # shared test fixtures
