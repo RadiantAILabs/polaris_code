@@ -80,6 +80,10 @@ error. Cheap tool-output compaction begins at half that history budget, and
 summary compaction at three quarters. Summary output is also bounded by the
 run's ceiling. These are local token estimates, calibrated from provider
 usage; no tokenizer can guarantee the exact boundary for arbitrary model ids.
+Replayed assistant reasoning counts toward these estimates and compaction
+thresholds. Elision, interrupted-tool repair and summary projection preserve
+reasoning on every retained assistant message; summaries replace complete older
+spans. See [context compaction](context-compaction.md) for provider differences.
 The active user turn stays intact even when oversized. Without an explicit
 window, existing retrieval defaults apply; Polaris does not infer an unknown
 model's capacity from its name. The declared window applies throughout the

@@ -2873,6 +2873,12 @@ impl LiveModelStep {
                         DEFAULT_COMPACT_BATCH,
                         keep_recent,
                         MODEL_STEP_TOKEN_RATIO,
+                        config
+                            .model_id
+                            .as_deref()
+                            .or(self.model_id.as_deref())
+                            .map(crate::providers::ReasoningHistory::for_model)
+                            .unwrap_or_default(),
                     );
                 }
                 if config.trim == TrimPolicy::Batched

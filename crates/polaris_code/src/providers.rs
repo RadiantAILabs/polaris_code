@@ -263,6 +263,45 @@ impl Provider {
     }
 }
 
+/// How the installed providers replay reasoning text in earlier messages.
+/// Unknown providers conservatively count every text fragment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReasoningHistory {
+    #[default]
+    Concatenated,
+    NewlineSeparated,
+    Omitted,
+}
+
+impl ReasoningHistory {
+    pub(crate) fn for_model(model_id: &str) -> Self {
+        match Provider::of_model(model_id) {
+            Some(Provider::Anthropic) => Self::NewlineSeparated,
+            Some(Provider::Bedrock) => {
+                // Bedrock replays Claude's thinking through Converse. Other
+                // Converse models and its Responses route strip reasoning.
+                if model_id.contains("anthropic.") && !model_id.contains("openai.") {
+                    Self::NewlineSeparated
+                } else {
+                    Self::Omitted
+                }
+            }
+            _ => Self::Concatenated,
+        }
+    }
+
+    pub(crate) fn chars(self, block: &polaris::models::llm::ReasoningBlock) -> usize {
+        if self == Self::Omitted {
+            return 0;
+        }
+        let text = block.reasoning.iter().map(String::len).sum::<usize>();
+        match self {
+            Self::NewlineSeparated => text + block.reasoning.len().saturating_sub(1),
+            _ => text,
+        }
+    }
+}
+
 /// Why a provider cannot start, with what to do about it.
 ///
 /// [`Display`](fmt::Display) renders the whole message, ready to print once

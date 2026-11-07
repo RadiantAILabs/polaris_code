@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use polaris::models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, LlmProvider,
-    LlmRequest, LlmResponse, LlmStream, Message, StopReason, StreamEvent, ToolCall,
+    LlmRequest, LlmResponse, LlmStream, Message, ReasoningBlock, StopReason, StreamEvent, ToolCall,
     ToolResultContent, Usage, UserBlock,
 };
 use polaris::models::pricing::PriceStore;
@@ -184,6 +184,21 @@ fn history() -> Vec<Message> {
         });
         messages.push(Message::assistant("Completed investigation. ".repeat(200)));
     }
+    for (index, message) in messages.iter_mut().enumerate() {
+        if let Message::Assistant { content, .. } = message {
+            content.insert(
+                0,
+                AssistantBlock::Reasoning(ReasoningBlock {
+                    id: Some(format!("thought-{index}")),
+                    reasoning: vec![
+                        format!("reasoning for message {index}"),
+                        "preserve all fragments".into(),
+                    ],
+                    signature: Some(format!("signature-{index}")),
+                }),
+            );
+        }
+    }
     messages
 }
 
@@ -342,7 +357,7 @@ async fn threshold_compaction_keeps_canonical_history_and_projects_the_checkpoin
     let original = history();
     assert_eq!(
         serde_json::to_value(&context.messages[..original.len()]).unwrap(),
-        serde_json::to_value(original).unwrap()
+        serde_json::to_value(&original).unwrap()
     );
     assert_eq!(
         context.messages.len(),
@@ -355,6 +370,23 @@ async fn threshold_compaction_keeps_canonical_history_and_projects_the_checkpoin
     assert!(calls[0].tools.is_none());
     let answers = model.answers.lock().unwrap();
     assert_eq!(answers.len(), 1);
+    for request in [&calls[0], &answers[0]] {
+        let assistants = request
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { .. }))
+            .collect::<Vec<_>>();
+        assert!(!assistants.is_empty());
+        for message in assistants {
+            assert!(
+                original
+                    .iter()
+                    .any(|source| serde_json::to_value(source).unwrap()
+                        == serde_json::to_value(message).unwrap()),
+                "summary input and retained history preserve complete assistant messages, including reasoning and signatures"
+            );
+        }
+    }
     let projected = serde_json::to_string(&answers[0].messages).unwrap();
     assert!(projected.contains("Conversation summary checkpoint"));
     assert!(projected.contains("Empty inputs caused the failure"));

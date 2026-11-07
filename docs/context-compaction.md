@@ -20,6 +20,21 @@ selected model for a structured checkpoint containing:
 - open tasks and unresolved checks;
 - facts needed to continue.
 
+Token estimates include the earlier reasoning text that the selected provider
+replays. Chat Completions and direct OpenAI Responses include all reasoning
+fragments; Anthropic and Claude on Bedrock join fragments with newlines. Other
+Bedrock models omit reasoning from requests, so it does not count toward their
+history budget. Unknown custom providers conservatively count all fragments.
+Calibration uses the same replay policy, and changes to that policy reset the
+previous sample before projection and compaction.
+
+Elision changes only tool-result bodies. Repairing an interrupted tool exchange
+appends missing results without modifying its assistant messages. A summary
+replaces a whole completed span; every assistant message retained outside that
+span keeps all reasoning fragments, ids and signatures, including messages
+without tool calls. This also preserves the reasoning required by
+[DeepSeek thinking mode with tools](https://api-docs.deepseek.com/guides/thinking_mode/).
+
 The 50-message recency cap alone does not trigger a paid summary.
 `PolicySnapshot.retrieval.summarize_after_tokens` controls the automatic token
 threshold; setting it to `None` disables automatic summaries.

@@ -407,7 +407,7 @@ async fn init_loop() -> LoopState {
 /// the retrieval decision. The compaction/budget seam lives here.
 #[system]
 async fn prepare_context(
-    context: Res<ContextManager>,
+    mut context: ResMut<ContextManager>,
     project: Res<ProjectContext>,
     mut policy: ResMut<PolicySnapshot>,
     mut llm: ResMut<AgentLlm>,
@@ -457,6 +457,7 @@ async fn prepare_context(
     let turn = context.turn_marker();
     let system_prompt = system_prompt_for(&config, &project);
 
+    context.set_model(&model_id);
     let total = context.messages.len();
     let projected = context.project(&policy.retrieval);
 

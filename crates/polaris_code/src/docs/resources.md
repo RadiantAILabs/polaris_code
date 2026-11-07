@@ -92,7 +92,7 @@ by the agent's own systems and is intentionally excluded — see the
 `ContextManager` persists both canonical messages and structured summary
 checkpoints. Its graph node reads the existing session `TokenMeter` for cost
 reservation and billing; compaction adds no separate resource. Summary focus
-requests and token calibration remain runtime state.
+requests, provider reasoning replay and token calibration remain runtime state.
 
 The embedded multi-language index adds no resource. Parser state is private and
 constructed on demand inside the existing background indexing task.

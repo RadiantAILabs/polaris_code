@@ -143,6 +143,17 @@ async fn run(dangerous: bool) {
         assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(request["max_completion_tokens"], 1024);
     }
+    let assistant = requests[1].1["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(
+        assistant["reasoning_content"],
+        "Create the file and verify the shell."
+    );
+    assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 5);
     let tools = requests[1].1["messages"]
         .as_array()
         .unwrap()

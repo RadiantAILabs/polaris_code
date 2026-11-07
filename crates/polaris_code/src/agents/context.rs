@@ -33,6 +33,7 @@ use super::policy::{PolicySnapshot, RetrievalPolicy};
 use super::retry;
 use super::state::LoopState;
 use super::trajectory::Decision;
+use crate::providers::ReasoningHistory;
 use crate::terminal::{SessionSettings, status};
 use crate::tools::code_index_state;
 use crate::usage::{ChargeOnDrop, TokenMeter};
@@ -106,6 +107,7 @@ impl ContextStrategy for SummarizingWindow {
                 messages: ctx.checkpoint_messages(ctx.messages.len()),
                 last_prompt_tokens: ctx.last_prompt_tokens,
                 last_window_chars: ctx.last_window_chars,
+                reasoning_history: ctx.reasoning_history,
                 strategy: self.base.clone(),
                 ..Default::default()
             };
@@ -127,7 +129,11 @@ impl ContextStrategy for SummarizingWindow {
             projected.messages.insert(0, checkpoint.message());
         }
         projected.compacted |= ctx.latest_checkpoint().is_some();
-        projected.estimated_tokens = estimated_tokens(&projected.messages, ctx.token_ratio());
+        projected.estimated_tokens = estimated_tokens(
+            &projected.messages,
+            ctx.token_ratio(),
+            ctx.reasoning_history,
+        );
         if projected.cache_prefix {
             projected.breakpoints = cache_breakpoints(&projected.messages);
         }
@@ -211,7 +217,7 @@ impl ContextStrategy for LinearWindow {
         let ratio = ctx.token_ratio();
         let messages = provider_valid(ctx.window(r.max_messages, r.max_tokens, ratio));
         ProjectedWindow {
-            estimated_tokens: estimated_tokens(&messages, ratio),
+            estimated_tokens: estimated_tokens(&messages, ratio, ctx.reasoning_history),
             token_budget: r.max_tokens.map(|value| value as u64),
             messages,
             cache_prefix: false,
@@ -247,7 +253,7 @@ impl ContextStrategy for CacheAwareWindow {
         // is handled by compaction below, not by sliding the start (which would
         // break the cached prefix).
         let mut messages = ctx.window(r.max_messages, None, ratio);
-        let before = message_chars(&messages);
+        let before = message_chars_for_replay(&messages, ctx.reasoning_history);
 
         compact_tool_results(
             &mut messages,
@@ -255,16 +261,17 @@ impl ContextStrategy for CacheAwareWindow {
             r.compact_batch.max(1),
             r.compact_keep_recent,
             ratio,
+            ctx.reasoning_history,
         );
         // Measure compaction before the provider-validity guard runs: that guard
         // may append a synthetic tool result, which would otherwise mask a
         // compaction that did happen.
-        let compacted = message_chars(&messages) < before;
+        let compacted = message_chars_for_replay(&messages, ctx.reasoning_history) < before;
         let messages = provider_valid(messages);
 
         let breakpoints = cache_breakpoints(&messages);
         ProjectedWindow {
-            estimated_tokens: estimated_tokens(&messages, ratio),
+            estimated_tokens: estimated_tokens(&messages, ratio, ctx.reasoning_history),
             token_budget: r.compact_after_tokens.map(|value| value as u64),
             compacted,
             messages,
@@ -330,9 +337,9 @@ fn is_checkpoint_tail(message: &Message) -> bool {
 }
 
 /// Estimate the token mass of a projected window at the calibrated ratio.
-fn estimated_tokens(messages: &[Message], ratio: f64) -> u64 {
+fn estimated_tokens(messages: &[Message], ratio: f64, reasoning: ReasoningHistory) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let tokens = (message_chars(messages) as f64 * ratio).ceil() as u64;
+    let tokens = (message_chars_for_replay(messages, reasoning) as f64 * ratio).ceil() as u64;
     tokens
 }
 
@@ -407,9 +414,9 @@ fn stub_message(msg: &mut Message) {
 }
 
 /// Estimated token mass of `msgs` under `ratio`.
-fn est_tokens(msgs: &[Message], ratio: f64) -> usize {
+fn est_tokens(msgs: &[Message], ratio: f64, reasoning: ReasoningHistory) -> usize {
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    let est = (ratio * message_chars(msgs) as f64) as usize;
+    let est = (ratio * message_chars_for_replay(msgs, reasoning) as f64) as usize;
     est
 }
 
@@ -417,7 +424,7 @@ fn est_tokens(msgs: &[Message], ratio: f64) -> usize {
 /// `batch` until the estimated window fits `trigger`, never touching the most
 /// recent `keep_recent` messages. Returns the number of messages stubbed.
 ///
-/// Deterministic given `(msgs, trigger, batch, keep_recent, ratio)`, which is
+/// Deterministic given the history, thresholds, ratio and reasoning replay, which is
 /// what keeps the cached prefix stable between jumps.
 ///
 /// `pub(crate)`: [`gate_blocks::configurable::LiveModelStep`](crate::cosmos::gate_blocks::configurable::LiveModelStep)
@@ -429,11 +436,12 @@ pub(crate) fn compact_tool_results(
     batch: usize,
     keep_recent: usize,
     ratio: f64,
+    reasoning: ReasoningHistory,
 ) -> usize {
     let Some(trigger) = trigger else {
         return 0;
     };
-    if msgs.len() <= keep_recent || est_tokens(msgs, ratio) <= trigger {
+    if msgs.len() <= keep_recent || est_tokens(msgs, ratio, reasoning) <= trigger {
         return 0;
     }
     let cutoff = msgs.len() - keep_recent;
@@ -441,7 +449,7 @@ pub(crate) fn compact_tool_results(
 
     let mut stubbed = 0;
     let mut next = 0;
-    while next < stubbable.len() && est_tokens(msgs, ratio) > trigger {
+    while next < stubbable.len() && est_tokens(msgs, ratio, reasoning) > trigger {
         for &idx in stubbable.iter().skip(next).take(batch) {
             stub_message(&mut msgs[idx]);
             stubbed += 1;
@@ -485,6 +493,9 @@ pub struct ContextManager {
     /// `last_prompt_tokens` to derive a tokens-per-char ratio).
     #[serde(skip)]
     last_window_chars: Option<usize>,
+    /// Provider replay policy used consistently for projection and calibration.
+    #[serde(skip)]
+    reasoning_history: ReasoningHistory,
     /// The projection behavior behind [`project`](Self::project).
     #[serde(skip, default = "default_strategy")]
     strategy: Arc<dyn ContextStrategy>,
@@ -501,6 +512,7 @@ impl Default for ContextManager {
             last_summary_attempt: None,
             last_prompt_tokens: None,
             last_window_chars: None,
+            reasoning_history: ReasoningHistory::default(),
             trajectory: None,
             strategy: default_strategy(),
         }
@@ -513,6 +525,7 @@ impl ContextManager {
     pub fn reset_runtime(&mut self, prompt_cache: bool) {
         self.last_prompt_tokens = None;
         self.last_window_chars = None;
+        self.reasoning_history = ReasoningHistory::default();
         self.compaction_focus = None;
         self.last_summary_attempt = None;
         self.strategy = if prompt_cache {
@@ -520,6 +533,15 @@ impl ContextManager {
         } else {
             Arc::new(SummarizingWindow::new(default_strategy()))
         };
+    }
+
+    pub(crate) fn set_model(&mut self, model_id: &str) {
+        let replay = ReasoningHistory::for_model(model_id);
+        if self.reasoning_history != replay {
+            self.reasoning_history = replay;
+            self.last_prompt_tokens = None;
+            self.last_window_chars = None;
+        }
     }
 
     /// Create a new context seeded with an initial user request.
@@ -622,9 +644,11 @@ impl ContextManager {
             retrieval.compact_batch.max(1),
             retrieval.compact_keep_recent,
             self.token_ratio(),
+            self.reasoning_history,
         );
-        let pressure =
-            threshold.is_some_and(|limit| est_tokens(&cheap, self.token_ratio()) > limit);
+        let pressure = threshold.is_some_and(|limit| {
+            est_tokens(&cheap, self.token_ratio(), self.reasoning_history) > limit
+        });
         if !manual && !pressure {
             return Ok(None);
         }
@@ -666,12 +690,17 @@ impl ContextManager {
             retrieval.compact_batch.max(1),
             0,
             self.token_ratio(),
+            self.reasoning_history,
         );
         if retrieval.max_tokens.is_some_and(|limit| {
             let focus_tokens = focus.as_ref().map_or(0, |text| {
-                est_tokens(&[Message::user(text)], self.token_ratio())
+                est_tokens(
+                    &[Message::user(text)],
+                    self.token_ratio(),
+                    self.reasoning_history,
+                )
             });
-            est_tokens(&messages, self.token_ratio())
+            est_tokens(&messages, self.token_ratio(), self.reasoning_history)
                 .saturating_add(focus_tokens)
                 .saturating_add(1_024)
                 > limit
@@ -690,7 +719,7 @@ impl ContextManager {
     /// a failed/retried attempt never miscalibrates the ratio.
     pub fn record_sent_window(&mut self, prompt_tokens: u64, window: &[Message]) {
         self.last_prompt_tokens = Some(prompt_tokens);
-        self.last_window_chars = Some(message_chars(window));
+        self.last_window_chars = Some(message_chars_for_replay(window, self.reasoning_history));
     }
 
     /// A coarse turn marker derived from history length, used to stamp reified
@@ -783,7 +812,9 @@ impl ContextManager {
         if let Some(max) = max_tokens {
             while start < last_boundary {
                 #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-                let est = (ratio * message_chars(&msgs[start..]) as f64) as usize;
+                let est = (ratio
+                    * message_chars_for_replay(&msgs[start..], self.reasoning_history) as f64)
+                    as usize;
                 if est <= max {
                     break;
                 }
@@ -795,7 +826,9 @@ impl ContextManager {
             }
 
             #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-            let est = (ratio * message_chars(&msgs[start..]) as f64) as usize;
+            let est = (ratio
+                * message_chars_for_replay(&msgs[start..], self.reasoning_history) as f64)
+                as usize;
             if est > max {
                 tracing::warn!(
                     "context window: active turn (~{est} tokens) alone exceeds max_tokens={max}; \
@@ -833,8 +866,12 @@ const IMAGE_CHARS: usize = 6_400;
 
 /// Total text mass across the blocks of `msgs` — the per-message proxy used to
 /// estimate token budget. Counts user/assistant text, tool-result text, image
-/// blocks at [`IMAGE_CHARS`], and the JSON of tool-call arguments.
+/// blocks at [`IMAGE_CHARS`], reasoning text and the JSON of tool-call arguments.
 pub(crate) fn message_chars(msgs: &[Message]) -> usize {
+    message_chars_for_replay(msgs, ReasoningHistory::default())
+}
+
+fn message_chars_for_replay(msgs: &[Message], reasoning: ReasoningHistory) -> usize {
     msgs.iter()
         .map(|msg| match msg {
             Message::User { content } => content
@@ -854,7 +891,7 @@ pub(crate) fn message_chars(msgs: &[Message]) -> usize {
                 .map(|b| match b {
                     AssistantBlock::Text(t) => t.text.len(),
                     AssistantBlock::ToolCall(tc) => tc.function.arguments.to_string().len(),
-                    AssistantBlock::Reasoning(_) => 0,
+                    AssistantBlock::Reasoning(block) => reasoning.chars(block),
                 })
                 .sum::<usize>(),
         })
@@ -894,11 +931,6 @@ pub(crate) async fn compact_context(
     session: Res<SessionInfo>,
 ) -> CompactionRun {
     let manual = context.compaction_focus.is_some();
-    let plan = context.plan_compaction(&policy.retrieval, policy.retrieval.summarize_after_tokens);
-    if matches!(&plan, Ok(None)) && !manual {
-        return CompactionRun { manual };
-    }
-
     // Resolve the same selected model prepare_context will use. A registry
     // refusal falls back to the configured model there as well.
     let selected = settings.turn_snapshot();
@@ -915,6 +947,11 @@ pub(crate) async fn compact_context(
         .map(|(_, llm)| llm)
         .map(Ok)
         .unwrap_or_else(|| models.llm(&config.model_id));
+    context.set_model(model_id);
+    let plan = context.plan_compaction(&policy.retrieval, policy.retrieval.summarize_after_tokens);
+    if matches!(&plan, Ok(None)) && !manual {
+        return CompactionRun { manual };
+    }
     settings.note_served(model_id);
 
     let attempt_timeout = policy.retry.attempt_timeout;
@@ -922,7 +959,8 @@ pub(crate) async fn compact_context(
     let result = match (plan, llm) {
         (Ok(Some(plan)), Ok(llm)) => {
             async {
-                let source_chars = message_chars(&plan.messages);
+                let source_chars =
+                    message_chars_for_replay(&plan.messages, context.reasoning_history);
                 let mut messages = provider_valid(plan.messages);
                 messages.push(Message::user(format!(
                     "Produce the summary checkpoint now. Optional focus: {}",
@@ -1074,7 +1112,7 @@ pub(crate) async fn finish_compaction(mut state: ResMut<LoopState>) -> LoopState
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polaris::models::llm::ToolCall;
+    use polaris::models::llm::{ReasoningBlock, ToolCall};
 
     fn user(text: &str) -> Message {
         Message::user(text)
@@ -1169,6 +1207,167 @@ mod tests {
         // The active turn is never dropped, even though it exceeds the cap.
         assert_eq!(window.len(), 1);
         assert!(is_turn_boundary(&window[0]));
+    }
+
+    fn thought(parts: &[&str]) -> AssistantBlock {
+        AssistantBlock::Reasoning(ReasoningBlock {
+            id: Some("reasoning-id".into()),
+            reasoning: parts.iter().map(|part| (*part).into()).collect(),
+            signature: Some("reasoning-signature".into()),
+        })
+    }
+
+    #[test]
+    fn reasoning_budget_and_calibration_follow_provider_replay() {
+        let messages = vec![Message::Assistant {
+            id: None,
+            content: vec![thought(&["αβ", "last"]), AssistantBlock::text("ok")],
+        }];
+        // Chat Completions concatenates fragments; Anthropic and Claude on
+        // Bedrock join them with newlines. Responses includes summary text.
+        for (model, chars, tokens) in [
+            ("openai-chat/deepseek/model", 10, 3),
+            ("chat_completions/vendor/model", 10, 3),
+            ("openai/model", 10, 3),
+            ("anthropic/model", 11, 4),
+            ("aws.bedrock/us.anthropic.claude-sonnet-4-6", 11, 4),
+            ("aws.bedrock/global.openai.gpt-oss-120b-1:0", 2, 1),
+            ("aws.bedrock/moonshot.kimi-k2-thinking", 2, 1),
+            ("unknown/model", 10, 3),
+        ] {
+            let mut context = ctx(messages.clone());
+            context.set_model(model);
+            let projected = context.project(&RetrievalPolicy::default());
+            assert_eq!(projected.estimated_tokens, tokens, "{model}");
+            context.record_sent_window(3, &projected.messages);
+            assert_eq!(context.last_window_chars, Some(chars), "{model}");
+        }
+        assert_eq!(
+            message_chars(&messages),
+            10,
+            "unknown providers count all reasoning text"
+        );
+        let mut context = ctx(messages.clone());
+        context.record_sent_window(3, &messages);
+        context.set_model("aws.bedrock/openai.model");
+        assert!(
+            context.last_window_chars.is_none(),
+            "a changed replay policy resets calibration"
+        );
+    }
+
+    #[test]
+    fn reasoning_triggers_compaction_and_survives_elision_repair_and_summary() {
+        let [mut old_call, _] = tool_exchange("old", 1);
+        let [mut pending_call, _] = tool_exchange("pending", 1);
+        if let Message::Assistant { content, .. } = &mut old_call {
+            content.insert(0, thought(&[&"x".repeat(4_000), "old detail"]));
+        }
+        if let Message::Assistant { content, .. } = &mut pending_call {
+            content.insert(0, thought(&["recent thinking", "keep this too"]));
+        }
+        let old_answer = Message::Assistant {
+            id: None,
+            content: vec![
+                thought(&["answer without tools"]),
+                AssistantBlock::text("done"),
+            ],
+        };
+        let original = vec![
+            user("goal"),
+            old_call,
+            big_tool_result("old", 300),
+            old_answer,
+            user("continue"),
+            pending_call,
+        ];
+        let policy = RetrievalPolicy {
+            max_messages: None,
+            max_tokens: Some(10_000),
+            compact_after_tokens: Some(200),
+            compact_batch: 1,
+            compact_keep_recent: 2,
+            ..Default::default()
+        };
+        let mut context = summary_ctx(original.clone());
+        context.set_model("openai-chat/deepseek/model");
+        let projected = context.project(&policy);
+        assert!(projected.compacted);
+        assert_eq!(stubbed_count(&projected.messages), 1);
+        assert!(projected.estimated_tokens >= 1_200);
+        assert!(pending_tool_calls(&projected.messages).is_empty());
+        assert_eq!(
+            projected.messages.len(),
+            original.len() + 1,
+            "repair adds a missing tool result"
+        );
+        let assistant_messages = |messages: &[Message]| {
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::Assistant { .. }))
+                .map(|message| serde_json::to_value(message).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            assistant_messages(&projected.messages),
+            assistant_messages(&original)
+        );
+
+        let linear = LinearWindow.project(
+            &context,
+            &RetrievalPolicy {
+                max_tokens: Some(200),
+                ..policy.clone()
+            },
+        );
+        assert_eq!(
+            assistant_messages(&linear.messages),
+            assistant_messages(&original[4..]),
+            "a sliding window drops whole older turns and retains recent reasoning"
+        );
+
+        let plan = context
+            .plan_compaction(&policy, Some(1_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.through_messages, 4);
+        assert_eq!(
+            assistant_messages(&plan.messages),
+            assistant_messages(&original[..4])
+        );
+        context.checkpoints.push(SummaryCheckpoint {
+            through_messages: plan.through_messages,
+            summary: ContextSummary {
+                goal: "goal".into(),
+                decisions: vec![],
+                files_touched: vec![],
+                open_tasks: vec!["continue".into()],
+                key_facts: vec![],
+            },
+            created_at_turn: None,
+        });
+        let summarized = context.project(&policy);
+        assert_eq!(
+            assistant_messages(&summarized.messages),
+            assistant_messages(&original[4..])
+        );
+        assert!(pending_tool_calls(&summarized.messages).is_empty());
+        assert_eq!(
+            serde_json::to_value(&context.messages).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+
+        // A provider that omits these same thoughts must not compact merely
+        // because they remain in canonical history.
+        let mut omitted = summary_ctx(original);
+        omitted.set_model("aws.bedrock/openai.model");
+        assert!(!omitted.project(&policy).compacted);
+        assert!(
+            omitted
+                .plan_compaction(&policy, Some(1_000))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1309,7 +1508,7 @@ mod tests {
         // Compaction relieved pressure back under the trigger (the default ratio
         // is 0.3, since no provider sample has been recorded).
         assert!(
-            est_tokens(&w.messages, 0.3) <= 1_000,
+            est_tokens(&w.messages, 0.3, ReasoningHistory::default()) <= 1_000,
             "post-compaction window fits compact_after_tokens"
         );
         // The final two messages (keep_recent=2) are never touched.
