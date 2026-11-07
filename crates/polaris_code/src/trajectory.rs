@@ -1,20 +1,22 @@
-//! Durable ATIF export for an explicitly recorded unattended run.
+//! Durable ATIF export with shared, reconstructable model-call histories.
 //!
-//! [`RunTrajectory`] owns one fresh destination and atomically checkpoints it
-//! after requests, content blocks, usage updates and tool results. Model calls
-//! carry the complete native request in `step.extra.request`; compaction never
-//! erases earlier steps. No credentials, HTTP headers or provider configuration
-//! are recorded. Tool results are the same redacted blocks the agent receives.
+//! Messages are recorded once. Each model call references a persistent history,
+//! system prompt, tool definitions and request parameters. New summaries and
+//! elided observations are new context steps; earlier evidence remains intact.
 
-use std::collections::BTreeMap;
+mod history;
+mod messages;
+
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use polaris::models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, LlmRequest, LlmResponse, Message,
-    StreamEvent, ToolResultContent, Usage, UserBlock,
+    ReasoningBlock, StopReason, StreamEvent, TextBlock, ToolCall, Usage, UserBlock,
 };
 use polaris::system::resource::GlobalResource;
 use serde_json::{Value, json};
@@ -73,6 +75,15 @@ struct Recording {
     path: PathBuf,
     document: Value,
     failure: Option<String>,
+    messages: HashMap<u64, Vec<usize>>,
+    configurations: HashMap<(String, u64), Vec<usize>>,
+    history: history::History,
+}
+
+fn fingerprint(value: &Value) -> u64 {
+    let mut hash = std::hash::DefaultHasher::new();
+    value.to_string().hash(&mut hash);
+    hash.finish()
 }
 
 impl Recording {
@@ -82,13 +93,11 @@ impl Recording {
             steps
                 .iter()
                 .filter_map(|step| step["metrics"][key].as_u64())
-                .sum::<u64>()
+                .fold(0u64, u64::saturating_add)
         };
         self.document["final_metrics"] = json!({
-            "total_prompt_tokens": sum("prompt_tokens"),
-            "total_completion_tokens": sum("completion_tokens"),
-            "total_cached_tokens": sum("cached_tokens"),
-            "total_steps": steps.len(),
+            "total_prompt_tokens": sum("prompt_tokens"), "total_completion_tokens": sum("completion_tokens"),
+            "total_cached_tokens": sum("cached_tokens"), "total_steps": steps.len(),
         });
         let parent = self.path.parent().expect("absolute destination has parent");
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
@@ -98,12 +107,79 @@ impl Recording {
         temporary.persist(&self.path).map_err(|err| err.error)?;
         Ok(())
     }
+
+    fn configuration(&mut self, kind: &str, value: &Value) -> Option<usize> {
+        if value.is_null() {
+            return None;
+        }
+        let key = (kind.to_string(), fingerprint(value));
+        if let Some(candidates) = self.configurations.get(&key) {
+            for id in candidates {
+                let step = &self.document["steps"][id - 1];
+                let stored = if kind == "system_prompt" {
+                    &step["message"]
+                } else {
+                    &step["extra"]["value"]
+                };
+                if stored == value {
+                    return Some(*id);
+                }
+            }
+        }
+        let id = messages::step(&mut self.document, "system", kind);
+        let step = &mut self.document["steps"][id - 1];
+        if kind == "system_prompt" {
+            step["message"] = value.clone();
+        } else {
+            step["extra"]["value"] = value.clone();
+        }
+        self.configurations.entry(key).or_default().push(id);
+        Some(id)
+    }
+
+    fn message(&mut self, message: &Message) -> usize {
+        if let Message::User { content } = message {
+            messages::tool_results(&mut self.document, content);
+        }
+        let native = json!(message);
+        let hash = fingerprint(&native);
+        if let Some(candidates) = self.messages.get(&hash) {
+            for id in candidates {
+                if messages::load(&self.document, *id).is_ok_and(|stored| json!(stored) == native) {
+                    return *id;
+                }
+            }
+        }
+        let compacted = matches!(message, Message::User { content } if content.iter().any(|block| match block {
+            UserBlock::Text(text) => text.text.starts_with("Conversation summary checkpoint"),
+            UserBlock::ToolResult(result) => matches!(&result.content, polaris::models::llm::ToolResultContent::Text(text) if text.starts_with("[elided ")),
+            _ => false,
+        }));
+        let (source, kind) = match message {
+            Message::Assistant { .. } => ("agent", "context_message"),
+            Message::User { .. } if compacted => ("system", "compacted_context"),
+            Message::User { content }
+                if content
+                    .iter()
+                    .any(|block| matches!(block, UserBlock::ToolResult(_))) =>
+            {
+                ("system", "tool_results")
+            }
+            _ => ("user", "message"),
+        };
+        let id = messages::step(&mut self.document, source, kind);
+        messages::store(&mut self.document, id, message);
+        if source == "agent" {
+            self.document["steps"][id - 1]["is_copied_context"] = json!(true);
+        }
+        self.messages.entry(hash).or_default().push(id);
+        id
+    }
 }
 
 impl RunTrajectory {
-    /// Reserve a new file and write the initial user instruction as ATIF-v1.7.
-    /// Existing destinations (including symlinks) are refused. Parent directories
-    /// must exist, so an invalid destination fails before the first model call.
+    /// Reserve a fresh owner-only file and record the initial instruction.
+    /// Existing destinations, including symlinks, are refused. Its parent must exist.
     pub fn create(
         path: &Path,
         session_id: &str,
@@ -122,40 +198,32 @@ impl RunTrajectory {
         let mut recording = Recording {
             path,
             document: json!({
-                "schema_version": "ATIF-v1.7",
-                "session_id": session_id,
+                "schema_version": "ATIF-v1.7", "session_id": session_id,
                 "agent": {"name": "polaris", "version": env!("CARGO_PKG_VERSION"), "model_name": model},
-                "steps": [{"step_id": 1, "timestamp": timestamp(), "source": "user", "message": instruction}],
-                "extra": {"status": "running"},
+                "steps": [], "extra": {"status": "running", "history_format": "polaris-code-message-history/v1", "histories": []},
             }),
             failure: None,
+            messages: HashMap::new(),
+            configurations: HashMap::new(),
+            history: history::History::default(),
         };
+        recording.message(&Message::user(instruction));
         recording.save()?;
         Ok(Self(Arc::new(Mutex::new(recording))))
     }
 
-    fn update(&self, change: impl FnOnce(&mut Value)) {
-        self.update_if(|document| {
-            change(document);
-            true
-        });
-    }
-
-    fn update_if(&self, change: impl FnOnce(&mut Value) -> bool) {
+    fn update(&self, change: impl FnOnce(&mut Recording) -> bool) {
         let mut recording = self.0.lock().unwrap_or_else(|err| err.into_inner());
-        if !change(&mut recording.document) {
+        if !change(&mut recording) {
             return;
         }
         if let Err(error) = recording.save() {
-            // Keep the error outside the artifact, because a failing destination
-            // cannot reliably record its own failure. The host checks it at exit.
             tracing::error!(%error, "could not checkpoint trajectory");
             recording.failure.get_or_insert_with(|| error.to_string());
         }
     }
 
-    /// Report the first persistence failure, if any. A caller requesting an
-    /// export must not receive a successful run with silently missing evidence.
+    /// Return any retained persistence failure, even if a later checkpoint succeeded.
     pub fn check(&self) -> io::Result<()> {
         let recording = self.0.lock().unwrap_or_else(|err| err.into_inner());
         match &recording.failure {
@@ -164,129 +232,182 @@ impl RunTrajectory {
         }
     }
 
-    /// Finalize run status after tool cleanup and session persistence.
+    /// Finalize the run after tool cleanup and session persistence.
     pub fn finish(&self, exit_code: i32) -> io::Result<()> {
-        self.update(|document| {
-            document["extra"]["status"] = json!(if exit_code == 0 {
+        self.update(|recording| {
+            recording.document["extra"]["status"] = json!(if exit_code == 0 {
                 "completed"
             } else {
                 "failed"
             });
-            document["extra"]["exit_code"] = json!(exit_code);
+            recording.document["extra"]["exit_code"] = json!(exit_code);
+            true
         });
         self.check()
     }
 
     pub(crate) fn begin(&self, model: &str, request: &LlmRequest) -> usize {
-        for message in &request.messages {
-            self.message(message);
-        }
         let mut index = 0;
-        self.update(|document| {
-            let steps = document["steps"].as_array_mut().expect("steps array");
-            index = steps.len();
-            let mut step = json!({
-                "step_id": index + 1, "timestamp": timestamp(), "source": "agent", "model_name": model,
-                "message": "", "extra": {"request": request, "status": "in_flight"},
+        self.update(|recording| {
+            let mut parameters = json!(request);
+            for key in ["messages", "system", "tools", "reasoning_effort"] { parameters.as_object_mut().unwrap().remove(key); }
+            let system = recording.configuration("system_prompt", &json!(request.system));
+            let tools = request.tools.as_ref().map(|definitions| {
+                let references = definitions.iter().map(|definition| {
+                    recording.configuration("tool_definition", &json!(definition)).expect("tool definition")
+                }).collect::<Vec<_>>();
+                recording.configuration("tool_definitions", &json!(references)).expect("tool palette")
             });
-            // Read from the serialized request so the ATIF representation uses
-            // exactly the framework's stable wire spelling.
-            if let Some(effort) = step["extra"]["request"]
-                .get("reasoning_effort")
-                .filter(|v| !v.is_null())
-                .cloned()
-            {
-                step["reasoning_effort"] = effort;
-            }
-            steps.push(step);
+            let references = parameters.as_object().unwrap().iter().map(|(key, value)| {
+                let reference = recording.configuration(&format!("request_parameter/{key}"), value);
+                (key.clone(), json!(reference))
+            }).collect::<serde_json::Map<_, _>>();
+            let parameters = recording.configuration("request_parameters", &json!(references)).expect("parameters object");
+            let messages = request.messages.iter().map(|message| recording.message(message)).collect();
+            let history = recording.history.record(&mut recording.document, messages);
+            let id = messages::step(&mut recording.document, "agent", "model_call");
+            index = id - 1;
+            let step = &mut recording.document["steps"][index];
+            step["model_name"] = json!(model);
+            step["llm_call_count"] = json!(1);
+            step["extra"]["input"] = json!({"history": history, "system": system, "tools": tools, "parameters": parameters});
+            step["extra"]["status"] = json!("in_flight");
+            if let Some(effort) = &request.reasoning_effort { step["reasoning_effort"] = json!(effort); }
+            true
         });
         index
     }
 
-    pub(crate) fn response(&self, index: usize, response: &LlmResponse) {
-        self.update(|document| {
-            let step = &mut document["steps"][index];
-            step["message"] = json!(response.text());
-            let mut reasoning = String::new();
-            let mut calls = Vec::new();
-            for block in &response.content {
-                match block {
-                    AssistantBlock::Reasoning(block) => {
-                        reasoning.push_str(&block.reasoning.join(""))
-                    }
-                    AssistantBlock::ToolCall(call) => calls.push(tool_call(
-                        &call.id,
-                        &call.function.name,
-                        call.function.arguments.clone(),
-                    )),
-                    _ => {}
-                }
+    fn assistant(
+        &self,
+        index: usize,
+        message: Message,
+        usage: &Usage,
+        metadata: Value,
+        completed: bool,
+    ) {
+        self.update(|recording| {
+            messages::store(&mut recording.document, index + 1, &message);
+            let step = &mut recording.document["steps"][index];
+            step["metrics"] = metrics(usage);
+            for (key, value) in metadata.as_object().expect("response metadata") {
+                step["extra"][key] = value.clone();
             }
-            if !reasoning.is_empty() {
-                step["reasoning_content"] = json!(reasoning);
-            }
-            if !calls.is_empty() {
-                step["tool_calls"] = json!(calls);
-            }
-            step["metrics"] = metrics(&response.usage);
-            step["extra"]["response"] = json!(response);
-            step["extra"]["status"] = json!("completed");
+            step["extra"]["status"] = json!(if completed { "completed" } else { "partial" });
+            recording
+                .messages
+                .entry(fingerprint(&json!(message)))
+                .or_default()
+                .push(index + 1);
+            true
         });
+    }
+
+    pub(crate) fn response(&self, index: usize, response: &LlmResponse) {
+        self.assistant(index, Message::Assistant { id: None, content: response.content.clone() }, &response.usage,
+            json!({"stop_reason": response.stop_reason, "response_id": response.id, "response_model": response.model}), true);
     }
 
     pub(crate) fn failure(&self, index: usize, kind: &str) {
-        self.update(|document| {
-            document["steps"][index]["extra"]["status"] = json!("failed");
-            document["steps"][index]["extra"]["error_type"] = json!(kind);
+        self.update(|recording| {
+            recording.document["steps"][index]["extra"]["status"] = json!("failed");
+            recording.document["steps"][index]["extra"]["error_type"] = json!(kind);
+            true
         });
     }
 
-    /// Record tool results before a following model call can project or compact
-    /// them. Duplicate observations from batch completion are ignored.
     pub(crate) fn tool_results(&self, blocks: &[UserBlock]) {
-        self.update_if(|document| {
-            let mut changed = false;
-            for block in blocks {
-                let UserBlock::ToolResult(result) = block else { continue };
-                let steps = document["steps"].as_array_mut().expect("steps array");
-                let step = steps.iter_mut().rev().find(|step| {
-                    step["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|call| call["tool_call_id"] == result.id))
-                });
-                let Some(step) = step else { continue };
-                if step.get("observation").is_none() { step["observation"] = json!({"results": []}); }
-                let observations = step["observation"]["results"].as_array_mut().expect("results array");
-                if observations.iter().any(|item| item["source_call_id"] == result.id) { continue; }
-                let text = match &result.content {
-                    ToolResultContent::Text(text) => text.clone(),
-                    ToolResultContent::Image(image) => serde_json::to_string(image).expect("image serialization"),
-                };
-                changed = true;
-                observations.push(json!({"source_call_id": result.id, "content": text, "extra": {"native_result": result}}));
-            }
-            changed
-        });
+        self.update(|recording| messages::tool_results(&mut recording.document, blocks));
     }
 
     pub(crate) fn message(&self, message: &Message) {
-        if let Message::User { content } = message
-            && content
-                .iter()
-                .any(|block| matches!(block, UserBlock::ToolResult(_)))
-        {
-            self.tool_results(content);
-        }
+        self.update(|recording| {
+            let count = recording.document["steps"].as_array().unwrap().len();
+            let observed = if let Message::User { content } = message {
+                messages::tool_results(&mut recording.document, content)
+            } else {
+                false
+            };
+            recording.message(message);
+            observed || count != recording.document["steps"].as_array().unwrap().len()
+        });
     }
 }
 
-// ATIF requires an object even when the model supplied invalid scalar/array
-// arguments. Retain that call and its exact native arguments for auditing.
-fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
-    let object = if arguments.is_object() {
-        arguments.clone()
-    } else {
-        json!({"_native_arguments": arguments})
+/// Reconstruct the exact native request sent by a model-call step (one-based
+/// ATIF step id). Resolves shared history ranges, configuration steps and native
+/// message field references, including compacted context and linked tool results.
+/// Returns an error for invalid or forward history references or missing fields.
+pub fn rebuild_request(document: &Value, step_id: usize) -> io::Result<LlmRequest> {
+    let invalid = || io::Error::other("invalid model-call step");
+    let step = document["steps"]
+        .get(step_id.checked_sub(1).ok_or_else(invalid)?)
+        .ok_or_else(invalid)?;
+    let input = &step["extra"]["input"];
+    let config = |key: &str, field: &str| -> io::Result<Value> {
+        match input[key].as_u64() {
+            Some(id) if id > 0 => document["steps"]
+                .get(id as usize - 1)
+                .and_then(|step| step.pointer(field))
+                .cloned()
+                .ok_or_else(invalid),
+            None if input[key].is_null() => Ok(Value::Null),
+            _ => Err(invalid()),
+        }
     };
-    json!({"tool_call_id": id, "function_name": name, "arguments": object, "extra": {"native_arguments": arguments}})
+    let parameters = config("parameters", "/extra/value")?;
+    let resolve_value = |reference: &Value| -> io::Result<Value> {
+        if reference.is_null() {
+            return Ok(Value::Null);
+        }
+        let id = reference
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or_else(invalid)? as usize;
+        document["steps"]
+            .get(id - 1)
+            .and_then(|step| step.pointer("/extra/value"))
+            .cloned()
+            .ok_or_else(invalid)
+    };
+    let mut request = Value::Object(
+        parameters
+            .as_object()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|(key, reference)| Ok((key.clone(), resolve_value(reference)?)))
+            .collect::<io::Result<serde_json::Map<_, _>>>()?,
+    );
+    let history = input["history"].as_u64().ok_or_else(invalid)? as usize;
+    let messages = history::resolve(document, history)?
+        .into_iter()
+        .map(|id| messages::load(document, id))
+        .collect::<io::Result<Vec<_>>>()?;
+    request["messages"] = json!(messages);
+    request["system"] = config("system", "/message")?;
+    let tools = config("tools", "/extra/value")?;
+    request["tools"] = if tools.is_null() {
+        Value::Null
+    } else {
+        Value::Array(
+            tools
+                .as_array()
+                .ok_or_else(invalid)?
+                .iter()
+                .map(resolve_value)
+                .collect::<io::Result<Vec<_>>>()?,
+        )
+    };
+    request["reasoning_effort"] = step.get("reasoning_effort").cloned().unwrap_or(Value::Null);
+    serde_json::from_value(request).map_err(io::Error::other)
+}
+
+fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
+    if arguments.is_object() {
+        json!({"tool_call_id": id, "function_name": name, "arguments": arguments})
+    } else {
+        json!({"tool_call_id": id, "function_name": name, "arguments": {"_native_arguments": arguments}, "extra": {"invalid_arguments": true}})
+    }
 }
 
 fn timestamp() -> String {
@@ -298,19 +419,27 @@ fn timestamp() -> String {
 fn metrics(usage: &Usage) -> Value {
     json!({
         "prompt_tokens": usage.input_tokens.map(|input| input.saturating_add(usage.cache_read_tokens.unwrap_or(0)).saturating_add(usage.cache_creation_tokens.unwrap_or(0))),
-        "completion_tokens": usage.output_tokens,
-        "cached_tokens": usage.cache_read_tokens,
+        "completion_tokens": usage.output_tokens, "cached_tokens": usage.cache_read_tokens,
         "extra": {"native_usage": usage},
     })
 }
 
-/// In-memory accumulator for one live stream. Captures native events so partial
-/// streams, reasoning signatures and provider identifiers remain recoverable.
+struct CapturedBlock {
+    kind: ContentBlockStartData,
+    text: String,
+    signature: Option<String>,
+}
+
+/// Accumulates one response; token-level events are not duplicated in the file.
 pub(crate) struct StreamCapture {
     trajectory: RunTrajectory,
     index: usize,
-    events: Vec<StreamEvent>,
-    blocks: BTreeMap<u32, (ContentBlockStartData, String)>,
+    blocks: BTreeMap<u32, CapturedBlock>,
+    closed: Vec<u32>,
+    usage: Usage,
+    stop_reason: Option<StopReason>,
+    response_id: Option<String>,
+    model: Option<String>,
     completed: bool,
 }
 
@@ -319,33 +448,60 @@ impl StreamCapture {
         Self {
             trajectory,
             index,
-            events: Vec::new(),
             blocks: BTreeMap::new(),
+            closed: Vec::new(),
+            usage: Usage::default(),
+            stop_reason: None,
+            response_id: None,
+            model: None,
             completed: false,
         }
     }
-
     pub(crate) fn event(&mut self, event: &StreamEvent) {
-        self.events.push(event.clone());
         match event {
             StreamEvent::ContentBlockStart { index, block } => {
-                self.blocks.insert(*index, (block.clone(), String::new()));
+                self.blocks.insert(
+                    *index,
+                    CapturedBlock {
+                        kind: block.clone(),
+                        text: String::new(),
+                        signature: None,
+                    },
+                );
             }
             StreamEvent::ContentBlockDelta { index, delta } => {
-                if let Some((_, text)) = self.blocks.get_mut(index) {
+                if let Some(block) = self.blocks.get_mut(index) {
                     match delta {
                         ContentBlockDelta::Text(value)
                         | ContentBlockDelta::Reasoning(value)
-                        | ContentBlockDelta::ToolCall { arguments: value } => text.push_str(value),
-                        ContentBlockDelta::Signature(_) => {}
+                        | ContentBlockDelta::ToolCall { arguments: value } => {
+                            block.text.push_str(value)
+                        }
+                        ContentBlockDelta::Signature(value) => {
+                            block.signature = Some(value.clone())
+                        }
                     }
                 }
             }
-            StreamEvent::MessageStop { .. } => self.completed = true,
-            _ => {}
+            StreamEvent::ContentBlockStop { index } => {
+                if !self.closed.contains(index) {
+                    self.closed.push(*index);
+                }
+            }
+            StreamEvent::MessageDelta { usage } => self.usage = usage.clone(),
+            StreamEvent::MessageStop {
+                usage,
+                stop_reason,
+                id,
+                model,
+            } => {
+                self.usage = usage.clone();
+                self.stop_reason = Some(stop_reason.clone());
+                self.response_id = id.clone();
+                self.model = model.clone();
+                self.completed = true;
+            }
         }
-        // A delta remains in memory until the next content-block boundary or
-        // drop. This avoids rewriting a growing trajectory for every token.
         if matches!(
             event,
             StreamEvent::ContentBlockStop { .. }
@@ -355,55 +511,38 @@ impl StreamCapture {
             self.checkpoint();
         }
     }
-
     fn checkpoint(&self) {
-        self.trajectory.update(|document| {
-            let step = &mut document["steps"][self.index];
-            let mut text = String::new();
-            let mut reasoning = String::new();
-            let mut calls = Vec::new();
-            for (kind, content) in self.blocks.values() {
-                match kind {
-                    ContentBlockStartData::Text => text.push_str(content),
-                    ContentBlockStartData::Reasoning => reasoning.push_str(content),
-                    ContentBlockStartData::ToolCall { id, name, .. } => {
-                        if let Ok(arguments) =
-                            serde_json::from_str::<Value>(if content.is_empty() {
-                                "{}"
-                            } else {
-                                content
-                            })
-                        {
-                            calls.push(tool_call(id, name, arguments));
+        let mut content = Vec::new();
+        let mut partial = Vec::new();
+        let indices = self.closed.iter().copied().chain(
+            self.blocks
+                .keys()
+                .filter(|index| !self.closed.contains(index))
+                .copied(),
+        );
+        for index in indices {
+            let Some(block) = self.blocks.get(&index) else {
+                continue;
+            };
+            match &block.kind {
+                ContentBlockStartData::Text => content.push(AssistantBlock::Text(TextBlock { text: block.text.clone() })),
+                ContentBlockStartData::Reasoning => content.push(AssistantBlock::Reasoning(ReasoningBlock { id: None, reasoning: vec![block.text.clone()], signature: block.signature.clone() })),
+                ContentBlockStartData::ToolCall { id, call_id, name } => {
+                    match serde_json::from_str::<Value>(if block.text.is_empty() { "{}" } else { &block.text }) {
+                        Ok(arguments) => {
+                            let mut call = ToolCall::new(id.clone(), name.clone(), arguments);
+                            call.call_id = call_id.clone();
+                            content.push(AssistantBlock::ToolCall(call));
                         }
+                        Err(_) => partial.push(json!({"index": index, "id": id, "call_id": call_id, "name": name, "arguments": block.text})),
                     }
                 }
             }
-            step["message"] = json!(text);
-            if !reasoning.is_empty() {
-                step["reasoning_content"] = json!(reasoning);
-            }
-            if !calls.is_empty() {
-                step["tool_calls"] = json!(calls);
-            }
-            for event in self.events.iter().rev() {
-                if let StreamEvent::MessageStop { usage, .. }
-                | StreamEvent::MessageDelta { usage } = event
-                {
-                    step["metrics"] = metrics(usage);
-                    break;
-                }
-            }
-            step["extra"]["stream_events"] = json!(self.events);
-            step["extra"]["status"] = json!(if self.completed {
-                "completed"
-            } else {
-                "partial"
-            });
-        });
+        }
+        self.trajectory.assistant(self.index, Message::Assistant { id: None, content }, &self.usage,
+            json!({"stop_reason": self.stop_reason, "response_id": self.response_id, "response_model": self.model, "partial_tool_calls": partial}), self.completed);
     }
 }
-
 impl Drop for StreamCapture {
     fn drop(&mut self) {
         self.checkpoint();
@@ -413,73 +552,117 @@ impl Drop for StreamCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polaris::models::llm::{StopReason, ToolCall};
+    use polaris::models::llm::{ReasoningEffort, ToolDefinition, ToolResultContent};
+    use std::num::NonZeroU32;
 
     fn document(path: &Path) -> Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
+    fn request(messages: Vec<Message>) -> LlmRequest {
+        LlmRequest {
+            system: Some("unique-system-prompt".into()),
+            messages,
+            tools: Some(vec![ToolDefinition::new(
+                "read_file",
+                "unique-tool-description",
+                json!({"type":"object"}),
+            )]),
+            reasoning_effort: Some(ReasoningEffort::High),
+            max_output_tokens: NonZeroU32::new(512),
+            output_schema: Some(json!({"type":"object", "description":"unique-output-schema"})),
+            ..Default::default()
+        }
+    }
+    fn response(content: Vec<AssistantBlock>) -> LlmResponse {
+        LlmResponse {
+            content,
+            usage: Usage::default(),
+            stop_reason: StopReason::EndTurn,
+            id: Some("response-id".into()),
+            model: Some("remote/model".into()),
+        }
+    }
 
     #[test]
-    fn native_requests_responses_results_and_usage_survive_checkpoints() {
+    fn requests_rebuild_exactly_from_messages_configuration_and_observations() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trajectory.json");
-        let trace =
-            RunTrajectory::create(&path, "run-1", "openai-chat/vendor/model:route", "Fix it")
-                .unwrap();
-        let request = LlmRequest {
-            system: Some("System prompt".into()),
-            messages: vec![Message::user("Fix it")],
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let first = request(vec![Message::user("task")]);
+        let index = trace.begin("fake/model", &first);
+        let mut call = ToolCall::new("call-1", "read_file", json!({"path":"a.rs"}));
+        call.call_id = Some("wire-id".into());
+        call.signature = Some("tool-signature".into());
+        let mut reply = response(vec![
+            AssistantBlock::text("text-one"),
+            AssistantBlock::Reasoning(ReasoningBlock {
+                id: Some("reason-id".into()),
+                reasoning: vec!["α-one".into(), "β-two".into()],
+                signature: Some("reason-signature".into()),
+            }),
+            AssistantBlock::ToolCall(call.clone()),
+            AssistantBlock::text("text-two"),
+        ]);
+        reply.usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            cache_read_tokens: Some(3),
+            cache_creation_tokens: Some(2),
+            reasoning_output_tokens: Some(2),
             ..Default::default()
         };
-        let index = trace.begin("openai-chat/vendor/model:route", &request);
-        let call = ToolCall::new("call-1", "run_command", json!({"command": "echo done"}));
-        let response = LlmResponse {
-            content: vec![
-                AssistantBlock::Reasoning(polaris::models::llm::ReasoningBlock {
-                    id: Some("reason-1".into()),
-                    reasoning: vec!["Check it".into()],
-                    signature: Some("signature".into()),
-                }),
-                AssistantBlock::ToolCall(call.clone()),
-            ],
-            usage: Usage {
-                input_tokens: Some(10),
-                output_tokens: Some(4),
-                cache_read_tokens: Some(3),
-                cache_creation_tokens: Some(2),
-                ..Default::default()
-            },
-            stop_reason: StopReason::ToolUse,
-            id: Some("response-1".into()),
-            model: Some("vendor/model:route".into()),
+        trace.response(index, &reply);
+        let result = Message::User {
+            content: vec![call.result(ToolResultContent::Text("unique-result-content".into()))],
         };
-        trace.response(index, &response);
-        let block = call.result(ToolResultContent::Text("done".into()));
-        trace.tool_results(std::slice::from_ref(&block));
-        trace.tool_results(&[block]);
+        trace.message(&result);
+        let second = request(vec![
+            Message::user("task"),
+            Message::Assistant {
+                id: None,
+                content: reply.content.clone(),
+            },
+            result,
+        ]);
+        let next = trace.begin("fake/model", &second);
+        trace.response(next, &response(vec![AssistantBlock::text("done")]));
         trace.finish(0).unwrap();
-        let value = document(&path);
-        assert_eq!(value["schema_version"], "ATIF-v1.7");
-        assert_eq!(value["steps"][0]["message"], "Fix it");
-        let timestamps = value["steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|step| {
-                OffsetDateTime::parse(step["timestamp"].as_str().unwrap(), &Rfc3339).unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
-        let step = &value["steps"][1];
-        assert_eq!(step["extra"]["request"], json!(request));
-        assert_eq!(step["extra"]["response"], json!(response));
-        assert_eq!(step["reasoning_content"], "Check it");
-        assert_eq!(step["tool_calls"][0]["tool_call_id"], "call-1");
-        assert_eq!(step["observation"]["results"].as_array().unwrap().len(), 1);
-        assert_eq!(step["observation"]["results"][0]["content"], "done");
-        assert_eq!(value["final_metrics"]["total_prompt_tokens"], 15);
-        assert_eq!(value["final_metrics"]["total_completion_tokens"], 4);
-        assert_eq!(value["extra"]["status"], "completed");
+        let doc = document(&path);
+        assert_eq!(
+            json!(rebuild_request(&doc, index + 1).unwrap()),
+            json!(first)
+        );
+        assert_eq!(
+            json!(rebuild_request(&doc, next + 1).unwrap()),
+            json!(second)
+        );
+        assert_eq!(
+            doc["steps"][index]["observation"]["results"][0]["source_call_id"],
+            "call-1"
+        );
+        assert_eq!(
+            doc["steps"][index]["extra"]["stop_reason"],
+            json!(StopReason::EndTurn)
+        );
+        assert_eq!(doc["steps"][index]["extra"]["response_id"], "response-id");
+        assert_eq!(doc["final_metrics"]["total_prompt_tokens"], 15);
+        assert_eq!(doc["final_metrics"]["total_completion_tokens"], 4);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for unique in [
+            "unique-system-prompt",
+            "unique-tool-description",
+            "unique-output-schema",
+            "unique-result-content",
+            "α-one",
+            "reason-signature",
+        ] {
+            assert_eq!(raw.matches(unique).count(), 1, "duplicated {unique}");
+        }
+        assert!(!raw.contains("stream_events"));
+        for step in doc["steps"].as_array().unwrap() {
+            assert!(step["extra"].get("request").is_none());
+            OffsetDateTime::parse(step["timestamp"].as_str().unwrap(), &Rfc3339).unwrap();
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -491,67 +674,265 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_partial_stream_preserves_reasoning_tools_and_signatures() {
+    fn long_histories_grow_linearly_even_with_identical_replies() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trajectory.json");
         let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
-        let index = trace.begin("fake/model", &LlmRequest::default());
-        let mut capture = StreamCapture::new(trace, index);
-        let events = vec![
-            StreamEvent::ContentBlockStart {
-                index: 0,
-                block: ContentBlockStartData::Reasoning,
-            },
-            StreamEvent::ContentBlockDelta {
-                index: 0,
-                delta: ContentBlockDelta::Reasoning("Think".into()),
-            },
-            StreamEvent::ContentBlockDelta {
-                index: 0,
-                delta: ContentBlockDelta::Signature("sig".into()),
-            },
-            StreamEvent::ContentBlockStop { index: 0 },
-            StreamEvent::ContentBlockStart {
-                index: 1,
-                block: ContentBlockStartData::ToolCall {
-                    id: "tool".into(),
-                    call_id: Some("wire-id".into()),
-                    name: "read_file".into(),
-                },
-            },
-            StreamEvent::ContentBlockDelta {
-                index: 1,
-                delta: ContentBlockDelta::ToolCall {
-                    arguments: "{\"path\":\"a.rs\"}".into(),
-                },
-            },
-        ];
-        for event in &events {
-            capture.event(event);
+        let mut messages = vec![Message::user("task")];
+        let mut checks = Vec::new();
+        let mut midpoint = 0;
+        for turn in 0..128 {
+            let mut input = request(messages.clone());
+            input.cache = polaris::models::llm::CacheControl::prefix()
+                .with_breakpoints([0, messages.len() - 1]);
+            let index = trace.begin("fake/model", &input);
+            trace.response(index, &response(vec![AssistantBlock::text("same-answer")]));
+            if [0, 1, 63, 127].contains(&turn) {
+                checks.push((index + 1, input));
+            }
+            messages.push(Message::assistant("same-answer"));
+            messages.push(Message::user(format!("turn-{turn}: {}", "x".repeat(512))));
+            if turn == 63 {
+                midpoint = std::fs::metadata(&path).unwrap().len();
+            }
         }
+        let final_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            final_size < midpoint * 23 / 10,
+            "growth {midpoint} -> {final_size}"
+        );
+        let doc = document(&path);
+        assert!(
+            doc["extra"]["histories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|node| node["segments"].as_array().unwrap().len() <= 2)
+        );
+        for (step, input) in checks {
+            assert_eq!(json!(rebuild_request(&doc, step).unwrap()), json!(input));
+        }
+    }
+
+    #[test]
+    fn compaction_and_sliding_histories_preserve_original_results_and_new_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let call = ToolCall::new("tool", "read_file", json!({"path":"a"}));
+        let first = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        trace.response(
+            first,
+            &response(vec![AssistantBlock::ToolCall(call.clone())]),
+        );
+        let original = Message::User {
+            content: vec![call.result(ToolResultContent::Text("original-observation-body".into()))],
+        };
+        trace.message(&original);
+        let original_request = request(vec![
+            Message::user("task"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantBlock::ToolCall(call.clone())],
+            },
+            original,
+        ]);
+        let before = trace.begin("fake/model", &original_request);
+        trace.response(before, &response(vec![AssistantBlock::text("continued")]));
+        let compacted = request(vec![
+            Message::user("Conversation summary checkpoint (older history): remembered facts"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantBlock::ToolCall(call.clone())],
+            },
+            Message::User {
+                content: vec![call.result(ToolResultContent::Text(
+                    "[elided 2048 chars of tool output]".into(),
+                ))],
+            },
+            Message::assistant("continued"),
+            Message::user("next"),
+        ]);
+        let after = trace.begin("fake/model", &compacted);
+        let sliding = request(
+            compacted.messages[1..]
+                .iter()
+                .cloned()
+                .chain([Message::user("new tail")])
+                .collect(),
+        );
+        let slid = trace.begin("fake/model", &sliding);
+        let doc = document(&path);
+        for (id, expected) in [
+            (before + 1, original_request),
+            (after + 1, compacted),
+            (slid + 1, sliding),
+        ] {
+            assert_eq!(json!(rebuild_request(&doc, id).unwrap()), json!(expected));
+        }
+        assert_eq!(
+            doc["steps"][first]["observation"]["results"][0]["content"],
+            "original-observation-body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("original-observation-body")
+                .count(),
+            1
+        );
+        assert_eq!(
+            doc["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|step| step["extra"]["kind"] == "compacted_context")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn stream_checkpoints_preserve_signatures_partial_arguments_and_final_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        let mut capture = StreamCapture::new(trace.clone(), index);
+        capture.event(&StreamEvent::ContentBlockStart {
+            index: 0,
+            block: ContentBlockStartData::Reasoning,
+        });
+        capture.event(&StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::Reasoning("thought".into()),
+        });
+        capture.event(&StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::Signature("signature".into()),
+        });
+        capture.event(&StreamEvent::ContentBlockStop { index: 0 });
+        capture.event(&StreamEvent::ContentBlockStart {
+            index: 1,
+            block: ContentBlockStartData::ToolCall {
+                id: "call".into(),
+                call_id: Some("wire".into()),
+                name: "read_file".into(),
+            },
+        });
+        capture.event(&StreamEvent::ContentBlockDelta {
+            index: 1,
+            delta: ContentBlockDelta::ToolCall {
+                arguments: "{\"path\":".into(),
+            },
+        });
+        capture.checkpoint();
+        assert_eq!(
+            document(&path)["steps"][index]["extra"]["partial_tool_calls"][0]["arguments"],
+            "{\"path\":"
+        );
+        capture.event(&StreamEvent::ContentBlockDelta {
+            index: 1,
+            delta: ContentBlockDelta::ToolCall {
+                arguments: "\"a\"}".into(),
+            },
+        });
+        // Concurrent tool blocks can close in a different order than they
+        // started. Match the framework collector's completed-block ordering.
+        capture.event(&StreamEvent::ContentBlockStart {
+            index: 2,
+            block: ContentBlockStartData::ToolCall {
+                id: "second".into(),
+                call_id: Some("second-wire".into()),
+                name: "read_file".into(),
+            },
+        });
+        capture.event(&StreamEvent::ContentBlockDelta {
+            index: 2,
+            delta: ContentBlockDelta::ToolCall {
+                arguments: "{}".into(),
+            },
+        });
+        capture.event(&StreamEvent::ContentBlockStop { index: 2 });
+        capture.event(&StreamEvent::ContentBlockStop { index: 1 });
+        let usage = Usage {
+            input_tokens: Some(30),
+            output_tokens: Some(5),
+            ..Default::default()
+        };
+        capture.event(&StreamEvent::MessageDelta {
+            usage: usage.clone(),
+        });
+        capture.event(&StreamEvent::MessageStop {
+            usage,
+            stop_reason: StopReason::ToolUse,
+            id: Some("response".into()),
+            model: Some("remote".into()),
+        });
         drop(capture);
-        let value = document(&path);
-        let step = &value["steps"][1];
-        assert_eq!(step["reasoning_content"], "Think");
-        assert_eq!(step["tool_calls"][0]["arguments"]["path"], "a.rs");
-        assert_eq!(step["extra"]["stream_events"], json!(events));
-        assert_eq!(step["extra"]["status"], "partial");
+        let doc = document(&path);
+        let message = messages::load(&doc, index + 1).unwrap();
+        let Message::Assistant { content, .. } = message else {
+            panic!("assistant response")
+        };
+        assert!(
+            matches!(&content[0], AssistantBlock::Reasoning(block) if block.signature.as_deref() == Some("signature"))
+        );
+        assert!(
+            matches!(&content[1], AssistantBlock::ToolCall(call) if call.call_id.as_deref() == Some("second-wire"))
+        );
+        assert!(
+            matches!(&content[2], AssistantBlock::ToolCall(call) if call.call_id.as_deref() == Some("wire"))
+        );
+        assert_eq!(doc["steps"][index]["extra"]["status"], "completed");
+        assert_eq!(doc["final_metrics"]["total_prompt_tokens"], 30);
+        assert_eq!(doc["final_metrics"]["total_completion_tokens"], 5);
     }
 
     #[test]
-    fn malformed_tool_arguments_stay_visible_without_invalidating_atif() {
-        let call = tool_call("call", "read_file", json!([1, 2]));
-        assert!(call["arguments"].is_object());
-        assert_eq!(call["arguments"]["_native_arguments"], json!([1, 2]));
-        assert_eq!(call["extra"]["native_arguments"], json!([1, 2]));
+    fn native_media_empty_reasoning_and_invalid_tool_arguments_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let call = ToolCall::new("call", "read_file", json!([1, 2]));
+        let reply = response(vec![
+            AssistantBlock::Reasoning(ReasoningBlock {
+                id: None,
+                reasoning: vec![String::new()],
+                signature: Some("signature".into()),
+            }),
+            AssistantBlock::ToolCall(call),
+        ]);
+        let first = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        trace.response(first, &reply);
+        let input = request(vec![
+            Message::Assistant {
+                id: None,
+                content: reply.content,
+            },
+            Message::User {
+                content: vec![UserBlock::image_base64(
+                    "aW1hZ2U=",
+                    polaris::models::llm::ImageMediaType::PNG,
+                )],
+            },
+        ]);
+        let id = trace.begin("fake/model", &input);
+        let doc = document(&path);
+        assert_eq!(json!(rebuild_request(&doc, id + 1).unwrap()), json!(input));
+        assert!(doc["steps"][first]["tool_calls"][0]["arguments"].is_object());
     }
 
     #[test]
-    fn export_refuses_existing_destinations_and_remembers_write_failures() {
+    fn existing_destinations_write_failures_and_invalid_history_refs_fail_visibly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trajectory.json");
         let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
         assert!(RunTrajectory::create(&path, "other", "fake/model", "task").is_err());
+        let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        let mut doc = document(&path);
+        doc["extra"]["histories"][0]["segments"] = json!([{"history": 1, "start": 0, "length": 1}]);
+        assert!(rebuild_request(&doc, index + 1).is_err());
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(trace.finish(0).is_err());

@@ -59,9 +59,9 @@ confirmation request.
 
 `--dangerously-skip-permissions` is an explicit CLI-only exception for `-p`
 inside disposable containers. It grants file edits and arbitrary shell syntax,
-removing shell command denials and opaque-syntax checks while retaining tool
-path containment, directory validation, explicit permission-rule denials and
-normal journaling/redaction. It cannot be configured or enabled by a prompt.
+removing shell command denials, opaque-syntax checks and file containment,
+while preserving shell directory validation, matching permission-rule denials
+and normal journaling/redaction. It cannot be configured or enabled by a prompt.
 See [unattended runs](unattended-runs.md) for the complete trust boundary.
 
 ## The permission ceiling

@@ -23,7 +23,7 @@
 //! ```
 
 use std::io::Write;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -177,7 +177,7 @@ ENVIRONMENT:
     POLARIS_CODE_MAX_OUTPUT_TOKENS
                                Positive per-request output-token limit;
                                `--max-output-tokens` wins.
-    POLARIS_CODE_MAX_TURNS     Positive agent iteration limit per turn;
+    POLARIS_CODE_MAX_TURNS     Agent iteration limit per turn; 0 disables it;
                                `--max-turns` wins. Default: 100, except the
                                explicit unrestricted container mode.
     POLARIS_CODE_CONTEXT_WINDOW
@@ -310,16 +310,20 @@ const MAX_TURNS_VAR: &str = "POLARIS_CODE_MAX_TURNS";
 /// Resolve the agent loop's turn limit for this run.
 ///
 /// Unset, or set to whitespace, keeps [`DEFAULT_MAX_TURNS`]. Anything else has
-/// to be a positive integer; a typo is refused as a configuration error rather
-/// than silently falling back to the default.
+/// to be a non-negative integer (zero disables the cap); a typo is refused as a
+/// configuration error rather than silently falling back to the default.
 fn resolve_max_turns(raw: Option<&str>) -> Result<usize, String> {
     let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_MAX_TURNS);
     };
     value
-        .parse::<NonZeroUsize>()
-        .map(NonZeroUsize::get)
-        .map_err(|_| format!("{MAX_TURNS_VAR} must be a positive integer, got {value:?}"))
+        .parse::<usize>()
+        .map(|value| if value == 0 { usize::MAX } else { value })
+        .map_err(|_| {
+            format!(
+                "{MAX_TURNS_VAR} must be a non-negative integer (0 disables the cap), got {value:?}"
+            )
+        })
 }
 
 /// The environment variable that pins this whole run to one registered
@@ -588,7 +592,7 @@ struct Cli {
     allow_edit: bool,
     /// Allow file edits and arbitrary shell commands without prompts. Only for
     /// disposable containers: shell commands can access the process filesystem.
-    /// Disables shell command denials and syntax checks, retaining tool path checks.
+    /// Disables shell command denials, syntax checks and file-tool path containment.
     #[arg(long, requires = "print", conflicts_with_all = ["topology_task", "allow_edit", "allow_command"])]
     dangerously_skip_permissions: bool,
     /// Allow shell commands matching this existing shell-policy glob during
@@ -617,7 +621,7 @@ struct Cli {
     /// Enforceable for any model, priced or not.
     #[arg(long, value_name = "TOKENS")]
     max_tokens: Option<u64>,
-    /// Maximum agent iterations per turn; must be positive. Defaults to 100,
+    /// Maximum agent iterations per turn; zero disables the cap. Defaults to 100,
     /// except --dangerously-skip-permissions, which has no practical turn cap.
     #[arg(
         long,
@@ -1172,6 +1176,7 @@ async fn main() {
     }
     let mut agent_config = AgentConfig::new(model_id, working_dir.clone())
         .with_graph_search(graph_search)
+        .with_unrestricted_file_paths(cli.dangerously_skip_permissions)
         .with_prompt_cache(prompt_cache)
         .with_max_output_tokens(max_output_tokens);
     agent_config.context_window = cli.context_window;
@@ -1358,7 +1363,9 @@ async fn main() {
         .add_plugins(ToolsPlugin)
         .add_plugins(mcp)
         .add_plugins(CodeToolsPlugin::new(
-            CodeToolsConfig::new(&working_dir).with_edit_journal(edit_journal.clone()),
+            CodeToolsConfig::new(&working_dir)
+                .with_edit_journal(edit_journal.clone())
+                .with_unrestricted_paths(cli.dangerously_skip_permissions),
         ))
         .add_plugins(OxigraphPlugin::in_memory().with_tools(true))
         .add_plugins(
@@ -2799,16 +2806,21 @@ mod tests {
         assert_eq!(resolve_max_turns(None), Ok(DEFAULT_MAX_TURNS));
         assert_eq!(resolve_max_turns(Some("  ")), Ok(DEFAULT_MAX_TURNS));
         assert_eq!(resolve_max_turns(Some(" 250 ")), Ok(250));
+        assert_eq!(resolve_max_turns(Some("0")), Ok(usize::MAX));
+        assert_eq!(
+            run_max_turns(&cli(&["-p", "hi", "--max-turns", "0"])),
+            usize::MAX
+        );
     }
 
-    /// Zero, a negative, a float and a typo are refused as a turn limit.
+    /// A negative, a float and a typo are refused as a turn limit.
     #[test]
     fn an_invalid_turn_limit_is_refused() {
-        for raw in ["0", "-1", "1.5", "lots"] {
+        for raw in ["-1", "1.5", "lots"] {
             let error = resolve_max_turns(Some(raw))
                 .expect_err("an invalid turn limit must be refused, not defaulted");
             assert!(
-                error.contains(MAX_TURNS_VAR) && error.contains("positive integer"),
+                error.contains(MAX_TURNS_VAR) && error.contains("non-negative integer"),
                 "unhelpful error for {raw:?}: {error}"
             );
         }

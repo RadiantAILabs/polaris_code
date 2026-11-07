@@ -780,6 +780,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_turn_limit_can_be_selected_by_file_environment_or_flag() {
+        let fixture = Fixture::new();
+        fixture.project("max_turns = 0\n");
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.max_turns, Some(usize::MAX));
+        fixture.project("max_turns = 7\n");
+        let (cli, _) = fixture
+            .load(&[], &[("POLARIS_CODE_MAX_TURNS", "0")])
+            .unwrap();
+        assert_eq!(cli.max_turns, Some(usize::MAX));
+        let (cli, _) = fixture
+            .load(&["--max-turns", "0"], &[("POLARIS_CODE_MAX_TURNS", "9")])
+            .unwrap();
+        assert_eq!(cli.max_turns, Some(usize::MAX));
+    }
+
+    #[test]
     fn profiles_overlay_each_file_before_project_overrides_user() {
         let fixture = Fixture::new();
         fixture.user("max_turns = 10\nregion = 'user'\n[profiles.careful]\nmax_turns = 20\npermission_mode = 'plan'\n");
@@ -919,7 +936,7 @@ mod tests {
     fn invalid_values_name_the_file_and_key_even_when_shadowed() {
         let fixture = Fixture::new();
         for (key, value) in [
-            ("max_turns", "0"),
+            ("max_turns", "-1"),
             ("max_output_tokens", "0"),
             ("max_tokens", "0"),
             ("max_cost_usd", "nan"),
@@ -1199,7 +1216,7 @@ mod tests {
         for (key, value) in [
             ("provider", "unknown"),
             ("api_key", "private-secret"),
-            ("max_turns", "0"),
+            ("max_turns", "-1"),
         ] {
             assert!(set_value(&path, key, value).is_err());
             assert_eq!(

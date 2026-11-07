@@ -20,6 +20,9 @@ pub struct AgentConfig {
     pub model_id: String,
     /// Root directory the agent operates within.
     pub working_dir: PathBuf,
+    /// Tell the model that the host explicitly enabled unrestricted file tools.
+    /// The host must mirror this on `CodeToolsConfig`; this is a prompt declaration.
+    pub unrestricted_file_paths: bool,
     /// Which graph-search surface to expose. The binary mirrors
     /// this onto [`crate::tools::CodeGraphPlugin`] and the freeform-tool
     /// permission gate; it is carried here so the gate has a single source.
@@ -71,6 +74,7 @@ impl AgentConfig {
         Self {
             model_id: model_id.into(),
             working_dir: working_dir.into(),
+            unrestricted_file_paths: false,
             graph_search: GraphSearchMode::default(),
             prompt_cache: true,
             system_prompt: None,
@@ -78,6 +82,14 @@ impl AgentConfig {
             context_window: None,
             command_globs: None,
         }
+    }
+
+    /// Describe explicitly unrestricted file access to the model. The host
+    /// must also configure the actual file-tool capability with the same policy.
+    #[must_use]
+    pub fn with_unrestricted_file_paths(mut self, enabled: bool) -> Self {
+        self.unrestricted_file_paths = enabled;
+        self
     }
 
     /// Use `prompt` as the system prompt instead of the built-in one. The

@@ -42,10 +42,23 @@ types resolve to one package instance.
 |------------|-----|
 | **Exactly one `UserIO` front end.** [`exec::ExecIOPlugin`](crate::exec::ExecIOPlugin) over [`exec::ExecIOProvider`](crate::exec::ExecIOProvider) is the channel-backed one; `polaris-tui`'s conversation panel is the other. | The agent takes its prompt and publishes its answer, its tool blocks and its permission questions through `UserIO`. Install one or the other — **never both**; the second registration wins and the first front end goes silent. |
 | **A model provider.** `ModelsPlugin`, plus a plugin that registers an `LlmProvider` (`AnthropicPlugin::from_env("ANTHROPIC_API_KEY")`, or your own). | `CodeAgent::setup` resolves the model by id and fails the session if it cannot. [`AgentConfig::model_id`](crate::agents::AgentConfig) must be `<provider name>/<model>` — the prefix is matched against `LlmProvider::name()`. |
-| **`ToolsPlugin` plus whichever capability plugins you want.** [`CodeToolsPlugin`](crate::tools::CodeToolsPlugin), [`CodeGraphPlugin`](crate::tools::CodeGraphPlugin), [`MemoryToolsPlugin`](crate::tools::MemoryToolsPlugin), `ShellPlugin`. | These are the agent's hands. All of them are optional: with none installed the turn still runs, the model simply has nothing to call. Each is sandboxed to the `working_dir` you give it, and for a single session that directory should be the one in your `AgentConfig`. Each call the agent makes also carries a [`CallRoot`](crate::tools::CallRoot) built from `AgentConfig::working_dir`, and the file and shell tools work in that folder instead of the one they were built with, which is how one server can serve sessions in different folders: see [Running several isolated calls on one server](#running-several-isolated-calls-on-one-server). |
+| **`ToolsPlugin` plus whichever capability plugins you want.** [`CodeToolsPlugin`](crate::tools::CodeToolsPlugin), [`CodeGraphPlugin`](crate::tools::CodeGraphPlugin), [`MemoryToolsPlugin`](crate::tools::MemoryToolsPlugin), `ShellPlugin`. | These are the agent's hands. All of them are optional: with none installed the turn still runs, the model simply has nothing to call. Each defaults to the `working_dir` you give it, and for a single session that directory should be the one in your `AgentConfig`. Each call the agent makes also carries a [`CallRoot`](crate::tools::CallRoot) built from `AgentConfig::working_dir`, and the file and shell tools work in that folder instead of the one they were built with, which is how one server can serve sessions in different folders: see [Running several isolated calls on one server](#running-several-isolated-calls-on-one-server). |
 | **`PersistencePlugin`, `SessionsPlugin`, [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin), and ontrace's `OxigraphPlugin`.** | Sessions and their serializers, the agent graph itself, and the RDF store the agent reifies its decisions into. `OxigraphPlugin::in_memory()` is enough; the agent writes its trajectory there whether or not you read it. |
 | **A [`TokenMeter`](crate::usage::TokenMeter) inserted as a global _before_ the first `create_context()`.** | Not optional, and the failure is quiet: the agent's `act` system takes the meter as a required `Res<TokenMeter>`, so a session context without one cannot run that step at all — the turn comes back `Completed` with `final_text: None` and `usage: None`, as if the model had said nothing. [`TurnOutcome::usage`](crate::run::TurnOutcome) reads the same meter back, and `usage: None` always means **unmeasured, not free**. |
 | **A session carrying an `AgentConfig`, and then a [`PolicySnapshot`](crate::agents::PolicySnapshot).** | The config names the model and the working directory. The policy is what every control decision reads — see the warning below, it is not optional in practice. |
+
+For a trusted disposable container, file tools can explicitly opt out of path
+containment with `CodeToolsConfig::with_unrestricted_paths(true)`. Mirror that
+choice with `AgentConfig::with_unrestricted_file_paths(true)` so the system
+prompt describes the actual access. The agent setting only changes that prompt;
+the tool configuration grants access. Edit permissions, exclusive file creation
+and journal capture still apply. The CLI exposes this combination only through
+`--dangerously-skip-permissions` in an unattended run.
+
+An optional [`RunTrajectory`](crate::trajectory::RunTrajectory) records native
+provider calls as ATIF with shared message histories. Use
+[`rebuild_request`](crate::trajectory::rebuild_request) to reconstruct a call's
+exact native input from its one-based step id, including compacted context.
 
 ## What you get back
 

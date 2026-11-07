@@ -170,7 +170,8 @@ explicit per-run grants to write files or execute commands. See
 [permission modes](docs/permission-modes.md) for the available settings.
 
 For a disposable container, `--dangerously-skip-permissions` with `-p` grants
-file edits and arbitrary shell commands without prompts. It is CLI-only and
+file access anywhere the process can reach, edits and arbitrary shell commands
+without prompts. It is CLI-only and
 removes shell command denials and syntax checks. Use container isolation to
 protect the host. [Unattended runs](docs/unattended-runs.md) documents this mode,
 Chat Completions endpoints, explicit model limits, reasoning effort and native

@@ -65,7 +65,8 @@ from both is an error. Flags and environment still take precedence.
 | `reasoning_effort` | `--reasoning-effort` | `POLARIS_CODE_REASONING_EFFORT` |
 
 `models` accepts an array of model IDs or the existing comma/whitespace-separated
-string format. Token and iteration limits must be positive integers. The cost
+string format. Token limits must be positive integers. Iteration limits accept zero to disable
+the turn cap; otherwise they must be positive integers. The cost
 ceiling must be positive and finite; a cost-limited run also needs a priced model.
 `region` applies to Bedrock; without it the AWS SDK resolves its region normally.
 Permission modes are `confirm`, `auto-edit`, `auto`, or `plan`. An interactive

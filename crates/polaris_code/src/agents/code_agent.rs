@@ -120,6 +120,9 @@ impl LocalResource for AgentLlm {}
 fn system_prompt_for(config: &AgentConfig, project: &ProjectContext) -> String {
     let base = config.system_prompt.as_deref().unwrap_or(SYSTEM_PROMPT);
     let mut prompt = format!("{base}\n\n{}", project.system_prompt());
+    if config.unrestricted_file_paths {
+        prompt.push_str("\n\nFile access: this disposable-container run explicitly permits file tools to access any path reachable by the process, including absolute paths and paths outside the working directory. Relative paths start in the working directory.");
+    }
     if let Some(globs) = config.command_globs.as_deref().filter(|g| !g.is_empty()) {
         prompt.push_str("\n\n");
         prompt.push_str(&command_patterns_note(globs));
@@ -1872,8 +1875,8 @@ async fn recover(
 /// [`RetryPolicy::max_attempts`]: super::policy::RetryPolicy::max_attempts
 const MODEL_RETRIES_BOUND: usize = u32::MAX as usize;
 
-/// How many times the agent loop may go round in one turn when
-/// `POLARIS_CODE_MAX_TURNS` is unset.
+/// Default loop bound for hosts that do not select a different turn limit.
+/// The CLI's explicit unrestricted container mode overrides this default.
 ///
 /// A real repository task often needs dozens of read, search and edit steps,
 /// so the default leaves room for them while still bounding a runaway loop.

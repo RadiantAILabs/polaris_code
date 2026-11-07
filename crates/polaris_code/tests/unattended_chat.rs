@@ -44,10 +44,13 @@ fn read_request(stream: &mut TcpStream) -> (String, Value) {
     )
 }
 
-fn serve(stream: &mut TcpStream, first: bool) {
+fn serve(stream: &mut TcpStream, first: bool, outside: &std::path::Path) {
     let delta = if first {
         json!({"reasoning_content": "Create the file and verify the shell.", "tool_calls": [
             {"index": 0, "id": "create-1", "type": "function", "function": {"name": "create_file", "arguments": json!({"path": "created.txt", "content": "created\n"}).to_string()}},
+            {"index": 2, "id": "outside-create", "type": "function", "function": {"name": "create_file", "arguments": json!({"path": outside.join("new.txt"), "content": "external\n"}).to_string()}},
+            {"index": 3, "id": "outside-edit", "type": "function", "function": {"name": "edit_file", "arguments": json!({"path": "../outside/existing.txt", "old_string": "before", "new_string": "after", "replace_all": false}).to_string()}},
+            {"index": 4, "id": "outside-read", "type": "function", "function": {"name": "read_file", "arguments": json!({"path": outside.join("existing.txt")}).to_string()}},
             {"index": 1, "id": "shell-1", "type": "function", "function": {"name": "run_command", "arguments": json!({"command": r#"for n in 1 2; do echo "$(printf %s "$n")"; done > shell.txt; rm -rf disposable"#}).to_string()}}
         ]})
     } else {
@@ -64,6 +67,10 @@ async fn run(dangerous: bool) {
     let workspace = dir.path().join("project");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::create_dir(workspace.join("disposable")).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("existing.txt"), "before\n").unwrap();
+    let server_outside = outside.clone();
     let trajectory = dir.path().join("trajectory.json");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -77,7 +84,7 @@ async fn run(dangerous: bool) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     requests.push(read_request(&mut stream));
-                    serve(&mut stream, requests.len() == 1);
+                    serve(&mut stream, requests.len() == 1, &server_outside);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10))
@@ -142,9 +149,9 @@ async fn run(dangerous: bool) {
         .iter()
         .filter(|message| message["role"] == "tool")
         .collect::<Vec<_>>();
-    assert_eq!(tools.len(), 2);
+    assert_eq!(tools.len(), 5);
     assert_eq!(tools[0]["tool_call_id"], "create-1");
-    assert_eq!(tools[1]["tool_call_id"], "shell-1");
+    assert!(tools.iter().any(|tool| tool["tool_call_id"] == "shell-1"));
     if dangerous {
         assert_eq!(
             std::fs::read_to_string(workspace.join("created.txt")).unwrap(),
@@ -155,37 +162,64 @@ async fn run(dangerous: bool) {
             "1\n2\n"
         );
         assert!(!workspace.join("disposable").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("new.txt")).unwrap(),
+            "external\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("existing.txt")).unwrap(),
+            "after\n"
+        );
     } else {
         assert!(!workspace.join("created.txt").exists());
         assert!(!workspace.join("shell.txt").exists());
         assert!(workspace.join("disposable").exists());
-        assert!(
-            tools
-                .iter()
-                .all(|result| result["content"].as_str().unwrap().contains("denied"))
+        assert!(!outside.join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("existing.txt")).unwrap(),
+            "before\n"
         );
+        for result in &tools {
+            let content = result["content"].as_str().unwrap();
+            if result["tool_call_id"] == "outside-read" {
+                assert!(content.contains("escapes sandbox"));
+            } else {
+                assert!(content.contains("denied"), "{content}");
+            }
+        }
     }
     let raw = std::fs::read_to_string(&trajectory).unwrap();
     assert!(!raw.contains("local-test-placeholder"));
     let trace: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(trace["steps"].as_array().unwrap().len(), 3);
+    let calls = trace["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| step["extra"]["kind"] == "model_call")
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
     assert_eq!(
-        trace["steps"][1]["reasoning_content"],
+        calls[0]["reasoning_content"],
         "Create the file and verify the shell."
     );
     assert_eq!(
-        trace["steps"][1]["observation"]["results"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        calls[0]["observation"]["results"].as_array().unwrap().len(),
+        5
     );
-    assert_eq!(trace["steps"][2]["message"], "done");
+    assert_eq!(calls[1]["message"], "done");
+    for call in &calls {
+        let request = polaris_code::trajectory::rebuild_request(
+            &trace,
+            call["step_id"].as_u64().unwrap() as usize,
+        )
+        .unwrap();
+        assert!(request.system.is_some());
+        assert!(!call["extra"].as_object().unwrap().contains_key("request"));
+    }
     assert_eq!(trace["final_metrics"]["total_prompt_tokens"], 200);
     assert_eq!(trace["final_metrics"]["total_completion_tokens"], 20);
     assert_eq!(trace["final_metrics"]["total_cached_tokens"], 40);
     assert_eq!(trace["extra"]["status"], "completed");
-    assert!(trace["steps"][1]["extra"]["request"]["system"].is_string());
 }
 
 #[tokio::test]

@@ -27,7 +27,9 @@ sent verbatim. No built-in model name or extra catalog declaration is required.
 `--dangerously-skip-permissions` requires `-p` and cannot be enabled by an
 environment variable, `.env`, settings, a profile or an in-session command.
 It conflicts with the narrower `--allow-edit` and `--allow-command` flags.
-It allows the normal file mutation tools and both foreground and background
+It allows file tools to reach any path accessible to the process, including
+absolute paths, parent traversal, and symlinks outside the working directory.
+Relative paths still start in the working directory. It also allows both foreground and background
 shell execution. The executor's command deny list and conservative shell
 syntax checks are bypassed through host-issued, invocation-bound receipts.
 Arbitrary scripts, substitutions, loops and destructive commands can run.
@@ -35,13 +37,18 @@ Arbitrary scripts, substitutions, loops and destructive commands can run.
 **Use only inside a disposable container.** Shell commands execute with the
 process's filesystem and network access; the working directory check is not
 an operating-system security sandbox. Explicit permission-rule denials still
-apply. File tools retain their working-directory and symlink checks; shell
-working directories must remain inside the workspace. Edit journaling,
+apply when their selectors match. File-tool containment is disabled only for
+this flag; exclusive file creation and normal result redaction remain in force.
+Shell working directories still start inside the workspace, while commands may
+touch arbitrary paths. Edit journaling,
 index refresh, result redaction, cancellation and review/rewind bookkeeping
-use the same paths as ordinary grants. Other confirming tools still need
+use the same paths as ordinary grants. External edits are journaled; workspace
+indexing and safe rewind remain confined to workspace files. Other confirming tools still need
 `--allow-tool`. The explicit container mode removes the normal 100-iteration
 turn cap (the executor uses the largest representable iteration count). Set
-`--max-turns` when an iteration limit is wanted; token/spend ceilings and
+`--max-turns N` when an iteration limit is wanted. `--max-turns 0` explicitly
+disables the cap in any mode; the environment and TOML equivalents are
+`POLARIS_CODE_MAX_TURNS=0` and `max_turns = 0`. Token/spend ceilings and
 external timeouts still apply. Interactive sessions and ordinary `-p` runs keep their existing
 permission behavior.
 
@@ -90,19 +97,51 @@ refused before the first model call. The file is ATIF-v1.7 JSON, following
 On Unix it is created and replaced with mode `0600` because it contains task
 content, complete model prompts and model outputs.
 
-The initial user instruction is followed by one agent step per provider call,
-including retries and auxiliary calls. Each step carries its actual UTC
-ISO-8601 start timestamp and includes text, returned
-reasoning, tool calls, linked observations and native token metrics. Failed
-or interrupted calls remain visible. Every step's `extra.request` holds the
-complete serialized framework request, including system prompt, projected
-messages, tools, effort and output allowance. Non-streaming replies are in
-`extra.response`; streaming replies retain every native framework event in
-`extra.stream_events`, including reasoning signatures, identifiers and usage.
-Tool observations retain the full native result in `extra.native_result`.
-A tool call with non-object arguments remains visible through an
-`arguments._native_arguments` wrapper and exact `extra.native_arguments` value.
-Tool outputs use the agent's normal redaction path. Provider credentials,
+Each new user or assistant message has one ATIF step, including new compacted
+summaries and elided versions of tool results. System prompts, tool definitions
+and request parameters are interned as system steps before the first call that
+uses them. Unchanged configuration is reused. A new version of a prompt, tool
+palette or schema is stored once when an auxiliary call needs it.
+
+Each inference has an agent step with `llm_call_count: 1`, its UTC ISO-8601
+start timestamp, returned text/reasoning, tool calls, native usage, stop reason,
+response identifiers and requested effort. Tool results follow ATIF's same-step
+observation contract: text is stored once beside the tool call it answers.
+The corresponding result-message step references that observation. Copied
+assistant context is marked `is_copied_context`; it is not a new inference.
+Token-level stream events and full repeated requests/responses are omitted.
+Partial tool arguments and reasoning signatures remain available.
+
+A call's `extra.input` contains one-based configuration step ids (`system`,
+`tools`, `parameters`) and a `history` id. Null system/tools ids mean those
+request fields were absent. Zero means an empty history. The system prompt is
+its step's `message`. A tools step's `extra.value` lists step ids containing
+individual definitions in their `extra.value`. The parameters step's
+`extra.value` maps native request field names to value-step ids (or null for
+null values). Individual schemas, definitions and parameter values are thus
+shared even when a palette or cache breakpoint changes. Effort is on the
+call's standard `reasoning_effort` field.
+
+Histories are stored in `extra.histories` (one-based ids). Each has a `length`
+and ordered `segments`: `{steps: [step_id, ...]}` supplies messages directly;
+`{history: earlier_id, start: zero_based_offset, length: count}` reuses an
+unchanged range. Normal appends, sliding windows and summary compaction share
+old ranges instead of copying all preceding step indexes for every call.
+Thus a long append-only run grows with its new content and per-call metadata.
+
+Message steps retain a native message skeleton in `extra.native_message`.
+`extra.native_refs` fills its null content fields from JSON pointers into the
+ATIF document (`native` identifies the skeleton field; `value` identifies its
+stored value). Optional `start`/`end` are UTF-8 byte offsets for reasoning
+fragments. This retains exact native block order, signatures, tool ids and
+media metadata without duplicating visible text. Non-object tool arguments
+use `arguments._native_arguments` so the ATIF object remains valid.
+
+`polaris_code::trajectory::rebuild_request(document, step_id)` reconstructs an
+exact native request from these references. The exporter regression tests
+round-trip requests before and after compaction and check file-size growth
+over 128 calls. Compaction preserves the original observations alongside new
+summary/stub messages. Tool outputs use normal redaction. Provider credentials,
 HTTP headers and provider configuration are never exported.
 
 Atomic checkpoints occur before calls, at content-block boundaries, on usage
@@ -115,8 +154,8 @@ that fails to persist makes the process exit unsuccessfully.
 
 `final_metrics` totals reported prompt tokens (uncached input plus cache reads
 and cache creation), completion tokens and cache reads, without double-counting
-usage updates within a call. Per-call `metrics.extra.native_usage` or native
-stream events preserve reasoning-output and cache-creation counts. These totals
+usage updates within a call. Per-call `metrics.extra.native_usage`
+preserves reasoning-output and cache-creation counts. These totals
 cover reported usage; interrupted calls without final usage can have unknown
 billable tokens. Dollar estimates and the run's normal failure/limit reporting
 remain in the headless JSON result. ATIF capture is independent of the selected

@@ -300,14 +300,17 @@ fn head_lines(content: &str, budget: usize) -> (String, usize) {
     (out, kept)
 }
 
-/// Configuration for [`CodeTools`] — a sandboxed working directory.
+/// Configuration for [`CodeTools`], sandboxed unless the host explicitly opts out.
 #[derive(Debug, Clone)]
 pub struct CodeToolsConfig {
-    /// Root directory; all tool paths resolve relative to this and may not
-    /// escape it.
+    /// Default working directory. Relative tool paths start here; containment
+    /// applies unless `unrestricted_paths` is explicitly enabled.
     pub working_dir: PathBuf,
     /// Optional durable tracker. Without it this toolset is explicitly untracked.
     pub edit_journal: Option<EditJournal>,
+    /// Permit absolute paths, parent traversal and symlinks outside the working
+    /// directory. Enable only for explicitly unrestricted disposable containers.
+    pub unrestricted_paths: bool,
 }
 
 impl CodeToolsConfig {
@@ -316,7 +319,17 @@ impl CodeToolsConfig {
         Self {
             working_dir: working_dir.into(),
             edit_journal: None,
+            unrestricted_paths: false,
         }
+    }
+
+    /// Permit file tools to access any path reachable by this process. Relative
+    /// paths still start in the session working directory. This does not disable
+    /// exclusive creation, journaling, permissions or result redaction.
+    #[must_use]
+    pub fn with_unrestricted_paths(mut self, enabled: bool) -> Self {
+        self.unrestricted_paths = enabled;
+        self
     }
 
     /// Require successful durable capture before `edit_file` or `create_file`
@@ -328,22 +341,22 @@ impl CodeToolsConfig {
     }
 
     /// Resolves `path` against the working directory, returning `None` if the
-    /// result escapes the sandbox. Handles not-yet-existing paths (e.g. a file
-    /// `create_file` is about to create) by canonicalizing the nearest existing
+    /// result escapes the sandbox in bounded mode. Handles not-yet-existing
+    /// paths (e.g. a file `create_file` is about to create) by canonicalizing the nearest existing
     /// ancestor and re-appending the not-yet-existing tail, so the *fully
     /// resolved* path is validated against the sandbox root — `..` segments in a
     /// non-existent leaf can't slip past the check.
     pub fn resolve_path(&self, path: &str) -> Option<PathBuf> {
-        resolve_within(&self.working_dir, path)
+        resolve_with_access(&self.working_dir, path, self.unrestricted_paths)
     }
 }
 
-/// Resolve `path` against `root`, returning `None` if the result escapes it.
-fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
+/// Resolve `path` against `root`, enforcing containment unless explicitly disabled.
+fn resolve_with_access(root: &Path, path: &str, unrestricted: bool) -> Option<PathBuf> {
     let working_dir = root.canonicalize().ok()?;
     let resolved = root.join(path);
     if let Ok(canonical) = resolved.canonicalize() {
-        return canonical.starts_with(&working_dir).then_some(canonical);
+        return (unrestricted || canonical.starts_with(&working_dir)).then_some(canonical);
     }
     // The path doesn't exist yet. Peel off trailing components until an
     // existing ancestor canonicalizes, then rebuild the real path from it.
@@ -353,7 +366,7 @@ fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
         if let Ok(base) = current.canonicalize() {
             let mut candidate = base;
             candidate.extend(tail.iter().rev());
-            return candidate.starts_with(&working_dir).then_some(candidate);
+            return (unrestricted || candidate.starts_with(&working_dir)).then_some(candidate);
         }
         // `file_name()` is `None` for a `..`/`.`-terminated component, which
         // we refuse to resolve through rather than guess past.
@@ -367,7 +380,8 @@ fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
 ///
 /// A toolset is built on one directory for the whole server. When an
 /// invocation carries a `CallRoot`, the file tools resolve paths against it
-/// instead, and refuse a path that leaves it (`..`, an absolute path, a
+/// instead. Unless the host explicitly enables unrestricted file paths, they
+/// refuse a path that leaves it (`..`, an absolute path, a
 /// symlink out); the shell wrapper
 /// ([`ApprovalShellTool`](crate::tools::approval::ApprovalShellTool)) starts
 /// the command there and refuses a `working_dir` outside it. `run_in_background`
@@ -435,7 +449,7 @@ impl CodeTools {
     }
 
     fn resolve(&self, call: &Option<CallRoot>, path: &str) -> Result<PathBuf, ToolError> {
-        resolve_within(self.root_of(call), path)
+        resolve_with_access(self.root_of(call), path, self.config.unrestricted_paths)
             .ok_or_else(|| ToolError::execution_error(format!("path '{path}' escapes sandbox")))
     }
 
@@ -713,7 +727,7 @@ impl CodeTools {
                 .root_of(&call_root)
                 .canonicalize()
                 .map_err(|err| ToolError::execution_error(err.to_string()))?;
-            if !real_parent.starts_with(&root) {
+            if !self.config.unrestricted_paths && !real_parent.starts_with(&root) {
                 return Err(ToolError::execution_error(format!(
                     "path '{path}' escapes sandbox"
                 )));
@@ -819,7 +833,15 @@ impl CodeTools {
     ) -> Result<String, ToolError> {
         let target = path.unwrap_or_else(|| ".".to_string());
         let root = self.resolve(&call_root, &target)?;
-        let sandbox = self.sandbox_root(&call_root)?;
+        let sandbox = if self.config.unrestricted_paths {
+            if root.is_dir() {
+                root.clone()
+            } else {
+                root.parent().unwrap_or(&root).to_path_buf()
+            }
+        } else {
+            self.sandbox_root(&call_root)?
+        };
         let matcher = compile_matcher(&pattern, literal, case_insensitive)?;
         let selector = glob
             .as_deref()
@@ -881,7 +903,15 @@ impl CodeTools {
     ) -> Result<String, ToolError> {
         let target = path.unwrap_or_else(|| ".".to_string());
         let root = self.resolve(&call_root, &target)?;
-        let sandbox = self.sandbox_root(&call_root)?;
+        let sandbox = if self.config.unrestricted_paths {
+            if root.is_dir() {
+                root.clone()
+            } else {
+                root.parent().unwrap_or(&root).to_path_buf()
+            }
+        } else {
+            self.sandbox_root(&call_root)?
+        };
         let selector = PathGlob::compile(&pattern).map_err(ToolError::execution_error)?;
 
         tokio::task::spawn_blocking(move || {
@@ -1138,6 +1168,120 @@ impl Plugin for CodeToolsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_unrestricted_file_access_reaches_external_paths_and_keeps_tracking() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("existing.txt"), "before\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let call = Some(CallRoot::new(&root));
+        let bounded = CodeTools::new(CodeToolsConfig::new(&root));
+        for path in [
+            outside.join("existing.txt").to_string_lossy().into_owned(),
+            "../outside/existing.txt".into(),
+            "link/existing.txt".into(),
+        ] {
+            assert!(
+                bounded
+                    .read_file(path.clone(), None, None, call.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("escapes sandbox")
+            );
+        }
+        let journal = EditJournal::open(&root).unwrap();
+        let tools = CodeTools::new(
+            CodeToolsConfig::new(&root)
+                .with_unrestricted_paths(true)
+                .with_edit_journal(journal.clone()),
+        );
+        tools
+            .create_file(
+                outside.join("new/deep.txt").to_string_lossy().into_owned(),
+                "needle\n".into(),
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        tools
+            .create_file("link/linked.txt".into(), "linked\n".into(), call.clone())
+            .await
+            .unwrap();
+        tools
+            .edit_file(
+                "../outside/existing.txt".into(),
+                "before".into(),
+                "after".into(),
+                false,
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tools
+                .read_file("link/existing.txt".into(), None, None, call.clone())
+                .await
+                .unwrap(),
+            "after\n"
+        );
+        assert!(
+            tools
+                .read_span("../outside/existing.txt".into(), 1, 1, call.clone())
+                .await
+                .unwrap()
+                .contains("after")
+        );
+        assert!(
+            tools
+                .list_files("../outside".into(), call.clone())
+                .await
+                .unwrap()
+                .contains("existing.txt")
+        );
+        assert!(
+            tools
+                .search(
+                    "needle".into(),
+                    Some("../outside".into()),
+                    None,
+                    true,
+                    false,
+                    true,
+                    call.clone()
+                )
+                .await
+                .unwrap()
+                .contains("deep.txt")
+        );
+        assert!(
+            tools
+                .glob(
+                    "*.txt".into(),
+                    Some("../outside".into()),
+                    true,
+                    call.clone()
+                )
+                .await
+                .unwrap()
+                .contains("linked.txt")
+        );
+        assert!(
+            tools
+                .create_file("link/linked.txt".into(), "overwrite".into(), call)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("linked.txt")).unwrap(),
+            "linked\n"
+        );
+        assert_eq!(journal.tracked_since(0).paths.len(), 3);
+    }
 
     #[tokio::test]
     async fn edit_file_unique_match_applies_and_diffs() {
