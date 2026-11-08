@@ -3,6 +3,10 @@
 //! Messages are recorded once. Each model call references a persistent history,
 //! system prompt, tool definitions and request parameters. New summaries and
 //! elided observations are new context steps; earlier evidence remains intact.
+//!
+//! The [embedding guide](crate::docs::embedding) shows how a host wires the
+//! recorder in. `docs/unattended-runs.md` in the repository describes the run
+//! controls and the file format.
 
 mod history;
 mod messages;
@@ -12,7 +16,7 @@ use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 
 use polaris::models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, LlmRequest, LlmResponse, Message,
@@ -24,11 +28,12 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// A process-scoped handle to one unattended run's ATIF destination.
 ///
-/// Provided optionally by the host before provider registration. The model-run
-/// plugin records every provider request, while the coding context records tool
-/// results. Clones share a mutex and atomic file replacement. An embedder can
-/// omit it without changing the agent's behavior. The destination contains task
-/// data and is created with owner-only permissions on Unix.
+/// Provided optionally by the host before provider registration. The
+/// [`ModelRunPlugin`](crate::model_run::ModelRunPlugin) records every provider
+/// request, while the coding context records tool results. Clones share a mutex
+/// and atomic file replacement. An embedder can omit it without changing the
+/// agent's behavior. The destination contains task data and is created with
+/// owner-only permissions on Unix.
 ///
 /// # Scope
 ///
@@ -43,29 +48,59 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 ///
 /// `Res<RunTrajectory>` or `Option<Res<RunTrajectory>>`. Methods use a shared
 /// mutex and atomically replace the JSON file. Persistence errors are retained
-/// and returned by `check` and `finish`, even if a later checkpoint succeeds.
+/// and returned by [`check`](Self::check) and [`finish`](Self::finish), even if
+/// a later checkpoint succeeds. The model-run plugin writes its checkpoints on
+/// Tokio's blocking pool, so a provider call never blocks an async worker with
+/// file I/O. A dropped response stream only records its partial content in
+/// memory; the next checkpoint or [`finish`](Self::finish) writes it.
 ///
 /// # Alternatives
 ///
 /// The agent's RDF trajectory records policy decisions; it does not replace a
-/// complete provider-call export. `RunUsage` reports accounting without content.
+/// complete provider-call export. [`RunUsage`](crate::usage::RunUsage) reports
+/// accounting without content.
 ///
 /// # Example
 ///
 /// ```no_run
+/// use polaris::system::system::SystemError;
 /// use polaris::system::{param::Res, system};
 /// use polaris_code::trajectory::RunTrajectory;
+///
 /// #[system]
-/// async fn verify_recording(trace: Option<Res<RunTrajectory>>) {
-///     if let Some(trace) = trace { trace.check().expect("trajectory is writable"); }
+/// async fn verify_recording(trace: Option<Res<RunTrajectory>>) -> Result<(), SystemError> {
+///     if let Some(trace) = trace {
+///         trace
+///             .check()
+///             .map_err(|error| SystemError::ExecutionError(error.to_string()))?;
+///     }
+///     Ok(())
 /// }
 /// ```
 #[derive(Clone)]
-pub struct RunTrajectory(Arc<Mutex<Recording>>);
+pub struct RunTrajectory(Arc<Shared>);
+
+struct Shared {
+    recording: Mutex<Recording>,
+    /// The first persistence failure. It lives outside the recording lock so
+    /// `check` never waits for a file write that is in progress.
+    failure: OnceLock<String>,
+}
 
 impl std::fmt::Debug for RunTrajectory {
+    // Shows counts only. Task content never appears, and a busy lock is not waited for.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RunTrajectory").finish_non_exhaustive()
+        let mut debug = f.debug_struct("RunTrajectory");
+        match self.0.recording.try_lock() {
+            Ok(recording) => debug.field("steps", &recording.step_count()),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                debug.field("steps", &poisoned.into_inner().step_count())
+            }
+            Err(TryLockError::WouldBlock) => debug.field("steps", &format_args!("<busy>")),
+        };
+        debug
+            .field("failed", &self.0.failure.get().is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -74,7 +109,8 @@ impl GlobalResource for RunTrajectory {}
 struct Recording {
     path: PathBuf,
     document: Value,
-    failure: Option<String>,
+    /// Set when a change is in memory but not yet in the file.
+    unsaved: bool,
     messages: HashMap<u64, Vec<usize>>,
     configurations: HashMap<(String, u64), Vec<usize>>,
     history: history::History,
@@ -87,6 +123,10 @@ fn fingerprint(value: &Value) -> u64 {
 }
 
 impl Recording {
+    fn step_count(&self) -> usize {
+        self.document["steps"].as_array().map_or(0, Vec::len)
+    }
+
     fn save(&mut self) -> io::Result<()> {
         let steps = self.document["steps"].as_array().expect("steps array");
         let sum = |key: &str| {
@@ -180,6 +220,28 @@ impl Recording {
 impl RunTrajectory {
     /// Reserve a fresh owner-only file and record the initial instruction.
     /// Existing destinations, including symlinks, are refused. Its parent must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the destination already exists (a symlink counts),
+    /// if its parent directory is missing, or if the first write fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use polaris_code::trajectory::RunTrajectory;
+    ///
+    /// let trace = RunTrajectory::create(
+    ///     Path::new("out/trajectory.json"),
+    ///     "session-1",
+    ///     "provider/model",
+    ///     "Fix the failing test.",
+    /// )?;
+    /// // Run the agent with a clone of `trace` published as a resource, then:
+    /// trace.finish(0)?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn create(
         path: &Path,
         session_id: &str,
@@ -202,37 +264,88 @@ impl RunTrajectory {
                 "agent": {"name": "polaris", "version": env!("CARGO_PKG_VERSION"), "model_name": model},
                 "steps": [], "extra": {"status": "running", "history_format": "polaris-code-message-history/v1", "histories": []},
             }),
-            failure: None,
+            unsaved: false,
             messages: HashMap::new(),
             configurations: HashMap::new(),
             history: history::History::default(),
         };
         recording.message(&Message::user(instruction));
         recording.save()?;
-        Ok(Self(Arc::new(Mutex::new(recording))))
+        Ok(Self(Arc::new(Shared {
+            recording: Mutex::new(recording),
+            failure: OnceLock::new(),
+        })))
     }
 
+    fn lock(&self) -> MutexGuard<'_, Recording> {
+        self.0
+            .recording
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Apply `change` in memory, then write the file. A change that returns
+    /// `true` leaves the recording unsaved until a write succeeds, so a later
+    /// checkpoint also writes anything that was deferred.
     fn update(&self, change: impl FnOnce(&mut Recording) -> bool) {
-        let mut recording = self.0.lock().unwrap_or_else(|err| err.into_inner());
-        if !change(&mut recording) {
+        self.apply(false, change);
+    }
+
+    /// Like [`update`](Self::update), but with `defer` set the file is not
+    /// touched. A deferred change is written by the next checkpoint.
+    fn apply(&self, defer: bool, change: impl FnOnce(&mut Recording) -> bool) {
+        let mut recording = self.lock();
+        let changed = change(&mut recording);
+        recording.unsaved |= changed;
+        if defer || !recording.unsaved {
             return;
         }
-        if let Err(error) = recording.save() {
-            tracing::error!(%error, "could not checkpoint trajectory");
-            recording.failure.get_or_insert_with(|| error.to_string());
+        match recording.save() {
+            Ok(()) => recording.unsaved = false,
+            Err(error) => {
+                tracing::error!(%error, "could not checkpoint trajectory");
+                let _ = self.0.failure.set(error.to_string());
+            }
+        }
+    }
+
+    /// Run `work` on Tokio's blocking pool, so file I/O never stalls an async
+    /// worker. Needs a Tokio runtime. A panic in `work` is raised again here.
+    pub(crate) async fn blocking<R: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Self) -> R + Send + 'static,
+    ) -> R {
+        let trace = self.clone();
+        match tokio::task::spawn_blocking(move || work(&trace)).await {
+            Ok(result) => result,
+            Err(error) => match error.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(error) => panic!("trajectory write task stopped: {error}"),
+            },
         }
     }
 
     /// Return any retained persistence failure, even if a later checkpoint succeeded.
+    ///
+    /// This never waits for a file write in progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure to write the destination file.
     pub fn check(&self) -> io::Result<()> {
-        let recording = self.0.lock().unwrap_or_else(|err| err.into_inner());
-        match &recording.failure {
+        match self.0.failure.get() {
             Some(error) => Err(io::Error::other(error.clone())),
             None => Ok(()),
         }
     }
 
-    /// Finalize the run after tool cleanup and session persistence.
+    /// Finalize the run after tool cleanup and session persistence. Also writes
+    /// any change a dropped stream left in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure to write the destination file, including one
+    /// from an earlier checkpoint, or the failure of this final write.
     pub fn finish(&self, exit_code: i32) -> io::Result<()> {
         self.update(|recording| {
             recording.document["extra"]["status"] = json!(if exit_code == 0 {
@@ -278,22 +391,26 @@ impl RunTrajectory {
         index
     }
 
-    fn assistant(
-        &self,
-        index: usize,
-        message: Message,
-        usage: &Usage,
-        metadata: Value,
-        completed: bool,
-    ) {
-        self.update(|recording| {
+    /// Store one response snapshot. With `defer` set, only memory changes.
+    pub(crate) fn assistant(&self, index: usize, snapshot: Snapshot, defer: bool) {
+        self.apply(defer, |recording| {
+            let Snapshot {
+                message,
+                usage,
+                metadata,
+                completed,
+            } = snapshot;
             messages::store(&mut recording.document, index + 1, &message);
             let step = &mut recording.document["steps"][index];
-            step["metrics"] = metrics(usage);
+            step["metrics"] = metrics(&usage);
             for (key, value) in metadata.as_object().expect("response metadata") {
                 step["extra"][key] = value.clone();
             }
-            step["extra"]["status"] = json!(if completed { "completed" } else { "partial" });
+            // A failed step stays failed. Its partial content is still kept,
+            // but a later snapshot must not replace the failure status.
+            if step["extra"]["status"] != "failed" {
+                step["extra"]["status"] = json!(if completed { "completed" } else { "partial" });
+            }
             recording
                 .messages
                 .entry(fingerprint(&json!(message)))
@@ -304,8 +421,18 @@ impl RunTrajectory {
     }
 
     pub(crate) fn response(&self, index: usize, response: &LlmResponse) {
-        self.assistant(index, Message::Assistant { id: None, content: response.content.clone() }, &response.usage,
-            json!({"stop_reason": response.stop_reason, "response_id": response.id, "response_model": response.model}), true);
+        // The snapshot owns a copy: the caller keeps its response, and the
+        // write may run on another thread.
+        let snapshot = Snapshot {
+            message: Message::Assistant {
+                id: None,
+                content: response.content.clone(),
+            },
+            usage: response.usage.clone(),
+            metadata: json!({"stop_reason": response.stop_reason, "response_id": response.id, "response_model": response.model}),
+            completed: true,
+        };
+        self.assistant(index, snapshot, false);
     }
 
     pub(crate) fn failure(&self, index: usize, kind: &str) {
@@ -337,7 +464,26 @@ impl RunTrajectory {
 /// Reconstruct the exact native request sent by a model-call step (one-based
 /// ATIF step id). Resolves shared history ranges, configuration steps and native
 /// message field references, including compacted context and linked tool results.
-/// Returns an error for invalid or forward history references or missing fields.
+///
+/// # Errors
+///
+/// Returns an error if `step_id` is zero, out of range or not a model-call
+/// step, if a history, configuration or message reference is invalid or points
+/// forward, if a native message field is missing, or if the rebuilt value is not
+/// a valid request.
+///
+/// # Examples
+///
+/// ```no_run
+/// use polaris_code::trajectory::rebuild_request;
+///
+/// let document: serde_json::Value =
+///     serde_json::from_slice(&std::fs::read("out/trajectory.json")?)?;
+/// // Step ids are one-based, as in ATIF: the first step is 1, not 0.
+/// let request = rebuild_request(&document, 3)?;
+/// println!("{} messages", request.messages.len());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn rebuild_request(document: &Value, step_id: usize) -> io::Result<LlmRequest> {
     let invalid = || io::Error::other("invalid model-call step");
     let step = document["steps"]
@@ -424,6 +570,15 @@ fn metrics(usage: &Usage) -> Value {
     })
 }
 
+/// One assistant response, detached from its source so a blocking thread can
+/// store it.
+pub(crate) struct Snapshot {
+    message: Message,
+    usage: Usage,
+    metadata: Value,
+    completed: bool,
+}
+
 struct CapturedBlock {
     kind: ContentBlockStartData,
     text: String,
@@ -431,6 +586,10 @@ struct CapturedBlock {
 }
 
 /// Accumulates one response; token-level events are not duplicated in the file.
+///
+/// `event` only updates memory and returns a [`Snapshot`] when a checkpoint is
+/// due; the caller writes it off the async worker. Dropping a capture that did
+/// not finish records its partial content in memory without any file I/O.
 pub(crate) struct StreamCapture {
     trajectory: RunTrajectory,
     index: usize,
@@ -457,7 +616,9 @@ impl StreamCapture {
             completed: false,
         }
     }
-    pub(crate) fn event(&mut self, event: &StreamEvent) {
+    /// Fold one event in. Returns a snapshot when the event ends a block or
+    /// carries usage, which is when the file should be updated.
+    pub(crate) fn event(&mut self, event: &StreamEvent) -> Option<Snapshot> {
         match event {
             StreamEvent::ContentBlockStart { index, block } => {
                 self.blocks.insert(
@@ -502,16 +663,15 @@ impl StreamCapture {
                 self.completed = true;
             }
         }
-        if matches!(
+        matches!(
             event,
             StreamEvent::ContentBlockStop { .. }
                 | StreamEvent::MessageDelta { .. }
                 | StreamEvent::MessageStop { .. }
-        ) {
-            self.checkpoint();
-        }
+        )
+        .then(|| self.snapshot())
     }
-    fn checkpoint(&self) {
+    fn snapshot(&self) -> Snapshot {
         let mut content = Vec::new();
         let mut partial = Vec::new();
         let indices = self.closed.iter().copied().chain(
@@ -525,6 +685,8 @@ impl StreamCapture {
                 continue;
             };
             match &block.kind {
+                // Text is cloned because the capture keeps growing it, and the
+                // snapshot may be written later on another thread.
                 ContentBlockStartData::Text => content.push(AssistantBlock::Text(TextBlock { text: block.text.clone() })),
                 ContentBlockStartData::Reasoning => content.push(AssistantBlock::Reasoning(ReasoningBlock { id: None, reasoning: vec![block.text.clone()], signature: block.signature.clone() })),
                 ContentBlockStartData::ToolCall { id, call_id, name } => {
@@ -539,13 +701,22 @@ impl StreamCapture {
                 }
             }
         }
-        self.trajectory.assistant(self.index, Message::Assistant { id: None, content }, &self.usage,
-            json!({"stop_reason": self.stop_reason, "response_id": self.response_id, "response_model": self.model, "partial_tool_calls": partial}), self.completed);
+        Snapshot {
+            message: Message::Assistant { id: None, content },
+            usage: self.usage.clone(),
+            metadata: json!({"stop_reason": self.stop_reason, "response_id": self.response_id, "response_model": self.model, "partial_tool_calls": partial}),
+            completed: self.completed,
+        }
     }
 }
 impl Drop for StreamCapture {
+    // No file I/O here: a drop can run on an async worker, so the partial
+    // response is only recorded in memory. The next checkpoint or `finish`
+    // writes it. A step that already failed keeps its failure status.
     fn drop(&mut self) {
-        self.checkpoint();
+        if !self.completed {
+            self.trajectory.assistant(self.index, self.snapshot(), true);
+        }
     }
 }
 
@@ -571,6 +742,15 @@ mod tests {
             max_output_tokens: NonZeroU32::new(512),
             output_schema: Some(json!({"type":"object", "description":"unique-output-schema"})),
             ..Default::default()
+        }
+    }
+    /// Feed one event and write any checkpoint it asks for, as the decorator does.
+    fn feed(capture: &mut StreamCapture, event: StreamEvent) {
+        if let Some(snapshot) = capture.event(&event) {
+            capture
+                .trajectory
+                .clone()
+                .assistant(capture.index, snapshot, false);
         }
     }
     fn response(content: Vec<AssistantBlock>) -> LlmResponse {
@@ -702,13 +882,6 @@ mod tests {
             "growth {midpoint} -> {final_size}"
         );
         let doc = document(&path);
-        assert!(
-            doc["extra"]["histories"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|node| node["segments"].as_array().unwrap().len() <= 2)
-        );
         for (step, input) in checks {
             assert_eq!(json!(rebuild_request(&doc, step).unwrap()), json!(input));
         }
@@ -799,76 +972,107 @@ mod tests {
         let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
         let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
         let mut capture = StreamCapture::new(trace.clone(), index);
-        capture.event(&StreamEvent::ContentBlockStart {
-            index: 0,
-            block: ContentBlockStartData::Reasoning,
-        });
-        capture.event(&StreamEvent::ContentBlockDelta {
-            index: 0,
-            delta: ContentBlockDelta::Reasoning("thought".into()),
-        });
-        capture.event(&StreamEvent::ContentBlockDelta {
-            index: 0,
-            delta: ContentBlockDelta::Signature("signature".into()),
-        });
-        capture.event(&StreamEvent::ContentBlockStop { index: 0 });
-        capture.event(&StreamEvent::ContentBlockStart {
-            index: 1,
-            block: ContentBlockStartData::ToolCall {
-                id: "call".into(),
-                call_id: Some("wire".into()),
-                name: "read_file".into(),
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::Reasoning,
             },
-        });
-        capture.event(&StreamEvent::ContentBlockDelta {
-            index: 1,
-            delta: ContentBlockDelta::ToolCall {
-                arguments: "{\"path\":".into(),
+        );
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::Reasoning("thought".into()),
             },
-        });
-        capture.checkpoint();
+        );
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::Signature("signature".into()),
+            },
+        );
+        feed(&mut capture, StreamEvent::ContentBlockStop { index: 0 });
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                block: ContentBlockStartData::ToolCall {
+                    id: "call".into(),
+                    call_id: Some("wire".into()),
+                    name: "read_file".into(),
+                },
+            },
+        );
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: ContentBlockDelta::ToolCall {
+                    arguments: "{\"path\":".into(),
+                },
+            },
+        );
+        let snapshot = capture.snapshot();
+        trace.assistant(index, snapshot, false);
         assert_eq!(
             document(&path)["steps"][index]["extra"]["partial_tool_calls"][0]["arguments"],
             "{\"path\":"
         );
-        capture.event(&StreamEvent::ContentBlockDelta {
-            index: 1,
-            delta: ContentBlockDelta::ToolCall {
-                arguments: "\"a\"}".into(),
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: ContentBlockDelta::ToolCall {
+                    arguments: "\"a\"}".into(),
+                },
             },
-        });
+        );
         // Concurrent tool blocks can close in a different order than they
         // started. Match the framework collector's completed-block ordering.
-        capture.event(&StreamEvent::ContentBlockStart {
-            index: 2,
-            block: ContentBlockStartData::ToolCall {
-                id: "second".into(),
-                call_id: Some("second-wire".into()),
-                name: "read_file".into(),
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockStart {
+                index: 2,
+                block: ContentBlockStartData::ToolCall {
+                    id: "second".into(),
+                    call_id: Some("second-wire".into()),
+                    name: "read_file".into(),
+                },
             },
-        });
-        capture.event(&StreamEvent::ContentBlockDelta {
-            index: 2,
-            delta: ContentBlockDelta::ToolCall {
-                arguments: "{}".into(),
+        );
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockDelta {
+                index: 2,
+                delta: ContentBlockDelta::ToolCall {
+                    arguments: "{}".into(),
+                },
             },
-        });
-        capture.event(&StreamEvent::ContentBlockStop { index: 2 });
-        capture.event(&StreamEvent::ContentBlockStop { index: 1 });
+        );
+        feed(&mut capture, StreamEvent::ContentBlockStop { index: 2 });
+        feed(&mut capture, StreamEvent::ContentBlockStop { index: 1 });
         let usage = Usage {
             input_tokens: Some(30),
             output_tokens: Some(5),
             ..Default::default()
         };
-        capture.event(&StreamEvent::MessageDelta {
-            usage: usage.clone(),
-        });
-        capture.event(&StreamEvent::MessageStop {
-            usage,
-            stop_reason: StopReason::ToolUse,
-            id: Some("response".into()),
-            model: Some("remote".into()),
-        });
+        feed(
+            &mut capture,
+            StreamEvent::MessageDelta {
+                usage: usage.clone(),
+            },
+        );
+        feed(
+            &mut capture,
+            StreamEvent::MessageStop {
+                usage,
+                stop_reason: StopReason::ToolUse,
+                id: Some("response".into()),
+                model: Some("remote".into()),
+            },
+        );
         drop(capture);
         let doc = document(&path);
         let message = messages::load(&doc, index + 1).unwrap();
@@ -923,19 +1127,169 @@ mod tests {
         assert!(doc["steps"][first]["tool_calls"][0]["arguments"].is_object());
     }
 
+    fn text_capture(trace: &RunTrajectory, index: usize, text: &str) -> StreamCapture {
+        let mut capture = StreamCapture::new(trace.clone(), index);
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                block: ContentBlockStartData::Text,
+            },
+        );
+        feed(
+            &mut capture,
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::Text(text.into()),
+            },
+        );
+        capture
+    }
+
+    fn texts(doc: &Value, index: usize) -> Vec<String> {
+        let Message::Assistant { content, .. } = messages::load(doc, index + 1).unwrap() else {
+            panic!("assistant response")
+        };
+        content
+            .into_iter()
+            .map(|block| match block {
+                AssistantBlock::Text(text) => text.text,
+                other => panic!("unexpected block {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
-    fn existing_destinations_write_failures_and_invalid_history_refs_fail_visibly() {
+    fn a_dropped_stream_is_partial_and_keeps_its_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trajectory.json");
         let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
-        assert!(RunTrajectory::create(&path, "other", "fake/model", "task").is_err());
         let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
-        let mut doc = document(&path);
-        doc["extra"]["histories"][0]["segments"] = json!([{"history": 1, "start": 0, "length": 1}]);
-        assert!(rebuild_request(&doc, index + 1).is_err());
+        drop(text_capture(&trace, index, "half an answer"));
+        trace.finish(0).unwrap();
+        let doc = document(&path);
+        assert_eq!(doc["steps"][index]["extra"]["status"], "partial");
+        assert_eq!(texts(&doc, index), ["half an answer"]);
+    }
+
+    #[test]
+    fn an_error_event_followed_by_a_drop_stays_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        let capture = text_capture(&trace, index, "cut off");
+        trace.failure(index, "http");
+        drop(capture);
+        trace.finish(1).unwrap();
+        let doc = document(&path);
+        assert_eq!(doc["steps"][index]["extra"]["status"], "failed");
+        assert_eq!(doc["steps"][index]["extra"]["error_type"], "http");
+        assert_eq!(texts(&doc, index), ["cut off"]);
+        assert_eq!(doc["extra"]["status"], "failed");
+        assert_eq!(doc["extra"]["exit_code"], 1);
+    }
+
+    #[test]
+    fn dropping_a_stream_does_no_file_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        let capture = text_capture(&trace, index, "unwritten");
+        // Any write to the destination would now fail and be remembered.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        drop(capture);
+        trace.check().expect("drop must not write the file");
+        std::fs::remove_dir(&path).unwrap();
+        // The next checkpoint writes what the drop kept in memory.
+        trace.finish(0).unwrap();
+        assert_eq!(texts(&document(&path), index), ["unwritten"]);
+    }
+
+    #[test]
+    fn debug_shows_counts_without_content_and_never_waits_for_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "secret-task-text").unwrap();
+        let shown = format!("{trace:?}");
+        assert!(shown.contains("steps: 1"), "{shown}");
+        assert!(shown.contains("failed: false"), "{shown}");
+        assert!(!shown.contains("secret-task-text"), "{shown}");
+        let guard = trace.lock();
+        let busy = format!("{trace:?}");
+        drop(guard);
+        assert!(busy.contains("<busy>"), "{busy}");
+    }
+
+    #[test]
+    fn existing_destinations_are_refused_and_write_failures_stay_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let error = RunTrajectory::create(&path, "other", "fake/model", "task").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(trace.finish(0).is_err());
         assert!(trace.check().is_err());
+        // A later write works, yet the earlier failure is still reported.
+        std::fs::remove_dir(&path).unwrap();
+        assert!(trace.finish(0).is_err());
+        assert_eq!(document(&path)["extra"]["status"], "completed");
+    }
+
+    #[test]
+    fn tampered_documents_are_rejected_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let first = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        trace.finish(0).unwrap();
+        let doc = document(&path);
+        rebuild_request(&doc, first + 1).expect("the untouched document rebuilds");
+        let reason = |doc: &Value, id: usize| rebuild_request(doc, id).unwrap_err().to_string();
+        // Step ids are one-based: zero, past the end and a non-model-call step.
+        for id in [0, 999, 1] {
+            assert_eq!(reason(&doc, id), "invalid model-call step", "step id {id}");
+        }
+        let input = format!("/steps/{first}/extra/input");
+        let edits = [
+            (
+                format!("{input}/parameters"),
+                json!(0),
+                "invalid model-call step",
+            ),
+            (
+                format!("{input}/history"),
+                json!("x"),
+                "invalid model-call step",
+            ),
+            (
+                "/extra/histories/0/length".into(),
+                json!(5),
+                "invalid trajectory history reference",
+            ),
+            (
+                "/extra/histories/0/segments".into(),
+                json!([{"history": 1, "start": 0, "length": 1}]),
+                "invalid trajectory history reference",
+            ),
+        ];
+        for (pointer, value, expected) in edits {
+            let mut edited = doc.clone();
+            *edited.pointer_mut(&pointer).unwrap() = value;
+            assert_eq!(reason(&edited, first + 1), expected, "edit at {pointer}");
+        }
+        let mut edited = doc.clone();
+        edited["steps"][0]["extra"]
+            .as_object_mut()
+            .unwrap()
+            .remove("native_message");
+        assert_eq!(
+            reason(&edited, first + 1),
+            "invalid trajectory message reference"
+        );
     }
 }

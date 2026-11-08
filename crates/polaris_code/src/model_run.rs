@@ -2,7 +2,11 @@
 //!
 //! Wrapping a provider once covers the main loop, retries, context summaries,
 //! reviewers and model-calling topologies. Systems continue to consume the
-//! ordinary `ModelRegistry` contract.
+//! ordinary [`ModelRegistry`] contract.
+//!
+//! The [embedding guide](crate::docs::embedding) shows how a host assembles this
+//! plugin. `docs/unattended-runs.md` in the repository describes the run
+//! controls it serves.
 
 use std::future::Future;
 use std::num::NonZeroU32;
@@ -11,6 +15,8 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use polaris::models::ModelRegistry;
+#[cfg(doc)]
+use polaris::models::ModelsPlugin;
 use polaris::models::llm::{
     DynLlmProvider, GenerationError, LlmRequest, LlmResponse, LlmStream, ModelPricing,
     ReasoningEffort,
@@ -65,21 +71,35 @@ impl DynLlmProvider for RunProvider {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, GenerationError>> + Send + 'a>> {
         Box::pin(async move {
             let request = self.request(request);
-            let index = self
-                .options
-                .trajectory
-                .as_ref()
-                .map(|trace| trace.begin(&format!("{}/{model}", self.name()), &request));
+            // Recorder writes run on the blocking pool, never on this worker.
+            let label = format!("{}/{model}", self.name());
+            let (index, request) = match &self.options.trajectory {
+                Some(trace) => {
+                    let (index, request) = trace
+                        .blocking(move |trace| (trace.begin(&label, &request), request))
+                        .await;
+                    (Some(index), request)
+                }
+                None => (None, request),
+            };
             if let Some(trace) = &self.options.trajectory {
                 trace.check().map_err(recording_error)?;
             }
             let result = self.inner.generate(model, request).await;
-            if let (Some(trace), Some(index)) = (&self.options.trajectory, index) {
-                match &result {
-                    Ok(response) => trace.response(index, response),
-                    Err(error) => trace.failure(index, error.error_type()),
+            let result = match (&self.options.trajectory, index) {
+                (Some(trace), Some(index)) => {
+                    trace
+                        .blocking(move |trace| {
+                            match &result {
+                                Ok(response) => trace.response(index, response),
+                                Err(error) => trace.failure(index, error.error_type()),
+                            }
+                            result
+                        })
+                        .await
                 }
-            }
+                _ => result,
+            };
             if let Some(trace) = &self.options.trajectory {
                 trace.check().map_err(recording_error)?;
             }
@@ -94,10 +114,16 @@ impl DynLlmProvider for RunProvider {
     ) -> Pin<Box<dyn Future<Output = Result<LlmStream, GenerationError>> + Send + 'a>> {
         Box::pin(async move {
             let request = self.request(request);
-            let recording = self.options.trajectory.clone().map(|trace| {
-                let index = trace.begin(&format!("{}/{model}", self.name()), &request);
-                (trace, index)
-            });
+            let label = format!("{}/{model}", self.name());
+            let (recording, request) = match self.options.trajectory.clone() {
+                Some(trace) => {
+                    let (index, request) = trace
+                        .blocking(move |trace| (trace.begin(&label, &request), request))
+                        .await;
+                    (Some((trace, index)), request)
+                }
+                None => (None, request),
+            };
             if let Some((trace, _)) = &recording {
                 trace.check().map_err(recording_error)?;
             }
@@ -105,7 +131,10 @@ impl DynLlmProvider for RunProvider {
                 Ok(stream) => stream,
                 Err(error) => {
                     if let Some((trace, index)) = recording {
-                        trace.failure(index, error.error_type());
+                        let kind = error.error_type();
+                        trace
+                            .blocking(move |trace| trace.failure(index, kind))
+                            .await;
                     }
                     return Err(error);
                 }
@@ -114,13 +143,33 @@ impl DynLlmProvider for RunProvider {
                 return Ok(stream);
             };
             let mut capture = StreamCapture::new(trace.clone(), index);
-            Ok(Box::pin(stream.map(move |event| {
-                match &event {
+            // `then` handles one event at a time, so writes keep their order.
+            // Only events that end a block or carry usage cost a write.
+            Ok(Box::pin(stream.then(move |event| {
+                let due = match &event {
                     Ok(event) => capture.event(event),
-                    Err(error) => trace.failure(index, error.error_type()),
+                    Err(_) => None,
+                };
+                let trace = trace.clone();
+                async move {
+                    match &event {
+                        Ok(_) => {
+                            if let Some(snapshot) = due {
+                                trace
+                                    .blocking(move |trace| trace.assistant(index, snapshot, false))
+                                    .await;
+                            }
+                        }
+                        Err(error) => {
+                            let kind = error.error_type();
+                            trace
+                                .blocking(move |trace| trace.failure(index, kind))
+                                .await;
+                        }
+                    }
+                    trace.check().map_err(recording_error)?;
+                    event
                 }
-                trace.check().map_err(recording_error)?;
-                event
             })) as LlmStream)
         })
     }
@@ -151,20 +200,31 @@ fn recording_error(error: std::io::Error) -> GenerationError {
 ///
 /// | API | Description |
 /// | --- | --- |
-/// | _none_ | Consumers use the ordinary `ModelRegistry::llm` contract. |
+/// | _none_ | Consumers use the ordinary [`ModelRegistry::llm`] contract. |
 ///
 /// # Dependencies
 ///
-/// `ModelsPlugin`, which provides `ModelRegistry`. The macro declares an
+/// [`ModelsPlugin`], which provides [`ModelRegistry`]. The macro declares an
 /// extension of that capability. Do not also register the same provider name.
-/// A recorder, when wanted, is supplied through `ModelRunOptions`; the host
-/// separately publishes the same `RunTrajectory` for coding tool results.
+/// A recorder, when wanted, is supplied through [`ModelRunOptions`]; the host
+/// separately publishes the same [`RunTrajectory`] for coding tool results.
+///
+/// # Extends
+///
+/// - [`ModelsPlugin`] / [`ModelRegistry`]: registers one provider under the
+///   wrapped provider's name, or the alias from
+///   [`with_registry_name`](Self::with_registry_name). Every request through it
+///   gets the output ceiling and pinned reasoning effort from
+///   [`ModelRunOptions`], and is recorded when a [`RunTrajectory`] is supplied.
+///   The remote model name is unchanged.
 ///
 /// # Lifecycle
 ///
 /// Construction starts no I/O. `build` registers one decorated provider.
-/// Requests and responses are recorded during calls; the host finalizes the
-/// recorder after tool cleanup. Dropped streams checkpoint partial content.
+/// Requests and responses are recorded during calls, with file writes on
+/// Tokio's blocking pool; the host finalizes the recorder after tool cleanup.
+/// Dropped streams record partial content in memory, and the next checkpoint
+/// or [`RunTrajectory::finish`] writes it.
 ///
 /// # Example
 ///
@@ -184,6 +244,16 @@ pub struct ModelRunPlugin {
     provider: Arc<dyn DynLlmProvider>,
     name: &'static str,
     options: ModelRunOptions,
+}
+
+impl std::fmt::Debug for ModelRunPlugin {
+    // The wrapped provider is left out: its own debug output may hold credentials.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelRunPlugin")
+            .field("name", &self.name)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModelRunPlugin {
@@ -218,8 +288,11 @@ impl Plugin for ModelRunPlugin {
 mod tests {
     use super::*;
     use polaris::models::llm::{
-        AssistantBlock, LlmProvider, Message, ReasoningEffort, StopReason, Usage,
+        AssistantBlock, ContentBlockDelta, ContentBlockStartData, LlmProvider, Message,
+        ReasoningEffort, StopReason, StreamEvent, Usage,
     };
+    use serde_json::Value;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     struct Fake(Arc<Mutex<Vec<(String, LlmRequest)>>>);
@@ -319,7 +392,10 @@ mod tests {
             .generate("model", LlmRequest::default())
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("trajectory export failed"));
+        assert!(
+            matches!(&error, GenerationError::UnsupportedOperation(message) if message.contains("trajectory export failed")),
+            "{error:?}"
+        );
         assert!(requests.lock().unwrap().is_empty());
     }
 
@@ -336,5 +412,282 @@ mod tests {
             .await
             .unwrap();
         assert!(requests.lock().unwrap()[0].1.reasoning_effort.is_none());
+    }
+
+    type Calls = Arc<Mutex<Vec<(String, LlmRequest)>>>;
+
+    /// What a [`Scripted`] provider does on its next call.
+    enum Script {
+        Answer,
+        GenerateError,
+        StreamStartError,
+        Stream(Vec<Result<StreamEvent, GenerationError>>),
+    }
+
+    /// A provider whose next result is chosen by the test.
+    struct Scripted {
+        calls: Calls,
+        script: Mutex<Option<Script>>,
+    }
+    impl LlmProvider for Scripted {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        async fn generate(
+            &self,
+            model: &str,
+            request: LlmRequest,
+        ) -> Result<LlmResponse, GenerationError> {
+            self.calls.lock().unwrap().push((model.into(), request));
+            match self.script.lock().unwrap().take() {
+                Some(Script::GenerateError) => {
+                    Err(GenerationError::Http("connection reset".into()))
+                }
+                _ => Ok(LlmResponse {
+                    content: vec![AssistantBlock::text("answer")],
+                    usage: Usage::default(),
+                    stop_reason: StopReason::EndTurn,
+                    id: Some("response-id".into()),
+                    model: None,
+                }),
+            }
+        }
+        async fn stream(
+            &self,
+            model: &str,
+            request: LlmRequest,
+        ) -> Result<LlmStream, GenerationError> {
+            self.calls.lock().unwrap().push((model.into(), request));
+            match self.script.lock().unwrap().take() {
+                Some(Script::StreamStartError) => Err(GenerationError::Auth("bad key".into())),
+                Some(Script::Stream(events)) => Ok(Box::pin(futures_util::stream::iter(events))),
+                _ => Ok(Box::pin(futures_util::stream::empty())),
+            }
+        }
+    }
+
+    /// A decorated provider writing to a real recorder in a temporary directory.
+    struct Recorded {
+        provider: RunProvider,
+        calls: Calls,
+        trace: RunTrajectory,
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Recorded {
+        fn new(script: Script) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("trajectory.json");
+            let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+            let calls = Calls::default();
+            let provider = RunProvider {
+                name: "fake",
+                inner: Arc::new(Scripted {
+                    calls: calls.clone(),
+                    script: Mutex::new(Some(script)),
+                }),
+                options: ModelRunOptions {
+                    trajectory: Some(trace.clone()),
+                    ..Default::default()
+                },
+            };
+            Self {
+                provider,
+                calls,
+                trace,
+                path,
+                _dir: dir,
+            }
+        }
+
+        /// Make every later write to the destination fail.
+        fn break_destination(&self) {
+            std::fs::remove_file(&self.path).unwrap();
+            std::fs::create_dir(&self.path).unwrap();
+        }
+
+        /// The one model-call step, after writing everything that is pending.
+        fn model_call(&self) -> Value {
+            let _ = self.trace.finish(0);
+            let document: Value =
+                serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
+            let mut calls = document["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|step| step["extra"]["kind"] == "model_call");
+            let step = calls.next().expect("a model-call step").clone();
+            assert!(calls.next().is_none(), "exactly one model-call step");
+            step
+        }
+    }
+
+    fn block_start(
+        index: u32,
+        block: ContentBlockStartData,
+    ) -> Result<StreamEvent, GenerationError> {
+        Ok(StreamEvent::ContentBlockStart { index, block })
+    }
+
+    fn text_delta(index: u32, text: &str) -> Result<StreamEvent, GenerationError> {
+        Ok(StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::Text(text.into()),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_recorded_generate_call_stores_the_request_and_the_response() {
+        let run = Recorded::new(Script::Answer);
+        let request = LlmRequest {
+            messages: vec![Message::user("task")],
+            ..Default::default()
+        };
+        let response = run.provider.generate("model", request).await.unwrap();
+        assert_eq!(response.id.as_deref(), Some("response-id"));
+        let step = run.model_call();
+        assert_eq!(step["model_name"], "fake/model");
+        assert_eq!(step["extra"]["status"], "completed");
+        assert_eq!(step["extra"]["response_id"], "response-id");
+        run.trace.check().unwrap();
+        assert_eq!(run.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_generate_error_is_returned_and_marks_the_step_failed() {
+        let run = Recorded::new(Script::GenerateError);
+        let error = run
+            .provider
+            .generate("model", LlmRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GenerationError::Http(_)), "{error:?}");
+        let step = run.model_call();
+        assert_eq!(step["extra"]["status"], "failed");
+        assert_eq!(step["extra"]["error_type"], "http");
+        run.trace.check().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_cannot_start_marks_the_step_failed() {
+        let run = Recorded::new(Script::StreamStartError);
+        let Err(error) = run.provider.stream("model", LlmRequest::default()).await else {
+            panic!("the provider refused to start the stream")
+        };
+        assert!(matches!(error, GenerationError::Auth(_)), "{error:?}");
+        let step = run.model_call();
+        assert_eq!(step["extra"]["status"], "failed");
+        assert_eq!(step["extra"]["error_type"], "auth");
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_error_reaches_the_caller_and_keeps_the_failure() {
+        let run = Recorded::new(Script::Stream(vec![
+            block_start(0, ContentBlockStartData::Text),
+            text_delta(0, "cut off"),
+            Err(GenerationError::Http("connection reset".into())),
+        ]));
+        let mut stream = run
+            .provider
+            .stream("model", LlmRequest::default())
+            .await
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, GenerationError::Http(_)), "{error:?}");
+        // Dropping the errored stream must not turn the failure into a partial.
+        drop(stream);
+        let step = run.model_call();
+        assert_eq!(step["extra"]["status"], "failed");
+        assert_eq!(step["extra"]["error_type"], "http");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_midway_is_recorded_as_partial() {
+        let run = Recorded::new(Script::Stream(vec![
+            block_start(0, ContentBlockStartData::Text),
+            text_delta(0, "half an answer"),
+            text_delta(0, " that never ends"),
+        ]));
+        let mut stream = run
+            .provider
+            .stream("model", LlmRequest::default())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            stream.next().await.unwrap().unwrap();
+        }
+        drop(stream);
+        let step = run.model_call();
+        assert_eq!(step["extra"]["status"], "partial");
+        // The half that arrived is kept in the step's message text.
+        assert_eq!(step["message"], "half an answer");
+    }
+
+    #[tokio::test]
+    async fn a_recording_that_fails_mid_stream_ends_the_stream_with_an_error() {
+        let run = Recorded::new(Script::Stream(vec![
+            block_start(0, ContentBlockStartData::Text),
+            text_delta(0, "answer"),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+        ]));
+        let mut stream = run
+            .provider
+            .stream("model", LlmRequest::default())
+            .await
+            .unwrap();
+        // Deltas need no write, so a broken destination goes unnoticed until
+        // the first event that does.
+        run.break_destination();
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().is_ok());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, GenerationError::UnsupportedOperation(message) if message.contains("trajectory export failed")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_recording_stops_a_stream_before_the_provider_is_called() {
+        let run = Recorded::new(Script::Answer);
+        run.break_destination();
+        let Err(error) = run.provider.stream("model", LlmRequest::default()).await else {
+            panic!("the stream must not start")
+        };
+        assert!(
+            matches!(&error, GenerationError::UnsupportedOperation(message) if message.contains("trajectory export failed")),
+            "{error:?}"
+        );
+        assert!(run.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn debug_hides_the_wrapped_provider() {
+        struct Secret;
+        impl LlmProvider for Secret {
+            fn name(&self) -> &'static str {
+                "secret-provider"
+            }
+            async fn generate(
+                &self,
+                _: &str,
+                _: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                unreachable!("not called")
+            }
+        }
+        impl std::fmt::Debug for Secret {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("api-key-123")
+            }
+        }
+        let plugin = ModelRunPlugin::new(Secret, ModelRunOptions::default());
+        let shown = format!("{plugin:?}");
+        assert!(shown.contains("secret-provider"), "{shown}");
+        assert!(!shown.contains("api-key-123"), "{shown}");
     }
 }
