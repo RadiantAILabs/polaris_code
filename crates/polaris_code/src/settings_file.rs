@@ -132,6 +132,10 @@ const KEYS: &[Key] = &[
     Key::with_flag("max_output_tokens", "POLARIS_CODE_MAX_OUTPUT_TOKENS"),
     Key::with_flag("context_window", "POLARIS_CODE_CONTEXT_WINDOW"),
     Key::with_flag("reasoning_effort", "POLARIS_CODE_REASONING_EFFORT"),
+    Key::with_flag(
+        "model_request_timeout_secs",
+        "POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS",
+    ),
 ];
 
 fn command() -> clap::Command {
@@ -644,18 +648,36 @@ fn setting_text(key: &str, item: &Item) -> Option<String> {
     }
     if matches!(
         key,
-        "max_cost_usd" | "max_tokens" | "max_turns" | "max_output_tokens" | "context_window"
+        "max_cost_usd"
+            | "max_tokens"
+            | "max_turns"
+            | "max_output_tokens"
+            | "context_window"
+            | "model_request_timeout_secs"
     ) {
         return item
             .as_integer()
             .map(|value| value.to_string())
-            .or_else(|| item.as_float().map(|value| value.to_string()));
+            .or_else(|| {
+                item.as_float().map(|value| {
+                    if key == "model_request_timeout_secs" {
+                        // Keep the decimal point so the integer parser refuses
+                        // floats such as 1.0 instead of silently coercing them.
+                        format!("{value:?}")
+                    } else {
+                        value.to_string()
+                    }
+                })
+            });
     }
     None
 }
 
 fn validate(key: &str, value: &str) -> Result<(), String> {
     match key {
+        "model_request_timeout_secs" => value
+            .parse::<polaris_code::providers::ModelRequestTimeout>()
+            .map(|_| ()),
         "max_turns" => super::resolve_max_turns(Some(value)).map(|_| ()),
         "max_output_tokens" => super::resolve_max_output_tokens(Some(value)).map(|_| ()),
         "context_window" => value
@@ -821,6 +843,60 @@ mod tests {
                 .unwrap()
                 .contains("profile `missing`")
         );
+    }
+
+    #[test]
+    fn request_timeout_follows_file_environment_and_flag_precedence() {
+        let fixture = Fixture::new();
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert!(cli.model_request_timeout_secs.is_none());
+        fixture.project("model_request_timeout_secs = 300\n");
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.model_request_timeout_secs, Some("300".parse().unwrap()));
+        let env = [("POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS", "600")];
+        let (cli, _) = fixture.load(&[], &env).unwrap();
+        assert_eq!(cli.model_request_timeout_secs, Some("600".parse().unwrap()));
+        let (cli, _) = fixture
+            .load(&["--model-request-timeout-secs", "86400"], &env)
+            .unwrap();
+        assert_eq!(
+            cli.model_request_timeout_secs,
+            Some("86400".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn request_timeout_refuses_invalid_values_from_every_source() {
+        use clap::Parser;
+
+        for value in ["", "0", "-1", "+1", "1.5", "86401", "abc"] {
+            let fixture = Fixture::new();
+            let error = super::super::Cli::try_parse_from([
+                "polaris",
+                &format!("--model-request-timeout-secs={value}"),
+            ])
+            .err()
+            .expect("invalid flag timeout")
+            .to_string();
+            assert!(error.contains("from 1 to 86400"), "{error}");
+            let error = fixture
+                .load(&[], &[("POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS", value)])
+                .err()
+                .expect("invalid environment timeout");
+            assert!(error.contains("from 1 to 86400"), "{error}");
+            fixture.project(&format!("model_request_timeout_secs = {value:?}\n"));
+            let error = fixture.load(&[], &[]).err().expect("invalid file timeout");
+            assert!(error.contains("from 1 to 86400"), "{error}");
+        }
+        for value in ["0", "-1", "1.0", "1.5", "86401"] {
+            let fixture = Fixture::new();
+            fixture.project(&format!("model_request_timeout_secs = {value}\n"));
+            let error = fixture
+                .load(&[], &[])
+                .err()
+                .expect("invalid numeric timeout");
+            assert!(error.contains("from 1 to 86400"), "{error}");
+        }
     }
 
     #[test]

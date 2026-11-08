@@ -5,6 +5,9 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Added
+- `--model-request-timeout-secs` / `POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS` / `model_request_timeout_secs` configures Bedrock's native per-attempt request timeout for Converse and Responses. Accepts whole seconds from 1 to 86400; unset preserves existing defaults. Other providers refuse this setting because their builders expose no total request timeout. See the embedding guide for retry and streaming behavior.
+
 ## [0.4.2] - 2026-11-08
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.

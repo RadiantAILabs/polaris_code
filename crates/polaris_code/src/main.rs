@@ -647,6 +647,14 @@ struct Cli {
     /// Custom non-empty values pass through; unsupported values fail visibly.
     #[arg(long, env = "POLARIS_CODE_REASONING_EFFORT", value_name = "EFFORT")]
     reasoning_effort: Option<polaris::models::llm::ReasoningEffort>,
+    /// Longest one Bedrock transport attempt may take, in whole seconds (1-86400).
+    /// Covers Converse and Responses; unset preserves provider defaults.
+    #[arg(
+        long,
+        env = "POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS",
+        value_name = "SECONDS"
+    )]
+    model_request_timeout_secs: Option<providers::ModelRequestTimeout>,
     /// Write native ATIF JSON to a fresh file during this unattended run.
     /// Parent directories must exist. Contains full prompts and model outputs.
     #[arg(
@@ -1294,6 +1302,15 @@ async fn main() {
     // fact before the TUI takes the screen. One check serves both, and what it
     // finds out — which region, which credential source — is reported, never
     // the credential itself.
+    if cli.model_request_timeout_secs.is_some() && cli.provider != providers::Provider::Bedrock {
+        fatal(
+            headless,
+            &providers::StartupError::UnsupportedRequestTimeout {
+                provider: cli.provider,
+            }
+            .to_string(),
+        );
+    }
     let ready_provider = match providers::prepare(
         cli.provider,
         cli.region.as_deref(),
@@ -1306,6 +1323,12 @@ async fn main() {
         Err(err) => fatal(headless, &err.to_string()),
     };
     startup_notes.push(ready_provider.report().line());
+    let ready_provider = match cli.model_request_timeout_secs {
+        Some(timeout) => ready_provider
+            .with_request_timeout(timeout)
+            .unwrap_or_else(|error| fatal(headless, &error.to_string())),
+        None => ready_provider,
+    };
     let trajectory = cli.trajectory_path.as_ref().map(|path| {
         polaris_code::trajectory::RunTrajectory::create(
             path,
