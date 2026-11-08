@@ -96,6 +96,20 @@ fn stream_reply(stream: &mut TcpStream, delta: Value, finish_reason: &str) {
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
 }
 
+/// A reply that calls no tool and only says what it will do next.
+fn serve_pause(stream: &mut TcpStream) {
+    stream_reply(
+        stream,
+        json!({"content": "Next I will create the file."}),
+        "stop",
+    );
+}
+
+/// A reply the server cut off at the output limit.
+fn serve_truncated(stream: &mut TcpStream) {
+    stream_reply(stream, json!({"content": "The answer begins"}), "length");
+}
+
 /// A refusal the client reports without retrying.
 fn serve_refusal(stream: &mut TcpStream) {
     let body = r#"{"error":{"message":"loopback refusal","type":"invalid_request_error"}}"#;
@@ -113,6 +127,10 @@ enum Script {
     Hang,
     /// Tool calls first, then read the next request and never answer.
     ToolCallsThenHang,
+    /// A reply without a tool call first, then the final answer.
+    PauseThenAnswer,
+    /// A reply cut off at the output limit first, then the final answer.
+    TruncatedThenAnswer,
 }
 
 /// A loopback server that follows a [`Script`] and records every request.
@@ -148,6 +166,15 @@ impl Mock {
                                 serve_tool_calls(&mut stream, &outside)
                             }
                             Script::ToolCalls => serve_final_answer(&mut stream),
+                            Script::PauseThenAnswer if requests.len() == 1 => {
+                                serve_pause(&mut stream)
+                            }
+                            Script::TruncatedThenAnswer if requests.len() == 1 => {
+                                serve_truncated(&mut stream)
+                            }
+                            Script::PauseThenAnswer | Script::TruncatedThenAnswer => {
+                                serve_final_answer(&mut stream)
+                            }
                             Script::Refuse => serve_refusal(&mut stream),
                             Script::ToolCallsThenHang if requests.len() == 1 => {
                                 serve_tool_calls(&mut stream, &outside)
@@ -233,6 +260,9 @@ impl Setup {
             .env("POLARIS_CONFIG_DIR", self.dir.path().join("config"))
             .env("OPENAI_API_KEY", SECRET)
             .env("OPENAI_BASE_URL", format!("http://{address}/v1"))
+            // These tests count model calls exactly; the nudge has its own
+            // tests below, which set the variable themselves.
+            .env("POLARIS_CODE_UNATTENDED_NUDGES", "0")
             .args([
                 "-p",
                 "Create a file and execute the requested verification.",
@@ -267,8 +297,21 @@ impl Setup {
         trajectory: &Path,
         dangerous: bool,
     ) -> (Output, Vec<(String, Value)>) {
+        self.run_with_nudges(script, trajectory, dangerous, "0")
+            .await
+    }
+
+    /// [`run`](Self::run) with `POLARIS_CODE_UNATTENDED_NUDGES` set to `nudges`.
+    async fn run_with_nudges(
+        &self,
+        script: Script,
+        trajectory: &Path,
+        dangerous: bool,
+        nudges: &str,
+    ) -> (Output, Vec<(String, Value)>) {
         let mock = Mock::start(script, self.outside.clone());
         let mut command = self.command(mock.address, trajectory, dangerous);
+        command.env("POLARIS_CODE_UNATTENDED_NUDGES", nudges);
         let output = tokio::time::timeout(CLI_TIMEOUT, command.output()).await;
         let requests = mock.finish();
         (output.expect("CLI must terminate").unwrap(), requests)
@@ -766,4 +809,83 @@ async fn sigterm_after_tools_ran_still_writes_their_results() {
         .expect("the first call's tool results are in the file");
     assert!(!results.is_empty(), "{results:?}");
     assert_ne!(calls[1]["extra"]["status"], "completed");
+}
+
+/// The text of the last user message a Chat Completions request carried.
+fn last_user_text(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .map(|message| match &message["content"] {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn an_unattended_reply_without_a_tool_call_is_asked_to_go_on_once() {
+    let setup = Setup::new();
+    let trajectory = setup.trajectory();
+    let (output, requests) = setup
+        .run_with_nudges(Script::PauseThenAnswer, &trajectory, true, "1")
+        .await;
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(requests.len(), 2, "one nudge, then the answer ends the run");
+    let nudge = last_user_text(&requests[1].1);
+    assert!(nudge.starts_with("[continuation] "), "{nudge}");
+    assert!(nudge.contains("the run ends at your next reply"), "{nudge}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("done"),
+        "the final answer is the result: {stdout}"
+    );
+    let trace = read_trace(&trajectory);
+    assert_eq!(model_calls(&trace).len(), 2);
+    assert_eq!(trace["extra"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn nudges_set_to_zero_end_the_run_on_the_first_reply_without_a_tool_call() {
+    let setup = Setup::new();
+    let trajectory = setup.trajectory();
+    let (output, requests) = setup
+        .run_with_nudges(Script::PauseThenAnswer, &trajectory, true, "0")
+        .await;
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn a_reply_cut_off_at_the_output_limit_is_continued() {
+    let setup = Setup::new();
+    let trajectory = setup.trajectory();
+    let (output, requests) = setup
+        .run_with_nudges(Script::TruncatedThenAnswer, &trajectory, true, "0")
+        .await;
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(requests.len(), 2, "the cut-off reply is continued once");
+    let prompt = last_user_text(&requests[1].1);
+    assert!(prompt.starts_with("[continuation] "), "{prompt}");
+    assert!(prompt.contains("output limit"), "{prompt}");
+    let replayed = requests[1].1["messages"].to_string();
+    assert!(
+        replayed.contains("The answer begins"),
+        "the cut-off text stays in the conversation: {replayed}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_nudge_setting_is_a_configuration_error() {
+    let setup = Setup::new();
+    let trajectory = setup.trajectory();
+    let (output, requests) = setup
+        .run_with_nudges(Script::PauseThenAnswer, &trajectory, true, "lots")
+        .await;
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("POLARIS_CODE_UNATTENDED_NUDGES"));
+    assert!(requests.is_empty());
 }

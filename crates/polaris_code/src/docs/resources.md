@@ -84,8 +84,8 @@ travels this way rather than as a factory parameter.
 | [`CodingTask`](crate::cosmos::task::CodingTask) | Local | The accepted task read by `code.classify-request` and `code.request-clarification`. A caller composing either block directly must insert the same task used to make its [`CodingWorkspace`](crate::cosmos::payload::CodingWorkspace), so classification and the bounded clarification question refer to the same request. |
 
 Per-turn agent state (`AgentConfig`, `AgentLlm`, `PolicySnapshot`,
-`ProjectContext`, `ContextManager`, `LoopState`, `AttemptLedger`, `ToolBatch`,
-`CallLifetime`) is internal plumbing read only
+`ProjectContext`, `ContextManager`, `LoopState`, `AttemptLedger`,
+`ContinuationLedger`, `ToolBatch`, `CallLifetime`) is internal plumbing read only
 by the agent's own systems and is intentionally excluded — see the
 `INTERNAL_RESOURCES` allowlist in `tests/resource_catalog.rs`.
 

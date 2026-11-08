@@ -44,6 +44,9 @@ use super::context::{
     CacheAwareWindow, CompactionRun, ContextManager, LinearWindow, SummarizingWindow,
     compact_context, compaction_focus, finish_compaction,
 };
+use super::continuation::{
+    Continuation, ContinuationLedger, continue_turn, decide_continuation, reset_continuations,
+};
 use super::failure::{self, Attempts, TurnFailure};
 use super::permission_rules::{
     ApprovalRequest, ApprovalScope, PermissionCall, PermissionRules, PermissionRulesPlugin,
@@ -1933,16 +1936,7 @@ impl Agent for CodeAgent {
         // block on a short-lived runtime handle.
         let project = futures_block_on(ProjectContext::discover(&config.working_dir));
         ctx.insert(project);
-        let mut policy = PolicySnapshot::defaults();
-        if let Some(window) = config.context_window {
-            policy.retrieval.apply_model_limits(
-                window,
-                config
-                    .max_output_tokens
-                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS),
-            );
-        }
-        ctx.insert(policy);
+        ctx.insert(PolicySnapshot::for_agent(&config));
         ctx.insert(LiveTranscript::default());
         ctx.insert(AttemptLedger::default());
         ctx.insert(tool_calls::ToolBatch::default());
@@ -1990,6 +1984,7 @@ impl Agent for CodeAgent {
         graph.add_system(receive_user_input);
         graph.add_system(refresh_project_docs);
         graph.add_system(init_loop);
+        graph.add_system(reset_continuations);
 
         graph.add_loop::<LoopState, _, _>(
             "agent_loop",
@@ -2048,7 +2043,21 @@ impl Agent for CodeAgent {
                                         tool_calls::build_tool_calls(tool_branch);
                                     },
                                     |done_branch| {
-                                        done_branch.add_system(finalize);
+                                        // A reply without a tool call ends the
+                                        // turn unless the continuation policy
+                                        // says it is not an answer yet.
+                                        done_branch.add_system(decide_continuation);
+                                        done_branch
+                                            .add_conditional_branch::<Continuation, _, _, _>(
+                                                "continues",
+                                                Continuation::continues,
+                                                |go_on| {
+                                                    go_on.add_system(continue_turn);
+                                                },
+                                                |finish| {
+                                                    finish.add_system(finalize);
+                                                },
+                                            );
                                     },
                                 );
                             },
@@ -2269,6 +2278,7 @@ impl Plugin for CodeAgentPlugin {
         }
         tool_calls::install_cleanup(server);
         server.register_local(LoopState::default);
+        server.register_local(ContinuationLedger::default);
         server.register_local(PolicySnapshot::defaults);
         // Process configuration, not session state: one rule set decided at
         // the composition root and read by every turn of every session.

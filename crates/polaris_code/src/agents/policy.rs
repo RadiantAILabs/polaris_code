@@ -413,6 +413,14 @@ pub struct UnattendedGrants {
     pub run_command_patterns: Vec<String>,
 }
 
+impl UnattendedGrants {
+    /// Whether the run may neither write files nor run commands.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        !self.edit_file && self.run_command_patterns.is_empty()
+    }
+}
+
 impl PermissionMode {
     /// Stable command and provenance label.
     #[must_use]
@@ -722,6 +730,26 @@ impl Default for RetryPolicy {
     }
 }
 
+/// How much of a tool's output the model sees.
+///
+/// [`Default`] shows everything the tools return;
+/// [`PolicySnapshot::defaults`] bounds shell output to
+/// [`DEFAULT_STREAM_VIEW_CHARS`](crate::tools::shell_render::DEFAULT_STREAM_VIEW_CHARS)
+/// characters per stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationPolicy {
+    /// The part of each `run_command` output stream the model sees.
+    pub shell_stream: crate::tools::shell_render::StreamView,
+}
+
+impl Default for ObservationPolicy {
+    fn default() -> Self {
+        Self {
+            shell_stream: crate::tools::shell_render::StreamView::FULL,
+        }
+    }
+}
+
 /// Snapshot of all control-decision policy for one turn. A [`LocalResource`]
 /// built once in the agent's `setup` and read by every decision point.
 #[derive(Debug, Clone, Default)]
@@ -734,6 +762,10 @@ pub struct PolicySnapshot {
     pub permission: PermissionPolicy,
     /// Retry policy.
     pub retry: RetryPolicy,
+    /// When a reply without a tool call does not end the turn.
+    pub continuation: super::continuation::ContinuationPolicy,
+    /// How much of a tool's output the model sees.
+    pub observation: ObservationPolicy,
 }
 
 impl PolicySnapshot {
@@ -752,8 +784,29 @@ impl PolicySnapshot {
                 summarize_after_tokens: Some(DEFAULT_SUMMARIZE_AFTER_TOKENS),
                 summary_output_tokens: DEFAULT_SUMMARY_OUTPUT_TOKENS,
             },
+            continuation: super::continuation::ContinuationPolicy::defaults(),
+            observation: ObservationPolicy {
+                shell_stream: crate::tools::shell_render::StreamView::default(),
+            },
             ..Default::default()
         }
+    }
+
+    /// [`defaults`](Self::defaults), with the window budgets sized to the model
+    /// limits `config` declares. Without a declared context window the
+    /// default budgets stay.
+    #[must_use]
+    pub fn for_agent(config: &super::config::AgentConfig) -> Self {
+        let mut policy = Self::defaults();
+        if let Some(window) = config.context_window {
+            policy.retrieval.apply_model_limits(
+                window,
+                config
+                    .max_output_tokens
+                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS),
+            );
+        }
+        policy
     }
 
     /// Load permission data from the installed capability. Store and intent

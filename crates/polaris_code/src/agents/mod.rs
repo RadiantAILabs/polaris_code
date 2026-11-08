@@ -17,6 +17,7 @@ pub mod auto_review;
 pub mod code_agent;
 pub mod config;
 pub mod context;
+pub mod continuation;
 pub mod failure;
 pub mod human_approval;
 pub mod permission_rules;
@@ -31,11 +32,12 @@ pub use polaris::agent::{Agent, SetupError};
 pub use code_agent::{AgentLlm, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS};
 pub use config::AgentConfig;
 pub use context::{ContextManager, ContextStrategy, LinearWindow};
+pub use continuation::{Continuation, ContinuationPolicy, ContinueReason};
 pub use failure::{FailureKind, TurnFailure};
 pub use human_approval::{HumanApproval, InteractiveApprovalPlugin};
 pub use policy::{
-    Approver, PaletteMode, PermissionCeiling, PermissionMode, PermissionPolicy, PolicySnapshot,
-    ToolPalettePolicy, UnattendedGrants,
+    Approver, ObservationPolicy, PaletteMode, PermissionCeiling, PermissionMode, PermissionPolicy,
+    PolicySnapshot, ToolPalettePolicy, UnattendedGrants,
 };
 pub use project_context::{ProjectContext, load_seed_ontologies};
 pub use state::LoopState;

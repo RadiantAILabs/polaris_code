@@ -52,6 +52,46 @@ disables the cap in any mode; the environment and TOML equivalents are
 external timeouts still apply. Interactive sessions and ordinary `-p` runs keep their existing
 permission behavior.
 
+## When a run ends
+
+A `-p` run ends on a model reply that calls no tool, with two exceptions:
+
+- **A reply cut off at the output limit is continued.** If the provider stops
+  the reply because it reached `--max-output-tokens`, the agent asks the model
+  to continue from where it stopped, up to three times per turn. This applies
+  to interactive sessions too.
+- **An unattended reply that calls no tool is asked to go on once.** Nobody can
+  answer a `-p` run, so a reply that only describes its next step would end the
+  run with the work undone. The agent sends one message saying the run is
+  unattended and that the next reply without a tool call ends it.
+  `POLARIS_CODE_UNATTENDED_NUDGES` sets how many such messages a turn may send;
+  `0` turns them off, and a value that is not a non-negative integer is a
+  configuration error (exit `2`). Interactive sessions never send them, and
+  neither does a host that embeds the agent unless it sets
+  `ContinuationPolicy::unattended_nudges` itself.
+
+Both messages start with `[continuation] `, appear in the trajectory as user
+messages, and are recorded as `continuation` decisions. Every budget is finite,
+so a model that keeps replying without tools still ends the run.
+
+A `-p` run whose prompt starts like a question (`find …`, `where is …`,
+`show me …`) is answered by the read-only question topology only when the run
+grants neither edits nor commands. A run that grants either always runs the
+full agent, because the question topology cannot change the workspace.
+
+## Shell commands
+
+Shell commands in a `-p` run time out after 600 seconds unless the call sets its
+own `timeout_secs`; interactive sessions keep 120 seconds, because a person can
+send a long run to the background there.
+
+The model sees at most 10,000 characters of each output stream: the first and
+the last 5,000, with a line saying how much was left out. When a stream is
+longer than the shell's 64 KB capture, the end comes from the overflow file
+that holds the whole stream, and the result names that file. The trajectory
+keeps the executor's full record, and the terminal shows the same text the
+model sees.
+
 ## Reasoning and model limits
 
 `--reasoning-effort` pins effort at provider registration for every model call,

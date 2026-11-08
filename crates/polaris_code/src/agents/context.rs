@@ -842,8 +842,13 @@ impl ContextManager {
 }
 
 /// Whether `msg` begins a clean user-input turn — a `Message::User` carrying **no**
-/// `ToolResult` block. A window may start here without orphaning a `tool_result`.
+/// `ToolResult` block and not a continuation prompt. A window may start here
+/// without orphaning a `tool_result`.
 fn is_turn_boundary(msg: &Message) -> bool {
+    // The agent loop's own continuation prompt continues the active turn.
+    if super::continuation::is_continuation_prompt(msg) {
+        return false;
+    }
     match msg {
         Message::User { content } => !content
             .iter()

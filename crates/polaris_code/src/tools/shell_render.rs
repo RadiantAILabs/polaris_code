@@ -28,14 +28,58 @@
 //!
 //! Unlabelled text is stdout; a `[stderr]` line introduces stderr; the last
 //! line is always the status marker.
+//!
+//! A long stream is shown as its start and its end, with a line saying how
+//! much was left out between them ([`StreamView`]). Build logs and test runs
+//! put their errors and summaries at the end, so the end is the part the
+//! model most needs; the start says what ran. When the executor's capture was
+//! cut at its byte cap and the whole stream went to an overflow file, the end
+//! is read from that file.
+
+use std::io::{Read, Seek, SeekFrom};
 
 use serde_json::Value;
 
+/// Default characters of one stream the model sees: half from the start and
+/// half from the end.
+pub const DEFAULT_STREAM_VIEW_CHARS: usize = 10_000;
+
+/// How much of each `run_command` output stream reaches the model.
+///
+/// The terminal block and the trajectory are unaffected: the trajectory keeps
+/// the executor's document, and the overflow file keeps the whole stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamView {
+    /// Most characters of one stream shown, split between its start and its
+    /// end. `None` shows the whole capture.
+    pub max_chars: Option<usize>,
+}
+
+impl StreamView {
+    /// Show every captured character.
+    pub const FULL: Self = Self { max_chars: None };
+
+    /// Show at most `max_chars` characters of each stream.
+    #[must_use]
+    pub const fn bounded(max_chars: usize) -> Self {
+        Self {
+            max_chars: Some(max_chars),
+        }
+    }
+}
+
+impl Default for StreamView {
+    /// [`DEFAULT_STREAM_VIEW_CHARS`].
+    fn default() -> Self {
+        Self::bounded(DEFAULT_STREAM_VIEW_CHARS)
+    }
+}
+
 /// Render `run_command`'s response for the model, or `None` if `value` is not
 /// one (in which case the caller keeps whatever the tool returned).
-pub(crate) fn render_run_command(value: &Value) -> Option<String> {
+pub(crate) fn render_run_command(value: &Value, view: StreamView) -> Option<String> {
     match value.get("status").and_then(Value::as_str)? {
-        "executed" => Some(render_executed(value)),
+        "executed" => Some(render_executed(value, view)),
         // The shell's own policy wants an approval that never came. Say what
         // did *not* happen, so the model does not read an empty result as a
         // command that ran and printed nothing.
@@ -94,26 +138,30 @@ pub(crate) fn run_command_succeeded(value: &Value) -> bool {
 }
 
 /// A completed run, as the text it produced plus a status marker.
-fn render_executed(value: &Value) -> String {
+fn render_executed(value: &Value, view: StreamView) -> String {
     let mut out = String::new();
-
-    let stdout = text(value, "stdout");
-    if !stdout.is_empty() {
-        out.push_str(stdout.trim_end_matches('\n'));
-        out.push('\n');
-    }
-    let stderr = text(value, "stderr");
-    if !stderr.is_empty() {
-        out.push_str("[stderr]\n");
-        out.push_str(stderr.trim_end_matches('\n'));
-        out.push('\n');
-    }
-    for (stream, truncated, overflow) in [
-        ("stdout", "stdout_truncated", "stdout_overflow_path"),
-        ("stderr", "stderr_truncated", "stderr_overflow_path"),
+    for (stream, truncated, overflow, label) in [
+        ("stdout", "stdout_truncated", "stdout_overflow_path", None),
+        (
+            "stderr",
+            "stderr_truncated",
+            "stderr_overflow_path",
+            Some("[stderr]\n"),
+        ),
     ] {
-        if value.get(truncated).and_then(Value::as_bool) == Some(true) {
-            match value.get(overflow).and_then(Value::as_str) {
+        let captured = text(value, stream);
+        if captured.is_empty() {
+            continue;
+        }
+        let cut = value.get(truncated).and_then(Value::as_bool) == Some(true);
+        let path = value.get(overflow).and_then(Value::as_str);
+        if let Some(label) = label {
+            out.push_str(label);
+        }
+        out.push_str(view_stream(captured, cut, path, view).trim_end_matches('\n'));
+        out.push('\n');
+        if cut {
+            match path {
                 Some(path) => out.push_str(&format!(
                     "[{stream} truncated at the shell's output cap; all of it is in {path}]\n"
                 )),
@@ -128,6 +176,84 @@ fn render_executed(value: &Value) -> String {
     } else {
         format!("{out}[{marker}]")
     }
+}
+
+/// The part of one stream the model sees under `view`.
+///
+/// A stream within the budget is returned whole. A longer one keeps its first
+/// and last halves with an omission line between. When the capture was `cut`
+/// at the executor's cap and an overflow file holds the whole stream, the
+/// last half comes from that file, so the real end of the output is shown.
+fn view_stream(captured: &str, cut: bool, overflow: Option<&str>, view: StreamView) -> String {
+    let Some(budget) = view.max_chars else {
+        return captured.to_string();
+    };
+    let half = budget / 2;
+    let file_tail = if cut {
+        overflow.and_then(|path| file_tail(path, half))
+    } else {
+        None
+    };
+    match file_tail {
+        Some(tail) => format!(
+            "{}\n[... middle of the output omitted ...]\n{}",
+            head_chars(captured, half),
+            tail
+        ),
+        None => {
+            let total = captured.chars().count();
+            if total <= budget {
+                return captured.to_string();
+            }
+            let head = head_chars(captured, half);
+            let tail = tail_chars(captured, half);
+            let omitted = total - head.chars().count() - tail.chars().count();
+            format!("{head}\n[... {omitted} characters omitted ...]\n{tail}")
+        }
+    }
+}
+
+/// At most `chars` characters from the start of `text`, ending at a line end
+/// when one falls in the second half of that span.
+fn head_chars(text: &str, chars: usize) -> &str {
+    let end = text
+        .char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index);
+    let head = &text[..end];
+    match head.rfind('\n') {
+        Some(newline) if end == text.len() || newline >= end / 2 => &head[..newline],
+        _ => head,
+    }
+}
+
+/// At most `chars` characters from the end of `text`, starting after a line
+/// end when one falls in the first half of that span.
+fn tail_chars(text: &str, chars: usize) -> &str {
+    let total = text.chars().count();
+    let start = text
+        .char_indices()
+        .nth(total.saturating_sub(chars))
+        .map_or(text.len(), |(index, _)| index);
+    let tail = &text[start..];
+    match tail.find('\n') {
+        Some(newline) if start > 0 && newline <= tail.len() / 2 => &tail[newline + 1..],
+        _ => tail,
+    }
+}
+
+/// The last `chars` characters of the file at `path`, or `None` when it cannot
+/// be read. Reads at most four bytes per character from the end, so a large
+/// overflow file costs one bounded read.
+fn file_tail(path: &str, chars: usize) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let want = u64::try_from(chars.saturating_mul(4)).ok()?.min(len);
+    file.seek(SeekFrom::Start(len - want)).ok()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(want).ok()?);
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    Some(tail_chars(text.trim_end_matches('\n'), chars).to_string())
 }
 
 /// How the run ended, in the terms the model's next decision turns on.
@@ -229,6 +355,10 @@ mod tests {
         }
     }
 
+    fn render_run_command_full(value: &Value) -> Option<String> {
+        render_run_command(value, StreamView::FULL)
+    }
+
     /// The executor's document for a run that wrote to both streams and failed.
     fn executed(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Value {
         json!({
@@ -252,7 +382,7 @@ mod tests {
     #[test]
     fn both_streams_are_labelled_and_the_status_is_the_last_line() {
         let rendered =
-            render_run_command(&executed("line one\nline two\n", "boom\n", Some(3))).unwrap();
+            render_run_command_full(&executed("line one\nline two\n", "boom\n", Some(3))).unwrap();
         assert_eq!(
             rendered,
             "line one\nline two\n[stderr]\nboom\n[exit code: 3]"
@@ -261,14 +391,15 @@ mod tests {
 
     #[test]
     fn stderr_alone_is_still_attributed_to_stderr() {
-        let rendered = render_run_command(&executed("", "warning: unused\n", Some(0))).unwrap();
+        let rendered =
+            render_run_command_full(&executed("", "warning: unused\n", Some(0))).unwrap();
         assert_eq!(rendered, "[stderr]\nwarning: unused\n[exit code: 0]");
     }
 
     #[test]
     fn a_silent_run_is_one_line() {
         assert_eq!(
-            render_run_command(&executed("", "", Some(0))).unwrap(),
+            render_run_command_full(&executed("", "", Some(0))).unwrap(),
             "[no output; exit code: 0]"
         );
     }
@@ -279,7 +410,7 @@ mod tests {
         value["timed_out"] = json!(true);
         value["outcome"] = json!("timed_out");
         value["duration"] = json!({ "secs": 30, "nanos": 0 });
-        let rendered = render_run_command(&value).unwrap();
+        let rendered = render_run_command_full(&value).unwrap();
         assert!(rendered.contains("timed out after 30s"), "{rendered}");
         assert!(rendered.contains("timeout_secs"), "{rendered}");
         assert!(
@@ -293,7 +424,7 @@ mod tests {
         let mut value = executed("", "", None);
         value["outcome"] = json!("cancelled");
         assert_eq!(
-            render_run_command(&value).unwrap(),
+            render_run_command_full(&value).unwrap(),
             "[no output; cancelled before it exited]"
         );
     }
@@ -303,7 +434,7 @@ mod tests {
         let mut value = executed("first half\n", "", Some(0));
         value["stdout_truncated"] = json!(true);
         value["stdout_overflow_path"] = json!("/cache/run-1.stdout");
-        let rendered = render_run_command(&value).unwrap();
+        let rendered = render_run_command_full(&value).unwrap();
         assert!(
             rendered.contains("/cache/run-1.stdout"),
             "the overflow file is named so the model can go and get it: {rendered}"
@@ -319,16 +450,16 @@ mod tests {
             "working_dir": null,
             "timeout_secs": null,
         });
-        let rendered = render_run_command(&value).unwrap();
+        let rendered = render_run_command_full(&value).unwrap();
         assert!(rendered.contains("not run"), "{rendered}");
         assert!(rendered.contains("cargo publish"), "{rendered}");
     }
 
     #[test]
     fn a_value_that_is_not_a_shell_response_is_left_alone() {
-        assert!(render_run_command(&json!("just a string")).is_none());
-        assert!(render_run_command(&json!({ "status": "something else" })).is_none());
-        assert!(render_run_command(&json!({ "exit_code": 0 })).is_none());
+        assert!(render_run_command_full(&json!("just a string")).is_none());
+        assert!(render_run_command_full(&json!({ "status": "something else" })).is_none());
+        assert!(render_run_command_full(&json!({ "exit_code": 0 })).is_none());
     }
 
     #[test]
@@ -336,12 +467,63 @@ mod tests {
         // The budget claim, asserted rather than assumed: escaping newlines
         // and carrying bookkeeping fields costs more than the markers do.
         let value = executed("line one\nline two\n", "boom\n", Some(3));
-        let rendered = render_run_command(&value).unwrap();
+        let rendered = render_run_command_full(&value).unwrap();
         assert!(
             rendered.len() < value.to_string().len() / 2,
             "rendered {} bytes vs {} bytes of JSON",
             rendered.len(),
             value.to_string().len(),
+        );
+    }
+
+    #[test]
+    fn a_long_stream_keeps_its_start_and_end() {
+        let stdout: String = (0..2_000).map(|n| format!("line {n}\n")).collect();
+        let rendered =
+            render_run_command(&executed(&stdout, "", Some(1)), StreamView::bounded(200)).unwrap();
+        assert!(rendered.starts_with("line 0\n"), "{rendered}");
+        assert!(rendered.contains("line 1999\n[exit code: 1]"), "{rendered}");
+        assert!(rendered.contains("characters omitted"), "{rendered}");
+        assert!(rendered.len() < 400, "{} chars: {rendered}", rendered.len());
+        assert!(!rendered.contains("line 1000\n"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stream_within_the_budget_is_shown_whole() {
+        let rendered =
+            render_run_command(&executed("a\nb\n", "", Some(0)), StreamView::bounded(200)).unwrap();
+        assert_eq!(rendered, "a\nb\n[exit code: 0]");
+    }
+
+    #[test]
+    fn a_cut_capture_takes_its_end_from_the_overflow_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.stdout");
+        let whole: String = (0..5_000).map(|n| format!("row {n}\n")).collect();
+        std::fs::write(&path, &whole).unwrap();
+        let mut value = executed(&whole[..1_000], "", Some(1));
+        value["stdout_truncated"] = json!(true);
+        value["stdout_overflow_path"] = json!(path.to_str().unwrap());
+        let rendered = render_run_command(&value, StreamView::bounded(200)).unwrap();
+        assert!(rendered.starts_with("row 0\n"), "{rendered}");
+        assert!(
+            rendered.contains("row 4999\n[stdout truncated"),
+            "the real end comes from the file: {rendered}"
+        );
+        assert!(
+            rendered.contains("middle of the output omitted"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_stream_is_cut_on_character_boundaries() {
+        let stdout = "é".repeat(1_000);
+        let rendered =
+            render_run_command(&executed(&stdout, "", Some(0)), StreamView::bounded(10)).unwrap();
+        assert!(
+            rendered.starts_with("ééééé\n[... 990 characters omitted ...]\nééééé\n"),
+            "{rendered}"
         );
     }
 }

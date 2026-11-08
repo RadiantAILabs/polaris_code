@@ -638,6 +638,7 @@ pub(crate) async fn execute_call(
     } = lifetime.take();
     let tool_call = &call.call;
     let name = &tool_call.function.name;
+    let stream_view = policy.observation.shell_stream;
     let policy = &policy.permission;
     let redactor = *redactor;
     let turn = context.turn_marker();
@@ -823,7 +824,7 @@ pub(crate) async fn execute_call(
                 // the scanned text.
                 let observed = redact_tool_output(redactor, name, observed);
                 let output = (name == "run_command")
-                    .then(|| render_run_command(&value))
+                    .then(|| render_run_command(&value, stream_view))
                     .flatten()
                     .map(|rendered| redact_tool_output(redactor, name, rendered))
                     .unwrap_or_else(|| observed.clone());

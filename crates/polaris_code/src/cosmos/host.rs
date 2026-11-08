@@ -2084,6 +2084,18 @@ fn directed_reasons(candidates: &[CandidateConsideration], requested: &str) -> V
 /// across repeated accepts without needing per-call uniqueness.
 const AUTO_ROUTE_REFERENCE: &str = "auto-answer";
 
+/// Whether a run under `mode` may take the [`auto_route`] acceptance path.
+///
+/// The auto-routed topology answers a question and cannot change the
+/// workspace. A run whose caller granted edits or commands asked for work that
+/// such an answer cannot do, even when its prompt opens like a question ("find
+/// a free meeting slot … and write it to `meeting.ics`"), so it runs the full
+/// agent instead. Only a read-only unattended run is routed.
+#[must_use]
+pub fn auto_route_admits(mode: &crate::agents::PermissionMode) -> bool {
+    matches!(mode, crate::agents::PermissionMode::Unattended(grants) if grants.is_read_only())
+}
+
 /// Classifies conversational text as a light-effort question and, if it is
 /// one, accepts it the same way an explicit `--topology-task` accept would —
 /// as an [`AcceptedCodingTask`], marked [`TaskOrigin::AutoRouted`].
@@ -3296,6 +3308,27 @@ mod tests {
         assert_ne!(decision, next_turn.decision().expect("next turn decision"));
         let other_session = TurnEventIds::new(&SessionId::from_string("session-two"), 7);
         assert_ne!(decision, other_session.decision().expect("other session"));
+    }
+
+    #[test]
+    fn auto_route_admits_only_read_only_unattended_runs() {
+        use crate::agents::{PermissionMode, UnattendedGrants};
+        assert!(auto_route_admits(&PermissionMode::Unattended(
+            UnattendedGrants::default()
+        )));
+        assert!(!auto_route_admits(&PermissionMode::Unattended(
+            UnattendedGrants {
+                edit_file: true,
+                run_command_patterns: Vec::new(),
+            }
+        )));
+        assert!(!auto_route_admits(&PermissionMode::Unattended(
+            UnattendedGrants {
+                edit_file: false,
+                run_command_patterns: vec!["*".into()],
+            }
+        )));
+        assert!(!auto_route_admits(&PermissionMode::Confirm));
     }
 
     #[test]

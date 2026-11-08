@@ -88,6 +88,7 @@ use crate::agents::code_agent::tool_calls::{
 };
 use crate::agents::code_agent::{PreparedContext, SecretRedactor};
 use crate::agents::context::CompactionRun;
+use crate::agents::continuation::{Continuation, ContinuationLedger};
 use crate::agents::permission_rules::{
     PermissionRules, RunToolGrants, SessionGrants, ShellApproval,
 };
@@ -289,6 +290,7 @@ pub fn type_explanations() -> Result<TypeExplanationRegistry, CatalogError> {
     registry.bind_resource::<ToolRegistry>(type_key("polaris-code.tool-registry"))?;
     registry.bind_resource::<SecretRedactor>(type_key("polaris-code.secret-redactor"))?;
     registry.bind_resource::<AttemptLedger>(type_key("polaris-code.attempt-ledger"))?;
+    registry.bind_resource::<ContinuationLedger>(type_key("polaris-code.continuation-ledger"))?;
     registry.bind_resource::<ToolBatch>(type_key("polaris-code.tool-batch"))?;
     registry.bind_resource::<CallLifetime>(type_key("polaris-code.call-lifetime"))?;
 
@@ -314,6 +316,7 @@ pub fn type_explanations() -> Result<TypeExplanationRegistry, CatalogError> {
     registry.bind_output::<CompactionRun>(type_key("polaris-code.compaction-run"))?;
     registry.bind_output::<AttemptOutcome>(type_key("polaris-code.attempt-outcome"))?;
     registry.bind_output::<RetryStep>(type_key("polaris-code.retry-step"))?;
+    registry.bind_output::<Continuation>(type_key("polaris-code.continuation"))?;
     registry.bind_output::<CaughtError>(type_key("polaris-code.caught-error"))?;
 
     Ok(registry)
@@ -386,20 +389,21 @@ impl ConversationalHost {
 
 /// Every resource the default loop reads or writes, with the access it needs.
 ///
-/// Write access subsumes read at the admission boundary, so the five resources
+/// Write access subsumes read at the admission boundary, so the resources
 /// the loop both reads and writes appear once, as writes.
 ///
 /// One of them, the secret redactor, is process configuration rather than
 /// session state. It is still reported from [`ConversationalHost`] with the
 /// rest: a plugin has to install it before the loop can read it, which is the
 /// same claim the other entries make.
-const LOOP_RESOURCES: [(&str, ResourceAccess); 30] = [
+const LOOP_RESOURCES: [(&str, ResourceAccess); 31] = [
     ("polaris-code.review-policy", ResourceAccess::Read),
     ("polaris-code.review-intent", ResourceAccess::Write),
     ("polaris-code.review-history", ResourceAccess::Write),
     ("polaris-code.agent-config", ResourceAccess::Read),
     ("polaris-code.agent-llm", ResourceAccess::Write),
     ("polaris-code.attempt-ledger", ResourceAccess::Write),
+    ("polaris-code.continuation-ledger", ResourceAccess::Write),
     ("polaris-code.tool-batch", ResourceAccess::Write),
     ("polaris-code.call-lifetime", ResourceAccess::Write),
     ("polaris-code.agent-loop-state", ResourceAccess::Write),
