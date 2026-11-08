@@ -279,7 +279,7 @@ Browse [`docs/`](docs/) for the full documentation.
 
 ```toml
 [dependencies]
-polaris_code = "0.4.1"
+polaris_code = "0.4.2"
 ```
 
 Compose model, tool, and I/O plugins on a Polaris `Server`, create a session,

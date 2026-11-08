@@ -5,12 +5,19 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-08
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
+
+### Fixed
+- `Cargo.lock` now locks every Polaris crate under `polaris-ai` at 0.9.1. The 0.4.1 lockfile locked `polaris-ai` 0.9.1 but kept `polaris_internal`, `polaris_model_providers` and the other Polaris crates at 0.9.0, so `cargo install polaris_code --locked` built 0.4.1 without the OpenAI history fix below.
+
 ## [0.4.1] - 2026-11-08
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 
 ### Changed
-- Uses `polaris-ai` 0.9.1. It fixes HTTP 400 errors from `--provider openai` and Bedrock `openai.*` models when an earlier model reply in the history had two or more text blocks. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are unchanged at 0.3.0.
+- Uses `polaris-ai` 0.9.1. It fixes HTTP 400 errors from `--provider openai` and Bedrock `openai.*` models when an earlier model reply in the history had two or more text blocks. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are unchanged at 0.3.0. Its lockfile still locked `polaris_model_providers` 0.9.0, so builds with `--locked` do not get this fix; use 0.4.2.
 - `--trajectory-path` and `RunTrajectory` no longer write the file for each tool result or message. They are queued in memory and written by the next model call or by `finish`, so they never block an async worker. A hard kill can lose the tool results and messages recorded since the last model call.
 
 ## [0.4.0] - 2026-11-08
@@ -121,7 +128,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.2.0...v0.3.0
