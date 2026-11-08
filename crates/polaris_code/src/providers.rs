@@ -1400,20 +1400,6 @@ mod tests {
             let mut bytes = vec![0; 16 * 1024];
             let read = socket.read(&mut bytes).await.unwrap();
             assert!(read > 0);
-            let request = String::from_utf8_lossy(&bytes[..read]).into_owned();
-            if model.contains("openai") {
-                assert!(
-                    request.starts_with("POST /openai/v1/responses "),
-                    "{request}"
-                );
-            } else {
-                let path = if streaming {
-                    "converse-stream"
-                } else {
-                    "converse"
-                };
-                assert!(request.lines().next().unwrap().contains(path), "{request}");
-            }
             // Drain the body so closing the socket cannot replace the 401
             // with a connection reset when a request arrives in several reads.
             let mut received = read;
@@ -1439,7 +1425,26 @@ mod tests {
                 assert!(read > 0);
                 received += read;
             }
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let request = String::from_utf8_lossy(&bytes[..received]);
+            if model.contains("openai") {
+                assert!(
+                    request.starts_with("POST /openai/v1/responses "),
+                    "{request}"
+                );
+            } else {
+                let path = if streaming {
+                    "converse-stream"
+                } else {
+                    "converse"
+                };
+                assert!(request.lines().next().unwrap().contains(path), "{request}");
+            }
+            let delay = if limited {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_millis(1500)
+            };
+            tokio::time::sleep(delay).await;
             let body = r#"{"__type":"AccessDeniedException","message":"delayed denial"}"#;
             let reply = format!(
                 "HTTP/1.1 401 Unauthorized\r\nx-amzn-errortype: AccessDeniedException\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1448,7 +1453,9 @@ mod tests {
             socket.write_all(reply.as_bytes()).await.unwrap();
         });
         let registry = server.get_global::<ModelRegistry>().unwrap();
-        let llm = registry.llm(&format!("bedrock/{model}")).unwrap();
+        let llm = registry
+            .llm(format!("{}/{model}", Provider::Bedrock.registry_name()))
+            .unwrap();
         let request = LlmRequest {
             messages: vec![Message::user("hello")],
             ..Default::default()
@@ -1474,7 +1481,17 @@ mod tests {
             );
             assert!(matches!(error, GenerationError::Http(_)), "{error:?}");
             assert!(crate::agents::failure::classify(&error).is_transient());
+            assert!(matches!(
+                crate::agents::policy::RetryPolicy::default().next_step(
+                    1,
+                    &error,
+                    crate::agents::retry::Commitment::Uncommitted,
+                    0.5,
+                ),
+                crate::agents::retry::RetryStep::Retry { .. }
+            ));
             serving.abort();
+            let _ = serving.await;
         } else {
             serving.await.unwrap();
             assert_eq!(

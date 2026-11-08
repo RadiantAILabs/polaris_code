@@ -101,7 +101,7 @@ retries only while attempts remain and no visible output or billed usage has
 committed the call. Its separate 300-second silence limit can fire first;
 raising this transport limit does not raise that policy limit.
 
-Anthropic and OpenAI expose no public request-timeout builder in Polaris 0.9.1.
+Anthropic and `OpenAI` expose no public request-timeout builder in Polaris 0.9.1.
 Chat Completions exposes a per-read idle timeout, which does not bound a live
 request's duration. Selecting any of those providers with this setting is
 therefore refused at startup.
