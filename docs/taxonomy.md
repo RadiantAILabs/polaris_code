@@ -27,6 +27,9 @@ composition and capability seams, while the upper layer is the agent design.**
 ## Layer 1: Composition Root
 
 **Files:** `src/main.rs`, `src/lib.rs`, `src/usage.rs` (`TokenMeter`),
+`src/model_run.rs` (`ModelRunPlugin`, `ModelRunOptions`),
+`src/trajectory.rs` (`RunTrajectory`, ATIF export; see
+[`unattended-runs.md`](unattended-runs.md)),
 `src/config.rs` (`ModelCatalog`), `src/sparql.rs`,
 `src/run.rs` (`drive_turn`/`drive_until`, `persist_turn`,
 `stop_signal`/`shutdown_driver`),
@@ -111,6 +114,12 @@ The swappable capabilities this app contributes as Polaris plugins:
   never colours or rows, and `background` keeps every process concept on this
   side of the boundary: the panel learns a count and a callback, never a task
   list, a process id type or a task state.
+- **Run-wide model policy and recording.** `ModelRunPlugin` wraps a provider
+  once, so one policy (output ceiling, pinned reasoning effort) covers every
+  model call, and feeds the optional `RunTrajectory`, which the host creates
+  before the first call and finalizes. `src/trajectory.rs` (the ATIF export of
+  model calls) is unrelated to `src/agents/trajectory.rs` (the Layer 3
+  write-only provenance seam); the two only share a name.
 - **Front-end IO.** `ExecIOPlugin` registers `UserIO` over a channel-backed
   provider for the non-interactive front end, structurally identical to how
   `polaris-tui`'s `ConversationPanelPlugin` registers `UserIO` for the TUI.
@@ -127,7 +136,8 @@ nothing more.
 
 **Files:** `src/agents/code_agent.rs` (`CodeAgent`, `CodeAgentPlugin`,
 `AgentLlm`), `src/agents/policy.rs` (`PolicySnapshot`),
-`src/agents/trajectory.rs`, `src/agents/project_context.rs` (`ProjectContext`),
+`src/agents/trajectory.rs` (the ABox write seam, not the ATIF export in
+`src/trajectory.rs`), `src/agents/project_context.rs` (`ProjectContext`),
 `src/agents/context.rs` (`ContextManager`), `src/agents/state.rs` (`LoopState`),
 `src/agents/config.rs` (`AgentConfig`).
 
