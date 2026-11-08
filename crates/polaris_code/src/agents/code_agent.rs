@@ -1898,6 +1898,17 @@ impl Agent for CodeAgent {
             .get_resource::<AgentConfig>()
             .map_err(SetupError::new)?
             .clone();
+        if let Some(window) = config.context_window {
+            let output = config
+                .max_output_tokens
+                .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS);
+            if window.get().saturating_sub(output.get()) < 2 {
+                return Err(SetupError::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "context_window must exceed max_output_tokens by at least two tokens",
+                )));
+            }
+        }
         if ctx.get_resource::<SessionSettings>().is_err() {
             ctx.insert(SessionSettings::compatibility_default(
                 config.model_id.clone(),
@@ -2719,6 +2730,134 @@ mod tests {
                     .get_resource_mut::<ModelRegistry>()
                     .expect("ModelsPlugin builds first")
                     .register_llm_provider(Handle(self.0.clone()));
+            }
+        }
+
+        #[tokio::test]
+        async fn setup_rejects_windows_without_input_room_and_applies_valid_limits() {
+            use std::num::NonZeroU32;
+
+            let workspace = tempfile::tempdir().unwrap();
+            let mut server = Server::new();
+            server
+                .add_plugins(ModelsPlugin)
+                .add_plugins(HandlePlugin(Arc::new(Recorder {
+                    requests: Mutex::new(Vec::new()),
+                    fail_with: None,
+                })));
+            server.finish().await.unwrap();
+            for output in [None, NonZeroU32::new(128)] {
+                let allowance = output
+                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS)
+                    .get();
+                for window in [
+                    allowance - 1,
+                    allowance,
+                    allowance + 1,
+                    allowance + 2,
+                    allowance + 100,
+                ] {
+                    let mut config = AgentConfig::new("anthropic/test-model", workspace.path())
+                        .with_context_window(NonZeroU32::new(window).unwrap());
+                    config.max_output_tokens = output;
+                    let mut ctx = server.create_context();
+                    ctx.insert(config);
+                    let result = CodeAgent.setup(&mut ctx);
+                    if window < allowance + 2 {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains("context_window must exceed max_output_tokens by at least two tokens"),
+                            "{error}"
+                        );
+                        assert!(ctx.get_resource::<PolicySnapshot>().is_err());
+                    } else {
+                        result.unwrap();
+                        let policy = ctx.get_resource::<PolicySnapshot>().unwrap();
+                        let budget = ((window - allowance) * 4 / 5) as usize;
+                        assert_eq!(policy.retrieval.max_tokens, Some(budget));
+                        assert_eq!(
+                            policy.retrieval.compact_after_tokens,
+                            Some((budget / 2).max(1))
+                        );
+                        assert_eq!(
+                            policy.retrieval.summarize_after_tokens,
+                            Some((budget * 3 / 4).max(1))
+                        );
+                        assert_eq!(
+                            policy.retrieval.summary_output_tokens.get(),
+                            allowance.min(2_048)
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn prepare_context_sets_the_model_before_counting_reasoning() {
+            use polaris::graph::GraphExecutor;
+            use polaris::models::llm::ReasoningBlock;
+            use polaris::sessions::SessionInfo;
+
+            for (model_id, tokens) in [
+                ("aws.bedrock/global.openai.gpt-oss-120b-1:0", 1),
+                ("anthropic/test-model", 4),
+            ] {
+                let workspace = tempfile::tempdir().unwrap();
+                let (io, _input, _output) = ExecIOProvider::new(16);
+                let mut server = Server::new();
+                server.insert_global(OxigraphStore::in_memory().unwrap());
+                server
+                    .add_plugins(ModelsPlugin)
+                    .add_plugins(HandlePlugin(Arc::new(Recorder {
+                        requests: Mutex::new(Vec::new()),
+                        fail_with: None,
+                    })));
+                server.finish().await.unwrap();
+                // prepare_context uses the already resolved handle when no turn
+                // snapshot selected a different one.
+                let llm = server
+                    .get_global::<ModelRegistry>()
+                    .unwrap()
+                    .llm("anthropic/test-model")
+                    .unwrap();
+                let mut ctx = server.create_context();
+                ctx.insert(AgentConfig::new(model_id, workspace.path()));
+                ctx.insert(AgentLlm(llm));
+                ctx.insert(SessionSettings::compatibility_default(model_id));
+                ctx.insert(SessionInfo {
+                    session_id: SessionId::new(),
+                    turn_number: 0,
+                });
+                ctx.insert(UserIO::new(Arc::new(io)));
+                ctx.insert(ProjectContext::default());
+                ctx.insert(PolicySnapshot::defaults());
+                let mut context = ContextManager::default();
+                context.messages = vec![Message::Assistant {
+                    id: None,
+                    content: vec![
+                        AssistantBlock::Reasoning(ReasoningBlock {
+                            id: None,
+                            reasoning: vec!["αβ".into(), "last".into()],
+                            signature: None,
+                        }),
+                        AssistantBlock::text("ok"),
+                    ],
+                }];
+                ctx.insert(context);
+                let mut graph = Graph::new();
+                graph.add_system(prepare_context);
+                GraphExecutor::new()
+                    .execute(&graph, &mut ctx, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ctx.get_resource::<ContextManager>()
+                        .unwrap()
+                        .project(&Default::default())
+                        .estimated_tokens,
+                    tokens,
+                    "{model_id}",
+                );
             }
         }
 

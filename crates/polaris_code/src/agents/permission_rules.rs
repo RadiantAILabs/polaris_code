@@ -624,6 +624,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_plugin_wires_unrestricted_shell_only_when_enabled() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({"command": "echo \"$(pwd)\""});
+        let policy = PermissionMode::Unattended(UnattendedGrants {
+            edit_file: false,
+            run_command_patterns: vec!["*".into()],
+        })
+        .permission_policy();
+        for enabled in [false, true] {
+            let mut server = Server::new();
+            server
+                .add_plugins(PermissionRulesPlugin::default().with_unrestricted_shell(enabled))
+                .add_plugins(ShellPlugin::with_working_dir(dir.path()))
+                .add_plugins(ToolsPlugin);
+            server.finish().await.unwrap();
+            let shell = server.get_global::<ShellApproval>().unwrap();
+            assert_eq!(shell.unrestricted(), enabled);
+            let call = PermissionCall {
+                tool: "run_command",
+                args: &args,
+                registry_default: polaris::tools::ToolPermission::Confirm,
+                root: dir.path(),
+                generation: 0,
+                ceiling: None,
+            };
+            assert_eq!(
+                shell
+                    .resolve(&policy, &call, &SessionGrants::default())
+                    .permission,
+                if enabled {
+                    polaris::tools::ToolPermission::Allow
+                } else {
+                    polaris::tools::ToolPermission::Deny
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn an_existing_permissions_command_is_kept_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let commands = Arc::new(CommandRegistry::with_builtins());

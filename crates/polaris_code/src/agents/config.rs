@@ -118,7 +118,8 @@ impl AgentConfig {
     }
 
     /// Declare this session's model input-plus-output capacity. The host must
-    /// reserve a smaller output allowance before context projection can fit.
+    /// leave at least two tokens beyond the output allowance (4096 by default).
+    /// [`super::CodeAgent`] rejects a smaller window during session setup.
     #[must_use]
     pub fn with_context_window(mut self, tokens: NonZeroU32) -> Self {
         self.context_window = Some(tokens);

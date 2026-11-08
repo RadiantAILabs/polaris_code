@@ -375,6 +375,111 @@ async fn answer_question(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn answer_question_preserves_provider_call_ids_on_success_and_error() {
+        use polaris::graph::GraphExecutor;
+        use polaris::models::llm::{
+            GenerationError, LlmProvider, LlmResponse, LlmStream, StopReason, ToolCall,
+            ToolResultStatus, Usage,
+        };
+        use polaris::system::server::Server;
+        use polaris::tools::{ToolError, tool};
+        use std::sync::{Arc, Mutex};
+
+        #[tool]
+        /// Return a deterministic inspection result.
+        async fn inspect_fixture() -> Result<String, ToolError> {
+            Ok("observed".into())
+        }
+
+        struct Scripted(Arc<Mutex<Vec<LlmRequest>>>);
+        impl LlmProvider for Scripted {
+            fn name(&self) -> &'static str {
+                "inspect-test"
+            }
+            async fn generate(
+                &self,
+                _: &str,
+                request: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                let mut requests = self.0.lock().unwrap();
+                requests.push(request);
+                let content = if requests.len() == 1 {
+                    ["inspect_fixture", "missing_fixture"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, tool)| {
+                            let mut call =
+                                ToolCall::new(format!("item-{i}"), tool, serde_json::json!({}));
+                            call.call_id = Some(format!("provider-call-{i}"));
+                            AssistantBlock::ToolCall(call)
+                        })
+                        .collect()
+                } else {
+                    vec![AssistantBlock::text("done")]
+                };
+                Ok(LlmResponse {
+                    stop_reason: if requests.len() == 1 {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    },
+                    content,
+                    usage: Usage::default(),
+                    id: None,
+                    model: None,
+                })
+            }
+            async fn stream(&self, _: &str, _: LlmRequest) -> Result<LlmStream, GenerationError> {
+                unreachable!("inspection uses generate")
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        server.insert_global(Spend::default());
+        let mut models = ModelRegistry::new();
+        models.register_llm_provider(Scripted(requests.clone()));
+        let llm = models.llm("inspect-test/model").unwrap();
+        server.insert_global(models);
+        let mut tools = ToolRegistry::new();
+        tools.register(inspect_fixture());
+        server.insert_global(tools);
+        let mut ctx = server.create_context();
+        ctx.insert(InspectInput::new("inspect the graph"));
+        ctx.insert(AgentLlm::new(llm));
+        ctx.insert(AgentConfig::new("inspect-test/model"));
+        ctx.insert(InspectConfig::default());
+        ctx.insert(InspectOntologyOverview::default());
+        let mut graph = Graph::new();
+        graph.add_system(answer_question);
+        GraphExecutor::new()
+            .execute(&graph, &mut ctx, None, None)
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let Some(Message::User { content }) = requests[1].messages.last() else {
+            panic!("the follow-up request includes tool results");
+        };
+        assert_eq!(content.len(), 2);
+        for (i, block) in content.iter().enumerate() {
+            let UserBlock::ToolResult(result) = block else {
+                panic!("expected a tool result");
+            };
+            assert_eq!(result.id, format!("item-{i}"));
+            assert_eq!(result.call_id, Some(format!("provider-call-{i}")));
+            assert_eq!(
+                result.status,
+                if i == 0 {
+                    ToolResultStatus::Success
+                } else {
+                    ToolResultStatus::Error
+                }
+            );
+        }
+    }
+
     #[test]
     fn system_prompt_mentions_both_named_graphs() {
         assert!(INSPECT_SYSTEM_PROMPT.contains("urn:polaris:graph:ontology"));

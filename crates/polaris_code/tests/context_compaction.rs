@@ -3,25 +3,27 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use polaris::models::ModelsPlugin;
 use polaris::models::llm::{
     AssistantBlock, ContentBlockDelta, ContentBlockStartData, GenerationError, LlmProvider,
     LlmRequest, LlmResponse, LlmStream, Message, ReasoningBlock, StopReason, StreamEvent, ToolCall,
     ToolResultContent, Usage, UserBlock,
 };
 use polaris::models::pricing::PriceStore;
-use polaris::models::{ModelRegistry, ModelsPlugin};
 use polaris::plugins::{IOMessage, PersistenceAPI, PersistencePlugin, UserIO};
 use polaris::sessions::{AgentTypeId, FileStore, SessionId, SessionsAPI, SessionsPlugin};
-use polaris::system::plugin::{Plugin, PluginId, Version};
+use polaris::system::plugin::{Plugin, Version};
 use polaris::system::server::Server;
 use polaris::tools::ToolsPlugin;
-use polaris_code::agents::context::{CacheAwareWindow, CompactionPlugin, SummarizingWindow};
+use polaris_code::agents::context::CompactionPlugin;
 use polaris_code::agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, ContextManager, PolicySnapshot,
 };
 use polaris_code::exec::ExecIOProvider;
+use polaris_code::model_run::{ModelRunOptions, ModelRunPlugin};
 use polaris_code::run::{TurnReason, drive_turn};
 use polaris_code::terminal::{CommandDispatch, CommandRegistry};
+use polaris_code::trajectory::{RunTrajectory, rebuild_request};
 use polaris_code::usage::TokenMeter;
 use polaris_ontrace::oxigraph::OxigraphPlugin;
 use polaris_tui::commands::{CommandInvocation, parse_status};
@@ -40,6 +42,7 @@ enum Stall {
 
 #[derive(Clone, Default)]
 struct FakeModel {
+    requests: Arc<Mutex<Vec<LlmRequest>>>,
     summaries: Arc<Mutex<Vec<LlmRequest>>>,
     answers: Arc<Mutex<Vec<LlmRequest>>>,
     failure: Option<&'static str>,
@@ -59,6 +62,7 @@ impl LlmProvider for FakeModel {
 
     async fn stream(&self, _: &str, request: LlmRequest) -> Result<LlmStream, GenerationError> {
         use futures_util::StreamExt;
+        self.requests.lock().unwrap().push(request.clone());
         let summary = request
             .system
             .as_deref()
@@ -126,24 +130,6 @@ impl LlmProvider for FakeModel {
             })
         });
         Ok(futures_util::stream::iter(events).boxed())
-    }
-}
-
-struct TestModelPlugin(FakeModel);
-
-impl Plugin for TestModelPlugin {
-    const ID: &'static str = "test::compaction_model";
-    const VERSION: Version = Version::new(0, 1, 0);
-
-    fn dependencies(&self) -> Vec<PluginId> {
-        vec![PluginId::of::<ModelsPlugin>()]
-    }
-
-    fn build(&self, server: &mut Server) {
-        server
-            .get_resource_mut::<ModelRegistry>()
-            .unwrap()
-            .register_llm_provider(self.0.clone());
     }
 }
 
@@ -226,6 +212,7 @@ async fn run_history_case(
 
 /// How a session under test is set up and driven.
 struct Case {
+    model_id: &'static str,
     /// Drive `/compact` rather than an ordinary prompt.
     manual: bool,
     cost_cap: Option<f64>,
@@ -238,6 +225,7 @@ struct Case {
 impl Default for Case {
     fn default() -> Self {
         Self {
+            model_id: MODEL,
             manual: false,
             cost_cap: None,
             attempt_timeout: None,
@@ -252,6 +240,7 @@ async fn run_configured(
     messages: Vec<Message>,
 ) -> (ContextManager, FakeModel, TokenMeter, Vec<IOMessage>) {
     let Case {
+        model_id,
         manual,
         cost_cap,
         attempt_timeout,
@@ -272,9 +261,27 @@ async fn run_configured(
     }
     let mut server = Server::new();
     server.insert_global(meter.clone());
+    let trace_path = data.path().join("trajectory.json");
+    let trace = RunTrajectory::create(
+        &trace_path,
+        "compaction-test",
+        model_id,
+        "Continue the work.",
+    )
+    .unwrap();
+    server.insert_global(trace.clone());
     server
         .add_plugins(ModelsPlugin)
-        .add_plugins(TestModelPlugin(model.clone()))
+        .add_plugins(
+            ModelRunPlugin::new(
+                model.clone(),
+                ModelRunOptions {
+                    trajectory: Some(trace.clone()),
+                    ..Default::default()
+                },
+            )
+            .with_registry_name(model_id.split_once('/').unwrap().0),
+        )
         .add_plugins(ToolsPlugin)
         .add_plugins(OxigraphPlugin::in_memory())
         .add_plugins(PersistencePlugin)
@@ -289,7 +296,7 @@ async fn run_configured(
     sessions.set_serializers(server.api::<PersistenceAPI>().unwrap().serializers());
     sessions.register_agent(CodeAgent).unwrap();
     let id = SessionId::new();
-    let config = AgentConfig::new(MODEL, workspace.path().to_path_buf());
+    let config = AgentConfig::new(model_id, workspace.path().to_path_buf());
     sessions
         .create_session_with(
             server.create_context(),
@@ -303,11 +310,7 @@ async fn run_configured(
     sessions.setup_session(&id).await.unwrap();
     sessions
         .with_context(&id, move |ctx| {
-            let mut context = ContextManager::with_strategy(Arc::new(SummarizingWindow::new(
-                Arc::new(CacheAwareWindow),
-            )));
-            context.messages = messages;
-            ctx.insert(context);
+            ctx.get_resource_mut::<ContextManager>().unwrap().messages = messages;
             let mut policy = PolicySnapshot::defaults();
             policy.retrieval.compact_after_tokens = Some(200);
             policy.retrieval.summarize_after_tokens = Some(500);
@@ -347,6 +350,26 @@ async fn run_configured(
     while let Ok(message) = output.try_recv() {
         shown.push(message);
     }
+    trace.finish(0).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(trace_path).unwrap()).unwrap();
+    let recorded: Vec<_> = document["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| step["extra"]["kind"] == "model_call")
+        .collect();
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(recorded.len(), requests.len());
+    for (step, request) in recorded.iter().zip(requests.iter()) {
+        let step_id = step["step_id"].as_u64().unwrap() as usize;
+        assert_eq!(
+            serde_json::to_value(rebuild_request(&document, step_id).unwrap()).unwrap(),
+            serde_json::to_value(request).unwrap(),
+            "request at step {step_id} must survive summary and elision"
+        );
+    }
+    drop(requests);
     (context, model, meter, shown)
 }
 
@@ -466,6 +489,47 @@ async fn failed_summary_falls_back_to_elision_and_the_turn_completes() {
             .contains("[elided ")
     );
     assert_eq!(meter.snapshot(MODEL).input_tokens, 10);
+}
+
+#[tokio::test]
+async fn compaction_uses_the_selected_models_reasoning_replay() {
+    for (model_id, fragments, summaries) in [
+        (
+            "aws.bedrock/global.openai.gpt-oss-120b-1:0",
+            vec!["x".repeat(8_000), "keep".into()],
+            0,
+        ),
+        ("anthropic/test-model", vec![String::new(); 4_000], 1),
+    ] {
+        let messages = vec![
+            Message::user("Fix the parser"),
+            Message::Assistant {
+                id: None,
+                content: vec![
+                    AssistantBlock::Reasoning(ReasoningBlock {
+                        id: Some("thinking".into()),
+                        reasoning: fragments,
+                        signature: Some("signature".into()),
+                    }),
+                    AssistantBlock::text("Investigated the parser"),
+                ],
+            },
+            Message::user("Keep working"),
+            Message::assistant("Ready to test"),
+        ];
+        let case = Case {
+            model_id,
+            ..Case::default()
+        };
+        let (context, model, _, _) = run_configured(FakeModel::default(), case, messages).await;
+        assert_eq!(
+            model.summaries.lock().unwrap().len(),
+            summaries,
+            "{model_id}"
+        );
+        assert_eq!(context.checkpoints.len(), summaries, "{model_id}");
+        assert_eq!(model.answers.lock().unwrap().len(), 1, "{model_id}");
+    }
 }
 
 #[tokio::test]
@@ -621,6 +685,7 @@ async fn run_stalled(
         cost_cap,
         attempt_timeout: Some(STALL_TIMEOUT),
         turns,
+        ..Case::default()
     };
     tokio::time::timeout(GIVE_UP, run_configured(model, case, history()))
         .await
