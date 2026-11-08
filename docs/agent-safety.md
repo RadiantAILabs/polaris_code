@@ -48,13 +48,20 @@ call. The order of the permission checks is in
   limit shell commands: the shell only checks the directory a command starts
   in, not the files the command touches.
 
+`--dangerously-skip-permissions` with `-p` is an explicit disposable-container
+exception: file tools may access absolute paths, parent paths and external
+symlink targets. Ordinary unattended grants and every interactive mode retain
+the sandbox. Exclusive creation, redaction and edit journaling still apply;
+workspace rewind does not restore outside paths. See [unattended runs](unattended-runs.md).
+
 ### 2. Shell deny list
 
 - **Protects against:** a few destructive commands, refused even after a
   person approves them. The list is `DENIED_COMMANDS` in
   [`main.rs`](../crates/polaris_code/src/main.rs). It is checked per
   subcommand. See [`shell-approval.md`](shell-approval.md).
-- **Does not protect against:** anything else. The list has five literal
+- **Does not protect against:** the explicit unrestricted container flag, which
+  bypasses the list, or anything else. The list has five literal
   patterns, and a small change in spelling avoids them. Patterns are text
   globs, not a shell parser.
 

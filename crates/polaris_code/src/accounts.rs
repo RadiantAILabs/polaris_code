@@ -282,7 +282,7 @@ pub async fn run(
                         .to_string(),
                 )),
                 Provider::Bedrock => login_bedrock(io, setup).await,
-                Provider::Anthropic | Provider::OpenAi => {
+                Provider::Anthropic | Provider::OpenAi | Provider::OpenAiChat => {
                     login_with_key(provider, with_api_key, io, setup)
                 }
             }
@@ -1004,6 +1004,8 @@ mod tests {
             (" 1 \n", Provider::Anthropic),
             ("bedrock", Provider::Bedrock),
             ("OpenAI", Provider::OpenAi),
+            ("4", Provider::OpenAiChat),
+            ("openai-chat", Provider::OpenAiChat),
         ] {
             let mut io = Script::default();
             io.answers.push_back(answer.to_string());
@@ -1012,13 +1014,16 @@ mod tests {
             assert!(said.contains("1) Anthropic"), "{said}");
             assert!(said.contains("2) OpenAI"), "{said}");
             assert!(said.contains("3) Amazon Bedrock"), "{said}");
+            assert!(said.contains("4) OpenAI Chat Completions"), "{said}");
         }
-        for bad in ["0", "4", "gemini", ""] {
+        for bad in ["0", "5", "gemini", ""] {
             let mut io = Script::default();
             io.answers.push_back(bad.to_string());
             let error = pick_provider(&mut io).expect_err(bad);
             assert!(
-                error.to_string().contains("anthropic, openai, bedrock"),
+                error
+                    .to_string()
+                    .contains("anthropic, openai, bedrock, openai-chat"),
                 "{error}"
             );
         }

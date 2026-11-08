@@ -55,6 +55,21 @@ pub struct RetrievalPolicy {
     pub summary_output_tokens: NonZeroU32,
 }
 
+impl RetrievalPolicy {
+    /// Size projection and compaction from an explicit model window and output
+    /// allowance. One fifth of the input capacity remains for the system prompt,
+    /// tool schemas and estimation error. The budget is an estimate, not a
+    /// provider token count; the active user turn is always retained.
+    pub fn apply_model_limits(&mut self, window: NonZeroU32, output: NonZeroU32) {
+        let input = window.get().saturating_sub(output.get()) as usize;
+        let budget = input.saturating_mul(4) / 5;
+        self.max_tokens = Some(budget.max(1));
+        self.compact_after_tokens = Some((budget / 2).max(1));
+        self.summarize_after_tokens = Some((budget * 3 / 4).max(1));
+        self.summary_output_tokens = self.summary_output_tokens.min(output);
+    }
+}
+
 impl Default for RetrievalPolicy {
     /// No caps, no compaction and no automatic summaries, with a summary
     /// output allowance of [`DEFAULT_SUMMARY_OUTPUT_TOKENS`]. A summary needs
@@ -760,6 +775,23 @@ impl LocalResource for PolicySnapshot {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_model_limits_size_compaction_and_reserve_output() {
+        let mut policy = PolicySnapshot::defaults().retrieval;
+        policy.apply_model_limits(
+            NonZeroU32::new(32_768).unwrap(),
+            NonZeroU32::new(4096).unwrap(),
+        );
+        assert_eq!(policy.max_tokens, Some(22_937));
+        assert_eq!(policy.compact_after_tokens, Some(11_468));
+        assert_eq!(policy.summarize_after_tokens, Some(17_202));
+        policy.apply_model_limits(
+            NonZeroU32::new(8192).unwrap(),
+            NonZeroU32::new(256).unwrap(),
+        );
+        assert_eq!(policy.summary_output_tokens.get(), 256);
+    }
 
     #[test]
     fn palette_defaults_to_offering_everything() {

@@ -19,7 +19,7 @@ missing_docs = "warn"
 doc_markdown = "warn"
 
 [dependencies]
-polaris = { workspace = true, features = ["anthropic", "openai", "bedrock", "tiktoken", "file-store"] }
+polaris = { workspace = true, features = ["anthropic", "openai", "chat-completions", "bedrock", "tiktoken", "file-store"] }
 # Domain-neutral cognition contracts; the coding embodiment lives in `src/cosmos/`.
 polaris_cosmos.workspace = true
 polaris-tui.workspace = true
@@ -36,6 +36,8 @@ process-wrap = { version = "10", features = ["tokio1"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# ISO-8601 timestamps for native ATIF steps.
+time = { version = "0.3", features = ["formatting", "parsing"] }
 similar.workspace = true
 anyhow = "1"
 # Deterministic Rust AST indexing → Code ABox triples.

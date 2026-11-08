@@ -120,6 +120,9 @@ impl LocalResource for AgentLlm {}
 fn system_prompt_for(config: &AgentConfig, project: &ProjectContext) -> String {
     let base = config.system_prompt.as_deref().unwrap_or(SYSTEM_PROMPT);
     let mut prompt = format!("{base}\n\n{}", project.system_prompt());
+    if config.unrestricted_file_paths {
+        prompt.push_str("\n\nFile access: this disposable-container run explicitly permits file tools to access any path reachable by the process, including absolute paths and paths outside the working directory. Relative paths start in the working directory.");
+    }
     if let Some(globs) = config.command_globs.as_deref().filter(|g| !g.is_empty()) {
         prompt.push_str("\n\n");
         prompt.push_str(&command_patterns_note(globs));
@@ -404,7 +407,7 @@ async fn init_loop() -> LoopState {
 /// the retrieval decision. The compaction/budget seam lives here.
 #[system]
 async fn prepare_context(
-    context: Res<ContextManager>,
+    mut context: ResMut<ContextManager>,
     project: Res<ProjectContext>,
     mut policy: ResMut<PolicySnapshot>,
     mut llm: ResMut<AgentLlm>,
@@ -454,6 +457,7 @@ async fn prepare_context(
     let turn = context.turn_marker();
     let system_prompt = system_prompt_for(&config, &project);
 
+    context.set_model(&model_id);
     let total = context.messages.len();
     let projected = context.project(&policy.retrieval);
 
@@ -677,7 +681,7 @@ async fn execute_read_only_batch(
                 tracing::info!("Observation: {output}");
                 activity.finish(user_io, PHASE_OK, &output).await;
                 record_tool_call(store, turn, name, &call.function.arguments, "ok", &output);
-                UserBlock::tool_result(&call.id, ToolResultContent::Text(output))
+                call.result(ToolResultContent::Text(output))
             }
             Some(Err(err)) => {
                 let output = redact_tool_output(redactor, name, err.to_string());
@@ -690,7 +694,7 @@ async fn execute_read_only_batch(
                     "error",
                     &output,
                 );
-                UserBlock::tool_error(&call.id, ToolResultContent::Text(output))
+                call.error(ToolResultContent::Text(output))
             }
             None => {
                 let output = "Interrupted by user".to_string();
@@ -703,7 +707,7 @@ async fn execute_read_only_batch(
                     "interrupted",
                     &output,
                 );
-                UserBlock::tool_error(&call.id, ToolResultContent::Text(output))
+                call.error(ToolResultContent::Text(output))
             }
         };
         result_blocks.push(block);
@@ -1872,8 +1876,8 @@ async fn recover(
 /// [`RetryPolicy::max_attempts`]: super::policy::RetryPolicy::max_attempts
 const MODEL_RETRIES_BOUND: usize = u32::MAX as usize;
 
-/// How many times the agent loop may go round in one turn when
-/// `POLARIS_CODE_MAX_TURNS` is unset.
+/// Default loop bound for hosts that do not select a different turn limit.
+/// The CLI's explicit unrestricted container mode overrides this default.
 ///
 /// A real repository task often needs dozens of read, search and edit steps,
 /// so the default leaves room for them while still bounding a runaway loop.
@@ -1894,6 +1898,17 @@ impl Agent for CodeAgent {
             .get_resource::<AgentConfig>()
             .map_err(SetupError::new)?
             .clone();
+        if let Some(window) = config.context_window {
+            let output = config
+                .max_output_tokens
+                .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS);
+            if window.get().saturating_sub(output.get()) < 2 {
+                return Err(SetupError::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "context_window must exceed max_output_tokens by at least two tokens",
+                )));
+            }
+        }
         if ctx.get_resource::<SessionSettings>().is_err() {
             ctx.insert(SessionSettings::compatibility_default(
                 config.model_id.clone(),
@@ -1905,13 +1920,29 @@ impl Agent for CodeAgent {
             .llm(&config.model_id)
             .map_err(SetupError::new)?;
         ctx.insert(AgentLlm(llm));
+        let trajectory = ctx
+            .get_resource::<crate::trajectory::RunTrajectory>()
+            .ok()
+            .map(|trace| trace.clone());
+        if let Ok(mut context) = ctx.get_resource_mut::<ContextManager>() {
+            context.set_trajectory(trajectory);
+        }
 
         // Build per-session project grounding and the policy snapshot. These are
         // synchronous to keep `setup` non-async; ProjectContext shells out, so we
         // block on a short-lived runtime handle.
         let project = futures_block_on(ProjectContext::discover(&config.working_dir));
         ctx.insert(project);
-        ctx.insert(PolicySnapshot::defaults());
+        let mut policy = PolicySnapshot::defaults();
+        if let Some(window) = config.context_window {
+            policy.retrieval.apply_model_limits(
+                window,
+                config
+                    .max_output_tokens
+                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS),
+            );
+        }
+        ctx.insert(policy);
         ctx.insert(LiveTranscript::default());
         ctx.insert(AttemptLedger::default());
         ctx.insert(tool_calls::ToolBatch::default());
@@ -2699,6 +2730,134 @@ mod tests {
                     .get_resource_mut::<ModelRegistry>()
                     .expect("ModelsPlugin builds first")
                     .register_llm_provider(Handle(self.0.clone()));
+            }
+        }
+
+        #[tokio::test]
+        async fn setup_rejects_windows_without_input_room_and_applies_valid_limits() {
+            use std::num::NonZeroU32;
+
+            let workspace = tempfile::tempdir().unwrap();
+            let mut server = Server::new();
+            server
+                .add_plugins(ModelsPlugin)
+                .add_plugins(HandlePlugin(Arc::new(Recorder {
+                    requests: Mutex::new(Vec::new()),
+                    fail_with: None,
+                })));
+            server.finish().await.unwrap();
+            for output in [None, NonZeroU32::new(128)] {
+                let allowance = output
+                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS)
+                    .get();
+                for window in [
+                    allowance - 1,
+                    allowance,
+                    allowance + 1,
+                    allowance + 2,
+                    allowance + 100,
+                ] {
+                    let mut config = AgentConfig::new("anthropic/test-model", workspace.path())
+                        .with_context_window(NonZeroU32::new(window).unwrap());
+                    config.max_output_tokens = output;
+                    let mut ctx = server.create_context();
+                    ctx.insert(config);
+                    let result = CodeAgent.setup(&mut ctx);
+                    if window < allowance + 2 {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains("context_window must exceed max_output_tokens by at least two tokens"),
+                            "{error}"
+                        );
+                        assert!(ctx.get_resource::<PolicySnapshot>().is_err());
+                    } else {
+                        result.unwrap();
+                        let policy = ctx.get_resource::<PolicySnapshot>().unwrap();
+                        let budget = ((window - allowance) * 4 / 5) as usize;
+                        assert_eq!(policy.retrieval.max_tokens, Some(budget));
+                        assert_eq!(
+                            policy.retrieval.compact_after_tokens,
+                            Some((budget / 2).max(1))
+                        );
+                        assert_eq!(
+                            policy.retrieval.summarize_after_tokens,
+                            Some((budget * 3 / 4).max(1))
+                        );
+                        assert_eq!(
+                            policy.retrieval.summary_output_tokens.get(),
+                            allowance.min(2_048)
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn prepare_context_sets_the_model_before_counting_reasoning() {
+            use polaris::graph::GraphExecutor;
+            use polaris::models::llm::ReasoningBlock;
+            use polaris::sessions::SessionInfo;
+
+            for (model_id, tokens) in [
+                ("aws.bedrock/global.openai.gpt-oss-120b-1:0", 1),
+                ("anthropic/test-model", 4),
+            ] {
+                let workspace = tempfile::tempdir().unwrap();
+                let (io, _input, _output) = ExecIOProvider::new(16);
+                let mut server = Server::new();
+                server.insert_global(OxigraphStore::in_memory().unwrap());
+                server
+                    .add_plugins(ModelsPlugin)
+                    .add_plugins(HandlePlugin(Arc::new(Recorder {
+                        requests: Mutex::new(Vec::new()),
+                        fail_with: None,
+                    })));
+                server.finish().await.unwrap();
+                // prepare_context uses the already resolved handle when no turn
+                // snapshot selected a different one.
+                let llm = server
+                    .get_global::<ModelRegistry>()
+                    .unwrap()
+                    .llm("anthropic/test-model")
+                    .unwrap();
+                let mut ctx = server.create_context();
+                ctx.insert(AgentConfig::new(model_id, workspace.path()));
+                ctx.insert(AgentLlm(llm));
+                ctx.insert(SessionSettings::compatibility_default(model_id));
+                ctx.insert(SessionInfo {
+                    session_id: SessionId::new(),
+                    turn_number: 0,
+                });
+                ctx.insert(UserIO::new(Arc::new(io)));
+                ctx.insert(ProjectContext::default());
+                ctx.insert(PolicySnapshot::defaults());
+                let mut context = ContextManager::default();
+                context.messages = vec![Message::Assistant {
+                    id: None,
+                    content: vec![
+                        AssistantBlock::Reasoning(ReasoningBlock {
+                            id: None,
+                            reasoning: vec!["αβ".into(), "last".into()],
+                            signature: None,
+                        }),
+                        AssistantBlock::text("ok"),
+                    ],
+                }];
+                ctx.insert(context);
+                let mut graph = Graph::new();
+                graph.add_system(prepare_context);
+                GraphExecutor::new()
+                    .execute(&graph, &mut ctx, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ctx.get_resource::<ContextManager>()
+                        .unwrap()
+                        .project(&Default::default())
+                        .estimated_tokens,
+                    tokens,
+                    "{model_id}",
+                );
             }
         }
 

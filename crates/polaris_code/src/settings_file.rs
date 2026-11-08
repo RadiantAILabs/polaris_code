@@ -130,6 +130,8 @@ const KEYS: &[Key] = &[
     Key::with_flag("max_tokens", "POLARIS_CODE_MAX_TOKENS"),
     Key::with_flag("max_turns", "POLARIS_CODE_MAX_TURNS"),
     Key::with_flag("max_output_tokens", "POLARIS_CODE_MAX_OUTPUT_TOKENS"),
+    Key::with_flag("context_window", "POLARIS_CODE_CONTEXT_WINDOW"),
+    Key::with_flag("reasoning_effort", "POLARIS_CODE_REASONING_EFFORT"),
 ];
 
 fn command() -> clap::Command {
@@ -642,7 +644,7 @@ fn setting_text(key: &str, item: &Item) -> Option<String> {
     }
     if matches!(
         key,
-        "max_cost_usd" | "max_tokens" | "max_turns" | "max_output_tokens"
+        "max_cost_usd" | "max_tokens" | "max_turns" | "max_output_tokens" | "context_window"
     ) {
         return item
             .as_integer()
@@ -656,6 +658,11 @@ fn validate(key: &str, value: &str) -> Result<(), String> {
     match key {
         "max_turns" => super::resolve_max_turns(Some(value)).map(|_| ()),
         "max_output_tokens" => super::resolve_max_output_tokens(Some(value)).map(|_| ()),
+        "context_window" => value
+            .trim()
+            .parse::<std::num::NonZeroU32>()
+            .map(|_| ())
+            .map_err(|_| "POLARIS_CODE_CONTEXT_WINDOW must be a positive integer".to_string()),
         "max_cost_usd" => {
             let value = value.parse::<f64>().map_err(|err| err.to_string())?;
             polaris_code::usage::RunCeiling::from_limits(Some(value), None)
@@ -776,6 +783,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_turn_limit_can_be_selected_by_file_environment_or_flag() {
+        let fixture = Fixture::new();
+        fixture.project("max_turns = 0\n");
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.max_turns, Some(usize::MAX));
+        fixture.project("max_turns = 7\n");
+        let (cli, _) = fixture
+            .load(&[], &[("POLARIS_CODE_MAX_TURNS", "0")])
+            .unwrap();
+        assert_eq!(cli.max_turns, Some(usize::MAX));
+        let (cli, _) = fixture
+            .load(&["--max-turns", "0"], &[("POLARIS_CODE_MAX_TURNS", "9")])
+            .unwrap();
+        assert_eq!(cli.max_turns, Some(usize::MAX));
+    }
+
+    #[test]
     fn profiles_overlay_each_file_before_project_overrides_user() {
         let fixture = Fixture::new();
         fixture.user("max_turns = 10\nregion = 'user'\n[profiles.careful]\nmax_turns = 20\npermission_mode = 'plan'\n");
@@ -797,6 +821,36 @@ mod tests {
                 .unwrap()
                 .contains("profile `missing`")
         );
+    }
+
+    #[test]
+    fn model_limits_and_effort_follow_file_environment_and_flag_precedence() {
+        let fixture = Fixture::new();
+        fixture.project(
+            "provider = 'openai-chat'\ncontext_window = 32768\nreasoning_effort = 'high'\n",
+        );
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.context_window.unwrap().get(), 32768);
+        assert_eq!(cli.reasoning_effort.unwrap().to_string(), "high");
+        let (cli, _) = fixture
+            .load(
+                &["--reasoning-effort", "max", "--context-window", "65536"],
+                &[
+                    ("POLARIS_CODE_REASONING_EFFORT", "low"),
+                    ("POLARIS_CODE_CONTEXT_WINDOW", "16384"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(cli.context_window.unwrap().get(), 65536);
+        assert_eq!(cli.reasoning_effort.unwrap().to_string(), "max");
+    }
+
+    #[test]
+    fn dangerously_skip_permissions_cannot_be_enabled_in_settings() {
+        let fixture = Fixture::new();
+        fixture.project("dangerously_skip_permissions = true\n");
+        let error = fixture.load(&[], &[]).err().unwrap();
+        assert!(error.contains("dangerously_skip_permissions"), "{error}");
     }
 
     #[test]
@@ -891,8 +945,10 @@ mod tests {
     fn invalid_values_name_the_file_and_key_even_when_shadowed() {
         let fixture = Fixture::new();
         for (key, value) in [
-            ("max_turns", "0"),
+            ("max_turns", "-1"),
             ("max_output_tokens", "0"),
+            ("context_window", "0"),
+            ("context_window", "''"),
             ("max_tokens", "0"),
             ("max_cost_usd", "nan"),
             ("provider", "'unknown'"),
@@ -904,6 +960,10 @@ mod tests {
             let error = fixture.load(&["--max-turns=12"], &[]).err().unwrap();
             assert!(error.contains("polaris.toml"), "{error}");
             assert!(error.contains(&format!("key `{key}`")), "{error}");
+            if key == "context_window" {
+                assert!(error.contains("POLARIS_CODE_CONTEXT_WINDOW"), "{error}");
+                assert!(!error.contains("POLARIS_CODE_MAX_OUTPUT_TOKENS"), "{error}");
+            }
         }
     }
 
@@ -1171,7 +1231,7 @@ mod tests {
         for (key, value) in [
             ("provider", "unknown"),
             ("api_key", "private-secret"),
-            ("max_turns", "0"),
+            ("max_turns", "-1"),
         ] {
             assert!(set_value(&path, key, value).is_err());
             assert_eq!(

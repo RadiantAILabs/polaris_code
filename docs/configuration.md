@@ -25,7 +25,7 @@ accept a `[permissions]` section.
 
 The accepted keys are `provider`, `model`, `models`, `region`, `permission_mode`,
 `permission_ceiling`, `max_cost_usd`, `max_tokens`, `max_turns`, and
-`max_output_tokens`, in the file's base table and in each `[profiles.<name>]`
+`max_output_tokens`, `context_window`, and `reasoning_effort`, in the file's base table and in each `[profiles.<name>]`
 table. Anything else is an unknown key. Credentials are never accepted.
 
 ```toml
@@ -61,15 +61,22 @@ from both is an error. Flags and environment still take precedence.
 | `max_tokens` | `--max-tokens` | `POLARIS_CODE_MAX_TOKENS` |
 | `max_turns` | `--max-turns` | `POLARIS_CODE_MAX_TURNS` |
 | `max_output_tokens` | `--max-output-tokens` | `POLARIS_CODE_MAX_OUTPUT_TOKENS` |
+| `context_window` | `--context-window` | `POLARIS_CODE_CONTEXT_WINDOW` |
+| `reasoning_effort` | `--reasoning-effort` | `POLARIS_CODE_REASONING_EFFORT` |
 
 `models` accepts an array of model IDs or the existing comma/whitespace-separated
-string format. Token and iteration limits must be positive integers. The cost
+string format. Token limits must be positive integers. Iteration limits accept zero to disable
+the turn cap; otherwise they must be positive integers. The cost
 ceiling must be positive and finite; a cost-limited run also needs a priced model.
 `region` applies to Bedrock; without it the AWS SDK resolves its region normally.
 Permission modes are `confirm`, `auto-edit`, `auto`, or `plan`. An interactive
 mode above the configured ceiling is refused. Permission mode and ceiling
 settings are interactive-only and are refused for unattended runs, including when
 set in a file.
+
+`--dangerously-skip-permissions` and `--trajectory-path` are CLI-only, require
+`-p`, and cannot be enabled by configuration or environment. See
+[unattended runs](unattended-runs.md) for model limits and effort semantics.
 
 Two settings are not file keys. `--notify` (or `POLARIS_CODE_NOTIFY`) chooses
 when the terminal bell and window title ask for attention: `off`, `approval`

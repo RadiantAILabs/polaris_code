@@ -619,7 +619,10 @@ impl ApprovalRequest {
 /// }
 /// ```
 #[derive(Debug, Clone, Default)]
-pub struct ShellApproval(Arc<OnceLock<ShellExecutor>>);
+pub struct ShellApproval {
+    executor: Arc<OnceLock<ShellExecutor>>,
+    pub(super) unrestricted: bool,
+}
 
 impl GlobalResource for ShellApproval {}
 
@@ -633,17 +636,21 @@ impl ShellApproval {
     }
 
     pub(super) fn bind(&self, executor: ShellExecutor) {
-        let _ = self.0.set(executor);
+        let _ = self.executor.set(executor);
     }
 
     /// Shell's hard deny/opaque-syntax verdict, when shell capability is installed.
     #[must_use]
     pub fn permission(&self, args: &Value) -> Option<ShellPermission> {
-        self.0.get().and_then(|executor| {
+        self.executor.get().and_then(|executor| {
             args.get("command")
                 .and_then(Value::as_str)
                 .map(|command| executor.check_permission(command))
         })
+    }
+
+    pub(crate) fn unrestricted(&self) -> bool {
+        self.unrestricted
     }
 
     /// Apply shell hard denies and opaque-syntax checks after deterministic
@@ -705,8 +712,11 @@ impl ShellApproval {
                 decision.remember = false;
                 return decision;
             }
+            if self.unrestricted && policy.is_unattended() {
+                return decision;
+            }
             let projected = parts.as_ref().and_then(|parts| {
-                self.0.get().map(|executor| {
+                self.executor.get().map(|executor| {
                     parts
                         .iter()
                         .map(|part| {
@@ -776,7 +786,7 @@ impl ShellApproval {
         rules: &super::PermissionRules,
         settings: &crate::terminal::SessionSettings,
     ) -> Option<ApprovalReceipt> {
-        if self.0.get().is_none()
+        if self.executor.get().is_none()
             || !matches!(request.tool.as_str(), "run_command" | "run_in_background")
         {
             return None;
@@ -1330,6 +1340,205 @@ mod tests {
             &args,
             dir.path()
         ));
+    }
+
+    #[tokio::test]
+    async fn unrestricted_unattended_shell_executes_opaque_syntax_with_a_bound_receipt() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, _, registry) = shell(dir.path());
+        let settings = SessionSettings::new(
+            "fake/model",
+            PermissionMode::Unattended(UnattendedGrants {
+                edit_file: true,
+                run_command_patterns: vec!["*".into()],
+            }),
+            &crate::config::ModelCatalog::pinned("fake/model"),
+        );
+        let policy = settings.snapshot().permission_mode.permission_policy();
+        let args = json!({"command": r#"for n in 1 2; do echo "$(printf %s "$n")"; done"#});
+        let call = super::super::PermissionCall {
+            tool: "run_command",
+            args: &args,
+            registry_default: ToolPermission::Confirm,
+            root: dir.path(),
+            generation: settings.approval_generation(),
+            ceiling: None,
+        };
+        let grants = SessionGrants::default();
+        assert_eq!(
+            shell.resolve(&policy, &call, &grants).permission,
+            ToolPermission::Deny
+        );
+        shell.unrestricted = true;
+        assert_eq!(
+            shell.resolve(&policy, &call, &grants).permission,
+            ToolPermission::Allow
+        );
+        let receipt = shell
+            .receipt(
+                "run_command",
+                &args,
+                dir.path(),
+                &super::super::PermissionRules::default(),
+                &settings,
+            )
+            .unwrap();
+        let run = shell.spawn(
+            &registry,
+            "run_command",
+            args.clone(),
+            ToolContext::new()
+                .with(crate::tools::CallRoot::new(dir.path()))
+                .with(receipt),
+        );
+        let result = run.await.unwrap().unwrap();
+        assert_eq!(result["stdout"], "1\n2\n");
+        assert_eq!(result["exit_code"], 0);
+        let outside = json!({"command": "echo hi", "working_dir": "/"});
+        let outside_call = super::super::PermissionCall {
+            args: &outside,
+            ..call
+        };
+        assert_eq!(
+            shell.resolve(&policy, &outside_call, &grants).permission,
+            ToolPermission::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_unattended_background_shell_uses_a_bound_receipt() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, executor, mut registry) = shell(dir.path());
+        shell.unrestricted = true;
+        let tasks = BackgroundTasks::detached(Duration::from_secs(5));
+        registry.register_toolset(crate::tools::TaskTools::new(
+            executor.clone(),
+            tasks.clone(),
+        ));
+        let settings = SessionSettings::new(
+            "fake/model",
+            PermissionMode::Unattended(UnattendedGrants {
+                edit_file: false,
+                run_command_patterns: vec!["*".into()],
+            }),
+            &crate::config::ModelCatalog::pinned("fake/model"),
+        );
+        let args = json!({"command": r#"printf "%s\n" "$(printf background)""#, "timeout_secs": 5});
+        let call = super::super::PermissionCall {
+            tool: "run_in_background",
+            args: &args,
+            registry_default: ToolPermission::Confirm,
+            root: dir.path(),
+            generation: settings.approval_generation(),
+            ceiling: None,
+        };
+        assert_eq!(
+            shell
+                .resolve(
+                    &settings.snapshot().permission_mode.permission_policy(),
+                    &call,
+                    &SessionGrants::default(),
+                )
+                .permission,
+            ToolPermission::Allow,
+        );
+        let receipt = shell
+            .receipt(
+                call.tool,
+                &args,
+                dir.path(),
+                &super::super::PermissionRules::default(),
+                &settings,
+            )
+            .unwrap();
+        let invocation = tasks.enter("unrestricted-background", call.tool, None);
+        let sink = invocation.sink(
+            &polaris::sessions::SessionId::from_string("test"),
+            0,
+            Duration::from_secs(5),
+        );
+        let result = shell
+            .spawn(
+                &registry,
+                call.tool,
+                args.clone(),
+                ToolContext::new()
+                    .with(crate::tools::CallRoot::new(dir.path()))
+                    .with(receipt)
+                    .with(polaris::shell::ShellSinkHandle::new(sink)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.as_str().unwrap().starts_with("Started task"));
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(task) = tasks.finished().first() {
+                    break task.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let output = finished.result.unwrap();
+        assert_eq!(output.stdout, "background\n");
+        assert_eq!(output.exit_code, Some(0));
+        executor.stop_all().await;
+    }
+
+    #[test]
+    fn unrestricted_shell_keeps_explicit_denies_and_attended_shell_policy() {
+        use crate::agents::UnattendedGrants;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, _, _) = shell(dir.path());
+        shell.unrestricted = true;
+        let args = json!({"command": "echo forbidden"});
+        let call = super::super::PermissionCall {
+            tool: "run_command",
+            args: &args,
+            registry_default: ToolPermission::Allow,
+            root: dir.path(),
+            generation: 0,
+            ceiling: None,
+        };
+        let grants = SessionGrants::default();
+        let mut policy = PermissionMode::Unattended(UnattendedGrants {
+            edit_file: false,
+            run_command_patterns: vec!["*".into()],
+        })
+        .permission_policy();
+        assert_eq!(
+            shell.resolve(&policy, &call, &grants).permission,
+            ToolPermission::Allow
+        );
+        let path = dir.path().join("rules.toml");
+        std::fs::write(
+            &path,
+            "[[rules]]\ntool = 'run_command'\ndecision = 'deny'\ncommand = 'echo forbidden'\n",
+        )
+        .unwrap();
+        policy.rules = Some(super::super::PermissionRules::from_paths(
+            dir.path(),
+            Some(&path),
+            None,
+        ));
+        let decision = shell.resolve(&policy, &call, &grants);
+        assert_eq!(decision.permission, ToolPermission::Deny);
+        assert!(
+            decision.source.contains("rules.toml"),
+            "{}",
+            decision.source
+        );
+        assert_eq!(
+            shell
+                .resolve(&PermissionMode::Confirm.permission_policy(), &call, &grants)
+                .permission,
+            ToolPermission::Deny,
+            "an unrestricted flag must not bypass the executor deny list in an attended session",
+        );
     }
 
     #[test]

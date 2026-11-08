@@ -23,7 +23,7 @@
 //! ```
 
 use std::io::Write;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -177,16 +177,20 @@ ENVIRONMENT:
     POLARIS_CODE_MAX_OUTPUT_TOKENS
                                Positive per-request output-token limit;
                                `--max-output-tokens` wins.
-    POLARIS_CODE_MAX_TURNS     Positive agent iteration limit per turn;
-                               `--max-turns` wins.
+    POLARIS_CODE_MAX_TURNS     Agent iteration limit per turn; 0 disables it;
+                               `--max-turns` wins. Default: 100, except the
+                               explicit unrestricted container mode.
+    POLARIS_CODE_CONTEXT_WINDOW
+                               Explicit model input-plus-output capacity.
+    POLARIS_CODE_REASONING_EFFORT
+                               Effort pinned on every model call; unset keeps
+                               provider/model defaults.
 
 EXPERIMENT SWITCHES (not configuration-file keys):
     POLARIS_CODE_EXP_SUBMIT_GUARD  Refuse submit_answer while nothing is edited or
                                the last run_python check failed (0/1, default 0).
     POLARIS_CODE_EXP_REPO_LAYOUT  Put a short workspace listing in the first
                                message of a model step (0/1, default 0).
-    POLARIS_CODE_EXP_REASONING_EFFORT  low/medium/high reasoning effort for
-                               Bedrock OpenAI models (default: the model's own).
     POLARIS_CODE_LEAN_TRIM     Batched tool-output trim (0/1, default 1 for lean).
     POLARIS_CODE_LEAN_AUTOTEST Run related tests after lean edits (0/1, default 1).
     POLARIS_CODE_LEAN_LOCATE   Cheap location step (0/1, default 1 for lean).
@@ -306,16 +310,20 @@ const MAX_TURNS_VAR: &str = "POLARIS_CODE_MAX_TURNS";
 /// Resolve the agent loop's turn limit for this run.
 ///
 /// Unset, or set to whitespace, keeps [`DEFAULT_MAX_TURNS`]. Anything else has
-/// to be a positive integer; a typo is refused as a configuration error rather
-/// than silently falling back to the default.
+/// to be a non-negative integer (zero disables the cap); a typo is refused as a
+/// configuration error rather than silently falling back to the default.
 fn resolve_max_turns(raw: Option<&str>) -> Result<usize, String> {
     let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_MAX_TURNS);
     };
     value
-        .parse::<NonZeroUsize>()
-        .map(NonZeroUsize::get)
-        .map_err(|_| format!("{MAX_TURNS_VAR} must be a positive integer, got {value:?}"))
+        .parse::<usize>()
+        .map(|value| if value == 0 { usize::MAX } else { value })
+        .map_err(|_| {
+            format!(
+                "{MAX_TURNS_VAR} must be a non-negative integer (0 disables the cap), got {value:?}"
+            )
+        })
 }
 
 /// The environment variable that pins this whole run to one registered
@@ -520,14 +528,16 @@ struct Cli {
     /// Model to run on, as `provider/model` or an unambiguous model name.
     /// Wins over `POLARIS_CODE_MODEL`. Must name one of the models this run
     /// can reach (`POLARIS_CODE_MODELS` declares the set); an unknown name is
-    /// refused at startup, naming what was available.
+    /// refused at startup, naming what was available. `openai-chat` also accepts
+    /// arbitrary remote ids, with or without its provider prefix.
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
     /// Model provider to run on. `anthropic` (the default) needs
     /// `ANTHROPIC_API_KEY`. `openai` needs `OPENAI_API_KEY` and also reaches
     /// any server that speaks the same API (Ollama, LM Studio, vLLM, a
     /// gateway) when `OPENAI_BASE_URL` names it; declare that server's models
-    /// with `POLARIS_CODE_MODELS`. `bedrock` uses the AWS Bedrock Converse API
+    /// with `POLARIS_CODE_MODELS`. `openai-chat` uses Chat Completions at the
+    /// same key/base-URL settings and accepts arbitrary model ids. `bedrock` uses the AWS Bedrock Converse API
     /// through the default AWS credential chain (an EC2/ECS instance role,
     /// `AWS_PROFILE`, or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) and
     /// needs a region. A run checks its provider's credentials before
@@ -580,6 +590,11 @@ struct Cli {
     /// Allow `edit_file` during this unattended run.
     #[arg(long, requires = "unattended")]
     allow_edit: bool,
+    /// Allow file edits and arbitrary shell commands without prompts. Only for
+    /// disposable containers: shell commands can access the process filesystem.
+    /// Disables shell command denials, syntax checks and file-tool path containment.
+    #[arg(long, requires = "print", conflicts_with_all = ["topology_task", "allow_edit", "allow_command"])]
+    dangerously_skip_permissions: bool,
     /// Allow shell commands matching this existing shell-policy glob during
     /// this unattended run. May be repeated.
     #[arg(long, requires = "unattended", value_name = "GLOB")]
@@ -606,7 +621,8 @@ struct Cli {
     /// Enforceable for any model, priced or not.
     #[arg(long, value_name = "TOKENS")]
     max_tokens: Option<u64>,
-    /// Maximum agent iterations per turn; must be positive.
+    /// Maximum agent iterations per turn; zero disables the cap. Defaults to 100,
+    /// except --dangerously-skip-permissions, which has no practical turn cap.
     #[arg(
         long,
         env = "POLARIS_CODE_MAX_TURNS",
@@ -622,6 +638,24 @@ struct Cli {
         value_parser = |raw: &str| resolve_max_output_tokens(Some(raw))
     )]
     max_output_tokens: Option<NonZeroU32>,
+    /// Model context window, including input and output tokens. Reserves output
+    /// and prompt overhead before sizing context projection and compaction.
+    #[arg(long, env = "POLARIS_CODE_CONTEXT_WINDOW", value_name = "TOKENS")]
+    context_window: Option<NonZeroU32>,
+    /// Pin reasoning effort on every model call, including summaries and
+    /// reviewers. Known levels: none, minimal, low, medium, high, xhigh, max.
+    /// Custom non-empty values pass through; unsupported values fail visibly.
+    #[arg(long, env = "POLARIS_CODE_REASONING_EFFORT", value_name = "EFFORT")]
+    reasoning_effort: Option<polaris::models::llm::ReasoningEffort>,
+    /// Write native ATIF JSON to a fresh file during this unattended run.
+    /// Parent directories must exist. Contains full prompts and model outputs.
+    #[arg(
+        long,
+        requires = "print",
+        conflicts_with = "topology_task",
+        value_name = "PATH"
+    )]
+    trajectory_path: Option<PathBuf>,
 }
 
 /// Permission modes a human may choose when starting an interactive session.
@@ -642,6 +676,30 @@ impl From<InteractivePermissionMode> for PermissionMode {
             InteractivePermissionMode::Plan => Self::Plan,
         }
     }
+}
+
+// The executor requires a finite usize bound even for a predicate-controlled
+// loop. The largest representable value leaves unrestricted container runs
+// governed by task completion, cancellation and explicit spend/time limits.
+fn run_max_turns(cli: &Cli) -> usize {
+    cli.max_turns
+        .unwrap_or(if cli.dangerously_skip_permissions {
+            usize::MAX
+        } else {
+            DEFAULT_MAX_TURNS
+        })
+}
+
+fn validate_context_window(
+    window: Option<NonZeroU32>,
+    max_output_tokens: NonZeroU32,
+) -> Result<(), &'static str> {
+    if let Some(window) = window
+        && window.get().saturating_sub(max_output_tokens.get()) < 2
+    {
+        return Err("--context-window must exceed --max-output-tokens by at least two tokens");
+    }
+    Ok(())
 }
 
 /// Resolve the posture this process starts in, and the ceiling it may never
@@ -686,8 +744,12 @@ fn startup_permissions(
         }
         return Ok((
             PermissionMode::Unattended(UnattendedGrants {
-                edit_file: cli.allow_edit,
-                run_command_patterns: cli.allow_command.clone(),
+                edit_file: cli.allow_edit || cli.dangerously_skip_permissions,
+                run_command_patterns: if cli.dangerously_skip_permissions {
+                    vec!["*".into()]
+                } else {
+                    cli.allow_command.clone()
+                },
             }),
             None,
         ));
@@ -733,7 +795,11 @@ fn ceiling_notice(ceiling: &PermissionCeiling, active: &PermissionMode) -> Strin
     )
 }
 
-fn shell_config(working_dir: &std::path::Path, mode: &PermissionMode) -> ShellConfig {
+fn configured_shell(
+    working_dir: &std::path::Path,
+    mode: &PermissionMode,
+    unrestricted: bool,
+) -> ShellConfig {
     let allowed_commands = match mode {
         PermissionMode::Unattended(grants) => grants.run_command_patterns.clone(),
         PermissionMode::Confirm
@@ -749,7 +815,11 @@ fn shell_config(working_dir: &std::path::Path, mode: &PermissionMode) -> ShellCo
         .with_max_output_bytes(64 * 1024)
         .with_allowed_dirs(vec![working_dir.to_path_buf()])
         .with_allowed_commands(allowed_commands)
-        .with_denied_commands(DENIED_COMMANDS.iter().map(|s| (*s).to_string()).collect())
+        .with_denied_commands(if unrestricted {
+            Vec::new()
+        } else {
+            DENIED_COMMANDS.iter().map(|s| (*s).to_string()).collect()
+        })
 }
 
 /// Keep the host's activated project runtime (conda env, virtualenv) in
@@ -974,8 +1044,15 @@ async fn main() {
     // first token. The set is narrowed to the registered providers once the
     // registry exists, further down.
     let declared_models = startup.catalog(cli.provider.catalog(&providers::process_env));
+    let requested_model = cli
+        .model
+        .as_deref()
+        .map(|id| cli.provider.qualify_model(id));
+    let declared_models = cli
+        .provider
+        .launch_catalog(declared_models, requested_model.as_deref());
     let selected_model = declared_models
-        .select_noting(cli.model.as_deref())
+        .select_noting(requested_model.as_deref())
         .unwrap_or_else(|err| fatal(headless, &err.to_string()));
     let model_id = selected_model.id.clone();
     // What startup has to tell the person running it, said once the front end
@@ -1095,11 +1172,16 @@ async fn main() {
     // carries. Resolved once here for the provider, the agent reservation,
     // and the non-interactive report, so they agree on the output allowance.
     let max_output_tokens = cli.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    let max_turns = cli.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
-    let agent_config = AgentConfig::new(model_id, working_dir.clone())
+    let max_turns = run_max_turns(&cli);
+    if let Err(why) = validate_context_window(cli.context_window, max_output_tokens) {
+        fatal(headless, why);
+    }
+    let mut agent_config = AgentConfig::new(model_id, working_dir.clone())
         .with_graph_search(graph_search)
+        .with_unrestricted_file_paths(cli.dangerously_skip_permissions)
         .with_prompt_cache(prompt_cache)
         .with_max_output_tokens(max_output_tokens);
+    agent_config.context_window = cli.context_window;
     // Everything this run writes that is not the user's work goes under one
     // directory, and that directory is invisible to git. Otherwise the agent's
     // own transcript rides along in whatever is built from the working tree —
@@ -1121,10 +1203,14 @@ async fn main() {
     //   operator-provided patterns, and an unmatched command fails closed.
     //
     // `denied_commands` is still evaluated first, per subcommand, so the
-    // destructive patterns stay authoritative: they are refused even when the
-    // user has already approved the call.
+    // destructive patterns stay authoritative unless the operator explicitly
+    // selected unrestricted container execution.
     let shell_config = project_shell_environment(
-        shell_config(&working_dir, &permission_mode),
+        configured_shell(
+            &working_dir,
+            &permission_mode,
+            cli.dangerously_skip_permissions,
+        ),
         std::env::var(TESTENV_VAR).is_ok_and(|v| v.trim() == "1"),
     );
 
@@ -1220,6 +1306,15 @@ async fn main() {
         Err(err) => fatal(headless, &err.to_string()),
     };
     startup_notes.push(ready_provider.report().line());
+    let trajectory = cli.trajectory_path.as_ref().map(|path| {
+        polaris_code::trajectory::RunTrajectory::create(
+            path,
+            &session_id.to_string(),
+            &agent_config.model_id,
+            cli.print.as_deref().expect("trajectory requires --print"),
+        )
+        .unwrap_or_else(|error| fatal(headless, &format!("cannot create trajectory: {error}")))
+    });
 
     // Built once and shared: the session plugin persists through it, and
     // `/sessions` reads the saved records back through the same store so a
@@ -1252,13 +1347,27 @@ async fn main() {
 
     let mut server = Server::new();
     server.add_plugins(ModelsPlugin);
-    ready_provider.install(&mut server, max_output_tokens, pricing_store.clone());
+    ready_provider.install_with_options(
+        &mut server,
+        max_output_tokens,
+        pricing_store.clone(),
+        polaris_code::model_run::ModelRunOptions {
+            max_output_tokens: Some(max_output_tokens),
+            reasoning_effort: cli.reasoning_effort.clone(),
+            trajectory: trajectory.clone(),
+        },
+    );
+    if let Some(trace) = &trajectory {
+        server.insert_global(trace.clone());
+    }
     server
         // Tools: file primitives, the SPARQL store + tools, the code graph, shell.
         .add_plugins(ToolsPlugin)
         .add_plugins(mcp)
         .add_plugins(CodeToolsPlugin::new(
-            CodeToolsConfig::new(&working_dir).with_edit_journal(edit_journal.clone()),
+            CodeToolsConfig::new(&working_dir)
+                .with_edit_journal(edit_journal.clone())
+                .with_unrestricted_paths(cli.dangerously_skip_permissions),
         ))
         .add_plugins(OxigraphPlugin::in_memory().with_tools(true))
         .add_plugins(
@@ -1277,6 +1386,7 @@ async fn main() {
         .add_plugins(TaskToolsPlugin::new(background_tasks.clone()))
         .add_plugins(
             polaris_code::agents::permission_rules::PermissionRulesPlugin::new(&working_dir)
+                .with_unrestricted_shell(cli.dangerously_skip_permissions)
                 .with_project_trust(startup.trust().clone())
                 .with_commands(commands.clone(), attachment_settings.clone())
                 .with_tool_grants(
@@ -1790,7 +1900,13 @@ async fn main() {
             max_output_tokens.get(),
         )
         .await;
-        let exit_code = finish_host(&mut server, exit_code).await;
+        let mut exit_code = finish_host(&mut server, exit_code).await;
+        if let Some(trace) = &trajectory
+            && let Err(error) = trace.finish(exit_code)
+        {
+            eprintln!("polaris: trajectory export failed: {error}");
+            exit_code = 1;
+        }
         std::process::exit(exit_code);
     }
 
@@ -2567,6 +2683,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unrestricted_permissions_require_an_explicit_print_flag() {
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--dangerously-skip-permissions"])
+                .err()
+                .expect("print is required")
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let parsed = cli(&["-p", "hello", "--dangerously-skip-permissions"]);
+        let (mode, ceiling) = startup_permissions(&parsed, true).unwrap();
+        assert_eq!(
+            mode,
+            PermissionMode::Unattended(UnattendedGrants {
+                edit_file: true,
+                run_command_patterns: vec!["*".into()],
+            })
+        );
+        assert!(ceiling.is_none());
+        assert_eq!(run_max_turns(&parsed), usize::MAX);
+        assert_eq!(run_max_turns(&cli(&["-p", "hello"])), DEFAULT_MAX_TURNS);
+        assert_eq!(
+            run_max_turns(&cli(&[
+                "-p",
+                "hello",
+                "--dangerously-skip-permissions",
+                "--max-turns",
+                "7"
+            ])),
+            7
+        );
+        let root = tempfile::tempdir().unwrap();
+        let config = configured_shell(root.path(), &mode, true);
+        assert!(config.denied_commands.is_empty());
+        assert!(config.sandbox);
+        assert_eq!(config.allowed_dirs, vec![root.path().to_path_buf()]);
+        assert!(
+            !configured_shell(root.path(), &mode, false)
+                .denied_commands
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unattended_flags_reject_conflicting_grants_and_topology_tasks() {
+        for flags in [
+            vec!["--dangerously-skip-permissions", "--topology-task", "x"],
+            vec!["--dangerously-skip-permissions", "--allow-edit"],
+            vec![
+                "--dangerously-skip-permissions",
+                "--allow-command",
+                "cargo *",
+            ],
+            vec![
+                "--trajectory-path",
+                "/tmp/trace.json",
+                "--topology-task",
+                "x",
+            ],
+        ] {
+            // Check this flag before clap reaches the print/topology group conflict.
+            let args = [vec!["polaris"], flags.clone(), vec!["-p", "hello"]].concat();
+            let error = Cli::try_parse_from(args).err().expect("flags conflict");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}: {error}"
+            );
+            for flag in flags.iter().filter(|flag| flag.starts_with("--")) {
+                assert!(error.to_string().contains(flag), "{flags:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn effort_accepts_known_and_custom_levels_but_refuses_empty_values() {
+        for level in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            assert_eq!(
+                cli(&["--reasoning-effort", level])
+                    .reasoning_effort
+                    .unwrap()
+                    .to_string(),
+                level
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--reasoning-effort", ""])
+                .err()
+                .expect("empty effort")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--trajectory-path", "/tmp/trace.json"])
+                .err()
+                .expect("print is required")
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn context_window_is_positive_and_explicit() {
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--context-window", "0"])
+                .err()
+                .expect("zero window")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        let parsed = cli(&["--context-window", "32768", "--max-output-tokens", "4096"]);
+        assert_eq!(parsed.context_window.unwrap().get(), 32768);
+        assert_eq!(parsed.max_output_tokens.unwrap().get(), 4096);
+    }
+
+    #[test]
+    fn context_window_reserves_at_least_two_tokens_beyond_output() {
+        let output = nz(4096);
+        assert_eq!(validate_context_window(None, output), Ok(()));
+        for window in [4095, 4096, 4097] {
+            assert_eq!(
+                validate_context_window(Some(nz(window)), output),
+                Err("--context-window must exceed --max-output-tokens by at least two tokens"),
+                "window {window}"
+            );
+        }
+        assert_eq!(validate_context_window(Some(nz(4098)), output), Ok(()));
+    }
+
     /// The session opens by saying what the user cannot do, in both labels.
     #[test]
     fn the_opening_notice_names_the_ceiling_and_the_starting_posture() {
@@ -2621,16 +2868,21 @@ mod tests {
         assert_eq!(resolve_max_turns(None), Ok(DEFAULT_MAX_TURNS));
         assert_eq!(resolve_max_turns(Some("  ")), Ok(DEFAULT_MAX_TURNS));
         assert_eq!(resolve_max_turns(Some(" 250 ")), Ok(250));
+        assert_eq!(resolve_max_turns(Some("0")), Ok(usize::MAX));
+        assert_eq!(
+            run_max_turns(&cli(&["-p", "hi", "--max-turns", "0"])),
+            usize::MAX
+        );
     }
 
-    /// Zero, a negative, a float and a typo are refused as a turn limit.
+    /// A negative, a float and a typo are refused as a turn limit.
     #[test]
     fn an_invalid_turn_limit_is_refused() {
-        for raw in ["0", "-1", "1.5", "lots"] {
+        for raw in ["-1", "1.5", "lots"] {
             let error = resolve_max_turns(Some(raw))
                 .expect_err("an invalid turn limit must be refused, not defaulted");
             assert!(
-                error.contains(MAX_TURNS_VAR) && error.contains("positive integer"),
+                error.contains(MAX_TURNS_VAR) && error.contains("non-negative integer"),
                 "unhelpful error for {raw:?}: {error}"
             );
         }
@@ -2888,7 +3140,7 @@ mod tests {
             PermissionMode::AutoEdit,
             PermissionMode::Plan,
         ] {
-            let executor = ShellExecutor::new(shell_config(&working_dir, &mode));
+            let executor = ShellExecutor::new(configured_shell(&working_dir, &mode, false));
             assert_eq!(executor.check_permission("echo ok"), ShellPermission::Allow);
             assert_eq!(
                 executor.check_permission("rm -rf build"),
@@ -2906,7 +3158,7 @@ mod tests {
             edit_file: false,
             run_command_patterns: vec!["cargo *".into()],
         });
-        let executor = ShellExecutor::new(shell_config(&working_dir, &mode));
+        let executor = ShellExecutor::new(configured_shell(&working_dir, &mode, false));
         assert_eq!(
             executor.check_permission("cargo test --workspace"),
             ShellPermission::Allow
@@ -2929,9 +3181,9 @@ mod tests {
             edit_file: false,
             run_command_patterns: vec!["python *".into()],
         });
-        let off = project_shell_environment(shell_config(&dir, &mode), false);
+        let off = project_shell_environment(configured_shell(&dir, &mode, false), false);
         assert!(off.env_allowlist.is_empty());
-        let on = project_shell_environment(shell_config(&dir, &mode), true);
+        let on = project_shell_environment(configured_shell(&dir, &mode, false), true);
         assert!(!on.inherit_env);
         assert!(on.env_allowlist.contains(&"PATH".to_string()));
         assert!(on.env_allowlist.contains(&"CONDA_PREFIX".to_string()));

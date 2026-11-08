@@ -27,7 +27,7 @@ Add these direct dependencies to the application that runs the full example:
 ```toml
 [dependencies]
 polaris_code = "0.3.0"
-polaris = { package = "polaris-ai", version = "0.8.0", default-features = false, features = ["anthropic"] }
+polaris = { package = "polaris-ai", version = "0.9.0", default-features = false, features = ["anthropic"] }
 polaris_ontrace = { version = "0.2.0", default-features = false, features = ["oxigraph"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -42,10 +42,31 @@ types resolve to one package instance.
 |------------|-----|
 | **Exactly one `UserIO` front end.** [`exec::ExecIOPlugin`](crate::exec::ExecIOPlugin) over [`exec::ExecIOProvider`](crate::exec::ExecIOProvider) is the channel-backed one; `polaris-tui`'s conversation panel is the other. | The agent takes its prompt and publishes its answer, its tool blocks and its permission questions through `UserIO`. Install one or the other — **never both**; the second registration wins and the first front end goes silent. |
 | **A model provider.** `ModelsPlugin`, plus a plugin that registers an `LlmProvider` (`AnthropicPlugin::from_env("ANTHROPIC_API_KEY")`, or your own). | `CodeAgent::setup` resolves the model by id and fails the session if it cannot. [`AgentConfig::model_id`](crate::agents::AgentConfig) must be `<provider name>/<model>` — the prefix is matched against `LlmProvider::name()`. |
-| **`ToolsPlugin` plus whichever capability plugins you want.** [`CodeToolsPlugin`](crate::tools::CodeToolsPlugin), [`CodeGraphPlugin`](crate::tools::CodeGraphPlugin), [`MemoryToolsPlugin`](crate::tools::MemoryToolsPlugin), `ShellPlugin`. | These are the agent's hands. All of them are optional: with none installed the turn still runs, the model simply has nothing to call. Each is sandboxed to the `working_dir` you give it, and for a single session that directory should be the one in your `AgentConfig`. Each call the agent makes also carries a [`CallRoot`](crate::tools::CallRoot) built from `AgentConfig::working_dir`, and the file and shell tools work in that folder instead of the one they were built with, which is how one server can serve sessions in different folders: see [Running several isolated calls on one server](#running-several-isolated-calls-on-one-server). |
+| **`ToolsPlugin` plus whichever capability plugins you want.** [`CodeToolsPlugin`](crate::tools::CodeToolsPlugin), [`CodeGraphPlugin`](crate::tools::CodeGraphPlugin), [`MemoryToolsPlugin`](crate::tools::MemoryToolsPlugin), `ShellPlugin`. | These are the agent's hands. All of them are optional: with none installed the turn still runs, the model simply has nothing to call. Each defaults to the `working_dir` you give it, and for a single session that directory should be the one in your `AgentConfig`. Each call the agent makes also carries a [`CallRoot`](crate::tools::CallRoot) built from `AgentConfig::working_dir`, and the file and shell tools work in that folder instead of the one they were built with, which is how one server can serve sessions in different folders: see [Running several isolated calls on one server](#running-several-isolated-calls-on-one-server). |
 | **`PersistencePlugin`, `SessionsPlugin`, [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin), and ontrace's `OxigraphPlugin`.** | Sessions and their serializers, the agent graph itself, and the RDF store the agent reifies its decisions into. `OxigraphPlugin::in_memory()` is enough; the agent writes its trajectory there whether or not you read it. |
 | **A [`TokenMeter`](crate::usage::TokenMeter) inserted as a global _before_ the first `create_context()`.** | Not optional, and the failure is quiet: the agent's `act` system takes the meter as a required `Res<TokenMeter>`, so a session context without one cannot run that step at all — the turn comes back `Completed` with `final_text: None` and `usage: None`, as if the model had said nothing. [`TurnOutcome::usage`](crate::run::TurnOutcome) reads the same meter back, and `usage: None` always means **unmeasured, not free**. |
 | **A session carrying an `AgentConfig`, and then a [`PolicySnapshot`](crate::agents::PolicySnapshot).** | The config names the model and the working directory. The policy is what every control decision reads — see the warning below, it is not optional in practice. |
+
+For a trusted disposable container, file tools can explicitly opt out of path
+containment with `CodeToolsConfig::with_unrestricted_paths(true)`. Mirror that
+choice with `AgentConfig::with_unrestricted_file_paths(true)` so the system
+prompt describes the actual access. The agent setting only changes that prompt;
+the tool configuration grants access. Edit permissions, exclusive file creation
+and journal capture still apply. The CLI exposes this combination only through
+`--dangerously-skip-permissions` in an unattended run.
+
+To apply one output limit and one reasoning effort to every model call, register
+the provider with [`ModelRunPlugin`](crate::model_run::ModelRunPlugin) and
+[`ModelRunOptions`](crate::model_run::ModelRunOptions) instead of its ordinary
+plugin. See [unattended runs](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/unattended-runs.md).
+
+An optional [`RunTrajectory`](crate::trajectory::RunTrajectory) records native
+provider calls as ATIF with shared message histories. Create it in the host
+before any model call, put a clone in `ModelRunOptions::trajectory`, insert
+another with `Server::insert_global` so tool results are recorded, and call
+`finish` when the run ends. Use
+[`rebuild_request`](crate::trajectory::rebuild_request) to reconstruct a call's
+exact native input from its one-based step id, including compacted context.
 
 ## What you get back
 
@@ -261,6 +282,7 @@ a prompt, a folder, a command list or a budget:
 | **Prompt** | [`AgentConfig::with_system_prompt`](crate::agents::AgentConfig::with_system_prompt) | Replaces the built-in system prompt in each request. The project grounding block is still appended. |
 | **Tool folder** | [`AgentConfig::working_dir`](crate::agents::AgentConfig) | The agent's tool lanes put a [`CallRoot`](crate::tools::CallRoot) with this folder on every call. The file tools (`read_file`, `read_span`, `edit_file`, `create_file`, `list_files`, `search`, `glob`) refuse a path that leaves it. `run_command` and `run_in_background` start in it, and `run_command` refuses a `working_dir` that leaves it. |
 | **Command list** | [`AgentConfig::with_command_globs`](crate::agents::AgentConfig::with_command_globs) | A shell command runs only if every command in it matches a pattern. An empty list gives the session no shell: the shell tools, including `task_output` and `stop_task`, are not offered to the model. A non-empty list is shown to the model in its prompt and in each refusal. |
+| **Context window** | `AgentConfig::context_window` | Optional explicit model input-plus-output capacity. Configures context projection and compaction after reserving the output allowance and prompt overhead. See [unattended runs](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/unattended-runs.md). |
 | **Output limit** | [`AgentConfig::with_max_output_tokens`](crate::agents::AgentConfig::with_max_output_tokens) | Bounds one reply, and is the output allowance the spend cap reserves for each request. Left unset, the request carries no limit from the agent and each reservation assumes the Anthropic fallback of 4096 tokens, whatever the provider. Set it to the limit your model provider was registered with, as `polaris` does. |
 | **Spend cap** | [`TokenMeter::set_task_cost_cap`](crate::usage::TokenMeter::set_task_cost_cap) on a meter of the call's own | Before each request the agent reserves the most it could cost, and ends the call without contacting the model when that does not fit in what is left. [`TokenMeter::task_cost_spent_usd`](crate::usage::TokenMeter::task_cost_spent_usd) reads back what the cap counted as spent. See `docs/run-cost-ceiling.md`. |
 

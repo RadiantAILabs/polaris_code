@@ -300,14 +300,17 @@ fn head_lines(content: &str, budget: usize) -> (String, usize) {
     (out, kept)
 }
 
-/// Configuration for [`CodeTools`] — a sandboxed working directory.
+/// Configuration for [`CodeTools`], sandboxed unless the host explicitly opts out.
 #[derive(Debug, Clone)]
 pub struct CodeToolsConfig {
-    /// Root directory; all tool paths resolve relative to this and may not
-    /// escape it.
+    /// Default working directory. Relative tool paths start here; containment
+    /// applies unless `unrestricted_paths` is explicitly enabled.
     pub working_dir: PathBuf,
     /// Optional durable tracker. Without it this toolset is explicitly untracked.
     pub edit_journal: Option<EditJournal>,
+    /// Permit absolute paths, parent traversal and symlinks outside the working
+    /// directory. Enable only for explicitly unrestricted disposable containers.
+    pub unrestricted_paths: bool,
 }
 
 impl CodeToolsConfig {
@@ -316,7 +319,17 @@ impl CodeToolsConfig {
         Self {
             working_dir: working_dir.into(),
             edit_journal: None,
+            unrestricted_paths: false,
         }
+    }
+
+    /// Permit file tools to access any path reachable by this process. Relative
+    /// paths still start in the session working directory. This does not disable
+    /// exclusive creation, journaling, permissions or result redaction.
+    #[must_use]
+    pub fn with_unrestricted_paths(mut self, enabled: bool) -> Self {
+        self.unrestricted_paths = enabled;
+        self
     }
 
     /// Require successful durable capture before `edit_file` or `create_file`
@@ -328,22 +341,22 @@ impl CodeToolsConfig {
     }
 
     /// Resolves `path` against the working directory, returning `None` if the
-    /// result escapes the sandbox. Handles not-yet-existing paths (e.g. a file
-    /// `create_file` is about to create) by canonicalizing the nearest existing
+    /// result escapes the sandbox in bounded mode. Handles not-yet-existing
+    /// paths (e.g. a file `create_file` is about to create) by canonicalizing the nearest existing
     /// ancestor and re-appending the not-yet-existing tail, so the *fully
     /// resolved* path is validated against the sandbox root — `..` segments in a
     /// non-existent leaf can't slip past the check.
     pub fn resolve_path(&self, path: &str) -> Option<PathBuf> {
-        resolve_within(&self.working_dir, path)
+        resolve_with_access(&self.working_dir, path, self.unrestricted_paths)
     }
 }
 
-/// Resolve `path` against `root`, returning `None` if the result escapes it.
-fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
+/// Resolve `path` against `root`, enforcing containment unless explicitly disabled.
+fn resolve_with_access(root: &Path, path: &str, unrestricted: bool) -> Option<PathBuf> {
     let working_dir = root.canonicalize().ok()?;
     let resolved = root.join(path);
     if let Ok(canonical) = resolved.canonicalize() {
-        return canonical.starts_with(&working_dir).then_some(canonical);
+        return (unrestricted || canonical.starts_with(&working_dir)).then_some(canonical);
     }
     // The path doesn't exist yet. Peel off trailing components until an
     // existing ancestor canonicalizes, then rebuild the real path from it.
@@ -353,7 +366,7 @@ fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
         if let Ok(base) = current.canonicalize() {
             let mut candidate = base;
             candidate.extend(tail.iter().rev());
-            return candidate.starts_with(&working_dir).then_some(candidate);
+            return (unrestricted || candidate.starts_with(&working_dir)).then_some(candidate);
         }
         // `file_name()` is `None` for a `..`/`.`-terminated component, which
         // we refuse to resolve through rather than guess past.
@@ -367,7 +380,8 @@ fn resolve_within(root: &Path, path: &str) -> Option<PathBuf> {
 ///
 /// A toolset is built on one directory for the whole server. When an
 /// invocation carries a `CallRoot`, the file tools resolve paths against it
-/// instead, and refuse a path that leaves it (`..`, an absolute path, a
+/// instead. Unless the host explicitly enables unrestricted file paths, they
+/// refuse a path that leaves it (`..`, an absolute path, a
 /// symlink out); the shell wrapper
 /// ([`ApprovalShellTool`](crate::tools::approval::ApprovalShellTool)) starts
 /// the command there and refuses a `working_dir` outside it. `run_in_background`
@@ -435,12 +449,12 @@ impl CodeTools {
     }
 
     fn resolve(&self, call: &Option<CallRoot>, path: &str) -> Result<PathBuf, ToolError> {
-        resolve_within(self.root_of(call), path)
+        resolve_with_access(self.root_of(call), path, self.config.unrestricted_paths)
             .ok_or_else(|| ToolError::execution_error(format!("path '{path}' escapes sandbox")))
     }
 
-    /// The canonical sandbox root, which the walking tools report paths
-    /// relative to and read ignore files from.
+    /// The canonical working directory. The walking tools report paths inside
+    /// it relative to it, and in bounded mode read ignore files from it.
     fn sandbox_root(&self, call: &Option<CallRoot>) -> Result<PathBuf, ToolError> {
         let working_dir = self.root_of(call);
         working_dir.canonicalize().map_err(|err| {
@@ -449,6 +463,17 @@ impl CodeTools {
                 working_dir.display()
             ))
         })
+    }
+}
+
+/// A walked file as the model sees it, in a form it can pass straight back to
+/// the file tools. A file inside `workspace` is shown relative to it; a file
+/// outside it (only reachable with unrestricted paths) is shown as an absolute
+/// path, which the file tools also accept in that mode.
+fn display_path(file: &Path, workspace: &Path) -> String {
+    match file.strip_prefix(workspace) {
+        Ok(relative) => slashed(relative),
+        Err(_) => file.to_string_lossy().into_owned(),
     }
 }
 
@@ -713,7 +738,7 @@ impl CodeTools {
                 .root_of(&call_root)
                 .canonicalize()
                 .map_err(|err| ToolError::execution_error(err.to_string()))?;
-            if !real_parent.starts_with(&root) {
+            if !self.config.unrestricted_paths && !real_parent.starts_with(&root) {
                 return Err(ToolError::execution_error(format!(
                     "path '{path}' escapes sandbox"
                 )));
@@ -780,9 +805,10 @@ impl CodeTools {
     /// repository's own `.gitignore` rules exclude are skipped, along with
     /// `.git`; set `include_ignored = true` to search them anyway.
     ///
-    /// Reported paths are relative to the working directory, so they feed
-    /// straight back into `read_file`, `read_span` and `edit_file`. Results are
-    /// bounded; when a bound applies the tool says so on a trailing `…` line.
+    /// Reported paths are relative to the working directory (absolute when the
+    /// file is outside it), so they feed straight back into `read_file`,
+    /// `read_span` and `edit_file`. Results are bounded; when a bound applies
+    /// the tool says so on a trailing `…` line.
     /// For Rust symbols prefer `find_definition` / `find_references` — they
     /// resolve by symbol rather than by text.
     #[expect(
@@ -819,7 +845,18 @@ impl CodeTools {
     ) -> Result<String, ToolError> {
         let target = path.unwrap_or_else(|| ".".to_string());
         let root = self.resolve(&call_root, &target)?;
-        let sandbox = self.sandbox_root(&call_root)?;
+        let sandbox = if self.config.unrestricted_paths {
+            if root.is_dir() {
+                root.clone()
+            } else {
+                root.parent().unwrap_or(&root).to_path_buf()
+            }
+        } else {
+            self.sandbox_root(&call_root)?
+        };
+        // The walk may start outside the working directory, so the directory
+        // that paths are shown against is kept apart from the one the walk uses.
+        let workspace = self.sandbox_root(&call_root)?;
         let matcher = compile_matcher(&pattern, literal, case_insensitive)?;
         let selector = glob
             .as_deref()
@@ -840,7 +877,7 @@ impl CodeTools {
                 },
             );
             render_search(
-                &sandbox,
+                &workspace,
                 &selection,
                 &matcher,
                 selector.as_ref(),
@@ -862,8 +899,9 @@ impl CodeTools {
     ///
     /// Paths the repository's own `.gitignore` rules exclude are omitted,
     /// along with `.git`; set `include_ignored = true` to list them anyway.
-    /// Results are relative to the working directory, sorted by path, and
-    /// bounded — when a bound applies the tool says so on a trailing `…` line.
+    /// Results are relative to the working directory (absolute when the file
+    /// is outside it), sorted by path, and bounded — when a bound applies the
+    /// tool says so on a trailing `…` line.
     #[tool]
     async fn glob(
         &self,
@@ -881,7 +919,17 @@ impl CodeTools {
     ) -> Result<String, ToolError> {
         let target = path.unwrap_or_else(|| ".".to_string());
         let root = self.resolve(&call_root, &target)?;
-        let sandbox = self.sandbox_root(&call_root)?;
+        let sandbox = if self.config.unrestricted_paths {
+            if root.is_dir() {
+                root.clone()
+            } else {
+                root.parent().unwrap_or(&root).to_path_buf()
+            }
+        } else {
+            self.sandbox_root(&call_root)?
+        };
+        // As in `search`: the walk root and the display root are separate.
+        let workspace = self.sandbox_root(&call_root)?;
         let selector = PathGlob::compile(&pattern).map_err(ToolError::execution_error)?;
 
         tokio::task::spawn_blocking(move || {
@@ -901,7 +949,7 @@ impl CodeTools {
             let mut listed: Vec<String> = selection
                 .files
                 .iter()
-                .map(|file| slashed(file.strip_prefix(&sandbox).unwrap_or(file)))
+                .map(|file| display_path(file, &workspace))
                 .collect();
             listed.sort();
             let mut out = listed.join("\n");
@@ -978,7 +1026,7 @@ fn no_files_message(pattern: &str, target: &str, include_ignored: bool) -> Strin
 
 /// Runs `matcher` over `selection` and renders the bounded result.
 fn render_search(
-    sandbox: &Path,
+    workspace: &Path,
     selection: &Selection,
     matcher: &Regex,
     glob: Option<&PathGlob>,
@@ -999,7 +1047,7 @@ fn render_search(
             continue;
         };
         searched += 1;
-        let display = slashed(file.strip_prefix(sandbox).unwrap_or(file));
+        let display = display_path(file, workspace);
         let before = hits.len();
         for (index, line) in content.lines().enumerate() {
             if !matcher.is_match(line) {
@@ -1138,6 +1186,205 @@ impl Plugin for CodeToolsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_unrestricted_file_access_reaches_external_paths_and_keeps_tracking() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("existing.txt"), "before\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let call = Some(CallRoot::new(&root));
+        let bounded = CodeTools::new(CodeToolsConfig::new(&root));
+        for path in [
+            outside.join("existing.txt").to_string_lossy().into_owned(),
+            "../outside/existing.txt".into(),
+            "link/existing.txt".into(),
+        ] {
+            assert!(
+                bounded
+                    .read_file(path.clone(), None, None, call.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("escapes sandbox")
+            );
+        }
+        let journal = EditJournal::open(&root).unwrap();
+        let tools = CodeTools::new(
+            CodeToolsConfig::new(&root)
+                .with_unrestricted_paths(true)
+                .with_edit_journal(journal.clone()),
+        );
+        tools
+            .create_file(
+                outside.join("new/deep.txt").to_string_lossy().into_owned(),
+                "needle\n".into(),
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        tools
+            .create_file("link/linked.txt".into(), "linked\n".into(), call.clone())
+            .await
+            .unwrap();
+        tools
+            .edit_file(
+                "../outside/existing.txt".into(),
+                "before".into(),
+                "after".into(),
+                false,
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tools
+                .read_file("link/existing.txt".into(), None, None, call.clone())
+                .await
+                .unwrap(),
+            "after\n"
+        );
+        assert!(
+            tools
+                .read_span("../outside/existing.txt".into(), 1, 1, call.clone())
+                .await
+                .unwrap()
+                .contains("after")
+        );
+        assert!(
+            tools
+                .list_files("../outside".into(), call.clone())
+                .await
+                .unwrap()
+                .contains("existing.txt")
+        );
+        assert!(
+            tools
+                .search(
+                    "needle".into(),
+                    Some("../outside".into()),
+                    None,
+                    true,
+                    false,
+                    true,
+                    call.clone()
+                )
+                .await
+                .unwrap()
+                .contains("deep.txt")
+        );
+        assert!(
+            tools
+                .glob(
+                    "*.txt".into(),
+                    Some("../outside".into()),
+                    true,
+                    call.clone()
+                )
+                .await
+                .unwrap()
+                .contains("linked.txt")
+        );
+        let clobber = tools
+            .create_file("link/linked.txt".into(), "overwrite".into(), call)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            clobber.contains("already exists") && clobber.contains("edit_file"),
+            "{clobber}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("linked.txt")).unwrap(),
+            "linked\n"
+        );
+        assert_eq!(journal.tracked_since(0).paths.len(), 3);
+    }
+
+    /// The first path of a `search` hit (`path:line: text`).
+    fn first_hit_path(search_output: &str) -> &str {
+        let line = search_output.lines().next().unwrap_or_default();
+        line.split(':').next().unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn unrestricted_search_and_glob_paths_feed_back_into_read_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        // The same name at the root and in `src` shows which one a path means.
+        std::fs::write(root.join("needle.txt"), "root copy\n").unwrap();
+        std::fs::write(root.join("src/needle.txt"), "needle in src\n").unwrap();
+        std::fs::write(outside.join("far.txt"), "needle outside\n").unwrap();
+        let call = Some(CallRoot::new(&root));
+        let tools = CodeTools::new(CodeToolsConfig::new(&root).with_unrestricted_paths(true));
+
+        // Inside the workspace: workspace-relative, not relative to `src`.
+        let found = tools
+            .search(
+                "needle in".into(),
+                Some("src".into()),
+                None,
+                false,
+                false,
+                false,
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_hit_path(&found), "src/needle.txt", "{found}");
+        let listed = tools
+            .glob("*.txt".into(), Some("src".into()), false, call.clone())
+            .await
+            .unwrap();
+        assert_eq!(listed.lines().next(), Some("src/needle.txt"), "{listed}");
+        for path in [first_hit_path(&found), listed.lines().next().unwrap()] {
+            let content = tools
+                .read_file(path.into(), None, None, call.clone())
+                .await
+                .unwrap();
+            assert_eq!(content, "needle in src\n", "{path}");
+        }
+
+        // Outside the workspace: an absolute path that read_file accepts.
+        let found = tools
+            .search(
+                "needle".into(),
+                Some("../outside".into()),
+                None,
+                false,
+                false,
+                false,
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        let far = first_hit_path(&found);
+        assert!(Path::new(far).is_absolute(), "{found}");
+        assert!(far.ends_with("outside/far.txt"), "{found}");
+        let listed = tools
+            .glob(
+                "*.txt".into(),
+                Some("../outside".into()),
+                false,
+                call.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.lines().next(), Some(far), "{listed}");
+        for path in [far, listed.lines().next().unwrap()] {
+            let content = tools
+                .read_file(path.into(), None, None, call.clone())
+                .await
+                .unwrap();
+            assert_eq!(content, "needle outside\n", "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn edit_file_unique_match_applies_and_diffs() {

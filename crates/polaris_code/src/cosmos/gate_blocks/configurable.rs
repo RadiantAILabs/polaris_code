@@ -2873,6 +2873,12 @@ impl LiveModelStep {
                         DEFAULT_COMPACT_BATCH,
                         keep_recent,
                         MODEL_STEP_TOKEN_RATIO,
+                        config
+                            .model_id
+                            .as_deref()
+                            .or(self.model_id.as_deref())
+                            .map(crate::providers::ReasoningHistory::for_model)
+                            .unwrap_or_default(),
                     );
                 }
                 if config.trim == TrimPolicy::Batched
@@ -3327,14 +3333,8 @@ impl LiveModelStep {
                         }
                     }
                     results.push(match outcome {
-                        Ok(content) => UserBlock::tool_result(
-                            tool_call.id.clone(),
-                            ToolResultContent::Text(content),
-                        ),
-                        Err(error) => UserBlock::tool_error(
-                            tool_call.id.clone(),
-                            ToolResultContent::Text(error),
-                        ),
+                        Ok(content) => tool_call.result(ToolResultContent::Text(content)),
+                        Err(error) => tool_call.error(ToolResultContent::Text(error)),
                     });
                 }
                 if let Some(index) = last_write_result {
@@ -5146,8 +5146,9 @@ mod tests {
     #[test]
     fn warm_continuation_keeps_old_autotest_feedback_short() {
         let mut messages = vec![Message::User {
-            content: vec![UserBlock::tool_result(
-                "edit-1".to_owned(),
+            content: vec![UserBlock::tool_result_with_call_id(
+                "edit-1",
+                "edit-1",
                 ToolResultContent::Text(format!(
                     "edited\nAutotest (related subset): {}",
                     "x".repeat(900)
@@ -5163,8 +5164,9 @@ mod tests {
     #[test]
     fn warm_continuation_preserves_an_autotest_not_run_message() {
         let mut messages = vec![Message::User {
-            content: vec![UserBlock::tool_result(
-                "edit-1".to_owned(),
+            content: vec![UserBlock::tool_result_with_call_id(
+                "edit-1",
+                "edit-1",
                 ToolResultContent::Text("edited\nAutotest not run: no allowed runner".to_owned()),
             )],
         }];
@@ -5567,7 +5569,8 @@ mod tests {
                 ))],
             },
             Message::User {
-                content: vec![UserBlock::tool_result(
+                content: vec![UserBlock::tool_result_with_call_id(
+                    "run-1",
                     "run-1",
                     ToolResultContent::Text("exit 0: 1".to_owned()),
                 )],
@@ -6507,6 +6510,138 @@ mod tests {
             }),
             Message::Assistant { .. } => false,
         }));
+    }
+
+    #[tokio::test]
+    async fn live_step_results_keep_provider_call_ids_on_success_error_and_denial() {
+        use polaris::models::llm::ToolResultStatus;
+
+        let (_dir, workspace) = workspace("todo!()");
+        let view = WorkspaceView::new(&workspace);
+        for (path, allowed, status) in [
+            ("lib.rs", true, ToolResultStatus::Success),
+            ("missing.rs", true, ToolResultStatus::Error),
+            ("lib.rs", false, ToolResultStatus::Error),
+        ] {
+            let mut response = tool_call_turn(READ_FILE_TOOL, serde_json::json!({"path":path}));
+            let AssistantBlock::ToolCall(call) = &mut response.content[0] else {
+                unreachable!()
+            };
+            call.call_id = Some("provider-read".into());
+            let (llm, requests) = live_llm_capturing(vec![
+                response,
+                tool_call_turn(
+                    SUBMIT_ANSWER_TOOL,
+                    serde_json::json!({"kind":"answer","answer":"done"}),
+                ),
+            ]);
+            let config = live_config(
+                ModelStepOutputKind::Answer,
+                if allowed {
+                    ToolSubset::Only(vec![READ_FILE_TOOL.into()])
+                } else {
+                    ToolSubset::None
+                },
+                10_000,
+            );
+            LiveModelStep::new(llm)
+                .propose(&config, &view, &TokenMeter::default())
+                .await
+                .unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let Some(Message::User { content }) = requests[1].messages.last() else {
+                panic!("tool feedback");
+            };
+            let UserBlock::ToolResult(result) = &content[0] else {
+                panic!("tool result");
+            };
+            assert_eq!(result.id, "call-1");
+            assert_eq!(result.call_id.as_deref(), Some("provider-read"));
+            assert_eq!(result.status, status, "{path}, allowed={allowed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_step_compaction_uses_the_selected_models_reasoning_replay() {
+        use polaris::models::llm::ReasoningBlock;
+
+        let (_dir, workspace) = workspace("todo!()");
+        let view = WorkspaceView::new(&workspace);
+        for (model_id, fragments, compacted) in [
+            (
+                "aws.bedrock/global.openai.gpt-oss-120b-1:0",
+                vec!["x".repeat(8_000)],
+                false,
+            ),
+            ("anthropic/test-model", vec![String::new(); 4_000], true),
+        ] {
+            let mut call = ToolCall::new(
+                "old-read",
+                READ_FILE_TOOL,
+                serde_json::json!({"path":"lib.rs"}),
+            );
+            call.call_id = Some("provider-old-read".into());
+            let conversation = ModelConversation(vec![
+                Message::user("Investigate"),
+                Message::Assistant {
+                    id: None,
+                    content: vec![
+                        AssistantBlock::Reasoning(ReasoningBlock {
+                            id: None,
+                            reasoning: fragments,
+                            signature: None,
+                        }),
+                        AssistantBlock::ToolCall(call.clone()),
+                    ],
+                },
+                Message::User {
+                    content: vec![call.result(ToolResultContent::Text("old observation".into()))],
+                },
+                Message::assistant("Ready"),
+            ]);
+            for override_model in [false, true] {
+                let (llm, requests) = live_llm_capturing(vec![tool_call_turn(
+                    SUBMIT_ANSWER_TOOL,
+                    serde_json::json!({"kind":"answer","answer":"done"}),
+                )]);
+                let mut executor = LiveModelStep::new(llm.clone()).with_model_id(model_id);
+                let mut config = live_config(ModelStepOutputKind::Answer, ToolSubset::None, 1_000);
+                if override_model {
+                    executor = executor
+                        .with_model_id("unknown/model")
+                        .with_model(model_id, llm);
+                    config = config.with_model(model_id);
+                }
+                executor
+                    .run(&config, &view, &TokenMeter::default(), Some(&conversation))
+                    .await
+                    .unwrap();
+                let requests = requests.lock().unwrap();
+                let result = requests[0]
+                    .messages
+                    .iter()
+                    .find_map(|message| match message {
+                        Message::User { content } => content.iter().find_map(|block| match block {
+                            UserBlock::ToolResult(result) if result.id == "old-read" => {
+                                Some(result)
+                            }
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                    .unwrap();
+                let ToolResultContent::Text(text) = &result.content else {
+                    panic!("text result");
+                };
+                assert_eq!(
+                    text.starts_with(crate::agents::context::COMPACTED_MARKER),
+                    compacted,
+                    "{model_id}, override={override_model}"
+                );
+                assert_eq!(result.call_id, call.call_id);
+            }
+        }
     }
 
     #[tokio::test]

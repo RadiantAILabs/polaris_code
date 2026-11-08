@@ -89,6 +89,8 @@ mod tests {
         assert!(text.starts_with("--provider anthropic"), "{text}");
         assert!(text.contains("anthropic/claude-sonnet-5-5"), "{text}");
         assert!(text.contains("openai/gpt-5.5"), "{text}");
+        assert!(text.contains("--provider openai-chat"), "{text}");
+        assert!(text.contains("openai-chat/gpt-5.5"), "{text}");
     }
 
     #[test]
@@ -99,7 +101,13 @@ mod tests {
         assert!(!json.contains('\n'), "one line: {json}");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(value["schema"], "polaris.models.v1");
-        assert_eq!(value["providers"].as_array().map(Vec::len), Some(3));
+        assert_eq!(value["providers"].as_array().map(Vec::len), Some(4));
+        let chat = &value["providers"][3];
+        assert_eq!(chat["provider"], "openai-chat");
+        assert_eq!(chat["credentials"]["status"], "missing");
+        assert_eq!(chat["credentials"]["variable"], "OPENAI_API_KEY");
+        assert_eq!(chat["models"][0]["id"], "openai-chat/gpt-5.5");
+        assert_eq!(chat["models"][0]["default"], true);
     }
 
     #[test]

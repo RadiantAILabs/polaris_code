@@ -77,10 +77,6 @@ const OPENAI_BASE_URL_VAR: &str = "OPENAI_BASE_URL";
 /// this build can honour it, so a value is refused.
 const ANTHROPIC_BASE_URL_VAR: &str = "ANTHROPIC_BASE_URL";
 
-/// The reasoning effort (`low`, `medium`, `high`) a Bedrock `OpenAI` model is
-/// asked for on every request.
-const REASONING_EFFORT_VAR: &str = "POLARIS_CODE_EXP_REASONING_EFFORT";
-
 /// The profile the AWS SDK's shared-config providers read.
 const AWS_PROFILE_VAR: &str = "AWS_PROFILE";
 
@@ -119,13 +115,23 @@ pub enum Provider {
     /// `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL`.
     #[value(name = "openai")]
     OpenAi,
+    /// An `OpenAI`-compatible Chat Completions server, with `OPENAI_API_KEY`
+    /// and optional `OPENAI_BASE_URL`. Accepts arbitrary remote model ids.
+    #[value(name = "openai-chat")]
+    #[serde(rename = "openai-chat")]
+    OpenAiChat,
     /// AWS Bedrock, through the AWS SDK's default credential chain.
     Bedrock,
 }
 
 impl Provider {
     /// Every provider, in the order listings show them.
-    pub const ALL: [Self; 3] = [Self::Anthropic, Self::OpenAi, Self::Bedrock];
+    pub const ALL: [Self; 4] = [
+        Self::Anthropic,
+        Self::OpenAi,
+        Self::Bedrock,
+        Self::OpenAiChat,
+    ];
 
     /// The name `--provider` takes.
     #[must_use]
@@ -133,6 +139,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::OpenAiChat => "openai-chat",
             Self::Bedrock => "bedrock",
         }
     }
@@ -143,6 +150,7 @@ impl Provider {
         match self {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
+            Self::OpenAiChat => "OpenAI Chat Completions",
             Self::Bedrock => "Amazon Bedrock",
         }
     }
@@ -193,6 +201,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::OpenAiChat => "openai-chat",
             Self::Bedrock => "aws.bedrock",
         }
     }
@@ -203,8 +212,34 @@ impl Provider {
     pub const fn key_var(self) -> Option<&'static str> {
         match self {
             Self::Anthropic => Some(ANTHROPIC_KEY_VAR),
-            Self::OpenAi => Some(OPENAI_KEY_VAR),
+            Self::OpenAi | Self::OpenAiChat => Some(OPENAI_KEY_VAR),
             Self::Bedrock => None,
+        }
+    }
+
+    /// Add this host's prefix to a Chat Completions id, preserving every byte
+    /// of the remote model name. Other providers retain their catalog resolver.
+    #[must_use]
+    pub fn qualify_model(self, id: &str) -> String {
+        if self == Self::OpenAiChat && !id.starts_with("openai-chat/") {
+            format!("openai-chat/{id}")
+        } else {
+            id.to_string()
+        }
+    }
+
+    /// Build the launch catalog. Compatible Chat Completions endpoints may
+    /// serve arbitrary ids, so an explicit model becomes selectable without an
+    /// additional catalog declaration. All other providers keep the given set.
+    #[must_use]
+    pub fn launch_catalog(self, catalog: ModelCatalog, requested: Option<&str>) -> ModelCatalog {
+        if self == Self::OpenAiChat {
+            ModelCatalog::new(
+                self.qualify_model(requested.unwrap_or(catalog.default_model())),
+                catalog.models().iter().map(|id| self.qualify_model(id)),
+            )
+        } else {
+            catalog
         }
     }
 
@@ -218,9 +253,52 @@ impl Provider {
             Self::OpenAi => {
                 ModelCatalog::from_lookup(DEFAULT_OPENAI_MODEL, BUILTIN_OPENAI_MODELS, env)
             }
+            Self::OpenAiChat => {
+                ModelCatalog::from_lookup("openai-chat/gpt-5.5", &["openai-chat/gpt-5.5"], env)
+            }
             Self::Bedrock => {
                 ModelCatalog::from_lookup(DEFAULT_BEDROCK_MODEL, BUILTIN_BEDROCK_MODELS, env)
             }
+        }
+    }
+}
+
+/// How the installed providers replay reasoning text in earlier messages.
+/// Unknown provider prefixes count every text fragment; unrecognized Bedrock
+/// model ids are treated as omitting reasoning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReasoningHistory {
+    #[default]
+    Concatenated,
+    NewlineSeparated,
+    Omitted,
+}
+
+impl ReasoningHistory {
+    pub(crate) fn for_model(model_id: &str) -> Self {
+        match Provider::of_model(model_id) {
+            Some(Provider::Anthropic) => Self::NewlineSeparated,
+            Some(Provider::Bedrock) => {
+                // Bedrock replays Claude's thinking through Converse. Other
+                // Converse models and its Responses route strip reasoning.
+                if model_id.contains("anthropic.") && !model_id.contains("openai.") {
+                    Self::NewlineSeparated
+                } else {
+                    Self::Omitted
+                }
+            }
+            _ => Self::Concatenated,
+        }
+    }
+
+    pub(crate) fn chars(self, block: &polaris::models::llm::ReasoningBlock) -> usize {
+        if self == Self::Omitted {
+            return 0;
+        }
+        let text = block.reasoning.iter().map(String::len).sum::<usize>();
+        match self {
+            Self::NewlineSeparated => text + block.reasoning.len().saturating_sub(1),
+            _ => text,
         }
     }
 }
@@ -232,6 +310,8 @@ impl Provider {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum StartupError {
+    /// The retired provider-specific effort variable was set.
+    RetiredReasoningSetting,
     /// The provider's key variable is unset or blank.
     MissingKey {
         /// The provider that needs it.
@@ -273,6 +353,7 @@ pub enum StartupError {
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RetiredReasoningSetting => f.write_str("POLARIS_CODE_EXP_REASONING_EFFORT was retired; unset it and use --reasoning-effort or POLARIS_CODE_REASONING_EFFORT"),
             Self::MissingKey { provider, var } => {
                 let flag = provider.flag();
                 let (name, where_to_get_one, example, more) = match provider {
@@ -282,7 +363,7 @@ impl fmt::Display for StartupError {
                         "sk-ant-...",
                         String::new(),
                     ),
-                    Provider::OpenAi => (
+                    Provider::OpenAi | Provider::OpenAiChat => (
                         "OpenAI",
                         "https://platform.openai.com/api-keys",
                         "sk-...",
@@ -481,7 +562,6 @@ impl ProviderReport {
 pub struct ReadyProvider {
     report: ProviderReport,
     sdk_config: Option<aws_config::SdkConfig>,
-    reasoning_fields: Option<serde_json::Value>,
     /// The key `polaris login` stored, when no environment variable held one.
     stored_key: Option<String>,
 }
@@ -492,7 +572,6 @@ impl fmt::Debug for ReadyProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadyProvider")
             .field("report", &self.report)
-            .field("reasoning_fields", &self.reasoning_fields)
             .finish_non_exhaustive()
     }
 }
@@ -502,6 +581,68 @@ impl ReadyProvider {
     #[must_use]
     pub fn report(&self) -> &ProviderReport {
         &self.report
+    }
+
+    /// Register this provider with immutable policy on every model call,
+    /// including auxiliary calls and optional complete-run trajectory capture.
+    ///
+    /// # Panics
+    ///
+    /// Panics if preparation loaded no stored key and the checked credential
+    /// is absent from the process environment, including when preparation used
+    /// an injected lookup. Also panics if an internal invariant is broken and
+    /// a prepared Bedrock provider has no checked SDK configuration.
+    pub fn install_with_options(
+        &self,
+        server: &mut Server,
+        max_output_tokens: NonZeroU32,
+        pricing: PriceStore,
+        options: crate::model_run::ModelRunOptions,
+    ) {
+        use crate::model_run::ModelRunPlugin;
+        let key = || {
+            self.stored_key.clone().unwrap_or_else(|| {
+                std::env::var(self.report.provider.key_var().expect("key provider"))
+                    .expect("provider credentials were checked at startup")
+            })
+        };
+        match self.report.provider {
+            Provider::Anthropic => {
+                server.add_plugins(ModelRunPlugin::new(
+                    polaris::models::anthropic::AnthropicProvider::new(key())
+                        .with_max_tokens(max_output_tokens)
+                        .with_pricing_store(pricing),
+                    options,
+                ));
+            }
+            Provider::OpenAi => {
+                server.add_plugins(ModelRunPlugin::new(
+                    OpenAiProvider::new(key()).with_pricing_store(pricing),
+                    options,
+                ));
+            }
+            Provider::OpenAiChat => {
+                let mut provider =
+                    polaris::models::chat_completions::ChatCompletionsProvider::new(key())
+                        .with_pricing_store(pricing);
+                if let Some(url) = present(process_env(OPENAI_BASE_URL_VAR)) {
+                    provider = provider.with_base_url(url);
+                }
+                server.add_plugins(
+                    ModelRunPlugin::new(provider, options).with_registry_name("openai-chat"),
+                );
+            }
+            Provider::Bedrock => {
+                let config = self.sdk_config.clone().expect("checked Bedrock SDK config");
+                let provider = polaris::models::bedrock::BedrockProvider::new(std::sync::Arc::new(
+                    aws_sdk_bedrockruntime::Client::new(&config),
+                ))
+                .with_sdk_config(config)
+                .with_max_tokens(max_output_tokens)
+                .with_pricing_store(pricing);
+                server.add_plugins(ModelRunPlugin::new(provider, options));
+            }
+        }
     }
 
     /// Register the provider's plugin with `server`.
@@ -538,6 +679,14 @@ impl ReadyProvider {
             (Provider::OpenAi, Some(key)) => {
                 server.add_plugins(StoredKeyOpenAiPlugin::new(key.clone(), pricing));
             }
+            (Provider::OpenAiChat, _) => {
+                self.install_with_options(
+                    server,
+                    max_output_tokens,
+                    pricing,
+                    crate::model_run::ModelRunOptions::default(),
+                );
+            }
             (Provider::Bedrock, _) => {
                 // The SDK config was loaded and checked in `prepare`; handing
                 // it over means the plugin does not load it a second time.
@@ -548,10 +697,7 @@ impl ReadyProvider {
                 let plugin = BedrockPlugin::from_sdk_config(sdk_config)
                     .with_max_tokens(max_output_tokens)
                     .with_pricing_store(pricing);
-                server.add_plugins(match self.reasoning_fields.clone() {
-                    Some(fields) => plugin.with_additional_model_request_fields(fields),
-                    None => plugin,
-                });
+                server.add_plugins(plugin);
             }
         }
     }
@@ -573,6 +719,9 @@ pub async fn prepare(
     env: Lookup<'_>,
     stored: &dyn StoredCredentials,
 ) -> Result<ReadyProvider, StartupError> {
+    if present(env("POLARIS_CODE_EXP_REASONING_EFFORT")).is_some() {
+        return Err(StartupError::RetiredReasoningSetting);
+    }
     match provider {
         Provider::Anthropic => {
             let origin = resolve_key(provider, env, stored)?;
@@ -584,7 +733,7 @@ pub async fn prepare(
             }
             Ok(ready_with_key(provider, origin, None))
         }
-        Provider::OpenAi => {
+        Provider::OpenAi | Provider::OpenAiChat => {
             let origin = resolve_key(provider, env, stored)?;
             let endpoint = match present(env(OPENAI_BASE_URL_VAR)) {
                 Some(url) if is_http_url(&url) => Some(redact_url(&url)),
@@ -676,7 +825,6 @@ fn ready_with_key(
             credential_source,
         },
         sdk_config: None,
-        reasoning_fields: None,
         stored_key,
     }
 }
@@ -803,7 +951,6 @@ async fn check_bedrock(
             credential_source: credential_source(features, profile.as_deref()),
         },
         sdk_config: Some(sdk_config),
-        reasoning_fields: reasoning_effort_fields(env(REASONING_EFFORT_VAR).as_deref()),
         stored_key: None,
     })
 }
@@ -859,14 +1006,6 @@ fn credential_source(features: &[AwsCredentialFeature], profile: Option<&str>) -
             })
         })
         .unwrap_or_else(|| "the AWS default credential chain".to_string())
-}
-
-/// The Converse request fields for a reasoning effort, or `None` when unset,
-/// blank, or not one of `low`/`medium`/`high` (the model's default applies).
-fn reasoning_effort_fields(value: Option<&str>) -> Option<serde_json::Value> {
-    let effort = value?.trim();
-    matches!(effort, "low" | "medium" | "high")
-        .then(|| serde_json::json!({"reasoning": {"effort": effort}}))
 }
 
 /// Whether `url` is an `http` or `https` address with a host.
@@ -1101,6 +1240,38 @@ mod tests {
     }
 
     #[test]
+    fn chat_model_ids_preserve_remote_slashes_and_routing_suffixes() {
+        let provider = Provider::OpenAiChat;
+        for id in ["vendor/model:route", "openai-chat/vendor/model:route"] {
+            let qualified = provider.qualify_model(id);
+            let catalog = provider.launch_catalog(provider.catalog(&|_| None), Some(&qualified));
+            assert_eq!(
+                catalog.select(Some(&qualified)).unwrap(),
+                "openai-chat/vendor/model:route"
+            );
+        }
+        assert_eq!(provider.registry_name(), "openai-chat");
+        assert_eq!(serde_json::to_value(provider).unwrap(), "openai-chat");
+    }
+
+    #[test]
+    fn the_chat_serde_name_round_trips_through_stored_credentials() {
+        let name: String =
+            serde_json::from_str(&serde_json::to_string(&Provider::OpenAiChat).unwrap()).unwrap();
+        let provider = Provider::from_str(&name, false).unwrap();
+        assert_eq!(provider, Provider::OpenAiChat);
+        let dir = tempfile::tempdir().unwrap();
+        let stored = stored_in(&dir, &[(provider, "chat-stored-key")], None);
+        let text = std::fs::read_to_string(stored.path()).unwrap();
+        assert!(text.contains("[openai-chat]"), "{text}");
+        let reopened = CredentialStore::at(stored.path().to_path_buf());
+        assert_eq!(
+            reopened.api_key(Provider::OpenAiChat).unwrap().as_deref(),
+            Some("chat-stored-key")
+        );
+    }
+
+    #[test]
     fn each_provider_owns_a_registry_name_and_a_catalog_of_its_own_models() {
         let none = |_: &str| None;
         for provider in Provider::ALL {
@@ -1168,6 +1339,7 @@ mod tests {
         for (provider, var) in [
             (Provider::Anthropic, "ANTHROPIC_API_KEY"),
             (Provider::OpenAi, "OPENAI_API_KEY"),
+            (Provider::OpenAiChat, "OPENAI_API_KEY"),
         ] {
             for pairs in [vec![], vec![(var, "")], vec![(var, "   ")]] {
                 let err = prepare_with(provider, &pairs)
@@ -1182,6 +1354,10 @@ mod tests {
                 assert!(message.contains(".env"), "{message}");
                 assert!(message.contains("--provider"), "{message}");
                 assert!(message.contains("POLARIS_CODE_PROVIDER"), "{message}");
+                assert!(
+                    message.contains(&format!("polaris login {}", provider.flag())),
+                    "{message}"
+                );
             }
         }
     }
@@ -1263,30 +1439,49 @@ mod tests {
 
     #[tokio::test]
     async fn a_base_url_that_is_not_http_is_refused_without_echoing_credentials() {
-        let err = prepare_with(
-            Provider::OpenAi,
-            &[
-                ("OPENAI_API_KEY", "k"),
-                ("OPENAI_BASE_URL", "ftp://user:hunter2@host/v1"),
-            ],
-        )
-        .await
-        .expect_err("only http and https are addresses");
-        let message = err.to_string();
-        assert!(message.contains("OPENAI_BASE_URL"), "{message}");
-        assert!(message.contains("ftp://host/v1"), "{message}");
-        assert!(!message.contains("hunter2"), "{message}");
-
-        for bad in ["localhost:11434", "http://", "https:///"] {
+        for provider in [Provider::OpenAi, Provider::OpenAiChat] {
+            let err = prepare_with(
+                provider,
+                &[
+                    ("OPENAI_API_KEY", "k"),
+                    ("OPENAI_BASE_URL", "ftp://user:hunter2@host/v1"),
+                ],
+            )
+            .await
+            .expect_err("only http and https are addresses");
             assert!(
-                prepare_with(
-                    Provider::OpenAi,
-                    &[("OPENAI_API_KEY", "k"), ("OPENAI_BASE_URL", bad)]
+                matches!(
+                    err,
+                    StartupError::BadBaseUrl {
+                        var: OPENAI_BASE_URL_VAR,
+                        ..
+                    }
+                ),
+                "{provider:?}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("OPENAI_BASE_URL"), "{message}");
+            assert!(message.contains("ftp://host/v1"), "{message}");
+            assert!(!message.contains("hunter2"), "{message}");
+
+            for bad in ["localhost:11434", "http://", "https:///"] {
+                let err = prepare_with(
+                    provider,
+                    &[("OPENAI_API_KEY", "k"), ("OPENAI_BASE_URL", bad)],
                 )
                 .await
-                .is_err(),
-                "{bad}"
-            );
+                .expect_err(bad);
+                assert!(
+                    matches!(
+                        err,
+                        StartupError::BadBaseUrl {
+                            var: OPENAI_BASE_URL_VAR,
+                            ..
+                        }
+                    ),
+                    "{provider:?}, {bad}: {err}"
+                );
+            }
         }
     }
 
@@ -1504,26 +1699,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bedrock_keeps_the_reasoning_effort_the_operator_asked_for() {
-        let config = sdk_config(Some("us-east-1"), Some(credentials_tagged(vec![])));
-        let ready = check(config, &[("POLARIS_CODE_EXP_REASONING_EFFORT", " high ")])
-            .await
-            .unwrap();
-        assert_eq!(
-            ready.reasoning_fields,
-            Some(serde_json::json!({"reasoning": {"effort": "high"}}))
-        );
-    }
-
-    #[test]
-    fn reasoning_effort_accepts_only_known_levels() {
-        assert_eq!(
-            reasoning_effort_fields(Some(" high ")),
-            Some(serde_json::json!({"reasoning": {"effort": "high"}}))
-        );
-        for value in [None, Some(""), Some("max"), Some("HIGH")] {
-            assert_eq!(reasoning_effort_fields(value), None);
-        }
+    async fn the_experimental_effort_variable_is_refused() {
+        let error = prepare_with(
+            Provider::OpenAi,
+            &[("POLARIS_CODE_EXP_REASONING_EFFORT", "high")],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("--reasoning-effort"));
     }
 
     /// `registry_name` is what a `provider/model` id is matched against, so it
@@ -1545,8 +1728,7 @@ mod tests {
     }
 
     /// Bedrock registers from the config the check loaded, so this reaches no
-    /// network. The other two read their key from the process environment
-    /// themselves, which a test must not set.
+    /// network. Key providers are tested separately with stored credentials.
     #[tokio::test]
     async fn bedrock_registers_from_the_config_the_check_loaded() {
         use polaris::models::{ModelRegistry, ModelsPlugin};
@@ -1555,14 +1737,16 @@ mod tests {
         let ready = check(config, &[]).await.unwrap();
         let mut server = Server::new();
         server.add_plugins(ModelsPlugin);
-        ready.install(
+        ready.install_with_options(
             &mut server,
             NonZeroU32::new(1024).unwrap(),
             PriceStore::builtin(),
+            crate::model_run::ModelRunOptions::default(),
         );
         server.finish().await.expect("the server builds");
         let registry = server.get_global::<ModelRegistry>().expect("registry");
         assert!(registry.has_llm_provider(Provider::Bedrock.registry_name()));
+        assert!(registry.llm(DEFAULT_BEDROCK_MODEL).is_ok());
         assert_eq!(registry.llm_provider_names().len(), 1);
     }
 
@@ -1706,17 +1890,19 @@ mod tests {
             &[
                 (Provider::Anthropic, "sk-ant-stored-key-1234"),
                 (Provider::OpenAi, "sk-openai-stored-key-5678"),
+                (Provider::OpenAiChat, "sk-chat-stored-key-9012"),
             ],
             None,
         );
-        for provider in [Provider::Anthropic, Provider::OpenAi] {
+        for provider in [Provider::Anthropic, Provider::OpenAi, Provider::OpenAiChat] {
             let ready = prepare_stored(provider, &[], &stored).await.unwrap();
             let mut server = Server::new();
             server.add_plugins(ModelsPlugin);
-            ready.install(
+            ready.install_with_options(
                 &mut server,
                 NonZeroU32::new(1024).unwrap(),
                 PriceStore::builtin(),
+                crate::model_run::ModelRunOptions::default(),
             );
             server.finish().await.expect("the server builds");
             let registry = server.get_global::<ModelRegistry>().expect("registry");
@@ -1724,6 +1910,13 @@ mod tests {
                 registry.has_llm_provider(provider.registry_name()),
                 "{} did not register",
                 provider.flag()
+            );
+            let catalog = provider.catalog(&|_| None);
+            assert!(
+                registry.llm(catalog.default_model()).is_ok(),
+                "{} default model did not resolve through {}",
+                provider.flag(),
+                provider.registry_name()
             );
         }
     }

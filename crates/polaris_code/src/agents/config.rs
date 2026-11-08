@@ -20,6 +20,9 @@ pub struct AgentConfig {
     pub model_id: String,
     /// Root directory the agent operates within.
     pub working_dir: PathBuf,
+    /// Tell the model that the host explicitly enabled unrestricted file tools.
+    /// The host must mirror this on `CodeToolsConfig`; this is a prompt declaration.
+    pub unrestricted_file_paths: bool,
     /// Which graph-search surface to expose. The binary mirrors
     /// this onto [`crate::tools::CodeGraphPlugin`] and the freeform-tool
     /// permission gate; it is carried here so the gate has a single source.
@@ -47,6 +50,9 @@ pub struct AgentConfig {
     /// registered with a larger ceiling than the value reserved here can
     /// produce more than was reserved.
     pub max_output_tokens: Option<NonZeroU32>,
+    /// Explicit model context window, including the reserved output allowance.
+    /// `None` keeps the built-in retrieval policy. Applies to this session.
+    pub context_window: Option<NonZeroU32>,
     /// The shell commands this session may run, as command patterns (`*`
     /// matches any text, `?` one character). `None` leaves shell commands to
     /// the permission mode and the server's shell policy alone, as they always
@@ -68,12 +74,22 @@ impl AgentConfig {
         Self {
             model_id: model_id.into(),
             working_dir: working_dir.into(),
+            unrestricted_file_paths: false,
             graph_search: GraphSearchMode::default(),
             prompt_cache: true,
             system_prompt: None,
             max_output_tokens: None,
+            context_window: None,
             command_globs: None,
         }
+    }
+
+    /// Describe explicitly unrestricted file access to the model. The host
+    /// must also configure the actual file-tool capability with the same policy.
+    #[must_use]
+    pub fn with_unrestricted_file_paths(mut self, enabled: bool) -> Self {
+        self.unrestricted_file_paths = enabled;
+        self
     }
 
     /// Use `prompt` as the system prompt instead of the built-in one. The
@@ -98,6 +114,15 @@ impl AgentConfig {
     #[must_use]
     pub fn with_max_output_tokens(mut self, tokens: NonZeroU32) -> Self {
         self.max_output_tokens = Some(tokens);
+        self
+    }
+
+    /// Declare this session's model input-plus-output capacity. The host must
+    /// leave at least two tokens beyond the output allowance (4096 by default).
+    /// [`super::CodeAgent`] rejects a smaller window during session setup.
+    #[must_use]
+    pub fn with_context_window(mut self, tokens: NonZeroU32) -> Self {
+        self.context_window = Some(tokens);
         self
     }
 
