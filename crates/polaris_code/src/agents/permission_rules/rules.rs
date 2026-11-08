@@ -1319,4 +1319,623 @@ command_prefix = "cargo test"
         let rules = PermissionRules::from_paths(dir.path(), Some(dir.path()), None);
         assert!(rules.snapshot().errors[0].contains("not a regular file"));
     }
+
+    mod code_rules {
+        use super::*;
+        use crate::agents::PermissionCeiling;
+        use crate::agents::permission_rules::ReviewEligibility;
+        use std::sync::Mutex;
+
+        type Verdict = Option<(RuleDecision, String)>;
+        type Check = Box<dyn Fn(&str, &Value, &Path) -> Verdict + Send + Sync>;
+
+        /// A rule that gives `decision` to calls whose `path` starts with `prefix`.
+        fn on_path(prefix: &'static str, decision: RuleDecision) -> Check {
+            Box::new(move |_, args, _| {
+                let path = args.get("path")?.as_str()?;
+                path.starts_with(prefix)
+                    .then(|| (decision, format!("{prefix} is generated")))
+            })
+        }
+
+        /// A rule that gives `decision` to calls whose `command` contains `needle`.
+        fn on_command(needle: &'static str, decision: RuleDecision) -> Check {
+            Box::new(move |_, args, _| {
+                let command = args.get("command")?.as_str()?;
+                command
+                    .contains(needle)
+                    .then(|| (decision, format!("{needle:?} is not allowed here")))
+            })
+        }
+
+        /// A rule that gives `decision` to calls whose `command` starts with `prefix`.
+        fn on_command_start(prefix: &'static str, decision: RuleDecision) -> Check {
+            Box::new(move |_, args, _| {
+                let command = args.get("command")?.as_str()?;
+                command
+                    .starts_with(prefix)
+                    .then(|| (decision, "starts like this".to_string()))
+            })
+        }
+
+        fn call<'a>(
+            dir: &'a Path,
+            tool: &'a str,
+            args: &'a Value,
+            registry_default: ToolPermission,
+            ceiling: Option<&'a PermissionCeiling>,
+        ) -> PermissionCall<'a> {
+            PermissionCall {
+                tool,
+                args,
+                registry_default,
+                root: dir,
+                generation: 1,
+                ceiling,
+            }
+        }
+
+        const FILE_ALLOWS_CREATE: &str = "[[rules]]\ntool = 'create_file'\ndecision = 'allow'\n";
+
+        #[test]
+        fn a_code_deny_beats_a_file_allow_and_names_the_rule() {
+            let (dir, mut rules) = files(FILE_ALLOWS_CREATE, "");
+            rules
+                .add_code_rule(
+                    "keep-out-of-generated",
+                    on_path("generated/", RuleDecision::Deny),
+                )
+                .unwrap();
+            let generated = json!({"path":"generated/a.rs"});
+            assert_eq!(
+                rules.resolve("create_file", &generated),
+                Some((
+                    RuleDecision::Deny,
+                    r#"code rule "keep-out-of-generated": generated/ is generated"#.to_string()
+                ))
+            );
+            // Other paths still follow the file.
+            let (decision, source) = rules
+                .resolve("create_file", &json!({"path":"src/a.rs"}))
+                .unwrap();
+            assert_eq!(decision, RuleDecision::Allow);
+            assert!(source.contains("user.toml"), "{source}");
+
+            // The agent's decision refuses the call and carries the same reason.
+            let mut policy = PermissionMode::Confirm.permission_policy();
+            policy.rules = Some(rules);
+            let held = policy.resolve_call(
+                &call(
+                    dir.path(),
+                    "create_file",
+                    &generated,
+                    ToolPermission::Confirm,
+                    None,
+                ),
+                &SessionGrants::default(),
+            );
+            assert_eq!(held.permission, ToolPermission::Deny);
+            assert_eq!(
+                held.source,
+                r#"code rule "keep-out-of-generated": generated/ is generated"#
+            );
+            assert!(!held.remember);
+        }
+
+        #[test]
+        fn a_code_allow_never_beats_a_file_deny_or_ask() {
+            for (file, held) in [("deny", RuleDecision::Deny), ("ask", RuleDecision::Ask)] {
+                let (_, mut rules) = files(
+                    &format!("[[rules]]\ntool = 'create_file'\ndecision = '{file}'\n"),
+                    "",
+                );
+                rules
+                    .add_code_rule("let-it-through", |_, _, _| {
+                        Some((RuleDecision::Allow, "fine".into()))
+                    })
+                    .unwrap();
+                let (decision, source) = rules
+                    .resolve("create_file", &json!({"path":"a.rs"}))
+                    .unwrap();
+                assert_eq!(decision, held, "{file}");
+                assert!(source.contains("user.toml"), "{source}");
+            }
+        }
+
+        #[test]
+        fn a_file_rule_keeps_a_tie_with_a_code_rule() {
+            let (_, mut rules) = files("[[rules]]\ntool = 'create_file'\ndecision = 'deny'\n", "");
+            rules
+                .add_code_rule("also-no", on_path("", RuleDecision::Deny))
+                .unwrap();
+            let (decision, source) = rules
+                .resolve("create_file", &json!({"path":"a.rs"}))
+                .unwrap();
+            assert_eq!(decision, RuleDecision::Deny);
+            assert!(source.contains("user.toml"), "{source}");
+        }
+
+        #[test]
+        fn among_code_rules_the_most_restrictive_wins_and_the_earliest_breaks_a_tie() {
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("asker", on_command("x", RuleDecision::Ask))
+                .unwrap();
+            rules
+                .add_code_rule("allower", on_command("x", RuleDecision::Allow))
+                .unwrap();
+            let args = json!({"command":"x"});
+            let (decision, reason) = rules.resolve("run_command", &args).unwrap();
+            assert_eq!(decision, RuleDecision::Ask);
+            assert!(reason.starts_with(r#"code rule "asker""#), "{reason}");
+
+            rules
+                .add_code_rule("denier", on_command("x", RuleDecision::Deny))
+                .unwrap();
+            rules
+                .add_code_rule("second-denier", on_command("x", RuleDecision::Deny))
+                .unwrap();
+            let (decision, reason) = rules.resolve("run_command", &args).unwrap();
+            assert_eq!(decision, RuleDecision::Deny);
+            assert!(reason.starts_with(r#"code rule "denier""#), "{reason}");
+            // No rule has an opinion about other calls.
+            assert_eq!(rules.resolve("run_command", &json!({"command":"y"})), None);
+        }
+
+        #[test]
+        fn a_code_allow_stays_inside_the_mode_and_the_ceiling() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("trusted-edit", |tool, _, _| {
+                    (tool == "create_file").then(|| (RuleDecision::Allow, "fine".to_string()))
+                })
+                .unwrap();
+            let args = json!({"path":"new.txt"});
+            let grants = SessionGrants::default();
+            let decide = |mode: PermissionMode, ceiling: Option<&PermissionCeiling>| {
+                let mut policy = mode.permission_policy();
+                policy.rules = Some(rules.clone());
+                policy.resolve_call(
+                    &call(
+                        dir.path(),
+                        "create_file",
+                        &args,
+                        ToolPermission::Confirm,
+                        ceiling,
+                    ),
+                    &grants,
+                )
+            };
+
+            // Plan and unattended runs do not grow an edit grant.
+            for mode in [
+                PermissionMode::Plan,
+                PermissionMode::Unattended(UnattendedGrants::default()),
+            ] {
+                assert_eq!(decide(mode, None).permission, ToolPermission::Deny);
+            }
+            // Where a person is asked by default, the allow removes the prompt.
+            let allowed = decide(PermissionMode::Confirm, None);
+            assert_eq!(allowed.permission, ToolPermission::Allow);
+            assert!(
+                allowed.source.contains("trusted-edit"),
+                "{}",
+                allowed.source
+            );
+
+            // The ceiling is applied last.
+            let confirm = PermissionCeiling::new(PermissionMode::Confirm).unwrap();
+            let bounded = decide(PermissionMode::AutoEdit, Some(&confirm));
+            assert_eq!(bounded.permission, ToolPermission::Confirm);
+            assert_eq!(bounded.source, "confirm permission ceiling");
+            let plan = PermissionCeiling::new(PermissionMode::Plan).unwrap();
+            let bounded = decide(PermissionMode::Confirm, Some(&plan));
+            assert_eq!(bounded.permission, ToolPermission::Deny);
+            assert_eq!(bounded.source, "plan permission ceiling");
+        }
+
+        #[test]
+        fn a_code_ask_is_refused_when_unattended_and_left_to_a_person_otherwise() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("review-tests", on_command("cargo test", RuleDecision::Ask))
+                .unwrap();
+            let args = json!({"command":"cargo test"});
+            let grants = SessionGrants::default();
+
+            let mut unattended = PermissionMode::Unattended(UnattendedGrants {
+                edit_file: false,
+                run_command_patterns: vec!["cargo *".into()],
+            })
+            .permission_policy();
+            unattended.rules = Some(rules.clone());
+            let refused = unattended.resolve_call(
+                &call(
+                    dir.path(),
+                    "run_command",
+                    &args,
+                    ToolPermission::Allow,
+                    None,
+                ),
+                &grants,
+            );
+            assert_eq!(refused.permission, ToolPermission::Deny);
+            assert!(
+                refused.source.contains("review-tests"),
+                "{}",
+                refused.source
+            );
+
+            let mut attended = PermissionMode::AutoEdit.permission_policy();
+            attended.rules = Some(rules);
+            let asked = attended.resolve_call(
+                &call(
+                    dir.path(),
+                    "run_command",
+                    &args,
+                    ToolPermission::Allow,
+                    None,
+                ),
+                &grants,
+            );
+            assert_eq!(asked.permission, ToolPermission::Confirm);
+            assert_eq!(asked.review, ReviewEligibility::HumanOnly);
+            assert!(!asked.remember);
+        }
+
+        #[test]
+        fn project_trust_does_not_apply_to_code_rules() {
+            let (_, mut rules) = files("", "[[rules]]\ntool = 'create_file'\ndecision = 'allow'\n");
+            rules
+                .add_code_rule("allow-edits", |tool, _, _| {
+                    (tool == "edit_file").then(|| (RuleDecision::Allow, "fine".to_string()))
+                })
+                .unwrap();
+            let create = json!({"path":"a.rs"});
+            let edit = json!({"path":"a.rs", "old_text":"a", "new_text":"b"});
+            // The project's allow asks until the project is trusted; the code
+            // rule's allow does not wait for that.
+            assert_eq!(
+                rules.resolve("create_file", &create).unwrap().0,
+                RuleDecision::Ask
+            );
+            assert_eq!(
+                rules.resolve("edit_file", &edit).unwrap().0,
+                RuleDecision::Allow
+            );
+            rules.trust_project();
+            assert_eq!(
+                rules.resolve("create_file", &create).unwrap().0,
+                RuleDecision::Allow
+            );
+            assert_eq!(
+                rules.resolve("edit_file", &edit).unwrap().0,
+                RuleDecision::Allow
+            );
+        }
+
+        #[test]
+        fn a_rule_that_panics_refuses_the_call_and_names_itself() {
+            let (_, mut rules) = files(FILE_ALLOWS_CREATE, "");
+            rules
+                .add_code_rule("crashy", |_, _, _| -> Verdict {
+                    panic!("secret internals")
+                })
+                .unwrap();
+            // Another rule that would allow does not rescue the call.
+            rules
+                .add_code_rule("allower", |_, _, _| {
+                    Some((RuleDecision::Allow, "fine".into()))
+                })
+                .unwrap();
+            let (decision, reason) = rules
+                .resolve("create_file", &json!({"path":"a.rs"}))
+                .unwrap();
+            assert_eq!(decision, RuleDecision::Deny);
+            assert_eq!(
+                reason,
+                r#"code rule "crashy" failed while checking this call, so the call is refused"#
+            );
+            assert!(!reason.contains("secret internals"), "{reason}");
+        }
+
+        #[test]
+        fn a_rule_that_panics_on_one_part_of_a_command_refuses_the_whole_call() {
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("crashy", |_, args, _| -> Verdict {
+                    let command = args["command"].as_str().unwrap();
+                    assert!(command != "ls", "cannot handle ls");
+                    None
+                })
+                .unwrap();
+            let (decision, reason) = rules
+                .resolve("run_command", &json!({"command":"echo a; ls"}))
+                .unwrap();
+            assert_eq!(decision, RuleDecision::Deny);
+            assert!(reason.contains(r#"code rule "crashy""#), "{reason}");
+        }
+
+        #[test]
+        fn names_are_checked_and_the_set_is_fixed_once_sealed() {
+            let mut rules = PermissionRules::default();
+            for name in ["", " padded", "padded ", "two\nlines", "tab\there"] {
+                assert_eq!(
+                    rules.add_code_rule(name, on_path("", RuleDecision::Deny)),
+                    Err(CodeRuleError::InvalidName(name.to_string())),
+                    "{name:?}"
+                );
+            }
+            rules
+                .add_code_rule("one", on_path("", RuleDecision::Deny))
+                .unwrap();
+            assert_eq!(
+                rules.add_code_rule("one", on_path("", RuleDecision::Ask)),
+                Err(CodeRuleError::Duplicate("one".into()))
+            );
+            let mut clone = rules.clone();
+            rules.seal();
+            for adder in [&mut rules, &mut clone] {
+                let error = adder
+                    .add_code_rule("two", on_path("", RuleDecision::Deny))
+                    .unwrap_err();
+                assert_eq!(error, CodeRuleError::Sealed("two".into()));
+                assert!(error.to_string().contains("fixed"), "{error}");
+            }
+            // The rule added before sealing still applies.
+            assert_eq!(
+                rules.resolve("any", &json!({"path":"a"})).unwrap().0,
+                RuleDecision::Deny
+            );
+            assert!(!rules.describe().contains("\"two\""));
+        }
+
+        #[test]
+        fn clones_share_the_rules_added_to_any_of_them() {
+            let mut original = PermissionRules::default();
+            let early_clone = original.clone();
+            original
+                .add_code_rule("late", on_path("generated/", RuleDecision::Deny))
+                .unwrap();
+            let args = json!({"path":"generated/x"});
+            assert_eq!(
+                early_clone.resolve("create_file", &args).unwrap().0,
+                RuleDecision::Deny
+            );
+            let mut other = early_clone.clone();
+            other
+                .add_code_rule("from-clone", on_path("tmp/", RuleDecision::Ask))
+                .unwrap();
+            assert!(original.describe().contains("\"from-clone\""));
+            assert_eq!(
+                original
+                    .resolve("create_file", &json!({"path":"tmp/x"}))
+                    .unwrap()
+                    .0,
+                RuleDecision::Ask
+            );
+        }
+
+        #[test]
+        fn describe_lists_code_rules_by_name_and_is_unchanged_without_any() {
+            let (_, mut rules) = files(FILE_ALLOWS_CREATE, "");
+            let before = rules.describe();
+            assert!(!before.contains("Code rules"), "{before}");
+            rules
+                .add_code_rule("keep-out", on_path("generated/", RuleDecision::Deny))
+                .unwrap();
+            rules
+                .add_code_rule("review-tests", on_path("tests/", RuleDecision::Ask))
+                .unwrap();
+            let listing = rules.describe();
+            assert!(listing.starts_with(&before), "{listing}");
+            assert!(
+                listing
+                    .contains("Code rules added by plugins:\n- \"keep-out\"\n- \"review-tests\""),
+                "{listing}"
+            );
+        }
+
+        #[test]
+        fn the_rule_gets_the_tool_the_arguments_and_the_root() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut rules = PermissionRules::default();
+            let record = seen.clone();
+            rules
+                .add_code_rule("recorder", move |tool, args, root| {
+                    record.lock().unwrap().push((
+                        tool.to_string(),
+                        args.clone(),
+                        root.to_path_buf(),
+                    ));
+                    None
+                })
+                .unwrap();
+            let args = json!({"path":"a.rs", "extra":[1, 2]});
+            assert_eq!(rules.resolve("read_file", &args), None);
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(rules.resolve_in(dir.path(), "read_file", &args), None);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].0, "read_file");
+            assert_eq!(seen[0].1, args);
+            assert_eq!(seen[1].2, dir.path());
+        }
+
+        /// What a rule is shown for one call, in order.
+        fn commands_seen(tool: &str, command: &str) -> Vec<String> {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut rules = PermissionRules::default();
+            let record = seen.clone();
+            rules
+                .add_code_rule("recorder", move |_, args, _| {
+                    record.lock().unwrap().push(args.clone());
+                    None
+                })
+                .unwrap();
+            let args = json!({"command":command, "timeout_secs": 5});
+            assert_eq!(rules.resolve(tool, &args), None);
+            let seen = seen.lock().unwrap();
+            for shown in seen.iter() {
+                // Everything but the command text is passed through unchanged.
+                assert_eq!(shown["timeout_secs"], 5);
+            }
+            seen.iter()
+                .map(|shown| shown["command"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[test]
+        fn a_shell_call_is_shown_whole_then_one_simple_command_at_a_time() {
+            for tool in ["run_command", "run_in_background"] {
+                assert_eq!(
+                    commands_seen(tool, "echo one && ls -l | wc -l; rm -rf build"),
+                    [
+                        "echo one && ls -l | wc -l; rm -rf build",
+                        "echo one",
+                        "ls -l",
+                        "wc -l",
+                        "rm -rf build"
+                    ],
+                    "{tool}"
+                );
+                // A single plain command is shown once.
+                assert_eq!(commands_seen(tool, "cargo test"), ["cargo test"], "{tool}");
+            }
+            // Other tools are never split, even with a command-like argument.
+            assert_eq!(commands_seen("read_file", "a; b"), ["a; b"]);
+            // The text of a here document is data, not a command.
+            let heredoc = "cat > notes.txt <<'EOF'\nrm -rf /\nEOF\nls";
+            let seen = commands_seen("run_command", heredoc);
+            assert_eq!(seen[0], heredoc);
+            assert!(
+                seen[1..].iter().all(|part| !part.contains("rm -rf")),
+                "{seen:?}"
+            );
+            // Grammar the parser does not follow is shown once, as written.
+            assert_eq!(
+                commands_seen("run_command", "echo $(rm -rf build)"),
+                ["echo $(rm -rf build)"]
+            );
+        }
+
+        #[test]
+        fn a_deny_on_any_part_of_a_shell_call_refuses_it() {
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("no-rm", on_command_start("rm ", RuleDecision::Deny))
+                .unwrap();
+            for tool in ["run_command", "run_in_background"] {
+                for command in [
+                    "rm -rf build",
+                    "echo ok; rm -rf build",
+                    "echo ok && rm -rf build",
+                    "false || rm -rf build",
+                    "ls | rm -rf build",
+                    "cat > f <<'EOF'\nbody\nEOF\nrm -rf build",
+                ] {
+                    let (decision, reason) = rules
+                        .resolve(tool, &json!({"command":command}))
+                        .unwrap_or_else(|| panic!("{tool}: {command:?} has no verdict"));
+                    assert_eq!(decision, RuleDecision::Deny, "{tool}: {command:?}");
+                    assert!(reason.starts_with(r#"code rule "no-rm""#), "{reason}");
+                }
+                for command in [
+                    "echo ok; ls",
+                    "echo rm -rf build",
+                    "cat > f <<'EOF'\nrm -rf build\nEOF",
+                ] {
+                    assert_eq!(
+                        rules.resolve(tool, &json!({"command":command})),
+                        None,
+                        "{tool}: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_shell_allow_needs_the_whole_command_and_every_part_to_agree() {
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("cargo-only", |_, args, _| {
+                    let command = args.get("command")?.as_str()?;
+                    command
+                        .starts_with("cargo ")
+                        .then(|| (RuleDecision::Allow, "cargo is fine".to_string()))
+                })
+                .unwrap();
+            let decide = |command: &str| {
+                rules
+                    .resolve("run_command", &json!({"command":command}))
+                    .map(|(decision, _)| decision)
+            };
+            assert_eq!(decide("cargo test"), Some(RuleDecision::Allow));
+            assert_eq!(
+                decide("cargo test && cargo build"),
+                Some(RuleDecision::Allow)
+            );
+            // One part without an allow keeps the rule from allowing the call.
+            assert_eq!(decide("cargo test && make"), None);
+            assert_eq!(decide("cargo test; ls"), None);
+            // So does a command the parser does not follow.
+            assert_eq!(decide("cargo test $(whoami)"), None);
+            // A deny elsewhere still wins over the allowed parts.
+            rules
+                .add_code_rule("no-publish", on_command("publish", RuleDecision::Deny))
+                .unwrap();
+            assert_eq!(
+                rules
+                    .resolve(
+                        "run_command",
+                        &json!({"command":"cargo test && cargo publish"})
+                    )
+                    .unwrap()
+                    .0,
+                RuleDecision::Deny
+            );
+        }
+
+        #[test]
+        fn an_opaque_command_is_still_refused_by_a_deny_on_the_whole_text() {
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("no-rm", on_command("rm -rf", RuleDecision::Deny))
+                .unwrap();
+            let (decision, _) = rules
+                .resolve("run_command", &json!({"command":"echo $(rm -rf build)"}))
+                .unwrap();
+            assert_eq!(decision, RuleDecision::Deny);
+        }
+
+        #[test]
+        fn a_shell_part_is_checked_through_the_agent_decision() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule("no-rm", on_command_start("rm ", RuleDecision::Deny))
+                .unwrap();
+            let mut policy = PermissionMode::AutoEdit.permission_policy();
+            policy.rules = Some(rules);
+            let args = json!({"command":"echo ok && rm -rf build"});
+            let held = policy.resolve_call(
+                &call(
+                    dir.path(),
+                    "run_command",
+                    &args,
+                    ToolPermission::Allow,
+                    None,
+                ),
+                &SessionGrants::default(),
+            );
+            assert_eq!(held.permission, ToolPermission::Deny);
+            assert!(
+                held.source.contains(r#"code rule "no-rm""#),
+                "{}",
+                held.source
+            );
+        }
+    }
 }
