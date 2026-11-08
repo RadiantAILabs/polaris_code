@@ -2,8 +2,8 @@
 //!
 //! Plugins fill [`CodeAgentSteps`] during `build`. After startup, the host calls
 //! [`CodeAgent::with_steps`] once and registers that agent instead of the unit
-//! `CodeAgent`. The same agent can be passed to the graph-view plugin: no opaque
-//! callback dispatcher or runtime-only graph hides contributed systems.
+//! `CodeAgent`. Pass the same agent to the graph-view plugin so contributed
+//! systems appear by name in the graph.
 //!
 //! Each place sorts contributions by ascending `(priority, key)`, independent
 //! of plugin registration order. A duplicate key at the same place is rejected.
@@ -23,8 +23,9 @@
 //! A hold continues the existing agent loop; each additional answer uses another
 //! iteration and a normally metered model call. Existing turn limits, provider
 //! output limits, context projection/compaction, spend admission, and executor
-//! cancellation still apply. A hold grants no extra budget. Async extension
-//! systems must yield for cancellation and must meter any model calls they make.
+//! cancellation still apply. A hold grants no extra budget. Extension systems
+//! that wait on I/O must race those awaits against `Res<RunCancellation>`, as
+//! stock systems do, and must meter any model calls they make.
 //! These are trusted host plugins: filesystem mutations must use the existing
 //! permission, containment, edit-journal and index-refresh contracts, just as a
 //! new tool capability must. This seam does not authorize filesystem access.
@@ -305,7 +306,9 @@ impl Agent for SteppedCodeAgent {
     fn setup(&self, ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
         CodeAgent.setup(ctx)?;
         if !self.steps.before_finish.is_empty() {
-            ctx.insert(FinishGate::default());
+            ctx.insert(FinishGate {
+                messages: Vec::new(),
+            });
         }
         Ok(())
     }
@@ -343,7 +346,6 @@ impl Agent for SteppedCodeAgent {
 ///     gate.hold("Run the requested verification and report its result.");
 /// }
 /// ```
-#[derive(Default)]
 pub struct FinishGate {
     messages: Vec<String>,
 }

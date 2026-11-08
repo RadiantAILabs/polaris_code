@@ -414,6 +414,7 @@ async fn after_tools_runs_once_per_round_and_next_request_reads_its_message() {
     assert_eq!(outcome.turn.reason, TurnReason::Completed);
     assert_eq!(outcome.order, ["observe", "observe", "first"]);
     assert_eq!(outcome.results.len(), 2);
+    assert_eq!(outcome.results[0].matches("tool-result-marker").count(), 2);
     for result in &outcome.results {
         assert!(result.contains("tool-result-marker"), "{result}");
     }
@@ -451,7 +452,20 @@ async fn several_plugins_run_by_key_and_keep_every_hold_message() {
     .await;
     assert_eq!(outcome.turn.reason, TurnReason::Completed);
     assert_eq!(outcome.order, ["first", "second", "first", "second"]);
-    let sent = format!("{:?}", outcome.requests[1]);
+    let messages = &outcome.requests[1];
+    assert!(matches!(
+        &messages[messages.len() - 3],
+        Message::Assistant { .. }
+    ));
+    assert!(matches!(
+        &messages[messages.len() - 2],
+        Message::User { .. }
+    ));
+    assert!(matches!(
+        &messages[messages.len() - 1],
+        Message::User { .. }
+    ));
+    let sent = format!("{messages:?}");
     assert!(sent.find("candidate").unwrap() < sent.find("First check").unwrap());
     assert!(sent.find("First check").unwrap() < sent.find("Second check").unwrap());
 }
@@ -459,10 +473,12 @@ async fn several_plugins_run_by_key_and_keep_every_hold_message() {
 #[tokio::test]
 async fn always_held_answers_still_end_at_the_turn_limit() {
     let outcome = run(vec![Reply::Text("candidate"); 3], 3, 1).await;
+    let TurnReason::Failed(failure) = &outcome.turn.reason else {
+        panic!("expected the iteration limit: {:?}", outcome.turn.reason);
+    };
     assert!(
-        matches!(outcome.turn.reason, TurnReason::Failed(_)),
-        "{:?}",
-        outcome.turn.reason
+        failure.message.contains("max iterations (3) exceeded"),
+        "{failure:?}"
     );
     assert_eq!(outcome.requests.len(), 3);
     assert_eq!(outcome.answers.len(), 3);

@@ -365,6 +365,8 @@ fn embedded_steps(graph: &Graph, depth: usize) -> Vec<GraphNode> {
 ///
 /// - [`GraphPanelPlugin`](polaris_tui::panels::GraphPanelPlugin) — provides the
 ///   global [`GraphFeed`] this plugin requires.
+/// - [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin) when constructed with
+///   [`Self::for_code_agent_steps`], to freeze the registry before publication.
 ///
 /// # Lifecycle
 ///
