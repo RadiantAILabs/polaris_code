@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 from collections.abc import Sequence
@@ -27,26 +28,52 @@ from harbor.utils.env import parse_bool_env_value
 REMOTE_BINARY = "/installed-agent/polaris-code"
 RELEASE_URL = "https://github.com/RadiantAILabs/polaris_code/releases/download"
 TRAJECTORY = "trajectory.json"
+STREAM_LOG = "polaris.jsonl"
+STDERR_LOG = "polaris-stderr.txt"
+# The usage event is the last stdout line, so only the end of the log is read.
+MAX_STREAM_BYTES = 8 * 1024 * 1024
+# The CLI takes the context window and output limit as unsigned 32-bit integers.
+MAX_MODEL_LIMIT = 2**32 - 1
 
 
-def release_install_command(version: str) -> str:
-    """Download the static Linux x86-64 release and verify its checksum."""
-    version = version.removeprefix("v")
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
-        raise ValueError("version must pin a release, for example 0.3.0 or v0.3.0")
+def release_install_command(version: str, sha256: str | None = None) -> str:
+    """Download the static Linux x86-64 release and verify its checksum.
+
+    ``sha256`` is the expected digest of the archive. Without it the script
+    trusts the ``.sha256`` file of the same release, which detects corruption
+    but not a replaced release. The file must name the downloaded archive.
+    """
+    pin = version.removeprefix("v")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", pin):
+        raise ValueError(
+            f"version must pin a release, for example 0.3.0 or v0.3.0, got {version!r}"
+        )
+    base = f"{RELEASE_URL}/v{pin}"
+    curl = "curl -fL --proto '=https' --proto-redir '=https' --retry 3"
+    if sha256 is None:
+        checksum = (
+            f'{curl} "{base}/$archive.sha256" -o "$archive.sha256"\n'
+            'read -r listed_digest listed_name < "$archive.sha256" || true\n'
+            '[ "${listed_name#\\*}" = "$archive" ] || '
+            '{ echo "$archive.sha256 does not name $archive" >&2; exit 1; }\n'
+            'echo "$listed_digest  $archive" | sha256sum -c -'
+        )
+    elif re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        checksum = f'echo "{sha256.lower()}  $archive" | sha256sum -c -'
+    else:
+        raise ValueError("sha256 must be 64 hexadecimal digits")
     return f'''set -eu
 [ "$(uname -s)" = Linux ] || {{ echo 'Polaris release installation requires Linux' >&2; exit 1; }}
 case "$(uname -m)" in
   x86_64|amd64) target=x86_64-unknown-linux-musl ;;
   *) echo 'Unsupported CPU: Polaris release installation supports x86_64-unknown-linux-musl only' >&2; exit 1 ;;
 esac
-archive="polaris-code-{version}-$target.tar.gz"
+archive="polaris-code-{pin}-$target.tar.gz"
 release_tmp=$(mktemp -d)
 trap 'rm -rf "$release_tmp"' EXIT
 cd "$release_tmp"
-curl -fL --retry 3 "{RELEASE_URL}/v{version}/$archive" -o "$archive"
-curl -fL --retry 3 "{RELEASE_URL}/v{version}/$archive.sha256" -o "$archive.sha256"
-sha256sum -c "$archive.sha256"
+{curl} "{base}/$archive" -o "$archive"
+{checksum}
 tar -xzf "$archive" polaris
 cp polaris {REMOTE_BINARY}
 chmod 755 {REMOTE_BINARY}
@@ -59,49 +86,67 @@ def _positive_int(name: str, value: int | str | None) -> int | None:
     if (
         isinstance(value, bool)
         or not re.fullmatch(r"[0-9]+", str(value))
-        or int(value) <= 0
+        or not 0 < int(value) <= MAX_MODEL_LIMIT
     ):
-        raise ValueError(f"{name} must be a positive integer")
+        raise ValueError(f"{name} must be a positive integer up to {MAX_MODEL_LIMIT}")
     return int(value)
 
 
 def _reported_cost(logs_dir: Path) -> float | None:
-    """Read a known cost from the application's authoritative usage event."""
-    cost = None
+    """Read a known cost from the application's authoritative usage event.
+
+    The sandbox writes this file, so no content in it may raise: undecodable
+    bytes are replaced, each line is parsed alone, and only the last
+    ``MAX_STREAM_BYTES`` are read.
+    """
     try:
-        with (logs_dir / "polaris.jsonl").open() as stream:
-            for line in stream:
-                try:
-                    event = json.loads(line)
-                    if (
-                        event.get("source") != "System"
-                        or event.get("metadata", {}).get("io_type") != "usage"
-                    ):
-                        continue
-                    usage = json.loads(event["content"]["Text"])
-                    if usage.get("schema") != "polaris-code-run-usage/v1":
-                        continue
-                    value = usage.get("estimated_cost_usd")
-                    if (
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and math.isfinite(value)
-                        and value >= 0
-                    ):
-                        cost = float(value)
-                except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
-                    continue
+        with (logs_dir / STREAM_LOG).open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - MAX_STREAM_BYTES))
+            tail = stream.read(MAX_STREAM_BYTES)
     except OSError:
-        pass
+        return None
+    cost = None
+    for line in tail.decode("utf-8", errors="replace").split("\n"):
+        try:
+            event = json.loads(line)
+            if (
+                event.get("source") != "System"
+                or event.get("metadata", {}).get("io_type") != "usage"
+            ):
+                continue
+            usage = json.loads(event["content"]["Text"])
+            if usage.get("schema") != "polaris-code-run-usage/v1":
+                continue
+            value = usage.get("estimated_cost_usd")
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
+                cost = float(value)
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            OverflowError,
+            RecursionError,
+        ):
+            continue
     return cost
 
 
 class PolarisCode(BaseInstalledAgent):
     """Harbor installed agent using either ``version`` or a local ``binary``.
 
-    ``unattended=True`` explicitly grants edits and shell execution inside the
-    disposable sandbox. Otherwise only edits and ``allow_command`` patterns are
-    granted. Model credentials are supplied through Harbor's ``extra_env``.
+    The keywords are documented in ``docs/terminal-bench-harbor.md``.
+    ``unattended=True`` passes ``--dangerously-skip-permissions``: the model may
+    edit any file and run any command, so the task container is the only
+    boundary. Otherwise only edits and ``allow_command`` patterns are granted;
+    the two cannot be combined. Model credentials are supplied through Harbor's
+    ``extra_env``.
     """
 
     capabilities = AgentCapabilities(atif=True)
@@ -110,8 +155,10 @@ class PolarisCode(BaseInstalledAgent):
     def __init__(
         self,
         logs_dir: Path,
+        *args: Any,
         binary: str | Path | None = None,
         version: str | None = None,
+        sha256: str | None = None,
         allow_command: Sequence[str] | str | None = None,
         graph_search: str = "both",
         provider: str | None = None,
@@ -120,13 +167,15 @@ class PolarisCode(BaseInstalledAgent):
         context_window: int | str | None = None,
         max_output_tokens: int | str | None = None,
         unattended: bool | str = False,
-        *args: Any,
         **kwargs: Any,
     ) -> None:
         if (binary is None) == (version is None):
             raise ValueError("supply exactly one of binary or a pinned version")
         self._binary = None
+        self._sha256 = sha256
         if binary is not None:
+            if sha256 is not None:
+                raise ValueError("sha256 pins a release; use it with version")
             binary_path = Path(binary).expanduser().resolve()
             if not binary_path.is_file():
                 raise FileNotFoundError(f"Polaris binary is not a file: {binary_path}")
@@ -134,7 +183,8 @@ class PolarisCode(BaseInstalledAgent):
             version = f"sha256:{hashlib.sha256(binary_path.read_bytes()).hexdigest()}"
         else:
             assert version is not None
-            release_install_command(version)  # Validate before any environment spend.
+            # Validate before any environment spend.
+            release_install_command(version, sha256)
             version = version.removeprefix("v")
         if graph_search not in ("curated", "freeform", "both"):
             raise ValueError("graph_search must be curated, freeform, or both")
@@ -143,6 +193,13 @@ class PolarisCode(BaseInstalledAgent):
             if isinstance(allow_command, str)
             else tuple(allow_command or ())
         )
+        self._unattended = parse_bool_env_value(unattended, name="unattended")
+        if self._unattended and self._allow_command:
+            # The CLI rejects this pair, but only after the environment is built.
+            raise ValueError(
+                "allow_command cannot be combined with unattended; "
+                "unattended already allows every command"
+            )
         self._graph_search = graph_search
         self._provider = provider
         self._base_url = base_url
@@ -157,7 +214,6 @@ class PolarisCode(BaseInstalledAgent):
             raise ValueError(
                 "context_window must exceed max_output_tokens by at least two tokens"
             )
-        self._unattended = parse_bool_env_value(unattended, name="unattended")
         super().__init__(logs_dir, *args, version=version, **kwargs)
 
     @staticmethod
@@ -179,9 +235,8 @@ class PolarisCode(BaseInstalledAgent):
             await self.exec_as_root(environment, command=f"chmod 755 {REMOTE_BINARY}")
         else:
             await self.ensure_system_dependencies(environment, ("curl", "tar"))
-            await self.exec_as_root(
-                environment, command=release_install_command(self._version)
-            )
+            command = release_install_command(self._version, self._sha256)
+            await self.exec_as_root(environment, command=command)
 
     @override
     @with_prompt_template
@@ -194,8 +249,8 @@ class PolarisCode(BaseInstalledAgent):
         logs = str(self.environment_logs_dir)
         argv = [
             REMOTE_BINARY,
-            "-p",
-            instruction,
+            # The joined form keeps an instruction that starts with "-" a value.
+            f"--print={instruction}",
             "--output-format",
             "stream-json",
             "--model",
@@ -216,10 +271,14 @@ class PolarisCode(BaseInstalledAgent):
                 argv.extend((flag, str(value)))
         for pattern in self._allow_command:
             argv.extend(("--allow-command", pattern))
-        # Preserve the task image's declared WORKDIR as the containment boundary.
+        stdout_log = shlex.quote(f"{logs}/{STREAM_LOG}")
+        stderr_log = shlex.quote(f"{logs}/{STDERR_LOG}")
+        # The run starts in the task image's declared WORKDIR. With
+        # --dangerously-skip-permissions that is only the start directory: the
+        # container is the one boundary.
         await self.exec_as_agent(
             environment,
-            command=f"{shlex.join(argv)} </dev/null >{shlex.quote(logs + '/polaris.jsonl')} 2>{shlex.quote(logs + '/polaris-stderr.txt')}",
+            command=f"{shlex.join(argv)} </dev/null >{stdout_log} 2>{stderr_log}",
             env={
                 "POLARIS_CODE_GRAPH_SEARCH": self._graph_search,
                 **(
