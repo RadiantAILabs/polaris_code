@@ -117,6 +117,7 @@ pub mod docs {
     pub mod resources {}
 }
 
+pub use agents::code_agent::steps::{CodeAgentSteps, DuplicateStep, FinishGate, SteppedCodeAgent};
 pub use agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, ContextManager, Decision, LoopState, PolicySnapshot,
     ProjectContext,

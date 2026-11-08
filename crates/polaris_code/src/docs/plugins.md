@@ -108,3 +108,14 @@ Startup configuration and `/status` use the existing terminal command registry;
 they add no plugin. The binary loads optional user/project TOML files before
 assembly and registers read-only diagnostics over its current session handles.
 See [startup configuration](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/configuration.md).
+
+`CodeAgentPlugin` also publishes the startup
+[`CodeAgentSteps`](crate::agents::code_agent::steps::CodeAgentSteps) registry.
+A contributing plugin depends on `CodeAgentPlugin` and appends graph builders
+during `build`; the host registers `CodeAgent::with_steps` after startup. Empty
+registries preserve the stock graph exactly. For a Graph tab installed before
+startup, use
+[`GraphViewPlugin::for_code_agent_steps`](crate::graph_view::GraphViewPlugin::for_code_agent_steps):
+it publishes the completed registry's graph during `ready`, after every plugin
+has built. This keeps contributed nodes visible by their system names. See the
+[`steps` example](crate::agents::code_agent::steps) for a complete plugin.

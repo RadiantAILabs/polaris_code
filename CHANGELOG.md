@@ -5,6 +5,9 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Added
+- Plugin-contributed coding-agent graph steps after tool rounds and before finish through `CodeAgentSteps` and `CodeAgent::with_steps`, with ordered finish holds that continue the existing bounded loop. `GraphViewPlugin::for_code_agent_steps` publishes the completed startup graph; an empty registry preserves the stock graph and agent identity.
+
 ## [0.4.2] - 2026-11-08
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.

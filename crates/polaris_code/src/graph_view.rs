@@ -45,7 +45,7 @@ use polaris::graph::middleware::info::{
 use polaris::graph::node::{CandidateSource, Node};
 use polaris::graph::{Graph, MiddlewareAPI, NodeId};
 use polaris::system::param::SystemContext;
-use polaris::system::plugin::{Contract, Plugin, PluginAccess, Version, VersionReq};
+use polaris::system::plugin::{Contract, Plugin, PluginAccess, PluginId, Version, VersionReq};
 use polaris::system::server::Server;
 use polaris_tui::panels::{
     Announcement, GraphBranch, GraphFeed, GraphModel, GraphNode, GraphNodeKind,
@@ -370,6 +370,8 @@ fn embedded_steps(graph: &Graph, depth: usize) -> Vec<GraphNode> {
 ///
 /// `build()` publishes the prepared model. The declared `GraphFeed` requirement
 /// makes the resolver build the panel plugin first, regardless of add order.
+/// With [`Self::for_code_agent_steps`], `ready()` republishes after all plugin
+/// builds have filled the coding agent step registry.
 ///
 /// # Example
 ///
@@ -392,6 +394,7 @@ fn embedded_steps(graph: &Graph, depth: usize) -> Vec<GraphNode> {
 #[derive(Debug)]
 pub struct GraphViewPlugin {
     model: GraphModel,
+    code_agent_steps: bool,
 }
 
 impl GraphViewPlugin {
@@ -400,10 +403,26 @@ impl GraphViewPlugin {
     pub fn for_agent(agent: &impl Agent) -> Self {
         Self {
             model: graph_model(agent.name(), &agent.to_graph()),
+            code_agent_steps: false,
         }
     }
 
-    /// The model this plugin publishes.
+    /// Publish the coding agent with all startup step contributions.
+    ///
+    /// Add this before `Server::finish`; `ready` reads the completed registry,
+    /// so contributing plugins can be added in any order. After startup, register
+    /// `CodeAgent::with_steps` from the same registry with `SessionsAPI`.
+    /// Requires `CodeAgentPlugin` as well as the graph panel.
+    #[must_use]
+    pub fn for_code_agent_steps() -> Self {
+        let mut plugin = Self::for_agent(&crate::agents::CodeAgent);
+        plugin.code_agent_steps = true;
+        plugin
+    }
+
+    /// The initial model this plugin publishes.
+    /// With `for_code_agent_steps`, `ready` replaces the feed with the completed
+    /// graph; this accessor still returns the initial stock model.
     #[must_use]
     pub fn model(&self) -> &GraphModel {
         &self.model
@@ -413,6 +432,27 @@ impl GraphViewPlugin {
 impl Plugin for GraphViewPlugin {
     const ID: &'static str = "polaris_code::graph_view";
     const VERSION: Version = Version::new(0, 1, 0);
+
+    fn dependencies(&self) -> Vec<PluginId> {
+        if self.code_agent_steps {
+            vec![PluginId::of::<crate::agents::CodeAgentPlugin>()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn ready(&self, server: &mut Server) {
+        if self.code_agent_steps {
+            let steps = server
+                .get_global::<crate::agents::code_agent::steps::CodeAgentSteps>()
+                .expect("CodeAgentPlugin provides the step registry");
+            let agent = crate::agents::CodeAgent::with_steps(&steps);
+            server
+                .get_global::<GraphFeed>()
+                .expect("GraphPanelPlugin provides GraphFeed")
+                .publish(graph_model(agent.name(), &agent.to_graph()));
+        }
+    }
 
     fn build(&self, server: &mut Server) {
         server
