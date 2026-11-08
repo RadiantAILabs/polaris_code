@@ -72,6 +72,28 @@ jobs:
         run: cargo +1.97.0 fmt --all -- --check
       - run: python3 -m unittest discover -s scripts/tests
 
+  harbor-adapter:
+    name: Harbor adapter tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # A missing Harbor is an error here, not a skip.
+      POLARIS_REQUIRE_HARBOR: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the tested Harbor version
+        run: |
+          # The adapter needs Python 3.12 (typing.override); the runner image provides it.
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+          python3 -m venv "$RUNNER_TEMP/harbor-venv"
+          "$RUNNER_TEMP/harbor-venv/bin/pip" install 'harbor==0.24.0'
+      - name: Run the adapter tests
+        run: |
+          "$RUNNER_TEMP/harbor-venv/bin/python" -m unittest discover \
+            -s evals/packs/terminal_bench_harbor/tests -t . -v
+
   test:
     name: Test (${{ matrix.os }})
     needs: prepare
@@ -139,6 +161,9 @@ jobs:
           # glibc 2.35 baseline; do not silently raise it with ubuntu-latest.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          # Static executable for task images with older glibc or musl.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
           - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -161,7 +186,13 @@ jobs:
           key: release-${{ matrix.target }}-1.97.0
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release executable
+        if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo +1.97.0 build --release --locked -p polaris_code --bin polaris --target "${{ matrix.target }}"
+      - name: Build portable release executable
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          PORTABLE_TARGET_DIR: ${{ github.workspace }}/target
+        run: scripts/build-portable-binary.sh
       - name: Package release executable
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -183,6 +214,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/polaris-smoke"
           tar -xzf "dist/${archive}" -C "$RUNNER_TEMP/polaris-smoke"
           binary="$RUNNER_TEMP/polaris-smoke/polaris"
+          if [ "$TARGET" = x86_64-unknown-linux-musl ]; then
+            # A missing readelf would make the checks below pass without looking.
+            command -v readelf >/dev/null || { echo "error: readelf is required" >&2; exit 1; }
+            file "$binary"
+            if readelf -d "$binary" | grep -q '(NEEDED)'; then
+              echo "error: portable archive has dynamic library dependencies" >&2
+              exit 1
+            fi
+            if readelf -l "$binary" | grep -q 'INTERP'; then
+              echo "error: portable archive requires a dynamic loader" >&2
+              exit 1
+            fi
+          fi
           test "$("$binary" --version)" = "polaris ${VERSION}"
           "$binary" --help
           "$binary" "$RUNNER_TEMP/polaris-smoke" --list-topologies --output-format json > inventory.json
@@ -278,7 +322,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [prepare, format, test, build, homebrew, homebrew-test]
+    needs: [prepare, format, harbor-adapter, test, build, homebrew, homebrew-test]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -292,7 +336,7 @@ jobs:
           import os
 
           jobs = json.loads(os.environ["JOB_RESULTS"])
-          required = ["prepare", "format"]
+          required = ["prepare", "format", "harbor-adapter"]
           if jobs["prepare"]["outputs"].get("run_rust") == "true":
               required += ["test", "build", "homebrew", "homebrew-test"]
           unsuccessful = {

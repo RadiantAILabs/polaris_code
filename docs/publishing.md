@@ -119,6 +119,8 @@ does not survive cancellation.
 
 Documentation and branding changes run quick Python checks, skipping Rust
 compilation, workspace tests, release builds, and Homebrew installation tests.
+The Harbor adapter tests run on every change in their own job, against Harbor
+0.24.0 and Python 3.12. That job fails if Harbor is missing instead of skipping.
 The full pipeline runs when crate sources, tests, examples, benches, embedded
 documentation, ontology inputs, evaluation code or fixtures, Cargo dependencies,
 toolchain settings, or CI/build/release tooling change.
@@ -126,10 +128,11 @@ Pushes compare the entire before/after range; pull requests
 compare against their merge base. If the range cannot be compared, CI runs
 the full pipeline. Release tags and manual dispatches always run it too.
 
-The final `CI` check verifies every job required for that change; use it as
-the required status check in branch protection. Documentation-only pushes do
-not cancel source builds already in progress. A newer source build cancels
-the older job for the same platform and branch; tagged jobs are retained.
+The final `CI` check verifies every job required for that change, including the
+Harbor adapter tests; use it as the required status check in branch protection.
+Documentation-only pushes do not cancel source builds already in progress. A
+newer source build cancels the older job for the same platform and branch;
+tagged jobs are retained.
 
 The workspace consumes the published `polaris-ai` 0.8.0 dependency rather than
 a developer's sibling checkout. The published 0.6.0 package lacks graph APIs
@@ -141,17 +144,37 @@ The build matrix produces:
 | Archive target | Minimum platform |
 | --- | --- |
 | `aarch64-apple-darwin` | Apple Silicon, macOS Sequoia 15 |
-| `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.35 (Ubuntu 22.04 baseline) |
+| `x86_64-unknown-linux-gnu` | Linux x86-64, glibc 2.35 (Ubuntu 22.04 baseline; Homebrew) |
+| `x86_64-unknown-linux-musl` | Linux x86-64, static musl executable (Harbor and portable installs) |
 
 Each `polaris-code-<version>-<target>.tar.gz` contains the executable, license,
 README, and its logo assets, with a matching `.tar.gz.sha256` file. Each runner
 extracts its archive and checks the version, help, and JSON topology inventory
-without model credentials. The Linux archive uses glibc; continue using
-`scripts/build-portable-binary.sh` for the static musl benchmark executable.
+without model credentials. The GNU archive retains its glibc baseline. The
+musl archive is built by `scripts/build-portable-binary.sh` in its pinned Rust
+Alpine image; it must have neither dynamic library dependencies nor a dynamic
+loader. The archive smoke test verifies those properties before exercising
+its version, help and topology inventory. Harbor downloads the musl archive:
+benchmark task images can use an older glibc or an unidentified base image.
+Homebrew continues to use the GNU archive.
+
+To build the same portable executable locally, use an empty build directory
+on a volume with room for Rust dependencies:
+
+```bash
+PORTABLE_TARGET_DIR=/path/to/build-target scripts/build-portable-binary.sh
+```
+
+The executable is at
+`<build-target>/x86_64-unknown-linux-musl/release/polaris`. Release builds use
+the application's default features: the Oxigraph store is in memory, and the
+optional `polaris_ontrace/oxigraph-rocksdb` C++ backend is not linked into the
+shipped binary. An all-features Clippy check separately covers that backend;
+it does not change the release archive's feature selection.
 
 Download the archives from the workflow's `polaris-<target>` artifacts within
-14 days. Only after all checks and both builds pass does the workflow generate
-the `homebrew-formula` artifact. For a pushed tag in
+14 days. Only after all checks and all three builds pass does the workflow
+generate the `homebrew-formula` artifact. For a pushed tag in
 `RadiantAILabs/polaris_code`, it also creates a **draft** GitHub release with
 the same archives, checksums, and `polaris-code.rb`. Tags must match the
 application version exactly (`v0.1.1` for application 0.1.1); supporting crate
@@ -171,8 +194,8 @@ and `patchelf` adjusts the installed copy's library search path and optional
 Homebrew glibc loader. When that loader is present, it also runs `patchelf`
 with Homebrew's libraries so the tool can run on the Ubuntu 22.04 baseline.
 The downloaded archive and its checksum stay intact.
-To regenerate it locally after downloading both archives and their checksum
-files:
+To regenerate it locally after downloading both Homebrew archives and their
+checksum files:
 
 ```bash
 python3 scripts/homebrew_formula.py 0.3.0 RadiantAILabs/polaris_code dist
@@ -218,9 +241,10 @@ A release reaches the tap in a few minutes. The formula installs the prebuilt
 archive for Apple Silicon on macOS Sequoia and newer, or Linux x86-64, with no
 Rust toolchain or build step. Its functional test checks the installed
 command's version, help, and a real JSON topology inventory without a model
-key. Only the two platforms in the build matrix are supported; elsewhere,
-install with `cargo install polaris_code --locked`, or extend the build matrix
-and the generator.
+key. The formula supports only those two platforms (Apple Silicon macOS and
+Linux x86-64). On a Linux x86-64 system without a suitable glibc, use the static
+musl archive; elsewhere, install with `cargo install polaris_code --locked`, or
+extend the build matrix and the generator.
 
 ### One-time automation setup
 
