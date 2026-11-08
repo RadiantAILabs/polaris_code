@@ -443,12 +443,17 @@ impl RunTrajectory {
         });
     }
 
+    // Tool results and messages change memory only. Their callers are sync
+    // code on async workers, so a full-document write here would stall them.
+    // The next model call or `finish` writes them.
     pub(crate) fn tool_results(&self, blocks: &[UserBlock]) {
-        self.update(|recording| messages::tool_results(&mut recording.document, blocks));
+        self.apply(true, |recording| {
+            messages::tool_results(&mut recording.document, blocks)
+        });
     }
 
     pub(crate) fn message(&self, message: &Message) {
-        self.update(|recording| {
+        self.apply(true, |recording| {
             let count = recording.document["steps"].as_array().unwrap().len();
             let observed = if let Message::User { content } = message {
                 messages::tool_results(&mut recording.document, content)
@@ -1206,6 +1211,34 @@ mod tests {
         // The next checkpoint writes what the drop kept in memory.
         trace.finish(0).unwrap();
         assert_eq!(texts(&document(&path), index), ["unwritten"]);
+    }
+
+    #[test]
+    fn tool_results_and_messages_do_no_file_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let call = ToolCall::new("tool", "read_file", json!({"path":"a"}));
+        let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        trace.response(
+            index,
+            &response(vec![AssistantBlock::ToolCall(call.clone())]),
+        );
+        // Any write to the destination would now fail and be remembered.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let result = call.result(ToolResultContent::Text("deferred-result".into()));
+        trace.tool_results(std::slice::from_ref(&result));
+        trace.message(&Message::user("deferred-message"));
+        trace
+            .check()
+            .expect("tool results and messages must not write the file");
+        std::fs::remove_dir(&path).unwrap();
+        // The next checkpoint writes both.
+        trace.finish(0).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("deferred-result"), "{written}");
+        assert!(written.contains("deferred-message"), "{written}");
     }
 
     #[test]
