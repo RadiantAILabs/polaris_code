@@ -149,7 +149,9 @@ summary/stub messages. Tool outputs use normal redaction. Provider credentials,
 HTTP headers and provider configuration are never exported.
 
 Atomic checkpoints occur before calls, at content-block boundaries, on usage
-updates, on tool results and when a stream is dropped. Compaction cannot erase
+updates, on tool results and when the run is finalized. A dropped stream keeps
+its partial content in memory and the next checkpoint writes it. A response
+that already failed keeps the `failed` status. Compaction cannot erase
 recorded evidence. SIGINT/SIGTERM use normal cleanup and finalization. A hard
 kill leaves the last complete checkpoint; a partially streamed block since
 that checkpoint may be absent. `extra.status` remains `running` until the run
