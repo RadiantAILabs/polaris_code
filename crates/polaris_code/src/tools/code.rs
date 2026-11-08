@@ -9,7 +9,11 @@
 //! the model supplies the surrounding text it wants to change, the edit applies
 //! only if that text matches exactly once (or `replace_all` is set), and the
 //! tool returns a unified diff of what changed. This is the most reliable edit
-//! primitive for LLMs because application is deterministic.
+//! primitive for LLMs because application is deterministic. A request that does
+//! not match is refused with the lines it matched or the text the file holds
+//! nearest to it; the one request that is matched although it is not exact is
+//! a newline ending `old_string` that a file lacking a final newline cannot
+//! have. The `edit_match` module explains why that one is safe.
 //!
 //! `edit_file` reads its target first, so it can only address a file that
 //! exists. [`CodeTools::create_file`] is its one complement: it brings a file
@@ -22,6 +26,7 @@
 //! `Confirm` default, the same per-mode policy, the same journal.
 
 use crate::terminal::EditJournal;
+use crate::tools::edit_match::{adjustment_note, plan_edit};
 use crate::tools::fileset::{PathGlob, Selection, WalkLimits, select_files, slashed};
 use polaris::system::plugin::{Plugin, PluginId, Version};
 use polaris::system::server::Server;
@@ -630,25 +635,13 @@ impl CodeTools {
             .await
             .map_err(|err| io_failure("edit_file", &path, &err))?;
 
-        let matches = original.matches(&old_string).count();
-        if matches == 0 {
-            return Err(ToolError::execution_error(format!(
-                "old_string not found in {path} (whitespace must match exactly); \
-                 read the file and copy the text you mean to replace",
-            )));
-        }
-        if matches > 1 && !replace_all {
-            return Err(ToolError::execution_error(format!(
-                "old_string is not unique in {path} ({matches} matches); add surrounding \
-                 context to disambiguate, or set replace_all = true",
-            )));
-        }
-
-        let updated = if replace_all {
-            original.replace(&old_string, &new_string)
-        } else {
-            original.replacen(&old_string, &new_string, 1)
-        };
+        // The tool's description is its doc comment, which the model reads on
+        // every request, so how a request is matched and refused is described
+        // in `edit_match` rather than there.
+        let plan = plan_edit(&original, &old_string, &new_string, replace_all)
+            .map_err(|refusal| ToolError::execution_error(refusal.message(&path)))?;
+        let matches = plan.replacements;
+        let updated = plan.updated;
 
         if let Some(journal) = &self.config.edit_journal {
             journal
@@ -695,7 +688,14 @@ impl CodeTools {
             .header(&path, &path)
             .to_string();
 
-        Ok(format!("Edited {path} ({matches} replacement(s)):\n{diff}"))
+        let mut receipt = format!("Edited {path} ({matches} replacement(s)):\n{diff}");
+        if plan.adjusted {
+            if !receipt.ends_with('\n') {
+                receipt.push('\n');
+            }
+            receipt.push_str(&adjustment_note(&path));
+        }
+        Ok(receipt)
     }
 
     /// Create a new file with the given content, creating any missing parent
@@ -1421,6 +1421,157 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not unique"));
+    }
+
+    /// Run one `edit_file` call against a file holding `original` and return
+    /// its outcome with the file's text afterwards.
+    async fn edit_in(
+        original: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> (Result<String, ToolError>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        tokio::fs::write(&file, original).await.unwrap();
+        let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
+        let outcome = tools
+            .edit_file("a.txt".into(), old.into(), new.into(), replace_all, None)
+            .await;
+        let after = tokio::fs::read_to_string(&file).await.unwrap();
+        (outcome, after)
+    }
+
+    #[tokio::test]
+    async fn edit_file_matches_the_end_of_a_file_with_no_final_newline() {
+        let original = "def add(a, b):\n    raise NotImplementedError";
+        let (outcome, after) = edit_in(
+            original,
+            "    raise NotImplementedError\n",
+            "    return a + b\n",
+            false,
+        )
+        .await;
+
+        let out = outcome.unwrap();
+        assert_eq!(after, "def add(a, b):\n    return a + b");
+        assert!(out.starts_with("Edited a.txt (1 replacement(s)):"), "{out}");
+        assert!(
+            out.ends_with(
+                "Note: a.txt has no newline after this text, so the newline that ended \
+                 old_string and new_string was left out. The file still ends without a \
+                 final newline."
+            ),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_leaves_off_as_many_newlines_from_new_string_as_from_old_string() {
+        for (old, new, expected) in [
+            ("b\n", "c\n\n", "a\nc\n"),
+            ("b\n\n", "c\n", "a\nc"),
+            ("b\n", "c", "a\nc"),
+            ("a\nb\n", "c\nd\n", "c\nd"),
+        ] {
+            let (outcome, after) = edit_in("a\nb", old, new, false).await;
+            outcome.unwrap();
+            assert_eq!(after, expected, "old {old:?} new {new:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_still_refuses_what_a_missing_final_newline_does_not_explain() {
+        for (original, old) in [
+            // The file has a final newline and the request asks for another.
+            ("a\nb\n", "b\n\n"),
+            // The text before the newline is not at the end of the file.
+            ("a\nb c\nd", "b\n"),
+            // The text also occurs earlier, so the end is not the only place.
+            ("b = 1\nb", "b\n"),
+            ("aaa", "aa\n"),
+            // Nothing but newlines names no place.
+            ("a", "\n"),
+        ] {
+            let (outcome, after) = edit_in(original, old, "x\n", false).await;
+            let err = outcome.unwrap_err().to_string();
+            assert!(err.contains("old_string not found in a.txt"), "{err}");
+            assert_eq!(after, original, "{original:?} {old:?} must not change");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_refuses_a_forgiven_request_that_would_change_nothing() {
+        let (outcome, after) = edit_in("a\nb", "b\n", "b", false).await;
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("would change nothing"), "{err}");
+        assert_eq!(after, "a\nb");
+    }
+
+    #[tokio::test]
+    async fn edit_file_refusal_shows_the_nearest_text_and_the_first_difference() {
+        let original = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+        let (outcome, after) = edit_in(original, "    if x:\n      return 1\n", "", false).await;
+
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("old_string not found in a.txt"), "{err}");
+        assert!(err.contains("starts at line 2"), "{err}");
+        assert!(err.contains("2\t    if x:\n3\t        return 1"), "{err}");
+        assert!(
+            err.contains(
+                r#"line 2 of old_string is "      return 1" but line 3 of the file is "        return 1""#
+            ),
+            "{err}"
+        );
+        assert!(err.contains("read_file with offset 2"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        assert_eq!(after, original);
+    }
+
+    #[tokio::test]
+    async fn edit_file_refusal_for_text_that_resembles_nothing_says_so() {
+        let (outcome, after) = edit_in("alpha\nbeta\n", "completely unrelated", "x", false).await;
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("nothing in the file is close"), "{err}");
+        assert_eq!(after, "alpha\nbeta\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_refusal_for_several_matches_lists_their_lines() {
+        let (outcome, after) = edit_in("x\ny\nx\n", "x", "z", false).await;
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("not unique"), "{err}");
+        assert!(err.contains("2 matches, starting at lines 1, 3"), "{err}");
+        assert!(err.contains("replace_all = true"), "{err}");
+        assert_eq!(after, "x\ny\nx\n");
+
+        let (outcome, after) = edit_in("x\ny\nx\n", "x", "z", true).await;
+        assert!(
+            outcome
+                .unwrap()
+                .starts_with("Edited a.txt (2 replacement(s)):")
+        );
+        assert_eq!(after, "z\ny\nz\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_refuses_an_empty_old_string_in_a_file_with_content() {
+        // With `replace_all` this used to put the new text between every
+        // character of the file.
+        for replace_all in [false, true] {
+            let (outcome, after) = edit_in("a\nb\n", "", "Z", replace_all).await;
+            let err = outcome.unwrap_err().to_string();
+            assert!(err.contains("old_string is empty"), "{err}");
+            assert!(err.contains("create_file"), "{err}");
+            assert_eq!(after, "a\nb\n", "replace_all {replace_all}");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_still_fills_an_empty_file_given_an_empty_old_string() {
+        let (outcome, after) = edit_in("", "", "Z", false).await;
+        outcome.unwrap();
+        assert_eq!(after, "Z");
     }
 
     #[tokio::test]

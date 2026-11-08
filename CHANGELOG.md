@@ -5,6 +5,11 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Fixed
+- `edit_file`: an `old_string` that ends with a newline matches the end of a file that has no final newline, when the text before the newline occurs once in the file and that place is the end. The same number of newlines is left off the end of `new_string`, the file still ends without one, and the result says so. Other requests that do not match are still refused.
+- `edit_file`: a refusal now says what to do next. An `old_string` that is not in the file shows the nearest text with line numbers and the first line where it differs; one that matches several places lists their lines. An empty `old_string` is refused for a file that has content (with `replace_all` it used to insert the new text between every character).
+- A tool call whose arguments are not a JSON object (a reply cut off at the output-length limit while the call was being written) is answered with an explanation instead of `Parameters must be an object`.
+
 ## [0.4.2] - 2026-11-08
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
