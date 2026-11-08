@@ -15,14 +15,16 @@ pub(crate) use approval::ceiling_permission;
 pub use approval::{
     ApprovalAnswer, ApprovalError, ApprovalRequest, ApprovalScope, SessionGrants, ShellApproval,
 };
-pub use rules::{PermissionRule, PermissionRules, RuleDecision, RuleSnapshot};
+pub use rules::{CodeRuleError, PermissionRule, PermissionRules, RuleDecision, RuleSnapshot};
 pub use tool_grants::{RunToolGrants, ToolGrantError};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use polaris::shell::ShellExecutor;
-use polaris::system::plugin::{DefaultDependencies, Plugin, PluginId, Version};
+use polaris::system::plugin::{
+    Contract, DefaultDependencies, Plugin, PluginAccess, PluginId, Version,
+};
 use polaris::system::server::Server;
 use polaris_tui::commands::CommandSpec;
 
@@ -171,6 +173,10 @@ impl Plugin for PermissionRulesPlugin {
         DefaultDependencies::new().add::<ToolPolicyPlugin>()
     }
 
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new().provides::<PermissionRules>(PermissionRules::CONTRACT_VERSION)
+    }
+
     fn build(&self, server: &mut Server) {
         let mut rules = self
             .root
@@ -232,12 +238,21 @@ impl Plugin for PermissionRulesPlugin {
             }
         }
         server.insert_global(self.tools.clone());
-        server.insert_global(rules);
+        // A mutable resource until `ready`, so plugins built after this one can
+        // add code rules. The command above holds a clone, which shares them.
+        server.insert_resource(rules);
         server.insert_global(grants);
         server.insert_global(shell);
     }
 
     async fn ready(&self, server: &mut Server) {
+        match server.remove_resource::<PermissionRules>() {
+            Some(rules) => {
+                rules.seal();
+                server.insert_global(rules);
+            }
+            None => tracing::warn!("permission rules missing at ready; the rules were lost"),
+        }
         if let (Some(shell), Some(executor)) = (
             server.get_global::<ShellApproval>(),
             server.get_global::<ShellExecutor>(),

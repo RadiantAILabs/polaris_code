@@ -298,7 +298,7 @@ impl PermissionPolicy {
         let matched = self
             .rules
             .as_ref()
-            .and_then(|rules| rules.resolve(call.tool, call.args));
+            .and_then(|rules| rules.resolve_in(call.root, call.tool, call.args));
         let ceiling = call.ceiling.map(|ceiling| {
             let mut held = ceiling.mode().permission_policy();
             held.tools = self.tools.clone();

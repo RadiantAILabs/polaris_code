@@ -21,16 +21,25 @@ use polaris::shell::{ShellConfig, ShellPermission};
 /// are refused before parsing.
 #[must_use]
 pub fn checked_commands(command: &str, patterns: &[String]) -> Option<Vec<String>> {
-    // Bound parsing and pattern matching by the executor's default byte limit.
-    if command.len() > ShellConfig::default().max_command_length {
-        return None;
-    }
-    let parts = decompose(command)?;
+    let parts = command_parts(command)?;
     (!parts.is_empty()
         && parts
             .iter()
             .all(|part| patterns.iter().any(|pattern| wildcard_match(pattern, part))))
     .then_some(parts)
+}
+
+/// The simple commands `command` would run, excluding here-document data.
+///
+/// `None` when the command is longer than [`ShellConfig::max_command_length`]'s
+/// default or uses grammar this module does not parse; callers treat that as
+/// opaque. The same parse backs [`checked_commands`].
+pub(crate) fn command_parts(command: &str) -> Option<Vec<String>> {
+    // Bound parsing and pattern matching by the executor's default byte limit.
+    if command.len() > ShellConfig::default().max_command_length {
+        return None;
+    }
+    decompose(command)
 }
 
 /// Match one already parsed command against the executor's literal patterns.

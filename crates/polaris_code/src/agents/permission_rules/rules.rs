@@ -1,13 +1,17 @@
+use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use polaris::shell::{ShellConfig, ShellExecutor, ShellPermission};
+use polaris::system::plugin::{Contract, Version};
 use polaris::system::resource::GlobalResource;
 use polaris_cosmos::contracts::ContentDigest;
 use serde_json::Value;
 
 use crate::project_trust::{MAX_FILE_BYTES, ProjectTrust, Subject, TrustError, read_content};
+use crate::tools::command_check::command_parts;
 
 /// Most restrictive matching rule wins, independently of file order.
 ///
@@ -61,6 +65,225 @@ pub struct RuleSnapshot {
     pub root: PathBuf,
 }
 
+/// Why a rule written in code could not be added to [`PermissionRules`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeRuleError {
+    /// The name is empty, has leading or trailing whitespace, or contains a
+    /// control character. Names are listed by `/permissions` and quoted in
+    /// refusals, so they must fit on one line.
+    InvalidName(String),
+    /// A rule with this name was already added.
+    Duplicate(String),
+    /// The server is ready, so the rule set is fixed.
+    Sealed(String),
+}
+
+impl fmt::Display for CodeRuleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidName(name) => write!(
+                f,
+                "invalid code rule name {name:?}; use a non-empty single line without \
+                 leading or trailing whitespace"
+            ),
+            Self::Duplicate(name) => write!(f, "a code rule named {name:?} already exists"),
+            Self::Sealed(name) => write!(
+                f,
+                "cannot add code rule {name:?}: rules are fixed once the server is ready"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CodeRuleError {}
+
+/// What a rule written in code returns: no opinion, or a decision with the reason
+/// the model and the operator are shown.
+type CodeVerdict = Option<(RuleDecision, String)>;
+
+type CodeRuleFn = dyn Fn(&str, &Value, &Path) -> CodeVerdict + Send + Sync;
+
+/// One named rule written in code.
+struct CodeRule {
+    name: String,
+    check: Box<CodeRuleFn>,
+}
+
+/// The rules plugins added in code, shared by every clone of one
+/// [`PermissionRules`].
+///
+/// Sharing lets a clone taken early, such as the one behind `/permissions`, see
+/// a rule a later plugin adds. Sealing at startup keeps the set fixed afterwards.
+#[derive(Default)]
+struct CodeRules {
+    rules: RwLock<Vec<Arc<CodeRule>>>,
+    sealed: AtomicBool,
+}
+
+impl fmt::Debug for CodeRules {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodeRules")
+            .field("names", &self.names())
+            .field("sealed", &self.sealed.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+impl CodeRules {
+    fn add(&self, name: String, check: Box<CodeRuleFn>) -> Result<(), CodeRuleError> {
+        if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {
+            return Err(CodeRuleError::InvalidName(name));
+        }
+        // The seal is checked under the write lock so a rule can never slip in
+        // between sealing and the last read.
+        let mut rules = self.rules.write().unwrap_or_else(PoisonError::into_inner);
+        if self.sealed.load(Ordering::SeqCst) {
+            return Err(CodeRuleError::Sealed(name));
+        }
+        if rules.iter().any(|rule| rule.name == name) {
+            return Err(CodeRuleError::Duplicate(name));
+        }
+        rules.push(Arc::new(CodeRule { name, check }));
+        Ok(())
+    }
+
+    fn seal(&self) {
+        let _rules = self.rules.write().unwrap_or_else(PoisonError::into_inner);
+        self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    fn all(&self) -> Vec<Arc<CodeRule>> {
+        self.rules
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.all().iter().map(|rule| rule.name.clone()).collect()
+    }
+
+    /// The most restrictive verdict among the rules, the earliest added winning
+    /// a tie. `None` when no rule has an opinion.
+    fn resolve(&self, root: &Path, tool: &str, args: &Value) -> CodeVerdict {
+        let rules = self.all();
+        if rules.is_empty() {
+            return None;
+        }
+        let parts = ShellParts::of(tool, args);
+        let mut winner: CodeVerdict = None;
+        for rule in &rules {
+            let Some((decision, reason)) = rule.evaluate(root, tool, args, &parts) else {
+                continue;
+            };
+            if winner.as_ref().is_none_or(|(held, _)| decision > *held) {
+                winner = Some((decision, reason));
+            }
+        }
+        winner
+    }
+}
+
+/// How a shell call splits for rules written in code.
+enum ShellParts {
+    /// Not a shell call, or one without command text: rules see the call once.
+    Whole,
+    /// A shell call whose command parsed into simple commands.
+    Parsed(Vec<Value>),
+    /// A shell call whose command did not parse into any simple command.
+    Opaque,
+}
+
+impl ShellParts {
+    /// Split a `run_command` or `run_in_background` call the way file rules see
+    /// it: the whole command, then each simple command on its own.
+    fn of(tool: &str, args: &Value) -> Self {
+        if !matches!(tool, "run_command" | "run_in_background") {
+            return Self::Whole;
+        }
+        let Some(command) = args.get("command").and_then(Value::as_str) else {
+            return Self::Whole;
+        };
+        match command_parts(command) {
+            Some(parts) if parts.is_empty() => Self::Opaque,
+            Some(parts) if parts.len() == 1 && parts[0] == command => Self::Whole,
+            Some(parts) => Self::Parsed(
+                parts
+                    .into_iter()
+                    .map(|part| {
+                        let mut part_args = args.clone();
+                        part_args["command"] = Value::String(part);
+                        part_args
+                    })
+                    .collect(),
+            ),
+            None => Self::Opaque,
+        }
+    }
+}
+
+impl CodeRule {
+    /// Run the rule once, refusing the call if it panics.
+    fn ask(&self, root: &Path, tool: &str, args: &Value) -> CodeVerdict {
+        match catch_unwind(AssertUnwindSafe(|| (self.check)(tool, args, root))) {
+            Ok(Some((decision, reason))) => Some((decision, self.reason(&reason))),
+            Ok(None) => None,
+            Err(_) => {
+                tracing::error!(rule = %self.name, tool, "code permission rule panicked; refusing the call");
+                Some((
+                    RuleDecision::Deny,
+                    format!(
+                        "code rule {:?} failed while checking this call, so the call is refused",
+                        self.name
+                    ),
+                ))
+            }
+        }
+    }
+
+    fn reason(&self, reason: &str) -> String {
+        format!("code rule {:?}: {reason}", self.name)
+    }
+
+    /// This rule's verdict on the call.
+    ///
+    /// A shell call is put to the rule as a whole and then once per simple
+    /// command, and the most restrictive answer stands. An allow stands only
+    /// when the rule allowed the whole command and every part; for a command
+    /// that did not parse an allow is dropped, as an opaque command never
+    /// matches an allow in a rule file.
+    fn evaluate(&self, root: &Path, tool: &str, args: &Value, parts: &ShellParts) -> CodeVerdict {
+        let whole = self.ask(root, tool, args);
+        let part_args = match parts {
+            ShellParts::Whole => return whole,
+            ShellParts::Opaque => {
+                return whole.filter(|(decision, _)| *decision != RuleDecision::Allow);
+            }
+            ShellParts::Parsed(part_args) => part_args,
+        };
+        let verdicts: Vec<CodeVerdict> = std::iter::once(whole)
+            .chain(part_args.iter().map(|part| self.ask(root, tool, part)))
+            .collect();
+        let mut restrictive: CodeVerdict = None;
+        for (decision, reason) in verdicts.iter().flatten() {
+            if *decision != RuleDecision::Allow
+                && restrictive
+                    .as_ref()
+                    .is_none_or(|(held, _)| *decision > *held)
+            {
+                restrictive = Some((*decision, reason.clone()));
+            }
+        }
+        if restrictive.is_some() {
+            return restrictive;
+        }
+        if verdicts.iter().all(Option::is_some) {
+            return verdicts.into_iter().next().flatten();
+        }
+        None
+    }
+}
+
 /// Rule files shared by all sessions, provided by [`super::PermissionRulesPlugin`].
 ///
 /// A snapshot is immutable after startup. Only project trust can change, through
@@ -72,23 +295,32 @@ pub struct RuleSnapshot {
 /// loaded (see [`with_project_trust`](Self::with_project_trust)), so editing the
 /// file withdraws it.
 ///
+/// Plugins can add named rules written in Rust while the server builds (see
+/// [`add_code_rule`](Self::add_code_rule)). [`resolve`](Self::resolve) weighs
+/// them together with the file rules: the most restrictive decision wins.
+///
 /// # Scope
 ///
-/// Global: one set of rule files governs every session of the process, and the
+/// Global: one set of rules governs every session of the process, and the
 /// project-trust decision made in one session applies to all of them.
 ///
 /// # Provided By
 ///
 /// [`PermissionRulesPlugin`](super::PermissionRulesPlugin) loads the files and
-/// inserts it during `build`. The plugin's default holds no rules.
+/// inserts it as a mutable resource during `build`, so plugins that depend on it
+/// can add code rules; it moves the resource to a global during `ready`, after
+/// which the rules are fixed. The plugin's default holds no file rules.
 ///
 /// # Access
 ///
-/// Read with `Res<PermissionRules>` only. The parsed snapshot is immutable and
-/// shared by clones. The one thing that can change is the project-trust
-/// decision, held behind interior mutability and changed only by the explicit
-/// `/permissions trust-project` command, so no system mutates it through the
-/// resource.
+/// Plugins that add code rules call [`add_code_rule`](Self::add_code_rule)
+/// through `Server::get_resource_mut` during their own `build`. Systems read it
+/// with `Res<PermissionRules>` only. The parsed snapshot is immutable and shared
+/// by clones, and so are the code rules: a clone taken before a rule was added
+/// sees it, and none can add one after startup. The one thing that can change
+/// is the project-trust decision, held behind interior mutability and changed
+/// only by the explicit `/permissions trust-project` command, so no system
+/// mutates it through the resource.
 ///
 /// # Alternatives
 ///
@@ -114,12 +346,17 @@ pub struct RuleSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct PermissionRules {
     snapshot: Arc<RuleSnapshot>,
+    code: Arc<CodeRules>,
     project_trusted: Arc<AtomicBool>,
     project_digest: Option<ContentDigest>,
     trust: ProjectTrust,
 }
 
 impl GlobalResource for PermissionRules {}
+
+impl Contract for PermissionRules {
+    const CONTRACT_VERSION: Version = Version::new(0, 1, 0);
+}
 
 impl PermissionRules {
     /// Read explicit paths. A missing file contributes no rules; malformed,
@@ -175,6 +412,7 @@ impl PermissionRules {
         }
         Self {
             snapshot: Arc::new(snapshot),
+            code: Arc::default(),
             project_trusted: Arc::new(AtomicBool::new(false)),
             project_digest,
             trust: ProjectTrust::default(),
@@ -255,13 +493,73 @@ impl PermissionRules {
         Ok(saved)
     }
 
+    /// Add a rule written in code, named so `/permissions` and refusals can say
+    /// which rule spoke.
+    ///
+    /// `rule` is called with the tool name, the call's arguments exactly as the
+    /// model gave them, and the workspace root. It returns `None` for no opinion,
+    /// or a [`RuleDecision`] and the reason to show the model and the operator.
+    /// The decision is weighed like a rule from a permission file by
+    /// [`resolve`](Self::resolve): the most restrictive decision wins, so a
+    /// code `Deny` beats a file `Allow`, and a code `Allow` never beats a deny.
+    /// Project trust does not apply to code rules, because they come from the
+    /// assembly and not from the project folder. The permission mode, the
+    /// ceiling and the unattended grants limit an `Allow` as they limit one in a
+    /// file. In an unattended run an `Ask` is a refusal.
+    ///
+    /// A rule that panics refuses the call, with a reason naming the rule. A rule
+    /// may be called several times for one call, so it should be a pure function
+    /// of its inputs. For `run_command` and `run_in_background` it is called with
+    /// the whole command and then with each simple command on its own; see
+    /// [`PermissionRulesPlugin`](super::PermissionRulesPlugin) for details.
+    ///
+    /// Call this from a plugin's `build`, through `Server::get_resource_mut`, on a
+    /// plugin that depends on [`PermissionRulesPlugin`](super::PermissionRulesPlugin).
+    /// Clones share the rules.
+    ///
+    /// # Errors
+    ///
+    /// [`CodeRuleError::InvalidName`] for an empty, padded or multi-line name,
+    /// [`CodeRuleError::Duplicate`] when the name is taken, and
+    /// [`CodeRuleError::Sealed`] once the server is ready.
+    pub fn add_code_rule(
+        &mut self,
+        name: impl Into<String>,
+        rule: impl Fn(&str, &Value, &Path) -> Option<(RuleDecision, String)> + Send + Sync + 'static,
+    ) -> Result<(), CodeRuleError> {
+        self.code.add(name.into(), Box::new(rule))
+    }
+
+    /// Fix the code rules: later calls to `add_code_rule`, on this value or any
+    /// clone, fail.
+    pub(super) fn seal(&self) {
+        self.code.seal();
+    }
+
     /// Most restrictive rule matching this exact call, and its source text.
+    ///
+    /// Weighs the permission files and the rules plugins added in code together.
+    /// Code rules are given the root the files were loaded for.
     #[must_use]
     pub fn resolve(&self, tool: &str, args: &Value) -> Option<(RuleDecision, String)> {
+        self.resolve_in(&self.snapshot.root, tool, args)
+    }
+
+    /// [`resolve`](Self::resolve) with the workspace root of this call, which
+    /// code rules receive. A session can work in a folder of its own, so the
+    /// agent passes the call's root rather than the one the files were loaded
+    /// for.
+    pub(crate) fn resolve_in(
+        &self,
+        root: &Path,
+        tool: &str,
+        args: &Value,
+    ) -> Option<(RuleDecision, String)> {
         if !self.snapshot.errors.is_empty() {
             return Some((RuleDecision::Deny, self.snapshot.errors.join("\n")));
         }
-        self.snapshot
+        let from_files = self
+            .snapshot
             .rules
             .iter()
             .filter(|rule| rule.matches(tool, args, &self.snapshot.root))
@@ -274,7 +572,13 @@ impl PermissionRules {
                 (decision, rule)
             })
             .max_by_key(|(decision, _)| *decision)
-            .map(|(decision, rule)| (decision, rule.describe()))
+            .map(|(decision, rule)| (decision, rule.describe()));
+        // A file rule keeps the call when a code rule is no more restrictive.
+        match (from_files, self.code.resolve(root, tool, args)) {
+            (Some((held, _)), Some(code)) if code.0 > held => Some(code),
+            (None, code) => code,
+            (files, _) => files,
+        }
     }
 
     /// Whether a project allow rule is still waiting for project trust.
@@ -298,6 +602,11 @@ impl PermissionRules {
         }
         if self.snapshot.rules.is_empty() {
             lines.push("No file rules.".into());
+        }
+        let code = self.code.names();
+        if !code.is_empty() {
+            lines.push("Code rules added by plugins:".into());
+            lines.extend(code.iter().map(|name| format!("- {name:?}")));
         }
         lines.extend(
             self.snapshot

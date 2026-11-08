@@ -603,7 +603,7 @@ async fn execute_read_only_batch(
         if let Some((_, source)) = policy
             .rules
             .as_ref()
-            .and_then(|rules| rules.resolve(&call.function.name, &call.function.arguments))
+            .and_then(|rules| rules.resolve_in(root, &call.function.name, &call.function.arguments))
         {
             recorded
                 .policy_refs

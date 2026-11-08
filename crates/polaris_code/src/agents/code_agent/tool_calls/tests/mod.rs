@@ -1,14 +1,17 @@
 //! Run the production tool graph with deterministic tools.
 use super::*;
+use crate::agents::permission_rules::RuleDecision;
 use polaris::graph::{GraphExecutor, cancel::CancellationSource};
 use polaris::models::llm::{AssistantBlock, StopReason, Usage};
 use polaris::plugins::{CONFIRMED, IOError, IOProvider};
 use polaris::sessions::SessionId;
+use polaris::system::plugin::{Contract, PluginAccess, VersionReq};
 use polaris::tools::toolset;
 use polaris_tui::{APPROVAL_NOTE, APPROVAL_SUBJECT};
 use std::sync::Mutex;
 
 mod call_ids;
+mod code_rules;
 
 struct Choose {
     messages: Mutex<Vec<IOMessage>>,
@@ -97,6 +100,29 @@ impl Plugin for FixturePlugin {
             .get_resource_mut::<ToolRegistry>()
             .unwrap()
             .register_toolset(self.0.clone());
+    }
+}
+
+/// A rule written in code, as a plugin would add it.
+type FixtureRule = fn(&str, &serde_json::Value, &std::path::Path) -> Option<(RuleDecision, String)>;
+
+/// A plugin that adds named code rules to the permission rules while building.
+struct AddsRules(Vec<(&'static str, FixtureRule)>);
+impl Plugin for AddsRules {
+    const ID: &'static str = "test::adds_rules";
+    const VERSION: Version = Version::new(0, 1, 0);
+    fn dependencies(&self) -> Vec<PluginId> {
+        vec![PluginId::of::<PermissionRulesPlugin>()]
+    }
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new()
+            .extends::<PermissionRules>(VersionReq::caret(PermissionRules::CONTRACT_VERSION))
+    }
+    fn build(&self, server: &mut Server) {
+        let mut rules = server.get_resource_mut::<PermissionRules>().unwrap();
+        for (name, rule) in &self.0 {
+            rules.add_code_rule(*name, *rule).unwrap();
+        }
     }
 }
 
@@ -202,6 +228,7 @@ struct ReplyControl {
     prompt_fails: bool,
     choice: Option<&'static str>,
     unrestricted_shell: bool,
+    code_rules: Vec<(&'static str, FixtureRule)>,
 }
 
 async fn run_controlled(
@@ -233,6 +260,9 @@ async fn run_controlled(
     server.add_plugins(ToolsPlugin).add_plugins(
         PermissionRulesPlugin::default().with_unrestricted_shell(control.unrestricted_shell),
     );
+    if !control.code_rules.is_empty() {
+        server.add_plugins(AddsRules(control.code_rules.clone()));
+    }
     if approver {
         server.add_plugins(crate::agents::InteractiveApprovalPlugin);
     }
