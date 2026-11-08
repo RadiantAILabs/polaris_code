@@ -690,6 +690,18 @@ fn run_max_turns(cli: &Cli) -> usize {
         })
 }
 
+fn validate_context_window(
+    window: Option<NonZeroU32>,
+    max_output_tokens: NonZeroU32,
+) -> Result<(), &'static str> {
+    if let Some(window) = window
+        && window.get().saturating_sub(max_output_tokens.get()) < 2
+    {
+        return Err("--context-window must exceed --max-output-tokens by at least two tokens");
+    }
+    Ok(())
+}
+
 /// Resolve the posture this process starts in, and the ceiling it may never
 /// exceed, from the operator's flags.
 ///
@@ -781,11 +793,6 @@ fn ceiling_notice(ceiling: &PermissionCeiling, active: &PermissionMode) -> Strin
         ceiling.label(),
         active.label()
     )
-}
-
-#[cfg(test)]
-fn shell_config(working_dir: &std::path::Path, mode: &PermissionMode) -> ShellConfig {
-    configured_shell(working_dir, mode, false)
 }
 
 fn configured_shell(
@@ -1166,13 +1173,8 @@ async fn main() {
     // and the non-interactive report, so they agree on the output allowance.
     let max_output_tokens = cli.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let max_turns = run_max_turns(&cli);
-    if let Some(window) = cli.context_window
-        && window.get().saturating_sub(max_output_tokens.get()) < 2
-    {
-        fatal(
-            headless,
-            "--context-window must exceed --max-output-tokens by at least two tokens",
-        );
+    if let Err(why) = validate_context_window(cli.context_window, max_output_tokens) {
+        fatal(headless, why);
     }
     let mut agent_config = AgentConfig::new(model_id, working_dir.clone())
         .with_graph_search(graph_search)
@@ -2683,15 +2685,12 @@ mod tests {
 
     #[test]
     fn unrestricted_permissions_require_an_explicit_print_flag() {
-        assert!(Cli::try_parse_from(["polaris", "--dangerously-skip-permissions"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "polaris",
-                "--topology-task",
-                "x",
-                "--dangerously-skip-permissions"
-            ])
-            .is_err()
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--dangerously-skip-permissions"])
+                .err()
+                .expect("print is required")
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
         let parsed = cli(&["-p", "hello", "--dangerously-skip-permissions"]);
         let (mode, ceiling) = startup_permissions(&parsed, true).unwrap();
@@ -2728,6 +2727,37 @@ mod tests {
     }
 
     #[test]
+    fn unattended_flags_reject_conflicting_grants_and_topology_tasks() {
+        for flags in [
+            vec!["--dangerously-skip-permissions", "--topology-task", "x"],
+            vec!["--dangerously-skip-permissions", "--allow-edit"],
+            vec![
+                "--dangerously-skip-permissions",
+                "--allow-command",
+                "cargo *",
+            ],
+            vec![
+                "--trajectory-path",
+                "/tmp/trace.json",
+                "--topology-task",
+                "x",
+            ],
+        ] {
+            // Check this flag before clap reaches the print/topology group conflict.
+            let args = [vec!["polaris"], flags.clone(), vec!["-p", "hello"]].concat();
+            let error = Cli::try_parse_from(args).err().expect("flags conflict");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flags:?}: {error}"
+            );
+            for flag in flags.iter().filter(|flag| flag.starts_with("--")) {
+                assert!(error.to_string().contains(flag), "{flags:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
     fn effort_accepts_known_and_custom_levels_but_refuses_empty_values() {
         for level in [
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -2740,16 +2770,48 @@ mod tests {
                 level
             );
         }
-        assert!(Cli::try_parse_from(["polaris", "--reasoning-effort", ""]).is_err());
-        assert!(Cli::try_parse_from(["polaris", "--trajectory-path", "/tmp/trace.json"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--reasoning-effort", ""])
+                .err()
+                .expect("empty effort")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--trajectory-path", "/tmp/trace.json"])
+                .err()
+                .expect("print is required")
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
     fn context_window_is_positive_and_explicit() {
-        assert!(Cli::try_parse_from(["polaris", "--context-window", "0"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["polaris", "--context-window", "0"])
+                .err()
+                .expect("zero window")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
         let parsed = cli(&["--context-window", "32768", "--max-output-tokens", "4096"]);
         assert_eq!(parsed.context_window.unwrap().get(), 32768);
         assert_eq!(parsed.max_output_tokens.unwrap().get(), 4096);
+    }
+
+    #[test]
+    fn context_window_reserves_at_least_two_tokens_beyond_output() {
+        let output = nz(4096);
+        assert_eq!(validate_context_window(None, output), Ok(()));
+        for window in [4095, 4096, 4097] {
+            assert_eq!(
+                validate_context_window(Some(nz(window)), output),
+                Err("--context-window must exceed --max-output-tokens by at least two tokens"),
+                "window {window}"
+            );
+        }
+        assert_eq!(validate_context_window(Some(nz(4098)), output), Ok(()));
     }
 
     /// The session opens by saying what the user cannot do, in both labels.
@@ -3078,7 +3140,7 @@ mod tests {
             PermissionMode::AutoEdit,
             PermissionMode::Plan,
         ] {
-            let executor = ShellExecutor::new(shell_config(&working_dir, &mode));
+            let executor = ShellExecutor::new(configured_shell(&working_dir, &mode, false));
             assert_eq!(executor.check_permission("echo ok"), ShellPermission::Allow);
             assert_eq!(
                 executor.check_permission("rm -rf build"),
@@ -3096,7 +3158,7 @@ mod tests {
             edit_file: false,
             run_command_patterns: vec!["cargo *".into()],
         });
-        let executor = ShellExecutor::new(shell_config(&working_dir, &mode));
+        let executor = ShellExecutor::new(configured_shell(&working_dir, &mode, false));
         assert_eq!(
             executor.check_permission("cargo test --workspace"),
             ShellPermission::Allow
@@ -3119,9 +3181,9 @@ mod tests {
             edit_file: false,
             run_command_patterns: vec!["python *".into()],
         });
-        let off = project_shell_environment(shell_config(&dir, &mode), false);
+        let off = project_shell_environment(configured_shell(&dir, &mode, false), false);
         assert!(off.env_allowlist.is_empty());
-        let on = project_shell_environment(shell_config(&dir, &mode), true);
+        let on = project_shell_environment(configured_shell(&dir, &mode, false), true);
         assert!(!on.inherit_env);
         assert!(on.env_allowlist.contains(&"PATH".to_string()));
         assert!(on.env_allowlist.contains(&"CONDA_PREFIX".to_string()));
