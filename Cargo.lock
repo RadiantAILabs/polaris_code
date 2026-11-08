@@ -3098,9 +3098,9 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "polaris-ai"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c059d7af66d9f66264a31aadc303bf7d504e868c8c06341c76936c2abf595ac1"
+checksum = "9c7234dead230dde4f145e3baf10b210d992b6b74b3ca056ce1e20e07024275a"
 dependencies = [
  "polaris_internal",
  "tracing",
