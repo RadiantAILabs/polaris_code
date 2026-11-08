@@ -5,8 +5,12 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
+
 ### Changed
-- Requires `polaris-ai` 0.9.1.
+- Uses `polaris-ai` 0.9.1. It fixes HTTP 400 errors from `--provider openai` and Bedrock `openai.*` models when an earlier model reply in the history had two or more text blocks. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are unchanged at 0.3.0.
 - `--trajectory-path` and `RunTrajectory` no longer write the file for each tool result or message. They are queued in memory and written by the next model call or by `finish`, so they never block an async worker. A hard kill can lose the tool results and messages recorded since the last model call.
 
 ## [0.4.0] - 2026-11-08
@@ -117,7 +121,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.1.1...v0.2.0
