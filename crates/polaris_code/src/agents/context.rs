@@ -1114,6 +1114,26 @@ mod tests {
     use super::*;
     use polaris::models::llm::{ReasoningBlock, ToolCall};
 
+    #[test]
+    fn push_does_not_write_the_trajectory_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let trace =
+            crate::trajectory::RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let mut context = ContextManager::default();
+        context.set_trajectory(Some(trace.clone()));
+        // Any write to the destination would now fail and be remembered.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        context.push(Message::user("pushed"));
+        trace
+            .check()
+            .expect("push must not write the trajectory file");
+        std::fs::remove_dir(&path).unwrap();
+        trace.finish(0).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("pushed"));
+    }
+
     fn user(text: &str) -> Message {
         Message::user(text)
     }

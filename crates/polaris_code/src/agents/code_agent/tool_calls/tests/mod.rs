@@ -927,3 +927,27 @@ async fn approving_a_non_command_tool_shows_its_detail_and_runs_it() {
         &["authorization.scope=once", "authorization.call_id=update-1"]
     ));
 }
+
+#[test]
+fn push_result_does_not_write_the_trajectory_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trajectory.json");
+    let trace =
+        crate::trajectory::RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+    let mut batch = ToolBatch {
+        trajectory: Some(trace.clone()),
+        ..ToolBatch::default()
+    };
+    // Any write to the destination would now fail and be remembered.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let call = polaris::models::llm::ToolCall::new("tool", "read_file", serde_json::json!({}));
+    let block = call.result(ToolResultContent::Text("pushed-result".into()));
+    CallDecision::Allow(None).push_result(&mut batch, block);
+    trace
+        .check()
+        .expect("push_result must not write the trajectory file");
+    assert_eq!(batch.results.len(), 1);
+    std::fs::remove_dir(&path).unwrap();
+    trace.finish(0).unwrap();
+}

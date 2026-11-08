@@ -223,8 +223,9 @@ fn recording_error(error: std::io::Error) -> GenerationError {
 /// Construction starts no I/O. `build` registers one decorated provider.
 /// Requests and responses are recorded during calls, with file writes on
 /// Tokio's blocking pool; the host finalizes the recorder after tool cleanup.
-/// Dropped streams record partial content in memory, and the next checkpoint
-/// or [`RunTrajectory::finish`] writes it.
+/// Tool results, messages and the partial content of a dropped stream are
+/// queued in memory, and the next checkpoint or [`RunTrajectory::finish`]
+/// writes them.
 ///
 /// # Example
 ///

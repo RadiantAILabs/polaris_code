@@ -154,8 +154,9 @@ stream's partial content are kept in memory and the next checkpoint writes
 them. A response that already failed keeps the `failed` status. Compaction
 cannot erase recorded evidence. SIGINT/SIGTERM use normal cleanup and
 finalization. A hard kill leaves the last complete checkpoint; a partially
-streamed block or tool results since that checkpoint may be absent. `extra.status` remains `running` until the run
-finalizes, and incomplete calls have their own status. A requested export
+streamed block, tool results or messages since that checkpoint may be absent.
+`extra.status` remains `running` until the run finalizes, and incomplete
+calls have their own status. A requested export
 that fails to persist makes the process exit unsuccessfully.
 
 `final_metrics` totals reported prompt tokens (uncached input plus cache reads

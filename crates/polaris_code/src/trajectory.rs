@@ -51,8 +51,11 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 /// and returned by [`check`](Self::check) and [`finish`](Self::finish), even if
 /// a later checkpoint succeeds. The model-run plugin writes its checkpoints on
 /// Tokio's blocking pool, so a provider call never blocks an async worker with
-/// file I/O. A dropped response stream only records its partial content in
-/// memory; the next checkpoint or [`finish`](Self::finish) writes it.
+/// file I/O. Tool results, messages and the partial content of a dropped
+/// response stream are only queued in memory. They never wait for a write in
+/// progress. The next model call or [`finish`](Self::finish) writes them, so a
+/// host must call `finish` at the end of a run, or the tool results of the last
+/// turn are lost.
 ///
 /// # Alternatives
 ///
@@ -82,6 +85,9 @@ pub struct RunTrajectory(Arc<Shared>);
 
 struct Shared {
     recording: Mutex<Recording>,
+    /// Changes waiting for the next checkpoint. This lock is never held during
+    /// file I/O, so queueing a change never waits for a write.
+    deferred: Mutex<Vec<Deferred>>,
     /// The first persistence failure. It lives outside the recording lock so
     /// `check` never waits for a file write that is in progress.
     failure: OnceLock<String>,
@@ -106,11 +112,16 @@ impl std::fmt::Debug for RunTrajectory {
 
 impl GlobalResource for RunTrajectory {}
 
+/// A change that is applied by the next checkpoint instead of being written now.
+enum Deferred {
+    ToolResults(Vec<UserBlock>),
+    Message(Message),
+    Assistant(usize, Snapshot),
+}
+
 struct Recording {
     path: PathBuf,
     document: Value,
-    /// Set when a change is in memory but not yet in the file.
-    unsaved: bool,
     messages: HashMap<u64, Vec<usize>>,
     configurations: HashMap<(String, u64), Vec<usize>>,
     history: history::History,
@@ -125,6 +136,34 @@ fn fingerprint(value: &Value) -> u64 {
 impl Recording {
     fn step_count(&self) -> usize {
         self.document["steps"].as_array().map_or(0, Vec::len)
+    }
+
+    fn tool_results(&mut self, blocks: &[UserBlock]) {
+        messages::tool_results(&mut self.document, blocks);
+    }
+
+    fn assistant(&mut self, index: usize, snapshot: Snapshot) {
+        let Snapshot {
+            message,
+            usage,
+            metadata,
+            completed,
+        } = snapshot;
+        messages::store(&mut self.document, index + 1, &message);
+        let step = &mut self.document["steps"][index];
+        step["metrics"] = metrics(&usage);
+        for (key, value) in metadata.as_object().expect("response metadata") {
+            step["extra"][key] = value.clone();
+        }
+        // A failed step stays failed. Its partial content is still kept,
+        // but a later snapshot must not replace the failure status.
+        if step["extra"]["status"] != "failed" {
+            step["extra"]["status"] = json!(if completed { "completed" } else { "partial" });
+        }
+        self.messages
+            .entry(fingerprint(&json!(message)))
+            .or_default()
+            .push(index + 1);
     }
 
     fn save(&mut self) -> io::Result<()> {
@@ -264,7 +303,6 @@ impl RunTrajectory {
                 "agent": {"name": "polaris", "version": env!("CARGO_PKG_VERSION"), "model_name": model},
                 "steps": [], "extra": {"status": "running", "history_format": "polaris-code-message-history/v1", "histories": []},
             }),
-            unsaved: false,
             messages: HashMap::new(),
             configurations: HashMap::new(),
             history: history::History::default(),
@@ -273,6 +311,7 @@ impl RunTrajectory {
         recording.save()?;
         Ok(Self(Arc::new(Shared {
             recording: Mutex::new(recording),
+            deferred: Mutex::new(Vec::new()),
             failure: OnceLock::new(),
         })))
     }
@@ -284,24 +323,40 @@ impl RunTrajectory {
             .unwrap_or_else(|err| err.into_inner())
     }
 
-    /// Apply `change` in memory, then write the file. A change that returns
-    /// `true` leaves the recording unsaved until a write succeeds, so a later
-    /// checkpoint also writes anything that was deferred.
-    fn update(&self, change: impl FnOnce(&mut Recording) -> bool) {
-        self.apply(false, change);
+    /// Queue a change for the next checkpoint. Only the queue lock is taken,
+    /// and it is never held during file I/O.
+    fn defer(&self, change: Deferred) {
+        self.0
+            .deferred
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(change);
     }
 
-    /// Like [`update`](Self::update), but with `defer` set the file is not
-    /// touched. A deferred change is written by the next checkpoint.
-    fn apply(&self, defer: bool, change: impl FnOnce(&mut Recording) -> bool) {
+    /// A checkpoint: apply queued changes in order, then `change`, then write
+    /// the whole file. A failed write keeps everything in memory, so the next
+    /// checkpoint writes it.
+    fn update(&self, change: impl FnOnce(&mut Recording)) {
         let mut recording = self.lock();
-        let changed = change(&mut recording);
-        recording.unsaved |= changed;
-        if defer || !recording.unsaved {
-            return;
+        let queued = std::mem::take(
+            &mut *self
+                .0
+                .deferred
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+        );
+        for queued in queued {
+            match queued {
+                Deferred::ToolResults(blocks) => recording.tool_results(&blocks),
+                Deferred::Message(message) => {
+                    recording.message(&message);
+                }
+                Deferred::Assistant(index, snapshot) => recording.assistant(index, snapshot),
+            }
         }
+        change(&mut recording);
         match recording.save() {
-            Ok(()) => recording.unsaved = false,
+            Ok(()) => {}
             Err(error) => {
                 tracing::error!(%error, "could not checkpoint trajectory");
                 let _ = self.0.failure.set(error.to_string());
@@ -340,7 +395,8 @@ impl RunTrajectory {
     }
 
     /// Finalize the run after tool cleanup and session persistence. Also writes
-    /// any change a dropped stream left in memory.
+    /// anything still in memory: tool results and messages recorded since the
+    /// last model call, and the partial content of a dropped stream.
     ///
     /// # Errors
     ///
@@ -354,7 +410,6 @@ impl RunTrajectory {
                 "failed"
             });
             recording.document["extra"]["exit_code"] = json!(exit_code);
-            true
         });
         self.check()
     }
@@ -386,38 +441,17 @@ impl RunTrajectory {
             step["extra"]["input"] = json!({"history": history, "system": system, "tools": tools, "parameters": parameters});
             step["extra"]["status"] = json!("in_flight");
             if let Some(effort) = &request.reasoning_effort { step["reasoning_effort"] = json!(effort); }
-            true
         });
         index
     }
 
-    /// Store one response snapshot. With `defer` set, only memory changes.
+    /// Store one response snapshot. With `defer` set, it is only queued.
     pub(crate) fn assistant(&self, index: usize, snapshot: Snapshot, defer: bool) {
-        self.apply(defer, |recording| {
-            let Snapshot {
-                message,
-                usage,
-                metadata,
-                completed,
-            } = snapshot;
-            messages::store(&mut recording.document, index + 1, &message);
-            let step = &mut recording.document["steps"][index];
-            step["metrics"] = metrics(&usage);
-            for (key, value) in metadata.as_object().expect("response metadata") {
-                step["extra"][key] = value.clone();
-            }
-            // A failed step stays failed. Its partial content is still kept,
-            // but a later snapshot must not replace the failure status.
-            if step["extra"]["status"] != "failed" {
-                step["extra"]["status"] = json!(if completed { "completed" } else { "partial" });
-            }
-            recording
-                .messages
-                .entry(fingerprint(&json!(message)))
-                .or_default()
-                .push(index + 1);
-            true
-        });
+        if defer {
+            self.defer(Deferred::Assistant(index, snapshot));
+        } else {
+            self.update(|recording| recording.assistant(index, snapshot));
+        }
     }
 
     pub(crate) fn response(&self, index: usize, response: &LlmResponse) {
@@ -439,30 +473,18 @@ impl RunTrajectory {
         self.update(|recording| {
             recording.document["steps"][index]["extra"]["status"] = json!("failed");
             recording.document["steps"][index]["extra"]["error_type"] = json!(kind);
-            true
         });
     }
 
-    // Tool results and messages change memory only. Their callers are sync
-    // code on async workers, so a full-document write here would stall them.
+    // Tool results and messages are only queued. Their callers are sync code
+    // on async workers, so they must not write the file or wait for a write.
     // The next model call or `finish` writes them.
     pub(crate) fn tool_results(&self, blocks: &[UserBlock]) {
-        self.apply(true, |recording| {
-            messages::tool_results(&mut recording.document, blocks)
-        });
+        self.defer(Deferred::ToolResults(blocks.to_vec()));
     }
 
     pub(crate) fn message(&self, message: &Message) {
-        self.apply(true, |recording| {
-            let count = recording.document["steps"].as_array().unwrap().len();
-            let observed = if let Message::User { content } = message {
-                messages::tool_results(&mut recording.document, content)
-            } else {
-                false
-            };
-            recording.message(message);
-            observed || count != recording.document["steps"].as_array().unwrap().len()
-        });
+        self.defer(Deferred::Message(message.clone()));
     }
 }
 
@@ -1213,32 +1235,121 @@ mod tests {
         assert_eq!(texts(&document(&path), index), ["unwritten"]);
     }
 
-    #[test]
-    fn tool_results_and_messages_do_no_file_io() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("trajectory.json");
-        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
-        let call = ToolCall::new("tool", "read_file", json!({"path":"a"}));
+    /// Steps whose stored message equals `message`.
+    fn message_steps(doc: &Value, message: &Message) -> usize {
+        (1..=doc["steps"].as_array().unwrap().len())
+            .filter(|id| {
+                messages::load(doc, *id).is_ok_and(|stored| json!(stored) == json!(message))
+            })
+            .count()
+    }
+
+    /// A trace with one model call that asked for `call`.
+    fn trace_with_call(path: &Path, call: &ToolCall) -> (RunTrajectory, usize) {
+        let trace = RunTrajectory::create(path, "run", "fake/model", "task").unwrap();
         let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
         trace.response(
             index,
             &response(vec![AssistantBlock::ToolCall(call.clone())]),
         );
+        (trace, index)
+    }
+
+    #[test]
+    fn tool_results_and_messages_do_no_file_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let first = ToolCall::new("first", "read_file", json!({"path":"a"}));
+        let second = ToolCall::new("second", "read_file", json!({"path":"b"}));
+        let trace = RunTrajectory::create(&path, "run", "fake/model", "task").unwrap();
+        let index = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        trace.response(
+            index,
+            &response(vec![
+                AssistantBlock::ToolCall(first.clone()),
+                AssistantBlock::ToolCall(second.clone()),
+            ]),
+        );
         // Any write to the destination would now fail and be remembered.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let result = call.result(ToolResultContent::Text("deferred-result".into()));
-        trace.tool_results(std::slice::from_ref(&result));
-        trace.message(&Message::user("deferred-message"));
+        trace.tool_results(&[first.result(ToolResultContent::Text("deferred-result".into()))]);
+        // A message that carries a tool result records it too.
+        let carried = Message::User {
+            content: vec![second.result(ToolResultContent::Text("carried-result".into()))],
+        };
+        trace.message(&carried);
+        let note = Message::user("deferred-message");
+        trace.message(&note);
         trace
             .check()
             .expect("tool results and messages must not write the file");
         std::fs::remove_dir(&path).unwrap();
-        // The next checkpoint writes both.
+        // The next checkpoint writes all of them.
         trace.finish(0).unwrap();
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("deferred-result"), "{written}");
-        assert!(written.contains("deferred-message"), "{written}");
+        let doc = document(&path);
+        let results = doc["steps"][index]["observation"]["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0]["source_call_id"], "first");
+        assert_eq!(results[0]["content"], "deferred-result");
+        assert_eq!(results[1]["source_call_id"], "second");
+        assert_eq!(results[1]["content"], "carried-result");
+        assert_eq!(message_steps(&doc, &note), 1, "the message is stored once");
+        assert_eq!(doc["extra"]["status"], "completed");
+    }
+
+    #[test]
+    fn the_next_model_call_writes_queued_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let call = ToolCall::new("tool", "read_file", json!({"path":"a"}));
+        let (trace, index) = trace_with_call(&path, &call);
+        let result = call.result(ToolResultContent::Text("queued-result".into()));
+        trace.tool_results(std::slice::from_ref(&result));
+        assert!(
+            document(&path)["steps"][index].get("observation").is_none(),
+            "queued results are not written yet"
+        );
+        trace.begin("fake/model", &request(vec![Message::user("task")]));
+        let doc = document(&path);
+        assert_eq!(
+            doc["steps"][index]["observation"]["results"][0]["content"],
+            "queued-result"
+        );
+    }
+
+    #[test]
+    fn queued_changes_never_wait_for_a_write_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trajectory.json");
+        let call = ToolCall::new("tool", "read_file", json!({"path":"a"}));
+        let (trace, index) = trace_with_call(&path, &call);
+        let stream = trace.begin("fake/model", &request(vec![Message::user("task")]));
+        let capture = text_capture(&trace, stream, "late-text");
+        // Hold the recording lock, as a checkpoint does while it writes.
+        let guard = trace.lock();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = trace.clone();
+        std::thread::spawn(move || {
+            worker.tool_results(&[call.result(ToolResultContent::Text("late".into()))]);
+            worker.message(&Message::user("late-message"));
+            drop(capture);
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("queued changes must not wait for the recording lock");
+        drop(guard);
+        trace.finish(0).unwrap();
+        let doc = document(&path);
+        assert_eq!(
+            doc["steps"][index]["observation"]["results"][0]["content"],
+            "late"
+        );
+        assert_eq!(message_steps(&doc, &Message::user("late-message")), 1);
+        assert_eq!(texts(&doc, stream), ["late-text"]);
     }
 
     #[test]
