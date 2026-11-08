@@ -657,9 +657,12 @@ fn setting_text(key: &str, item: &Item) -> Option<String> {
 fn validate(key: &str, value: &str) -> Result<(), String> {
     match key {
         "max_turns" => super::resolve_max_turns(Some(value)).map(|_| ()),
-        "max_output_tokens" | "context_window" => {
-            super::resolve_max_output_tokens(Some(value)).map(|_| ())
-        }
+        "max_output_tokens" => super::resolve_max_output_tokens(Some(value)).map(|_| ()),
+        "context_window" => value
+            .trim()
+            .parse::<std::num::NonZeroU32>()
+            .map(|_| ())
+            .map_err(|_| "POLARIS_CODE_CONTEXT_WINDOW must be a positive integer".to_string()),
         "max_cost_usd" => {
             let value = value.parse::<f64>().map_err(|err| err.to_string())?;
             polaris_code::usage::RunCeiling::from_limits(Some(value), None)
@@ -840,8 +843,14 @@ mod tests {
             .unwrap();
         assert_eq!(cli.context_window.unwrap().get(), 65536);
         assert_eq!(cli.reasoning_effort.unwrap().to_string(), "max");
+    }
+
+    #[test]
+    fn dangerously_skip_permissions_cannot_be_enabled_in_settings() {
+        let fixture = Fixture::new();
         fixture.project("dangerously_skip_permissions = true\n");
-        assert!(fixture.load(&[], &[]).is_err());
+        let error = fixture.load(&[], &[]).err().unwrap();
+        assert!(error.contains("dangerously_skip_permissions"), "{error}");
     }
 
     #[test]
@@ -938,6 +947,8 @@ mod tests {
         for (key, value) in [
             ("max_turns", "-1"),
             ("max_output_tokens", "0"),
+            ("context_window", "0"),
+            ("context_window", "''"),
             ("max_tokens", "0"),
             ("max_cost_usd", "nan"),
             ("provider", "'unknown'"),
@@ -949,6 +960,10 @@ mod tests {
             let error = fixture.load(&["--max-turns=12"], &[]).err().unwrap();
             assert!(error.contains("polaris.toml"), "{error}");
             assert!(error.contains(&format!("key `{key}`")), "{error}");
+            if key == "context_window" {
+                assert!(error.contains("POLARIS_CODE_CONTEXT_WINDOW"), "{error}");
+                assert!(!error.contains("POLARIS_CODE_MAX_OUTPUT_TOKENS"), "{error}");
+            }
         }
     }
 

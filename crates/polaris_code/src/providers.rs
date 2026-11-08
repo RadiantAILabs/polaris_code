@@ -264,7 +264,8 @@ impl Provider {
 }
 
 /// How the installed providers replay reasoning text in earlier messages.
-/// Unknown providers conservatively count every text fragment.
+/// Unknown provider prefixes count every text fragment; unrecognized Bedrock
+/// model ids are treated as omitting reasoning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ReasoningHistory {
     #[default]
@@ -584,6 +585,13 @@ impl ReadyProvider {
 
     /// Register this provider with immutable policy on every model call,
     /// including auxiliary calls and optional complete-run trajectory capture.
+    ///
+    /// # Panics
+    ///
+    /// Panics if preparation loaded no stored key and the checked credential
+    /// is absent from the process environment, including when preparation used
+    /// an injected lookup. Also panics if an internal invariant is broken and
+    /// a prepared Bedrock provider has no checked SDK configuration.
     pub fn install_with_options(
         &self,
         server: &mut Server,
@@ -1247,6 +1255,23 @@ mod tests {
     }
 
     #[test]
+    fn the_chat_serde_name_round_trips_through_stored_credentials() {
+        let name: String =
+            serde_json::from_str(&serde_json::to_string(&Provider::OpenAiChat).unwrap()).unwrap();
+        let provider = Provider::from_str(&name, false).unwrap();
+        assert_eq!(provider, Provider::OpenAiChat);
+        let dir = tempfile::tempdir().unwrap();
+        let stored = stored_in(&dir, &[(provider, "chat-stored-key")], None);
+        let text = std::fs::read_to_string(stored.path()).unwrap();
+        assert!(text.contains("[openai-chat]"), "{text}");
+        let reopened = CredentialStore::at(stored.path().to_path_buf());
+        assert_eq!(
+            reopened.api_key(Provider::OpenAiChat).unwrap().as_deref(),
+            Some("chat-stored-key")
+        );
+    }
+
+    #[test]
     fn each_provider_owns_a_registry_name_and_a_catalog_of_its_own_models() {
         let none = |_: &str| None;
         for provider in Provider::ALL {
@@ -1314,6 +1339,7 @@ mod tests {
         for (provider, var) in [
             (Provider::Anthropic, "ANTHROPIC_API_KEY"),
             (Provider::OpenAi, "OPENAI_API_KEY"),
+            (Provider::OpenAiChat, "OPENAI_API_KEY"),
         ] {
             for pairs in [vec![], vec![(var, "")], vec![(var, "   ")]] {
                 let err = prepare_with(provider, &pairs)
@@ -1328,6 +1354,10 @@ mod tests {
                 assert!(message.contains(".env"), "{message}");
                 assert!(message.contains("--provider"), "{message}");
                 assert!(message.contains("POLARIS_CODE_PROVIDER"), "{message}");
+                assert!(
+                    message.contains(&format!("polaris login {}", provider.flag())),
+                    "{message}"
+                );
             }
         }
     }
@@ -1409,30 +1439,49 @@ mod tests {
 
     #[tokio::test]
     async fn a_base_url_that_is_not_http_is_refused_without_echoing_credentials() {
-        let err = prepare_with(
-            Provider::OpenAi,
-            &[
-                ("OPENAI_API_KEY", "k"),
-                ("OPENAI_BASE_URL", "ftp://user:hunter2@host/v1"),
-            ],
-        )
-        .await
-        .expect_err("only http and https are addresses");
-        let message = err.to_string();
-        assert!(message.contains("OPENAI_BASE_URL"), "{message}");
-        assert!(message.contains("ftp://host/v1"), "{message}");
-        assert!(!message.contains("hunter2"), "{message}");
-
-        for bad in ["localhost:11434", "http://", "https:///"] {
+        for provider in [Provider::OpenAi, Provider::OpenAiChat] {
+            let err = prepare_with(
+                provider,
+                &[
+                    ("OPENAI_API_KEY", "k"),
+                    ("OPENAI_BASE_URL", "ftp://user:hunter2@host/v1"),
+                ],
+            )
+            .await
+            .expect_err("only http and https are addresses");
             assert!(
-                prepare_with(
-                    Provider::OpenAi,
-                    &[("OPENAI_API_KEY", "k"), ("OPENAI_BASE_URL", bad)]
+                matches!(
+                    err,
+                    StartupError::BadBaseUrl {
+                        var: OPENAI_BASE_URL_VAR,
+                        ..
+                    }
+                ),
+                "{provider:?}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("OPENAI_BASE_URL"), "{message}");
+            assert!(message.contains("ftp://host/v1"), "{message}");
+            assert!(!message.contains("hunter2"), "{message}");
+
+            for bad in ["localhost:11434", "http://", "https:///"] {
+                let err = prepare_with(
+                    provider,
+                    &[("OPENAI_API_KEY", "k"), ("OPENAI_BASE_URL", bad)],
                 )
                 .await
-                .is_err(),
-                "{bad}"
-            );
+                .expect_err(bad);
+                assert!(
+                    matches!(
+                        err,
+                        StartupError::BadBaseUrl {
+                            var: OPENAI_BASE_URL_VAR,
+                            ..
+                        }
+                    ),
+                    "{provider:?}, {bad}: {err}"
+                );
+            }
         }
     }
 
@@ -1679,8 +1728,7 @@ mod tests {
     }
 
     /// Bedrock registers from the config the check loaded, so this reaches no
-    /// network. The other two read their key from the process environment
-    /// themselves, which a test must not set.
+    /// network. Key providers are tested separately with stored credentials.
     #[tokio::test]
     async fn bedrock_registers_from_the_config_the_check_loaded() {
         use polaris::models::{ModelRegistry, ModelsPlugin};
@@ -1689,14 +1737,16 @@ mod tests {
         let ready = check(config, &[]).await.unwrap();
         let mut server = Server::new();
         server.add_plugins(ModelsPlugin);
-        ready.install(
+        ready.install_with_options(
             &mut server,
             NonZeroU32::new(1024).unwrap(),
             PriceStore::builtin(),
+            crate::model_run::ModelRunOptions::default(),
         );
         server.finish().await.expect("the server builds");
         let registry = server.get_global::<ModelRegistry>().expect("registry");
         assert!(registry.has_llm_provider(Provider::Bedrock.registry_name()));
+        assert!(registry.llm(DEFAULT_BEDROCK_MODEL).is_ok());
         assert_eq!(registry.llm_provider_names().len(), 1);
     }
 
@@ -1840,17 +1890,19 @@ mod tests {
             &[
                 (Provider::Anthropic, "sk-ant-stored-key-1234"),
                 (Provider::OpenAi, "sk-openai-stored-key-5678"),
+                (Provider::OpenAiChat, "sk-chat-stored-key-9012"),
             ],
             None,
         );
-        for provider in [Provider::Anthropic, Provider::OpenAi] {
+        for provider in [Provider::Anthropic, Provider::OpenAi, Provider::OpenAiChat] {
             let ready = prepare_stored(provider, &[], &stored).await.unwrap();
             let mut server = Server::new();
             server.add_plugins(ModelsPlugin);
-            ready.install(
+            ready.install_with_options(
                 &mut server,
                 NonZeroU32::new(1024).unwrap(),
                 PriceStore::builtin(),
+                crate::model_run::ModelRunOptions::default(),
             );
             server.finish().await.expect("the server builds");
             let registry = server.get_global::<ModelRegistry>().expect("registry");
@@ -1858,6 +1910,13 @@ mod tests {
                 registry.has_llm_provider(provider.registry_name()),
                 "{} did not register",
                 provider.flag()
+            );
+            let catalog = provider.catalog(&|_| None);
+            assert!(
+                registry.llm(catalog.default_model()).is_ok(),
+                "{} default model did not resolve through {}",
+                provider.flag(),
+                provider.registry_name()
             );
         }
     }
