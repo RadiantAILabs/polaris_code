@@ -300,9 +300,10 @@ cargo +1.97.0 clippy --workspace --all-targets --all-features --locked -- -D war
 ```
 
 GitHub Actions checks the workspace on Linux and macOS and builds release
-archives for Linux x86-64 and Apple Silicon macOS. Matching `v*` tags in the
-public repository stage a draft release with those same archives, SHA-256
-checksums, and a Homebrew formula. See
+archives for Apple Silicon macOS and Linux x86-64 (a glibc archive for Homebrew
+and a static musl archive for portable installs and Harbor). Matching `v*` tags
+in the public repository stage a draft release with those same archives,
+SHA-256 checksums, and a Homebrew formula. See
 [CI and binary releases](docs/publishing.md#ci-and-binary-releases) for
 platform requirements and the tap handoff.
 

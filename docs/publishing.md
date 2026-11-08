@@ -119,6 +119,8 @@ does not survive cancellation.
 
 Documentation and branding changes run quick Python checks, skipping Rust
 compilation, workspace tests, release builds, and Homebrew installation tests.
+The Harbor adapter tests run on every change in their own job, against Harbor
+0.24.0 and Python 3.12. That job fails if Harbor is missing instead of skipping.
 The full pipeline runs when crate sources, tests, examples, benches, embedded
 documentation, ontology inputs, evaluation code or fixtures, Cargo dependencies,
 toolchain settings, or CI/build/release tooling change.
@@ -126,10 +128,11 @@ Pushes compare the entire before/after range; pull requests
 compare against their merge base. If the range cannot be compared, CI runs
 the full pipeline. Release tags and manual dispatches always run it too.
 
-The final `CI` check verifies every job required for that change; use it as
-the required status check in branch protection. Documentation-only pushes do
-not cancel source builds already in progress. A newer source build cancels
-the older job for the same platform and branch; tagged jobs are retained.
+The final `CI` check verifies every job required for that change, including the
+Harbor adapter tests; use it as the required status check in branch protection.
+Documentation-only pushes do not cancel source builds already in progress. A
+newer source build cancels the older job for the same platform and branch;
+tagged jobs are retained.
 
 The workspace consumes the published `polaris-ai` 0.8.0 dependency rather than
 a developer's sibling checkout. The published 0.6.0 package lacks graph APIs
@@ -238,9 +241,10 @@ A release reaches the tap in a few minutes. The formula installs the prebuilt
 archive for Apple Silicon on macOS Sequoia and newer, or Linux x86-64, with no
 Rust toolchain or build step. Its functional test checks the installed
 command's version, help, and a real JSON topology inventory without a model
-key. Only the two platforms in the build matrix are supported; elsewhere,
-install with `cargo install polaris_code --locked`, or extend the build matrix
-and the generator.
+key. The formula supports only those two platforms (Apple Silicon macOS and
+Linux x86-64). On a Linux x86-64 system without a suitable glibc, use the static
+musl archive; elsewhere, install with `cargo install polaris_code --locked`, or
+extend the build matrix and the generator.
 
 ### One-time automation setup
 
