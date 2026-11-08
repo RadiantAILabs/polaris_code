@@ -195,7 +195,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let document = trace.0.lock().unwrap().document.clone();
+        let document = trace.0.recording.lock().unwrap().document.clone();
         let message = document["steps"]
             .as_array()
             .unwrap()
