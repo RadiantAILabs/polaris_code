@@ -8,6 +8,8 @@ use polaris::tools::toolset;
 use polaris_tui::{APPROVAL_NOTE, APPROVAL_SUBJECT};
 use std::sync::Mutex;
 
+mod call_ids;
+
 struct Choose {
     messages: Mutex<Vec<IOMessage>>,
     deny: bool,
@@ -57,6 +59,9 @@ impl Fixtures {
     #[tool]
     async fn run_command(&self, command: String) -> Result<String, ToolError> {
         self.0.lock().unwrap().push(command.clone());
+        if command == "slow" {
+            return std::future::pending().await;
+        }
         if command == "fail" {
             Err(ToolError::execution_error("fixture failed"))
         } else {
@@ -73,7 +78,11 @@ impl Fixtures {
     #[tool]
     async fn read_file(&self, path: String) -> Result<String, ToolError> {
         self.0.lock().unwrap().push(path.clone());
-        Ok(path)
+        if path == "fail" {
+            Err(ToolError::execution_error("fixture read failed"))
+        } else {
+            Ok(path)
+        }
     }
 }
 struct FixturePlugin(Fixtures);
@@ -113,11 +122,13 @@ async fn seed_reviews() -> ReviewResult {
     ReviewResult::default()
 }
 fn command(id: usize, text: &str) -> ToolCall {
-    ToolCall::new(
+    let mut call = ToolCall::new(
         format!("call-{id}"),
         "run_command",
         serde_json::json!({"command": text}),
-    )
+    );
+    call.call_id = Some(format!("provider-call-{id}"));
+    call
 }
 struct Outcome {
     messages: Vec<Message>,
@@ -190,6 +201,7 @@ struct ReplyControl {
     note: Option<&'static str>,
     prompt_fails: bool,
     choice: Option<&'static str>,
+    unrestricted_shell: bool,
 }
 
 async fn run_controlled(
@@ -202,6 +214,10 @@ async fn run_controlled(
     control: ReplyControl,
 ) -> Outcome {
     let stop_after = control.stop_after;
+    let expected_ids: Vec<_> = calls
+        .iter()
+        .map(|call| (call.id.clone(), call.call_id.clone()))
+        .collect();
     let root = tempfile::tempdir().unwrap();
     let ran = Arc::new(Mutex::new(Vec::new()));
     let cancellation = CancellationSource::new();
@@ -214,16 +230,26 @@ async fn run_controlled(
         choice: control.choice.unwrap_or("exact"),
     });
     let mut server = Server::new();
-    server
-        .add_plugins(ToolsPlugin)
-        .add_plugins(PermissionRulesPlugin::default());
+    server.add_plugins(ToolsPlugin).add_plugins(
+        PermissionRulesPlugin::default().with_unrestricted_shell(control.unrestricted_shell),
+    );
     if approver {
         server.add_plugins(crate::agents::InteractiveApprovalPlugin);
     }
     let store = OxigraphStore::in_memory().unwrap();
     server.insert_global(store.clone());
     server.insert_global(SecretRedactor::new(true));
-    server.add_plugins(FixturePlugin(Fixtures(ran.clone())));
+    if control.unrestricted_shell {
+        server
+            .add_plugins(polaris::shell::ShellPlugin::new(
+                ShellConfig::new()
+                    .with_working_dir(root.path())
+                    .with_allowed_dirs(vec![root.path().to_path_buf()]),
+            ))
+            .add_plugins(crate::tools::approval::ApprovalShellPlugin);
+    } else {
+        server.add_plugins(FixturePlugin(Fixtures(ran.clone())));
+    }
     install_cleanup(&mut server);
     if let Some(stop_after) = stop_after {
         let cancel = cancellation.clone();
@@ -244,6 +270,14 @@ async fn run_controlled(
     server.finish().await.unwrap();
     let mut ctx = server.create_context();
     let mut policy = PolicySnapshot::defaults();
+    if control.unrestricted_shell {
+        policy.permission =
+            crate::agents::PermissionMode::Unattended(crate::agents::UnattendedGrants {
+                edit_file: false,
+                run_command_patterns: vec!["*".into()],
+            })
+            .permission_policy();
+    }
     for tool in ["run_command", "update_file"] {
         policy.permission.overrides.insert(
             tool.into(),
@@ -263,7 +297,18 @@ async fn run_controlled(
         session_id: SessionId::new(),
         turn_number: 0,
     });
-    ctx.insert(SessionSettings::compatibility_default("test/model"));
+    ctx.insert(if control.unrestricted_shell {
+        SessionSettings::new(
+            "test/model",
+            crate::agents::PermissionMode::Unattended(crate::agents::UnattendedGrants {
+                edit_file: false,
+                run_command_patterns: vec!["*".into()],
+            }),
+            &crate::config::ModelCatalog::pinned("test/model"),
+        )
+    } else {
+        SessionSettings::compatibility_default("test/model")
+    });
     let tasks = BackgroundTasks::detached(Duration::from_secs(30));
     ctx.insert(tasks.clone());
     ctx.insert(UserIO::new(io.clone()));
@@ -295,6 +340,19 @@ async fn run_controlled(
         .unwrap()
         .messages
         .to_vec();
+    for (id, call_id) in expected_ids {
+        let result = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => content.iter().find_map(|block| match block {
+                    UserBlock::ToolResult(result) if result.id == id => Some(result),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("every proposed call gets a result");
+        assert_eq!(result.call_id, call_id, "provider call id for {id}");
+    }
     let ran = ran.lock().unwrap().clone();
     Outcome {
         messages,
@@ -327,6 +385,34 @@ fn results(outcome: &Outcome) -> Vec<(bool, String)> {
             _ => Vec::new(),
         })
         .collect()
+}
+
+#[tokio::test]
+async fn unrestricted_unattended_dispatch_binds_the_receipt_for_opaque_shell() {
+    let outcome = run_controlled(
+        vec![command(0, r#"printf "%s\n" "$(printf receipt-bound)""#)],
+        false,
+        10,
+        false,
+        false,
+        false,
+        ReplyControl {
+            unrestricted_shell: true,
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    let results = results(&outcome);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].0, "{}", results[0].1);
+    let messages = outcome.io.messages.lock().unwrap();
+    let document = messages
+        .iter()
+        .find_map(|message| message.metadata.get("document"))
+        .expect("the shell result includes its structured document");
+    let result: serde_json::Value = serde_json::from_str(document).unwrap();
+    assert_eq!(result["stdout"], "receipt-bound\n");
+    assert_eq!(result["exit_code"], 0);
 }
 /// Whether the trajectory holds a `human_approval` decision that chose `chose`
 /// and cites every one of `refs`.
@@ -370,6 +456,32 @@ async fn a_tool_failure_keeps_the_remaining_calls_running() {
     let results = results(&outcome);
     assert!(results[0].0);
     assert!(!results[1].0);
+}
+
+#[tokio::test]
+async fn parallel_read_results_keep_distinct_provider_call_ids_on_success_and_error() {
+    let calls = ["ok", "fail"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let mut call = ToolCall::new(
+                format!("read-{i}"),
+                "read_file",
+                serde_json::json!({"path":path}),
+            );
+            call.call_id = Some(format!("provider-read-{i}"));
+            call
+        })
+        .collect();
+    let outcome = run_calls(calls, false, 10).await;
+    let results = results(&outcome);
+    assert_eq!(results[0], (false, "ok".into()));
+    assert!(results[1].0);
+    assert!(
+        results[1].1.contains("fixture read failed"),
+        "{}",
+        results[1].1
+    );
 }
 #[tokio::test]
 async fn the_outer_turn_bound_does_not_truncate_a_batch() {
