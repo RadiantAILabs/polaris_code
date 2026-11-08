@@ -5,6 +5,10 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.0.
+
 ### Added
 - `--provider openai-chat` for OpenAI-compatible Chat Completions endpoints, including arbitrary vendor model ids.
 - `--reasoning-effort` / `POLARIS_CODE_REASONING_EFFORT` / `reasoning_effort` pins effort on every model request, including auxiliary calls. The experimental Bedrock variable is retired with a startup migration error.
@@ -28,6 +32,7 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 - Harbor adapter (`evals/packs/terminal_bench_harbor`): the agent keyword `version=` installs a pinned release of that musl archive (Linux x86-64 task images only, checksum checked, optional `sha256=` digest pin) instead of uploading a local `binary=`. New keywords `provider`, `base_url`, `reasoning_effort`, `context_window`, `max_output_tokens` and `unattended`. Harbor's token and cost fields come from the native ATIF trajectory. `unattended=true` together with `allow_command` is refused when the agent is created. CI runs the adapter tests against Harbor 0.24.0.
 
 ### Changed
+- Uses `polaris-ai` 0.9.0. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are released as 0.3.0 against it.
 - `polaris_cosmos` now depends on `async-trait` 0.1, `toml` 0.8 and `tokio` 1 (features `macros`, `rt`, `sync`, `time`). The single `polaris-ai` is unchanged.
 - A spend cap now applies per call. When a session's `TokenMeter` carries a cap (`TokenMeter::set_task_cost_cap`), the agent reserves the most each model request could cost before sending it, replaces the reservation with the billed usage when the reply ends, and ends the call with a failure beginning `cost-cap:`, without contacting the model, when the reservation does not fit in what is left. The reservation is given back only when the provider refused the request with an authentication, rate-limit or invalid-request error; a request cut off in flight, one that fails any other way, and one whose reply does not report both token counts are charged at their estimate. The operator's `--max-cost-usd` and `--max-tokens` still set no such cap.
 - `AgentConfig` has three new public fields and is now `#[non_exhaustive]`. Build it with `AgentConfig::new` and the `with_*` builders; a struct literal outside the crate no longer compiles. Its public fields can still be read and assigned.
@@ -108,7 +113,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.1.0...v0.1.1
