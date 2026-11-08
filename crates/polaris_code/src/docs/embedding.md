@@ -27,7 +27,7 @@ Add these direct dependencies to the application that runs the full example:
 ```toml
 [dependencies]
 polaris_code = "0.3.0"
-polaris = { package = "polaris-ai", version = "0.8.0", default-features = false, features = ["anthropic"] }
+polaris = { package = "polaris-ai", version = "0.9.0", default-features = false, features = ["anthropic"] }
 polaris_ontrace = { version = "0.2.0", default-features = false, features = ["oxigraph"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -55,8 +55,16 @@ the tool configuration grants access. Edit permissions, exclusive file creation
 and journal capture still apply. The CLI exposes this combination only through
 `--dangerously-skip-permissions` in an unattended run.
 
+To apply one output limit and one reasoning effort to every model call, register
+the provider with [`ModelRunPlugin`](crate::model_run::ModelRunPlugin) and
+[`ModelRunOptions`](crate::model_run::ModelRunOptions) instead of its ordinary
+plugin. See [unattended runs](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/unattended-runs.md).
+
 An optional [`RunTrajectory`](crate::trajectory::RunTrajectory) records native
-provider calls as ATIF with shared message histories. Use
+provider calls as ATIF with shared message histories. Create it in the host
+before any model call, put a clone in `ModelRunOptions::trajectory`, insert
+another with `Server::insert_global` so tool results are recorded, and call
+`finish` when the run ends. Use
 [`rebuild_request`](crate::trajectory::rebuild_request) to reconstruct a call's
 exact native input from its one-based step id, including compacted context.
 
