@@ -522,6 +522,36 @@ impl PermissionRules {
     /// [`CodeRuleError::InvalidName`] for an empty, padded or multi-line name,
     /// [`CodeRuleError::Duplicate`] when the name is taken, and
     /// [`CodeRuleError::Sealed`] once the server is ready.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_code::agents::permission_rules::{CodeRuleError, PermissionRules, RuleDecision};
+    ///
+    /// let mut rules = PermissionRules::default();
+    /// rules
+    ///     .add_code_rule("keep-env-files-private", |_tool, args, _root| {
+    ///         let path = args.get("path")?.as_str()?;
+    ///         path.ends_with(".env")
+    ///             .then(|| (RuleDecision::Deny, "environment files hold secrets".to_string()))
+    ///     })
+    ///     .unwrap();
+    ///
+    /// let args = serde_json::json!({ "path": "config/.env" });
+    /// let (decision, reason) = rules.resolve("read_file", &args).unwrap();
+    /// assert_eq!(decision, RuleDecision::Deny);
+    /// assert_eq!(
+    ///     reason,
+    ///     r#"code rule "keep-env-files-private": environment files hold secrets"#
+    /// );
+    /// // No opinion on other calls.
+    /// assert_eq!(rules.resolve("read_file", &serde_json::json!({ "path": "src/lib.rs" })), None);
+    /// // Names are unique.
+    /// assert_eq!(
+    ///     rules.add_code_rule("keep-env-files-private", |_, _, _| None),
+    ///     Err(CodeRuleError::Duplicate("keep-env-files-private".into()))
+    /// );
+    /// ```
     pub fn add_code_rule(
         &mut self,
         name: impl Into<String>,
