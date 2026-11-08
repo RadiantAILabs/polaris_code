@@ -702,4 +702,138 @@ mod tests {
         assert_eq!(text, "host");
         assert!(server.get_global::<PermissionRules>().is_some());
     }
+
+    /// A plugin that adds one code rule, refusing paths under `generated/`.
+    struct RefusesGenerated;
+
+    impl Plugin for RefusesGenerated {
+        const ID: &'static str = "test::refuses_generated";
+        const VERSION: Version = Version::new(0, 1, 0);
+
+        fn dependencies(&self) -> Vec<PluginId> {
+            vec![PluginId::of::<PermissionRulesPlugin>()]
+        }
+
+        fn access(&self) -> PluginAccess {
+            PluginAccess::new().extends::<PermissionRules>(
+                polaris::system::plugin::VersionReq::caret(PermissionRules::CONTRACT_VERSION),
+            )
+        }
+
+        fn build(&self, server: &mut Server) {
+            let mut rules = server
+                .get_resource_mut::<PermissionRules>()
+                .expect("permission rules are mutable while plugins build");
+            rules
+                .add_code_rule("no-generated-edits", |_, args, _| {
+                    let path = args.get("path")?.as_str()?;
+                    path.starts_with("generated/").then(|| {
+                        (
+                            RuleDecision::Deny,
+                            "generated files are rewritten by the build".to_string(),
+                        )
+                    })
+                })
+                .expect("the rule is new and the server is still building");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_built_after_the_rules_plugin_adds_a_rule_that_resolve_uses_and_permissions_lists()
+     {
+        for order in ["rules first", "rule plugin first"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".git")).unwrap();
+            std::fs::write(
+                dir.path().join("polaris.permissions.toml"),
+                "[[rules]]\ntool = 'create_file'\ndecision = 'allow'\n",
+            )
+            .unwrap();
+            let commands = Arc::new(CommandRegistry::with_builtins());
+            let mut server = Server::new();
+            server.add_plugins(ToolsPlugin);
+            let rules_plugin = PermissionRulesPlugin::new(dir.path())
+                .with_commands(commands.clone(), Arc::new(OnceLock::new()));
+            if order == "rules first" {
+                server
+                    .add_plugins(rules_plugin)
+                    .add_plugins(RefusesGenerated);
+            } else {
+                server
+                    .add_plugins(RefusesGenerated)
+                    .add_plugins(rules_plugin);
+            }
+            server.finish().await.unwrap();
+
+            let rules = server.get_global::<PermissionRules>().unwrap().clone();
+            let (decision, reason) = rules
+                .resolve("create_file", &json!({"path":"generated/api.rs"}))
+                .unwrap_or_else(|| panic!("{order}: no verdict"));
+            assert_eq!(decision, RuleDecision::Deny, "{order}");
+            assert_eq!(
+                reason,
+                "code rule \"no-generated-edits\": generated files are rewritten by the build",
+                "{order}"
+            );
+            // Other calls still follow the project's file.
+            let (decision, _) = rules
+                .resolve("create_file", &json!({"path":"src/api.rs"}))
+                .unwrap();
+            assert_ne!(decision, RuleDecision::Deny, "{order}");
+
+            // The command was registered before the rule was added, and still lists it.
+            let CommandOutcome::Reply(listing) = commands
+                .dispatch(&CommandInvocation::parse("/permissions").unwrap())
+                .await
+            else {
+                panic!("{order}: inspection replies");
+            };
+            assert!(
+                listing.contains("Code rules added by plugins:\n- \"no-generated-edits\""),
+                "{order}: {listing}"
+            );
+            assert!(listing.contains("polaris.permissions.toml"), "{listing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn code_rules_are_fixed_once_the_server_is_ready() {
+        let mut server = Server::new();
+        server
+            .add_plugins(ToolsPlugin)
+            .add_plugins(PermissionRulesPlugin::default())
+            .add_plugins(RefusesGenerated);
+        // While building, the rules are a mutable resource and not yet a global.
+        assert!(server.get_global::<PermissionRules>().is_none());
+        server.finish().await.unwrap();
+
+        assert!(server.get_resource_mut::<PermissionRules>().is_none());
+        let mut late = server.get_global::<PermissionRules>().unwrap().clone();
+        let error = late
+            .add_code_rule("too-late", |_, _, _| None)
+            .expect_err("the set is fixed after startup");
+        assert_eq!(error, CodeRuleError::Sealed("too-late".into()));
+        assert!(!late.describe().contains("too-late"));
+        // The rule added while building survived the move to a global.
+        assert!(late.describe().contains("no-generated-edits"));
+    }
+
+    #[tokio::test]
+    async fn the_default_plugin_without_files_still_applies_code_rules() {
+        let mut server = Server::new();
+        server
+            .add_plugins(ToolsPlugin)
+            .add_plugins(RefusesGenerated)
+            .add_plugins(PermissionRulesPlugin::default());
+        server.finish().await.unwrap();
+        let rules = server.get_global::<PermissionRules>().unwrap();
+        assert_eq!(
+            rules
+                .resolve("update_file", &json!({"path":"generated/x"}))
+                .unwrap()
+                .0,
+            RuleDecision::Deny
+        );
+        assert_eq!(rules.resolve("update_file", &json!({"path":"src/x"})), None);
+    }
 }
