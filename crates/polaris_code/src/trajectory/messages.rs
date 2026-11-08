@@ -2,7 +2,7 @@
 
 use polaris::models::llm::{AssistantBlock, Message, ToolResultContent, UserBlock};
 use serde_json::{Value, json};
-use std::io;
+use std::io::{self, Write};
 
 pub(super) fn step(document: &mut Value, source: &str, kind: &str) -> usize {
     let steps = document["steps"].as_array_mut().expect("steps array");
@@ -195,8 +195,45 @@ pub(super) fn store(document: &mut Value, id: usize, message: &Message) {
     step["extra"]["native_refs"] = json!(refs);
 }
 
+fn fail() -> io::Error {
+    io::Error::other("invalid trajectory message reference")
+}
+
+// Count JSON bytes without allocating another copy. Include reference metadata
+// and whole targets: load clones the target before taking any UTF-8 subrange.
+pub(super) fn check_size(document: &Value, id: usize, remaining: &mut usize) -> io::Result<()> {
+    struct Counter<'a>(&'a mut usize);
+    impl Write for Counter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            *self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| io::Error::other("trajectory message byte budget exceeded"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let step = document["steps"]
+        .get(id.checked_sub(1).ok_or_else(fail)?)
+        .ok_or_else(fail)?;
+    let native = step["extra"].get("native_message").ok_or_else(fail)?;
+    let refs = step["extra"]["native_refs"].as_array().ok_or_else(fail)?;
+    let mut counter = Counter(remaining);
+    serde_json::to_writer(&mut counter, native).map_err(io::Error::other)?;
+    serde_json::to_writer(&mut counter, refs).map_err(io::Error::other)?;
+    for reference in refs {
+        let pointer = reference["value"].as_str().ok_or_else(fail)?;
+        let value = document.pointer(pointer).ok_or_else(fail)?;
+        serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
 pub(super) fn load(document: &Value, id: usize) -> io::Result<Message> {
-    let fail = || io::Error::other("invalid trajectory message reference");
     let step = document["steps"]
         .get(id.checked_sub(1).ok_or_else(fail)?)
         .ok_or_else(fail)?;
