@@ -27,7 +27,7 @@ Add these direct dependencies to the application that runs the full example:
 ```toml
 [dependencies]
 polaris_code = "0.4.0"
-polaris = { package = "polaris-ai", version = "0.9.0", default-features = false, features = ["anthropic"] }
+polaris = { package = "polaris-ai", version = "0.9.1", default-features = false, features = ["anthropic"] }
 polaris_ontrace = { version = "0.3.0", default-features = false, features = ["oxigraph"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -64,7 +64,8 @@ An optional [`RunTrajectory`](crate::trajectory::RunTrajectory) records native
 provider calls as ATIF with shared message histories. Create it in the host
 before any model call, put a clone in `ModelRunOptions::trajectory`, insert
 another with `Server::insert_global` so tool results are recorded, and call
-`finish` when the run ends. Use
+`finish` when the run ends. `finish` also writes the tool results and messages
+recorded since the last model call; a hard kill before then can lose them. Use
 [`rebuild_request`](crate::trajectory::rebuild_request) to reconstruct a call's
 exact native input from its one-based step id, including compacted context.
 

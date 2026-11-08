@@ -5,6 +5,10 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Changed
+- Requires `polaris-ai` 0.9.1.
+- `--trajectory-path` and `RunTrajectory` no longer write the file for each tool result or message. They are queued in memory and written by the next model call or by `finish`, so they never block an async worker. A hard kill can lose the tool results and messages recorded since the last model call.
+
 ## [0.4.0] - 2026-11-08
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.0.

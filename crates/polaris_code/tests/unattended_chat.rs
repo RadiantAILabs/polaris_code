@@ -111,6 +111,8 @@ enum Script {
     Refuse,
     /// Read the request and never answer.
     Hang,
+    /// Tool calls first, then read the next request and never answer.
+    ToolCallsThenHang,
 }
 
 /// A loopback server that follows a [`Script`] and records every request.
@@ -147,7 +149,10 @@ impl Mock {
                             }
                             Script::ToolCalls => serve_final_answer(&mut stream),
                             Script::Refuse => serve_refusal(&mut stream),
-                            Script::Hang => {
+                            Script::ToolCallsThenHang if requests.len() == 1 => {
+                                serve_tool_calls(&mut stream, &outside)
+                            }
+                            Script::Hang | Script::ToolCallsThenHang => {
                                 while !server_stop.load(Ordering::Relaxed)
                                     && Instant::now() < deadline
                                 {
@@ -717,4 +722,48 @@ async fn sigterm_during_a_model_call_still_finalizes_the_trajectory() {
         calls[0]["extra"]["status"], "completed",
         "the interrupted call is not reported as complete"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_after_tools_ran_still_writes_their_results() {
+    let setup = Setup::new();
+    let trajectory = setup.trajectory();
+    let mock = Mock::start(Script::ToolCallsThenHang, setup.outside.clone());
+    let child = setup
+        .command(mock.address, &trajectory, false)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().expect("the CLI is running");
+    // The second request means the tools ran and their results are recorded.
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    while mock.received.load(Ordering::Relaxed) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the CLI never asked the model again"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let signalled = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success(), "kill -TERM failed");
+    let output = tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await;
+    mock.finish();
+    let output = output.expect("SIGTERM must stop the CLI").unwrap();
+    let code = output.status.code().expect("the CLI exits by itself");
+    assert_ne!(code, 0, "stderr: {}", stderr(&output));
+    let trace = read_trace(&trajectory);
+    assert_eq!(trace["extra"]["status"], "failed");
+    assert_eq!(trace["extra"]["exit_code"], code);
+    let calls = model_calls(&trace);
+    assert_eq!(calls.len(), 2, "both calls are recorded");
+    let results = calls[0]["observation"]["results"]
+        .as_array()
+        .expect("the first call's tool results are in the file");
+    assert!(!results.is_empty(), "{results:?}");
+    assert_ne!(calls[1]["extra"]["status"], "completed");
 }
