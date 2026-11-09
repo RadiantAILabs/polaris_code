@@ -44,10 +44,20 @@ use serde_json::Value;
 /// half from the end.
 pub const DEFAULT_STREAM_VIEW_CHARS: usize = 10_000;
 
-/// How much of each `run_command` output stream reaches the model.
+/// How much of each `run_command` output stream reaches the model and terminal.
 ///
-/// The terminal block and the trajectory are unaffected: the trajectory keeps
-/// the executor's document, and the overflow file keeps the whole stream.
+/// The trajectory keeps the executor's document, and the overflow file keeps
+/// the whole stream.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_code::tools::shell_render::StreamView;
+///
+/// let bounded = StreamView::bounded(2_000);
+/// assert_eq!(bounded.max_chars, Some(2_000));
+/// assert_eq!(StreamView::FULL.max_chars, None);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamView {
     /// Most characters of one stream shown, split between its start and its
@@ -77,9 +87,14 @@ impl Default for StreamView {
 
 /// Render `run_command`'s response for the model, or `None` if `value` is not
 /// one (in which case the caller keeps whatever the tool returned).
-pub(crate) fn render_run_command(value: &Value, view: StreamView) -> Option<String> {
+/// Captures and optional stdout/stderr tails must be redacted before rendering.
+pub(crate) fn render_run_command(
+    value: &Value,
+    view: StreamView,
+    tails: [Option<&str>; 2],
+) -> Option<String> {
     match value.get("status").and_then(Value::as_str)? {
-        "executed" => Some(render_executed(value, view)),
+        "executed" => Some(render_executed(value, view, tails)),
         // The shell's own policy wants an approval that never came. Say what
         // did *not* happen, so the model does not read an empty result as a
         // command that ran and printed nothing.
@@ -138,9 +153,9 @@ pub(crate) fn run_command_succeeded(value: &Value) -> bool {
 }
 
 /// A completed run, as the text it produced plus a status marker.
-fn render_executed(value: &Value, view: StreamView) -> String {
+fn render_executed(value: &Value, view: StreamView, tails: [Option<&str>; 2]) -> String {
     let mut out = String::new();
-    for (stream, truncated, overflow, label) in [
+    for ((stream, truncated, overflow, label), tail) in [
         ("stdout", "stdout_truncated", "stdout_overflow_path", None),
         (
             "stderr",
@@ -148,7 +163,10 @@ fn render_executed(value: &Value, view: StreamView) -> String {
             "stderr_overflow_path",
             Some("[stderr]\n"),
         ),
-    ] {
+    ]
+    .into_iter()
+    .zip(tails)
+    {
         let captured = text(value, stream);
         if captured.is_empty() {
             continue;
@@ -158,7 +176,7 @@ fn render_executed(value: &Value, view: StreamView) -> String {
         if let Some(label) = label {
             out.push_str(label);
         }
-        out.push_str(view_stream(captured, cut, path, view).trim_end_matches('\n'));
+        out.push_str(view_stream(captured, tail, view).trim_end_matches('\n'));
         out.push('\n');
         if cut {
             match path {
@@ -184,21 +202,16 @@ fn render_executed(value: &Value, view: StreamView) -> String {
 /// and last halves with an omission line between. When the capture was `cut`
 /// at the executor's cap and an overflow file holds the whole stream, the
 /// last half comes from that file, so the real end of the output is shown.
-fn view_stream(captured: &str, cut: bool, overflow: Option<&str>, view: StreamView) -> String {
+fn view_stream(captured: &str, tail: Option<&str>, view: StreamView) -> String {
     let Some(budget) = view.max_chars else {
         return captured.to_string();
     };
     let half = budget / 2;
-    let file_tail = if cut {
-        overflow.and_then(|path| file_tail(path, half))
-    } else {
-        None
-    };
-    match file_tail {
+    match tail {
         Some(tail) => format!(
             "{}\n[... middle of the output omitted ...]\n{}",
             head_chars(captured, half),
-            tail
+            tail_chars(tail.trim_end_matches('\n'), half)
         ),
         None => {
             let total = captured.chars().count();
@@ -242,18 +255,75 @@ fn tail_chars(text: &str, chars: usize) -> &str {
     }
 }
 
-/// The last `chars` characters of the file at `path`, or `None` when it cannot
-/// be read. Reads at most four bytes per character from the end, so a large
-/// overflow file costs one bounded read.
+/// Read bounded overflow windows off the async worker. The caller must redact
+/// these windows and the captured streams before passing them to the renderer.
+pub(crate) async fn overflow_tails(value: &Value, view: StreamView) -> [Option<String>; 2] {
+    let Some(budget) = view.max_chars else {
+        return [None, None];
+    };
+    let paths = [
+        ("stdout_truncated", "stdout_overflow_path"),
+        ("stderr_truncated", "stderr_overflow_path"),
+    ]
+    .map(|(cut, path)| {
+        (value.get(cut).and_then(Value::as_bool) == Some(true))
+            .then(|| value.get(path).and_then(Value::as_str).map(String::from))
+            .flatten()
+    });
+    if paths.iter().all(Option::is_none) {
+        return [None, None];
+    }
+    tokio::task::spawn_blocking(move || {
+        paths.map(|path| path.and_then(|path| file_tail(&path, budget / 2)))
+    })
+    .await
+    .unwrap_or([None, None])
+}
+
+/// Read at most four bytes per requested character. Discard a leading partial
+/// line so its missing assignment label cannot hide a secret from redaction.
+/// Character selection happens only after the caller redacts the whole window.
 fn file_tail(path: &str, chars: usize) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    read_tail_window(file, metadata.len(), chars)
+}
+
+/// The length is a snapshot: a writer may append before or during this read.
+fn read_tail_window(mut file: impl Read + Seek, len: u64, chars: usize) -> Option<String> {
     let want = u64::try_from(chars.saturating_mul(4)).ok()?.min(len);
     file.seek(SeekFrom::Start(len - want)).ok()?;
     let mut bytes = Vec::with_capacity(usize::try_from(want).ok()?);
-    file.read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    Some(tail_chars(text.trim_end_matches('\n'), chars).to_string())
+    file.take(want).read_to_end(&mut bytes).ok()?;
+    let bytes = if want < len {
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => &bytes[newline + 1..],
+            None => &[],
+        }
+    } else {
+        &bytes
+    };
+    let text = String::from_utf8_lossy(bytes);
+    // A private-key record spans lines. If its first delimiter is a footer,
+    // the header was outside this window; withhold the incomplete record.
+    let mut end = 0;
+    if want < len {
+        for line in text.split_inclusive('\n') {
+            end += line.len();
+            if line.contains("PRIVATE KEY-----") {
+                if line.contains("-----END ") {
+                    return Some(text[end..].to_string());
+                }
+                if line.contains("-----BEGIN ") {
+                    break;
+                }
+            }
+        }
+    }
+    Some(text.into_owned())
 }
 
 /// How the run ended, in the terms the model's next decision turns on.
@@ -356,7 +426,7 @@ mod tests {
     }
 
     fn render_run_command_full(value: &Value) -> Option<String> {
-        render_run_command(value, StreamView::FULL)
+        render_run_command(value, StreamView::FULL, [None, None])
     }
 
     /// The executor's document for a run that wrote to both streams and failed.
@@ -479,8 +549,12 @@ mod tests {
     #[test]
     fn a_long_stream_keeps_its_start_and_end() {
         let stdout: String = (0..2_000).map(|n| format!("line {n}\n")).collect();
-        let rendered =
-            render_run_command(&executed(&stdout, "", Some(1)), StreamView::bounded(200)).unwrap();
+        let rendered = render_run_command(
+            &executed(&stdout, "", Some(1)),
+            StreamView::bounded(200),
+            [None, None],
+        )
+        .unwrap();
         assert!(rendered.starts_with("line 0\n"), "{rendered}");
         assert!(rendered.contains("line 1999\n[exit code: 1]"), "{rendered}");
         assert!(rendered.contains("characters omitted"), "{rendered}");
@@ -490,13 +564,17 @@ mod tests {
 
     #[test]
     fn a_stream_within_the_budget_is_shown_whole() {
-        let rendered =
-            render_run_command(&executed("a\nb\n", "", Some(0)), StreamView::bounded(200)).unwrap();
+        let rendered = render_run_command(
+            &executed("a\nb\n", "", Some(0)),
+            StreamView::bounded(200),
+            [None, None],
+        )
+        .unwrap();
         assert_eq!(rendered, "a\nb\n[exit code: 0]");
     }
 
-    #[test]
-    fn a_cut_capture_takes_its_end_from_the_overflow_file() {
+    #[tokio::test]
+    async fn a_cut_capture_takes_its_end_from_the_overflow_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.stdout");
         let whole: String = (0..5_000).map(|n| format!("row {n}\n")).collect();
@@ -504,7 +582,13 @@ mod tests {
         let mut value = executed(&whole[..1_000], "", Some(1));
         value["stdout_truncated"] = json!(true);
         value["stdout_overflow_path"] = json!(path.to_str().unwrap());
-        let rendered = render_run_command(&value, StreamView::bounded(200)).unwrap();
+        let tails = overflow_tails(&value, StreamView::bounded(200)).await;
+        let rendered = render_run_command(
+            &value,
+            StreamView::bounded(200),
+            [tails[0].as_deref(), tails[1].as_deref()],
+        )
+        .unwrap();
         assert!(rendered.starts_with("row 0\n"), "{rendered}");
         assert!(
             rendered.contains("row 4999\n[stdout truncated"),
@@ -519,11 +603,131 @@ mod tests {
     #[test]
     fn a_multibyte_stream_is_cut_on_character_boundaries() {
         let stdout = "é".repeat(1_000);
-        let rendered =
-            render_run_command(&executed(&stdout, "", Some(0)), StreamView::bounded(10)).unwrap();
+        let rendered = render_run_command(
+            &executed(&stdout, "", Some(0)),
+            StreamView::bounded(10),
+            [None, None],
+        )
+        .unwrap();
         assert!(
             rendered.starts_with("ééééé\n[... 990 characters omitted ...]\nééééé\n"),
             "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_overflow_file_falls_back_to_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = executed("first\nlast\n", "", Some(3));
+        value["stdout_truncated"] = json!(true);
+        value["stdout_overflow_path"] = json!(dir.path().join("missing.stdout"));
+        let tails = overflow_tails(&value, StreamView::bounded(200)).await;
+        let rendered = render_run_command(
+            &value,
+            StreamView::bounded(200),
+            [tails[0].as_deref(), tails[1].as_deref()],
+        )
+        .unwrap();
+        assert!(rendered.starts_with("first\nlast\n"), "{rendered}");
+        assert!(rendered.ends_with("[exit code: 3]"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_multibyte_file_tail_preserves_the_real_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.stdout");
+        let whole = format!("{}終わり\n", "ééé\n".repeat(1000));
+        std::fs::write(&path, &whole).unwrap();
+        let mut value = executed("start\n", "", Some(0));
+        value["stdout_truncated"] = json!(true);
+        value["stdout_overflow_path"] = json!(path);
+        let tails = overflow_tails(&value, StreamView::bounded(20)).await;
+        let rendered = render_run_command(
+            &value,
+            StreamView::bounded(20),
+            [tails[0].as_deref(), tails[1].as_deref()],
+        )
+        .unwrap();
+        assert!(rendered.starts_with("start\n"), "{rendered}");
+        assert!(rendered.contains("終わり\n[stdout truncated"), "{rendered}");
+        assert!(!rendered.contains('�'), "{rendered}");
+        assert!(rendered.ends_with("[exit code: 0]"), "{rendered}");
+    }
+
+    #[test]
+    fn a_tail_read_drops_a_leading_partial_assignment() {
+        let output = format!("PASSWORD={}hunter2\nFINAL ERROR\n", "x".repeat(1000));
+        let tail = read_tail_window(
+            std::io::Cursor::new(output.as_bytes()),
+            output.len() as u64,
+            20,
+        )
+        .unwrap();
+        assert_eq!(tail, "FINAL ERROR\n");
+    }
+
+    #[test]
+    fn a_tail_read_withholds_a_key_whose_header_is_outside_the_window() {
+        let output = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}-----END PRIVATE KEY-----\nFINAL ERROR\n",
+            "private-payload\n".repeat(1000),
+        );
+        let tail = read_tail_window(
+            std::io::Cursor::new(output.as_bytes()),
+            output.len() as u64,
+            100,
+        )
+        .unwrap();
+        assert_eq!(tail, "FINAL ERROR\n");
+    }
+
+    #[test]
+    fn a_tail_read_stops_at_the_length_snapshot_even_if_the_file_grows() {
+        let before = "old line\n".repeat(100);
+        let grown = format!("{before}{}", "appended line\n".repeat(1000));
+        let tail = read_tail_window(std::io::Cursor::new(grown), before.len() as u64, 10).unwrap();
+        assert!(tail.ends_with("old line\n"), "{tail}");
+        assert!(!tail.contains("appended"), "{tail}");
+        assert!(tail.len() <= 40, "the read stays within its byte budget");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn overflow_reads_do_not_block_the_async_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        // Opening the FIFO waits for the writer. A separate thread releases
+        // even a blocked runtime, so a regression fails instead of hanging.
+        let writer = std::thread::spawn(move || {
+            let progressed = rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            let _writer = std::fs::File::create(writer_path).unwrap();
+            progressed
+        });
+        let value = json!({
+            "stdout_truncated": true,
+            "stdout_overflow_path": path,
+        });
+        let (tails, ()) = tokio::join!(overflow_tails(&value, StreamView::default()), async {
+            tokio::task::yield_now().await;
+            let _ = tx.send(());
+        },);
+        assert!(
+            writer.join().unwrap(),
+            "the async worker must keep making progress during open"
+        );
+        assert_eq!(
+            tails,
+            [None, None],
+            "non-regular files use the captured fallback"
         );
     }
 }

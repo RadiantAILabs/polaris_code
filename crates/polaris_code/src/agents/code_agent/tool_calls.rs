@@ -11,6 +11,8 @@
 
 use std::collections::VecDeque;
 
+use serde_json::Value;
+
 use super::*;
 use crate::agents::human_approval::HumanApproval;
 use crate::agents::permission_rules::{ApprovalAnswer, ApprovalReceipt};
@@ -815,19 +817,33 @@ pub(crate) async fn execute_call(
                     .as_str()
                     .map(String::from)
                     .unwrap_or_else(|| value.to_string());
-                // The one seam, applied to both strings: everything
-                // downstream — the log line below, the terminal block, the
-                // reified `ToolCall` in the Session `ABox`, and the
-                // provider-bound `UserBlock` — is built from these two and
-                // nothing else. The rendering is scanned in its own right
-                // because it is re-read from the raw response, not from
-                // the scanned text.
                 let observed = redact_tool_output(redactor, name, observed);
-                let output = (name == "run_command")
-                    .then(|| render_run_command(&value, stream_view))
-                    .flatten()
+                let output = if name == "run_command" {
+                    let mut sanitized = value.clone();
+                    // Scan complete captures before omission can remove an
+                    // assignment name or private-key header from its value.
+                    for stream in ["stdout", "stderr"] {
+                        if let Some(text) = sanitized.get(stream).and_then(Value::as_str) {
+                            let text = redact_tool_output(redactor, name, text.to_string());
+                            sanitized[stream] = Value::String(text);
+                        }
+                    }
+                    let mut tails =
+                        crate::tools::shell_render::overflow_tails(&value, stream_view).await;
+                    for tail in tails.iter_mut().flatten() {
+                        *tail = redact_tool_output(redactor, name, std::mem::take(tail));
+                    }
+                    render_run_command(
+                        &sanitized,
+                        stream_view,
+                        [tails[0].as_deref(), tails[1].as_deref()],
+                    )
+                    // Scan again as a backstop for metadata and status text.
                     .map(|rendered| redact_tool_output(redactor, name, rendered))
-                    .unwrap_or_else(|| observed.clone());
+                    .unwrap_or_else(|| observed.clone())
+                } else {
+                    observed.clone()
+                };
                 tracing::info!("Observation: {observed}");
                 // The terminal block shows a command the way a shell
                 // would — real lines, collapsed behind its exit status
