@@ -443,6 +443,7 @@ async fn refusals_and_usage_errors_return_exit_codes() {
             assert!(launch.is_headless());
             assert!(launch.working_dir().is_absolute());
             assert!(options.auto_route);
+            assert!(options.model_request_timeout.is_none());
             options.auto_route = false;
             seen.fetch_add(1, Ordering::SeqCst);
             Err("early validation refused the host settings".into())
@@ -452,6 +453,17 @@ async fn refusals_and_usage_errors_return_exit_codes() {
         .await;
     assert_eq!(code, 2);
     assert_eq!(checked.load(Ordering::SeqCst), 1);
+
+    // A host timeout follows the same provider validation as the stock setting.
+    let code = host(&script)
+        .configure(|_, options| {
+            options.model_request_timeout = Some("12".parse().unwrap());
+            Ok(())
+        })
+        .run(command_line(root.path(), &["--provider", "anthropic"]))
+        .await;
+    assert_eq!(code, 2, "the host fallback must reach provider validation");
+    assert!(script.requests.lock().unwrap().is_empty());
 
     // A closure that returns an error refuses the run.
     let code = Host::new()

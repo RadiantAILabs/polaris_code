@@ -238,11 +238,18 @@ pub struct LaunchOptions {
     /// Recognize ordinary prompts that can be served by a coding topology.
     /// Explicit `--topology-task` and topology pins remain available.
     pub auto_route: bool,
+    /// Fallback model-request timeout supplied by a host. An explicit stock
+    /// flag, environment value or configuration-file setting wins. Subject to
+    /// the selected provider's usual validation. `None` keeps provider defaults.
+    pub model_request_timeout: Option<providers::ModelRequestTimeout>,
 }
 
 impl Default for LaunchOptions {
     fn default() -> Self {
-        Self { auto_route: true }
+        Self {
+            auto_route: true,
+            model_request_timeout: None,
+        }
     }
 }
 
@@ -753,11 +760,14 @@ type ExecIo = (
 /// start it.
 async fn prepare(
     host: Host,
-    cli: Cli,
+    mut cli: Cli,
     startup: Startup,
     launch: &Launch<'_>,
     permissions: (PermissionMode, Option<PermissionCeiling>),
 ) -> Result<(Server, Run), Refusal> {
+    cli.model_request_timeout_secs = cli
+        .model_request_timeout_secs
+        .or(launch.options.model_request_timeout);
     let headless = launch.headless;
     let working_dir = launch.working_dir.to_path_buf();
     let (permission_mode, permission_ceiling) = permissions;

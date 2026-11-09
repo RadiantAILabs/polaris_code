@@ -7,6 +7,8 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 
+- Let host startup callbacks supply a fallback model-request timeout below explicit stock settings.
+
 - Add optional observation of collected model attempts and classified turn outcomes for host recorders.
 
 - Add an opt-in canonical conversation message ceiling, independent of context projection and the turn limit.
