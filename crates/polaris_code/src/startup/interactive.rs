@@ -59,7 +59,7 @@ pub(super) struct Driver {
 }
 
 impl Driver {
-    /// Spawn the loop. It runs one ReAct turn per user submission, and ends
+    /// Spawn the loop. It runs one agent turn per user submission, and ends
     /// when the session stops taking turns or the process exits.
     pub(super) fn spawn(self) -> tokio::task::JoinHandle<()> {
         let Self {
