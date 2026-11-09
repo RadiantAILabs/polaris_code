@@ -68,6 +68,24 @@ const LOG_TARGETS: [&str; 1] = ["polaris"];
 /// # }
 /// ```
 pub fn add_shell_tabs(server: &mut Server, log_buffer: LogBuffer, agent: &impl Agent) {
+    add_tabs(server, log_buffer, GraphViewPlugin::for_agent(agent));
+}
+
+/// Adds the shell's tabs other than the conversation, with the Graph tab
+/// showing the coding agent as plugins extended it.
+///
+/// This is [`add_shell_tabs`] for a host that registers
+/// [`CodeAgent::with_steps`](crate::agents::CodeAgent::with_steps): the tab
+/// draws the graph built from the step registry once every plugin has built, so
+/// steps that plugins add appear in it. With no steps added the graph is the
+/// stock one. Everything else, including the requirements and the tab order, is
+/// as for [`add_shell_tabs`]. The server also needs
+/// [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin), which owns the registry.
+pub fn add_code_agent_shell_tabs(server: &mut Server, log_buffer: LogBuffer) {
+    add_tabs(server, log_buffer, GraphViewPlugin::for_code_agent_steps());
+}
+
+fn add_tabs(server: &mut Server, log_buffer: LogBuffer, graph: GraphViewPlugin) {
     server
         .add_plugins(HelpPanelPlugin)
         .add_plugins(
@@ -76,5 +94,5 @@ pub fn add_shell_tabs(server: &mut Server, log_buffer: LogBuffer, agent: &impl A
                 .without_panel(),
         )
         .add_plugins(GraphPanelPlugin::default())
-        .add_plugins(GraphViewPlugin::for_agent(agent));
+        .add_plugins(graph);
 }

@@ -4,15 +4,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::agents::{PermissionCeiling, PermissionMode};
+use crate::project_trust::{MAX_FILE_BYTES, ProjectTrust, STORE_FILE, Subject, read_content};
 use clap::{CommandFactory, FromArgMatches, ValueEnum};
-use polaris_code::agents::{PermissionCeiling, PermissionMode};
-use polaris_code::project_trust::{
-    MAX_FILE_BYTES, ProjectTrust, STORE_FILE, Subject, read_content,
-};
 use polaris_cosmos::contracts::ContentDigest;
 use toml_edit::{DocumentMut, Item, TableLike};
 
-#[path = "terminal/status_command.rs"]
 mod status_command;
 
 /// Resolved launch inputs and the files that supplied them.
@@ -45,8 +42,8 @@ impl Startup {
     /// wins, then the files, then `fallback`.
     pub(crate) fn catalog(
         &self,
-        fallback: polaris_code::config::ModelCatalog,
-    ) -> polaris_code::config::ModelCatalog {
+        fallback: crate::config::ModelCatalog,
+    ) -> crate::config::ModelCatalog {
         let lookup = |name: &str| {
             std::env::var(name)
                 .ok()
@@ -63,17 +60,17 @@ impl Startup {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        polaris_code::config::ModelCatalog::from_lookup(fallback.default_model(), &builtin, &lookup)
+        crate::config::ModelCatalog::from_lookup(fallback.default_model(), &builtin, &lookup)
     }
 
     pub(crate) fn register_status(
         self,
-        commands: &polaris_code::terminal::CommandRegistry,
-        settings: &polaris_code::terminal::SessionSettings,
-        navigation: &polaris_code::terminal::SessionNavigation,
+        commands: &crate::terminal::CommandRegistry,
+        settings: &crate::terminal::SessionSettings,
+        navigation: &crate::terminal::SessionNavigation,
         workspace: &Path,
-        report: polaris_code::providers::ProviderReport,
-    ) -> Result<(), polaris_code::terminal::CommandError> {
+        report: crate::providers::ProviderReport,
+    ) -> Result<(), crate::terminal::CommandError> {
         status_command::register(commands, settings, navigation, workspace, self, report)
     }
 }
@@ -138,48 +135,83 @@ const KEYS: &[Key] = &[
     ),
 ];
 
-fn command() -> clap::Command {
-    super::Cli::command().arg(
-        clap::Arg::new("profile")
-            .long("profile")
-            .value_name("NAME")
-            .help("Select a named profile from the user and project configuration files"),
-    )
+fn command(extra: &[clap::Arg]) -> clap::Command {
+    super::cli::Cli::command()
+        .arg(
+            clap::Arg::new("profile")
+                .long("profile")
+                .value_name("NAME")
+                .help("Select a named profile from the user and project configuration files"),
+        )
+        .args(extra.iter().cloned())
+}
+
+/// What `load` returns: the parsed command line, the configuration it was
+/// resolved against, and the raw matches a host reads its own arguments from.
+pub(crate) type Loaded = (super::cli::Cli, Startup, clap::ArgMatches);
+
+/// Why launch inputs could not be resolved.
+#[derive(Debug)]
+pub(crate) enum LoadError {
+    /// The command line is not valid, or asked for `--help` or `--version`.
+    Usage(clap::Error),
+    /// A configuration or environment file is not usable.
+    Config(String),
+}
+
+impl From<String> for LoadError {
+    fn from(message: String) -> Self {
+        Self::Config(message)
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usage(error) => write!(f, "{error}"),
+            Self::Config(message) => f.write_str(message),
+        }
+    }
 }
 
 /// Resolve launch inputs through the existing CLI and limit validators.
-pub(crate) fn load() -> (super::Cli, Startup) {
-    let cwd = std::env::current_dir().unwrap_or_else(|err| fail(err));
+///
+/// `argv` is the whole command line, program name first. `extra` are the
+/// arguments a host adds to the ones `polaris` defines; they are parsed with
+/// the rest and left in the returned matches.
+pub(crate) fn load(argv: Vec<OsString>, extra: &[clap::Arg]) -> Result<Loaded, LoadError> {
+    let cwd = std::env::current_dir().map_err(|err| LoadError::Config(err.to_string()))?;
     let path = cwd.join(".env");
-    let dotenv = match read_dotenv(&cwd).unwrap_or_else(|err| fail(err)) {
+    let dotenv = match read_dotenv(&cwd)? {
         Some(file) => {
             let is_set = |key: &str| std::env::var_os(key).is_some();
             // The launch directory is project-controlled. Refuse before applying
             // anything, so the file cannot choose where the user's own
             // configuration, credentials and trust decisions are read from.
             if let Some(key) = reserved_key(&file.entries, is_set) {
-                fail(format!(
+                return Err(LoadError::Config(format!(
                     "{}: the environment file may not set {key}; set it in your shell or in \
                      your user configuration instead",
                     path.display()
-                ));
+                )));
             }
             // Apply the bytes that were checked, not a second read of the file.
-            dotenvy::from_read(file.bytes.as_slice())
-                .unwrap_or_else(|_| fail(format!("{}: invalid environment file", path.display())));
+            dotenvy::from_read(file.bytes.as_slice()).map_err(|_| {
+                LoadError::Config(format!("{}: invalid environment file", path.display()))
+            })?;
             eprintln!("Loaded environment file {}", path.display());
             Some(path)
         }
         None => None,
     };
-    let (cli, mut startup) = load_from(
-        std::env::args_os().collect(),
+    let (cli, mut startup, matches) = load_from(
+        argv,
         std::env::vars_os().collect(),
         user_config_path().ok(),
-    )
-    .unwrap_or_else(|err| fail(err));
+        extra,
+    )?;
     startup.dotenv = dotenv;
-    (cli, startup)
+    Ok((cli, startup, matches))
 }
 
 /// Variables a project's `.env` may not set: they choose where user-owned
@@ -206,14 +238,15 @@ fn load_from(
     argv: Vec<OsString>,
     environment: BTreeMap<OsString, OsString>,
     user: Option<PathBuf>,
-) -> Result<(super::Cli, Startup), String> {
-    let preliminary = command()
+    extra: &[clap::Arg],
+) -> Result<Loaded, LoadError> {
+    let preliminary = command(extra)
         .try_get_matches_from(argv.clone())
-        .unwrap_or_else(|err| err.exit());
-    let workspace = preliminary
-        .get_one::<PathBuf>("working_dir")
-        .cloned()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|err| fail(err)));
+        .map_err(LoadError::Usage)?;
+    let workspace = match preliminary.get_one::<PathBuf>("working_dir").cloned() {
+        Some(directory) => directory,
+        None => std::env::current_dir().map_err(|err| LoadError::Config(err.to_string()))?,
+    };
     let workspace = workspace
         .canonicalize()
         .map_err(|err| format!("{}: {err}", workspace.display()))?;
@@ -229,9 +262,7 @@ fn load_from(
         profile: profile.clone(),
         config_directory,
         config_dir_explicit: environment
-            .get(std::ffi::OsStr::new(
-                polaris_code::config_dir::CONFIG_DIR_VAR,
-            ))
+            .get(std::ffi::OsStr::new(crate::config_dir::CONFIG_DIR_VAR))
             .is_some_and(|value| !value.is_empty()),
         trust: trust.clone(),
         ..Startup::default()
@@ -288,10 +319,11 @@ fn load_from(
     {
         return Err(format!(
             "profile `{profile}` was not found in the user or project configuration"
-        ));
+        )
+        .into());
     }
     let resolved = resolve(&startup.settings, &environment, &preliminary);
-    let mut command = command();
+    let mut command = command(extra);
     for key in KEYS {
         let Some(setting) = resolved.get(key.name) else {
             continue;
@@ -304,15 +336,10 @@ fn load_from(
     }
     let mut matches = command
         .try_get_matches_from(argv)
-        .unwrap_or_else(|err| err.exit());
+        .map_err(LoadError::Usage)?;
     matches.remove_one::<String>("profile");
-    let cli = super::Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
-    Ok((cli, startup))
-}
-
-fn fail(error: impl std::fmt::Display) -> ! {
-    eprintln!("Configuration error: {error}");
-    std::process::exit(2)
+    let cli = super::cli::Cli::from_arg_matches(&matches).map_err(LoadError::Usage)?;
+    Ok((cli, startup, matches))
 }
 
 /// Why a user setting could not be saved.
@@ -390,7 +417,7 @@ impl From<SettingsError> for String {
 
 /// Resolve the user configuration file in the shared configuration directory.
 pub(crate) fn user_config_path() -> Result<PathBuf, SettingsError> {
-    polaris_code::config_dir::config_file("config.toml").ok_or(SettingsError::NoConfigDir)
+    crate::config_dir::config_file("config.toml").ok_or(SettingsError::NoConfigDir)
 }
 
 /// Persist one validated user setting, preserving unrelated TOML content.
@@ -490,7 +517,7 @@ fn resolve(
 fn loosening(user: &Settings, project: &Settings) -> Vec<&'static str> {
     let mode = |settings: &Settings, key: &str| {
         settings.get(key).and_then(|setting| {
-            super::InteractivePermissionMode::from_str(&setting.value, true)
+            super::cli::InteractivePermissionMode::from_str(&setting.value, true)
                 .ok()
                 .map(PermissionMode::from)
         })
@@ -676,10 +703,10 @@ fn setting_text(key: &str, item: &Item) -> Option<String> {
 fn validate(key: &str, value: &str) -> Result<(), String> {
     match key {
         "model_request_timeout_secs" => value
-            .parse::<polaris_code::providers::ModelRequestTimeout>()
+            .parse::<crate::providers::ModelRequestTimeout>()
             .map(|_| ()),
-        "max_turns" => super::resolve_max_turns(Some(value)).map(|_| ()),
-        "max_output_tokens" => super::resolve_max_output_tokens(Some(value)).map(|_| ()),
+        "max_turns" => super::cli::resolve_max_turns(Some(value)).map(|_| ()),
+        "max_output_tokens" => super::cli::resolve_max_output_tokens(Some(value)).map(|_| ()),
         "context_window" => value
             .trim()
             .parse::<std::num::NonZeroU32>()
@@ -687,20 +714,20 @@ fn validate(key: &str, value: &str) -> Result<(), String> {
             .map_err(|_| "POLARIS_CODE_CONTEXT_WINDOW must be a positive integer".to_string()),
         "max_cost_usd" => {
             let value = value.parse::<f64>().map_err(|err| err.to_string())?;
-            polaris_code::usage::RunCeiling::from_limits(Some(value), None)
+            crate::usage::RunCeiling::from_limits(Some(value), None)
                 .map(|_| ())
                 .map_err(|err| err.to_string())
         }
         "max_tokens" => {
             let value = value.parse::<u64>().map_err(|err| err.to_string())?;
-            polaris_code::usage::RunCeiling::from_limits(None, Some(value))
+            crate::usage::RunCeiling::from_limits(None, Some(value))
                 .map(|_| ())
                 .map_err(|err| err.to_string())
         }
         "provider" | "permission_mode" | "permission_ceiling" => {
             // Reuse clap's parser, including provider variants contributed by the host.
             let flag = key.replace('_', "-");
-            super::Cli::command()
+            super::cli::Cli::command()
                 .try_get_matches_from(["polaris", &format!("--{flag}={value}")])
                 .map(|_| ())
                 .map_err(|err| err.to_string())
@@ -751,7 +778,7 @@ mod tests {
             &self,
             flags: &[&str],
             environment: &[(&str, &str)],
-        ) -> Result<(super::super::Cli, Startup), String> {
+        ) -> Result<(super::super::cli::Cli, Startup), String> {
             let mut argv = vec!["polaris".into(), self.workspace.clone().into_os_string()];
             argv.extend(flags.iter().map(OsString::from));
             let mut env = BTreeMap::from([(
@@ -763,14 +790,21 @@ mod tests {
                     .iter()
                     .map(|(key, value)| (key.into(), value.into())),
             );
-            let directory = polaris_code::config_dir::resolve(
+            let directory = crate::config_dir::resolve(
                 env.get(std::ffi::OsStr::new("POLARIS_CONFIG_DIR"))
                     .map(PathBuf::from),
                 env.get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
                     .map(PathBuf::from),
                 env.get(std::ffi::OsStr::new("HOME")).map(PathBuf::from),
             );
-            load_from(argv, env, directory.map(|path| path.join("config.toml")))
+            load_from(
+                argv,
+                env,
+                directory.map(|path| path.join("config.toml")),
+                &[],
+            )
+            .map(|(cli, startup, _)| (cli, startup))
+            .map_err(|error| error.to_string())
         }
     }
 
@@ -830,7 +864,7 @@ mod tests {
         assert_eq!(cli.max_turns, Some(40));
         assert!(matches!(
             cli.permission_mode,
-            Some(super::super::InteractivePermissionMode::Plan)
+            Some(super::super::cli::InteractivePermissionMode::Plan)
         ));
         assert_eq!(startup.profile.as_deref(), Some("careful"));
         let (cli, _) = fixture.load(&[], &[]).unwrap();
@@ -871,7 +905,7 @@ mod tests {
 
         for value in ["", "0", "-1", "+1", "1.5", "86401", "abc"] {
             let fixture = Fixture::new();
-            let error = super::super::Cli::try_parse_from([
+            let error = super::super::cli::Cli::try_parse_from([
                 "polaris",
                 &format!("--model-request-timeout-secs={value}"),
             ])
@@ -934,7 +968,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.project("provider = 'bedrock'\nmodel = 'bedrock/custom'\nmodels = ['bedrock/other', 'bedrock/custom']\nregion = 'us-test-1'\npermission_mode = 'plan'\npermission_ceiling = 'confirm'\nmax_cost_usd = 1.5\nmax_tokens = 2500\nmax_turns = 7\nmax_output_tokens = 1200\n");
         let (cli, startup) = fixture.load(&[], &[]).unwrap();
-        assert_eq!(cli.provider, super::super::Provider::Bedrock);
+        assert_eq!(cli.provider, crate::providers::Provider::Bedrock);
         assert_eq!(cli.model.as_deref(), Some("bedrock/custom"));
         assert_eq!(cli.region.as_deref(), Some("us-test-1"));
         assert_eq!(cli.max_cost_usd, Some(1.5));
@@ -943,7 +977,7 @@ mod tests {
         assert_eq!(cli.max_output_tokens.unwrap().get(), 1200);
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
         assert_eq!(
             startup.settings["models"].value,
@@ -967,7 +1001,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             cli.permission_mode,
-            Some(super::super::InteractivePermissionMode::AutoEdit)
+            Some(super::super::cli::InteractivePermissionMode::AutoEdit)
         ));
         assert_eq!(cli.max_turns, Some(11));
         assert_eq!(cli.max_output_tokens.unwrap().get(), 600);
@@ -1166,11 +1200,11 @@ mod tests {
         let (cli, startup) = fixture.load(&[], &[]).unwrap();
         assert!(matches!(
             cli.permission_mode,
-            Some(super::super::InteractivePermissionMode::Plan)
+            Some(super::super::cli::InteractivePermissionMode::Plan)
         ));
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
         // Settings that are not about permissions still apply.
         assert_eq!(cli.max_turns, Some(5));
@@ -1191,7 +1225,7 @@ mod tests {
         assert!(cli.permission_mode.is_none());
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
         assert!(!startup.notices.is_empty());
         // The same overlay is not read without its profile.
@@ -1207,11 +1241,11 @@ mod tests {
         let (cli, startup) = fixture.load(&[], &[]).unwrap();
         assert!(matches!(
             cli.permission_mode,
-            Some(super::super::InteractivePermissionMode::Plan)
+            Some(super::super::cli::InteractivePermissionMode::Plan)
         ));
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
         assert!(startup.notices.is_empty(), "{:?}", startup.notices);
     }
@@ -1227,7 +1261,7 @@ mod tests {
         let (cli, _) = fixture.load(&[], &[]).unwrap();
         assert!(matches!(
             cli.permission_mode,
-            Some(super::super::InteractivePermissionMode::Plan)
+            Some(super::super::cli::InteractivePermissionMode::Plan)
         ));
     }
 
@@ -1239,13 +1273,13 @@ mod tests {
         let (cli, _) = fixture.load(&[], &[]).unwrap();
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
         trust_project_settings(&fixture);
         let (cli, startup) = fixture.load(&[], &[]).unwrap();
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::AutoEdit)
+            Some(super::super::cli::InteractivePermissionMode::AutoEdit)
         ));
         assert!(startup.notices.is_empty(), "{:?}", startup.notices);
         // Any change to the file ends the trust that was given to the old text.
@@ -1253,7 +1287,7 @@ mod tests {
         let (cli, startup) = fixture.load(&[], &[]).unwrap();
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
         assert!(!startup.notices.is_empty());
     }
@@ -1273,11 +1307,16 @@ mod tests {
         .unwrap();
         let argv = vec!["polaris".into(), other.into_os_string()];
         let environment = BTreeMap::new();
-        let (cli, _) =
-            load_from(argv, environment, Some(fixture.user.join("config.toml"))).unwrap();
+        let (cli, _, _) = load_from(
+            argv,
+            environment,
+            Some(fixture.user.join("config.toml")),
+            &[],
+        )
+        .unwrap();
         assert!(matches!(
             cli.permission_ceiling,
-            Some(super::super::InteractivePermissionMode::Confirm)
+            Some(super::super::cli::InteractivePermissionMode::Confirm)
         ));
     }
 
@@ -1345,7 +1384,7 @@ mod tests {
 
     #[test]
     fn config_location_uses_explicit_directory_then_xdg_then_home() {
-        use polaris_code::config_dir::resolve;
+        use crate::config_dir::resolve;
 
         for (explicit, xdg, home, expected) in [
             (
@@ -1409,7 +1448,7 @@ mod tests {
 
     #[test]
     fn files_choose_the_default_model_and_the_declared_models() {
-        use polaris_code::config::ModelCatalog;
+        use crate::config::ModelCatalog;
         let fixture = Fixture::new();
         let fallback = || ModelCatalog::new("fallback/default", ["fallback/default", "fallback/b"]);
 
