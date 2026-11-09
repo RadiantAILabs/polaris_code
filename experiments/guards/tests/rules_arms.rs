@@ -1315,7 +1315,8 @@ async fn graph_feedback_counts_and_equality_blocks_only_the_next_model_call() {
 
 #[tokio::test]
 async fn enabling_a_nonbinding_message_limit_preserves_every_request_in_every_arm() {
-    let copy_path = regex::Regex::new(r"/tmp/polaris-check-[A-Za-z0-9]+").unwrap();
+    // Only the copy's random name differs; the temporary directory is the same.
+    let copy_path = regex::Regex::new(r"polaris-check-[A-Za-z0-9]+").unwrap();
     for arm in [Arm::None, Arm::Prompt, Arm::PerCall, Arm::Steps, Arm::Moved] {
         let script = || {
             vec![
@@ -1340,7 +1341,7 @@ async fn enabling_a_nonbinding_message_limit_preserves_every_request_in_every_ar
             let normalize = |text: String, workspace: &Path| {
                 let text = text.replace(workspace.to_str().unwrap(), "WORKSPACE");
                 copy_path
-                    .replace_all(&text, "/tmp/polaris-check-COPY")
+                    .replace_all(&text, "polaris-check-COPY")
                     .into_owned()
             };
             assert_eq!(
