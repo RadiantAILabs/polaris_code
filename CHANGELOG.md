@@ -7,6 +7,7 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 - A plugin that depends on `PermissionRulesPlugin` can add a named permission rule written in Rust, with `PermissionRules::add_code_rule`, while the server is built. The rule is a function of the tool name, the call's arguments and the workspace root, and returns no opinion or a `RuleDecision` with a reason. It is weighed with the permission-file rules (deny over ask over allow), an allow never goes above the mode or the permission ceiling, and project trust does not apply to it. A denial reaches the model as a refusal that names the rule and is recorded as `denied` with the rule's reason. A rule that panics refuses the call. For `run_command` and `run_in_background` the rule is called with the whole command and then with each simple command. Rules cannot be added once the server is ready, and `/permissions` lists them by name. `PermissionRules` is now a mutable resource until the server is ready, and a global after that.
+- Plugin-contributed coding-agent graph steps after tool rounds and before finish through `CodeAgentSteps` and `CodeAgent::with_steps`, with ordered finish holds that continue the existing bounded loop. `GraphViewPlugin::for_code_agent_steps` publishes the completed startup graph; an empty registry preserves the stock graph and agent identity.
 
 ## [0.4.2] - 2026-11-08
 

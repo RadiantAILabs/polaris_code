@@ -85,3 +85,13 @@ empty list is not offered `task_output` or the other shell tools. Neither adds a
 API: for the tools above, two sessions on one server differ only in the
 `AgentConfig` they were created with, and in the `TokenMeter` when one of them
 carries a spend cap.
+
+Coding-loop graph extensions likewise use a typed startup resource rather than
+a framework `API`: plugins fill
+[`CodeAgentSteps`](crate::agents::code_agent::steps::CodeAgentSteps) in `build`,
+then the host calls [`CodeAgent::with_steps`](crate::agents::CodeAgent::with_steps).
+Builders append ordinary graph nodes after tools or before finish. A local
+[`FinishGate`](crate::agents::code_agent::steps::FinishGate) accumulates holds;
+existing `ContextManager` and `Out<LlmResponse>` provide conversation and answer
+access. The unit `CodeAgent` and the published default-loop signature are
+unchanged. The configured agent has the same name and session identity.

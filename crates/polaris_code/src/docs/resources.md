@@ -134,3 +134,16 @@ credential source names remain immutable launch inputs owned by the binary.
 foreground and background tools consume the same lower-layer contract.
 [`CallRoot`](crate::tools::CallRoot), the folder one tool call works in, is
 likewise per-invocation `ToolContext` and not a resource.
+
+# Coding agent graph extensions
+
+| Resource | Scope | What it exposes |
+|----------|-------|-----------------|
+| [`CodeAgentSteps`](crate::agents::code_agent::steps::CodeAgentSteps) | Global | Startup builders contributed during plugin `build`, ordered by ascending priority then namespaced key. `CodeAgentPlugin` installs an empty registry; the host snapshots it with `CodeAgent::with_steps` after startup. Runtime systems do not mutate this registry. |
+| [`FinishGate`](crate::agents::code_agent::steps::FinishGate) | Local | A before-finish system calls `hold(message)` to continue the coding loop. Every hold becomes a separate user message after the candidate assistant answer, in step order. Reset before each candidate; later checks cannot remove an earlier hold. Provided by the stepped agent only when before-finish builders are installed. |
+
+Extension systems may also read the existing `AgentConfig` for the session's
+working directory, inspect `Out<LlmResponse>` for the current answer, and read
+or append to `ContextManager`. Those types remain owned and initialized by the
+coding agent; appended messages pass through its ordinary projection and
+compaction. See [`steps`](crate::agents::code_agent::steps) for plugin wiring.

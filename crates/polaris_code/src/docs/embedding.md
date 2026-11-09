@@ -352,3 +352,23 @@ What a call's folder and command list do **not** cover:
 * **A spend cap works inside the turn only.** It is a different mechanism from
   the operator's `--max-cost-usd` ceiling; `docs/run-cost-ceiling.md` says how
   the two differ.
+
+## Adding coding-agent graph steps
+
+A host can let plugins extend the coding loop without replacing its graph.
+Each contributing plugin depends on `CodeAgentPlugin` and fills the
+[`CodeAgentSteps`](crate::agents::CodeAgentSteps) startup resource during
+`build`. Its `after_tools` builders append ordinary graph systems after a full
+tool round; its `before_finish` builders append systems that may call
+[`FinishGate::hold`](crate::agents::FinishGate::hold) on a candidate answer.
+Builders run by ascending priority, then stable namespaced key.
+
+After `server.finish().await`, read `server.get_global::<CodeAgentSteps>()` and
+register [`CodeAgent::with_steps`](crate::agents::CodeAgent::with_steps) with
+`SessionsAPI`, using `CodeAgent::NAME` for sessions as before. The registry is
+frozen at startup; an empty registry builds exactly the stock graph. For a
+Graph tab installed before startup, use
+[`GraphViewPlugin::for_code_agent_steps`](crate::graph_view::GraphViewPlugin::for_code_agent_steps)
+with `GraphPanelPlugin`; it publishes the complete graph during `ready`.
+The [step-extension module](crate::agents::code_agent::steps) has a complete
+plugin and host example, along with hold ordering and budget semantics.
