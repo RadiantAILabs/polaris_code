@@ -114,7 +114,7 @@ def main():
                 )
                 if refused:
                     output = (
-                        "Refused before it ran: the file is a protected test. Nothing was run.\n\n"
+                        "Error: Refused before it ran: the file is a protected test. Nothing was run.\n\n"
                         "This breaks rule 1 of the rules for this task:\n" + RULES
                     )
                     record["refusals"].append({"tool": "edit_file", "tool_call_id": call["call_id"]})

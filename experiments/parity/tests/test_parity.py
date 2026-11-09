@@ -191,6 +191,17 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual((rest, [i.kind for i in items]), ("", ["refusal"]))
         self.assertEqual(items[0].call_id, "call_1")
 
+    def test_refusal_is_found_behind_the_error_prefix_the_agent_adds(self):
+        text = "Error: Refused before it ran (rule 1: tests must not be changed): `test.py`."
+        rest, items = extract.split_rule_text(self.segment(text, "result", "tool", "call_1"))
+        self.assertEqual((rest, [i.kind for i in items]), ("", ["refusal"]))
+        self.assertEqual(items[0].text, text)
+
+    def test_an_error_that_is_not_a_refusal_is_stock_text(self):
+        text = "Error: 'solution.py' already exists"
+        rest, items = extract.split_rule_text(self.segment(text, "result", "tool", "call_1"))
+        self.assertEqual((rest, items), (text, []))
+
     def test_note_after_a_tool_result_keeps_the_stock_result(self):
         segment = self.segment("exit 0\n\n[Rules check] Protected files were changed.", "result", "tool", "call_2")
         rest, items = extract.split_rule_text(segment)

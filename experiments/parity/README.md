@@ -51,9 +51,18 @@ For each run the tool starts each binary once, as a child process, with:
   `127.0.0.1` port that the tool serves;
 - `--provider bedrock` through `POLARIS_CODE_PROVIDER`, and the model
   `aws.bedrock/global.openai.gpt-5.4`, which the agent reaches with one
-  `POST /openai/v1/responses` per model call.
+  `POST /openai/v1/responses` per model call;
+- `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` (and the lower-case names) naming
+  a second local server that refuses every request, with `NO_PROXY` listing
+  `127.0.0.1` so the model endpoint is reached directly.
 
-No real model, no real credentials and no other network are involved.
+No real model and no real credentials are involved. The agent on its own
+reaches for the internet: it fetches a table of model prices from
+`raw.githubusercontent.com` in the background, on its first price lookup. The
+refusing proxy stops that request, and the report lists every such attempt (a
+build that ignores proxy settings would not be stopped, and would not be
+listed). Without it, a run can record a cost that depends on whether the fetch
+finished in time, so two runs of the same build would differ.
 
 A binary that has no `--rules-arm` option in its `--help` (the stock agent) is
 run with every rules option left out of its command line. The report says so.
@@ -130,7 +139,9 @@ code.
 2. **Rule text.** The rule-related text each build sent the model, in order,
    with the request each piece first appeared in:
    - the prompt section `## Rules for this task`;
-   - each refusal (a tool result that starts `Refused before it ran`);
+   - each refusal (a tool result that starts `Refused before it ran`, with or
+     without the `Error: ` the agent puts before the result of a call that did
+     not run);
    - each note after a step and each hold message (text that starts
      `[Rules check]` or `[Recorded check`, alone or at the end of a message or
      tool result);
@@ -149,7 +160,10 @@ code.
    (`started_unix_ms`, `ended_unix_ms`, `model_calls[*].at_ms`, check
    `duration_ms`). Paths of the run's own folders are replaced by `<workspace>`,
    `<tmp>`, `<home>` and `<run>`, and the random name of the agent's temporary
-   check folder by `polaris-check-<id>`, before values are compared.
+   check folder by `polaris-check-<id>`, before values are compared. A check's
+   `output_sha256` is left out when its output names one of those folders,
+   because the hash covers the folder name; the check's `output_tail` is still
+   compared, with the names replaced.
 5. **Stock text, for information only.** The system prompt with the rule
    section taken out, the tool definitions, the other request fields, and the
    messages and tool results that are not rule text. These may differ between

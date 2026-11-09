@@ -5,7 +5,9 @@ the run record, never on the agent's own code. The rule-related text is found
 by its wording, so the same reading applies to any build:
 
 * a section headed ``## Rules for this task`` in the system prompt (``prompt``);
-* a tool result that starts ``Refused before it ran`` (``refusal``);
+* a tool result that starts ``Refused before it ran``, with or without the
+  ``Error: `` the agent puts before the result of a call that did not run
+  (``refusal``);
 * text that starts ``[Rules check]`` or ``[Recorded check``, either alone or at
   the end of a message or tool result: a ``hold`` when it says the final message
   was not accepted, a ``note`` otherwise;
@@ -26,7 +28,9 @@ from dataclasses import dataclass
 PROMPT_HEADING = re.compile(r"(?m)^## Rules for this task[ \t]*$")
 NEXT_HEADING = re.compile(r"(?m)^#{1,2} \S")
 NOTICE_START = re.compile(r"(?m)^\[(?:Rules check|Recorded check)")
-REFUSAL_START = "Refused before it ran"
+#: A refusal is a whole tool result. The agent puts ``Error: `` in front of the
+#: result of a call that did not run, so that prefix is allowed.
+REFUSAL_START = re.compile(r"\s*(?:Error:\s*)?Refused before it ran")
 HOLD_PHRASE = "was not accepted"
 #: Wording that marks a message as being about the rules even without a prefix.
 OTHER_MARKERS = [
@@ -176,7 +180,7 @@ def split_rule_text(segment: Segment) -> tuple[str, list[RuleItem]]:
         items.append(RuleItem("prompt", segment.where, segment.call_id, section))
         return text[: heading.start()] + text[end:], items
 
-    if text.lstrip().startswith(REFUSAL_START):
+    if REFUSAL_START.match(text):
         return "", [RuleItem("refusal", segment.where, segment.call_id, text)]
 
     notice = NOTICE_START.search(text)
