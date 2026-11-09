@@ -24,9 +24,6 @@ pub async fn record_refusals(
         let ToolResultContent::Text(text) = &result.content else {
             continue;
         };
-        if !text.contains("code rule \"rules.integrity\"") {
-            continue;
-        }
         let Some(call) = answer
             .tool_calls()
             .into_iter()

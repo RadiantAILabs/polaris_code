@@ -640,8 +640,7 @@ async fn the_third_setup_refuses_each_kind_of_protected_write_before_it_runs() {
     assert!(
         run.results_shown()
             .iter()
-            .all(|r| r.starts_with("Permission denied:")
-                && r.contains("code rule \"rules.integrity\": Refused before it ran (rule 1")),
+            .all(|r| r.starts_with("Refused before it ran (rule 1")),
         "{:?}",
         run.results_shown()
     );

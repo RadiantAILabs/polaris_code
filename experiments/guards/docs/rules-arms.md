@@ -379,6 +379,6 @@ observation still runs after termination. This arm's mechanism record has
 ## Plugin composition and compatibility
 
 See the [crate README](../README.md) for the plugin/seam table, current commands,
-tests, replay results, and all known differences. Code-rule refusals retain the
-stock permission-policy prefix rather than rewriting canonical tool results.
-The rule words and findings inside that wrapper are unchanged.
+tests, replay results, and all known differences. The code permission rule
+supplies each complete refusal directly, so canonical result text and recorded
+excerpts match the original messages. Tool results are never rewritten afterward.

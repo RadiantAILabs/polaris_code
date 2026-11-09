@@ -194,7 +194,7 @@ impl Plugin for PerCallRulesPlugin {
         server
             .get_resource_mut::<PermissionRules>()
             .unwrap()
-            .add_code_rule("rules.integrity", move |tool, args, _root| {
+            .add_code_rule_with_refusal_text("rules.integrity", move |tool, args, _root| {
                 rules.guard()?.check(tool, args).map(|refusal| {
                     let message = rules.refusal_message(&refusal);
                     rules.remember_refusal(message.clone(), refusal);

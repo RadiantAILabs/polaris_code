@@ -332,16 +332,11 @@ impl RunRules {
         }
     }
 
-    /// Recover the original finding embedded inside a permission-policy result.
+    /// Recover the original finding for an exact delivered refusal.
     pub fn evaluated_refusal(&self, result: &str) -> Option<Refusal> {
         let active = self.0.as_ref()?;
         let inner = lock(&active.inner);
-        inner
-            .evaluated_refusals
-            .iter()
-            .filter(|(message, _)| result.contains(message.as_str()))
-            .max_by_key(|(message, _)| message.len())
-            .map(|(_, refusal)| refusal.clone())
+        inner.evaluated_refusals.get(result).cloned()
     }
 
     /// Record a refused call.
@@ -877,10 +872,7 @@ fn tool_call_log(history: &[Message]) -> Vec<ToolCallRecord> {
         .enumerate()
         .map(|(i, (id, name, arguments))| {
             let (is_error, text) = results.remove(&id).unwrap_or((true, String::new()));
-            let outcome = if text.starts_with("Refused before it ran")
-                || (text.contains("code rule \"rules.integrity\"")
-                    && text.contains("Refused before it ran"))
-            {
+            let outcome = if text.starts_with("Refused before it ran") {
                 "refused"
             } else if text.starts_with("Permission denied") {
                 "denied"

@@ -75,7 +75,7 @@ Each mechanism is a plugin:
 |---|---|
 | `RulesStatePlugin` | Typed global `RunRules` and local `StepState`; seals before provider startup. |
 | `PromptRulesPlugin` | `CodeAgentSteps::configure_session` appends `AgentConfig::prompt_sections`. |
-| `PerCallRulesPlugin` | `PermissionRules::add_code_rule`; an after-tools step records actual denials without rewriting results. |
+| `PerCallRulesPlugin` | `PermissionRules::add_code_rule_with_refusal_text`; an after-tools step records actual denials without rewriting results. |
 | `RuleStepsPlugin` | Ordered after-tools and before-finish systems; `FinishGate::hold` retains the candidate and sends feedback. |
 | `MessageLimitPlugin` | Session setup configures the existing `ContextManager` canonical limit. |
 | `RunRecordPlugin` | Optional model-attempt and completed-turn observers; the latter projects the checked report. |
@@ -87,18 +87,12 @@ confined to the sealed workspace, and do not change tool permission grants.
 
 Known differences from the original integrated binary:
 
-- Code-rule refusals retain the stock permission wrapper:
-  `Permission denied: tool '…' is not allowed (code rule "rules.integrity": …)`.
-  The original refusal and configured rule words remain inside it. Canonical
-  tool results and recorded result excerpts retain that wrapper.
 - Stock tool definitions for `edit_file`, `glob`, and `search` have changed
   wording. The stock system prompt otherwise matched in scripted comparisons.
 - `--max-messages` can also be used without a rules arm.
-- For the 50 scripted comparison cases, all model-call counts matched; 42 cases
-  agreed completely. Eight cases differed only in refusal framing and result
-  excerpts. Refusal codes, gate decisions, check results, restoration, findings,
-  end reasons, exit codes, and other record fields matched. The comparator's
-  old-prefix detector labels wrapped refusals differently.
+
+All 50 scripted old/new comparison runs agree on model-call counts, rule text,
+decisions, and every compared record field, including refusal result excerpts.
 
 Run tests with `cargo +1.97.0 test -p polaris-guards`. They include the ported
 check tests, scripted models for every setup, CLI validation, an independent
