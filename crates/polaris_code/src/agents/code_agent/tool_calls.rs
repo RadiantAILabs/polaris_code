@@ -807,6 +807,23 @@ pub(crate) async fn execute_call(
                         .push_result(&mut batch, tool_call.error(ToolResultContent::Text(reason)));
                     return;
                 }
+                // `view_image` answers with a picture, which the model
+                // receives as one. Nothing else does, and the helper says so
+                // by tool name and payload together.
+                if let Some((content, shown)) = viewed_image_result(redactor, name, &value) {
+                    tracing::info!("Observation: {shown}");
+                    activity.finish(&user_io, PHASE_OK, &shown).await;
+                    record_tool_call(
+                        &store,
+                        turn,
+                        name,
+                        &tool_call.function.arguments,
+                        "ok",
+                        &shown,
+                    );
+                    decision.push_result(&mut batch, tool_call.result(content));
+                    return;
+                }
                 // Every toolset in this crate answers with the string it
                 // built; `run_command` answers with the executor's JSON
                 // document. The document is what the trajectory keeps —

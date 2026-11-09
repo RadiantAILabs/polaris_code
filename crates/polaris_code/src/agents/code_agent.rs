@@ -75,8 +75,8 @@ use crate::terminal::transcript::{
 use crate::terminal::{ContainedPrompt, SessionSettings, TurnPrompt, TurnSteering};
 use crate::tools::shell_render::{render_run_command, run_command_outcome, run_command_succeeded};
 use crate::tools::{
-    CallRoot, CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, code_index_state, enrich,
-    tool_is_read_only,
+    CallRoot, CodeIndexer, RUN_IN_BACKGROUND, ToolPolicyRegistry, ViewedImage, code_index_state,
+    enrich, tool_is_read_only,
 };
 use crate::usage::TokenMeter;
 
@@ -678,22 +678,29 @@ async fn execute_read_only_batch(
         let name = &call.function.name;
         let block = match outcome {
             Some(Ok(value)) => {
-                // The same seam the sequential lane applies, for the same
-                // reason: a read-only tool is exactly the kind that reads a
-                // `.env`, and this lane's results reach the provider, the
-                // transcript and the `ABox` through this string alone.
-                let output = redact_tool_output(
-                    redactor,
-                    name,
-                    value
-                        .as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| value.to_string()),
-                );
-                tracing::info!("Observation: {output}");
-                activity.finish(user_io, PHASE_OK, &output).await;
-                record_tool_call(store, turn, name, &call.function.arguments, "ok", &output);
-                call.result(ToolResultContent::Text(output))
+                if let Some((content, shown)) = viewed_image_result(redactor, name, &value) {
+                    tracing::info!("Observation: {shown}");
+                    activity.finish(user_io, PHASE_OK, &shown).await;
+                    record_tool_call(store, turn, name, &call.function.arguments, "ok", &shown);
+                    call.result(content)
+                } else {
+                    // The same seam the sequential lane applies, for the same
+                    // reason: a read-only tool is exactly the kind that reads a
+                    // `.env`, and this lane's results reach the provider, the
+                    // transcript and the `ABox` through this string alone.
+                    let output = redact_tool_output(
+                        redactor,
+                        name,
+                        value
+                            .as_str()
+                            .map(String::from)
+                            .unwrap_or_else(|| value.to_string()),
+                    );
+                    tracing::info!("Observation: {output}");
+                    activity.finish(user_io, PHASE_OK, &output).await;
+                    record_tool_call(store, turn, name, &call.function.arguments, "ok", &output);
+                    call.result(ToolResultContent::Text(output))
+                }
             }
             Some(Err(err)) => {
                 let output = redact_tool_output(redactor, name, err.to_string());
@@ -1598,6 +1605,32 @@ fn redact_tool_output(redactor: SecretRedactor, tool: &str, output: String) -> S
     }
     text.push_str(&notice);
     text
+}
+
+/// The picture `view_image` returned, as the result block's content, with the
+/// one line shown for it everywhere else; `None` when `value` is not one.
+///
+/// Both result lanes call this first, so there is one rule for when the model
+/// receives an image. It is `Some` only when the tool is `view_image` **and**
+/// the value is that tool's typed payload ([`ViewedImage::from_result`] checks
+/// both): another tool, an MCP server included, cannot return JSON that makes
+/// the model receive an image, and `view_image` returning anything else is an
+/// ordinary text result. Everything that gets `None` keeps the text path and its
+/// secret redaction.
+///
+/// The line is `[image a.png, PNG, 34.0 KB]`. It is what the transcript, the log
+/// and `record_tool_call` get, so the encoded picture is in the provider-bound
+/// block alone. It is redacted like any other text, because the path in it is
+/// the model's own string.
+fn viewed_image_result(
+    redactor: SecretRedactor,
+    tool: &str,
+    value: &serde_json::Value,
+) -> Option<(ToolResultContent, String)> {
+    let image = ViewedImage::from_result(tool, value)?;
+    let shown = redact_tool_output(redactor, tool, image.summary());
+    let block = image.into_block()?;
+    Some((ToolResultContent::Image(block), shown))
 }
 
 /// Most diff lines carried in a confirm preview.
@@ -2690,6 +2723,100 @@ mod tests {
             redact_tool_output(SecretRedactor::new(true), "read_file", clean.to_string()),
             clean
         );
+    }
+
+    /// The rule both result lanes share for when the model receives a picture.
+    mod viewed_image {
+        use super::*;
+        use crate::tools::VIEW_IMAGE;
+        use polaris::models::llm::{DocumentSource, ImageMediaType};
+
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0";
+
+        fn payload(path: &str) -> serde_json::Value {
+            serde_json::to_value(ViewedImage::new(path, "image/png", PNG)).unwrap()
+        }
+
+        #[test]
+        fn view_image_with_its_typed_payload_gives_the_model_a_picture() {
+            let (content, shown) =
+                viewed_image_result(SecretRedactor::new(true), VIEW_IMAGE, &payload("a.png"))
+                    .expect("view_image's own payload is a picture");
+            let ToolResultContent::Image(block) = content else {
+                panic!("the model is given an image block");
+            };
+            assert!(matches!(block.media_type, ImageMediaType::PNG));
+            let DocumentSource::Base64(data) = &block.data;
+            assert_eq!(data, &crate::images::base64(PNG));
+            assert_eq!(shown, "[image a.png, PNG, 29 B]");
+        }
+
+        #[test]
+        fn the_line_shown_and_recorded_never_holds_the_encoded_picture() {
+            let value = payload("a.png");
+            let encoded = value["data"].as_str().unwrap().to_string();
+            let (_, shown) = viewed_image_result(SecretRedactor::new(true), VIEW_IMAGE, &value)
+                .expect("a picture");
+            assert!(!shown.contains(&encoded), "{shown}");
+            assert!(shown.len() < 80, "one short line: {shown}");
+        }
+
+        #[test]
+        fn another_tool_returning_the_same_payload_gets_no_picture() {
+            let value = payload("a.png");
+            for tool in [
+                "read_file",
+                "run_command",
+                "mcp__shots__view_image",
+                "View_Image",
+                "view_image ",
+                "",
+            ] {
+                assert!(
+                    viewed_image_result(SecretRedactor::new(true), tool, &value).is_none(),
+                    "{tool:?} must not be able to hand the model a picture"
+                );
+            }
+        }
+
+        #[test]
+        fn view_image_returning_anything_else_stays_text() {
+            let redactor = SecretRedactor::new(true);
+            for value in [
+                serde_json::json!("view_image failed: not an image"),
+                serde_json::json!({"path": "a.png", "data": "AAAA"}),
+                serde_json::json!({"kind": "polaris_code.viewed_image"}),
+                serde_json::json!({
+                    "kind": "something_else", "path": "a.png",
+                    "media_type": "image/png", "bytes": 1, "data": "AA=="
+                }),
+                serde_json::json!({
+                    "kind": "polaris_code.viewed_image", "path": "a.png",
+                    "media_type": "image/svg+xml", "bytes": 1, "data": "AA=="
+                }),
+                serde_json::json!({
+                    "kind": "polaris_code.viewed_image", "path": "a.png",
+                    "media_type": "image/png", "bytes": 1, "data": "AA==", "extra": true
+                }),
+                serde_json::json!({
+                    "kind": "polaris_code.viewed_image", "path": "a.png",
+                    "media_type": "image/png", "bytes": 99_999_999u64, "data": "AA=="
+                }),
+            ] {
+                assert!(
+                    viewed_image_result(redactor, VIEW_IMAGE, &value).is_none(),
+                    "{value} is not a picture"
+                );
+            }
+        }
+
+        #[test]
+        fn the_path_in_the_shown_line_is_redacted_like_any_text() {
+            let value = payload("OPENAI_API_KEY=sk-proj-0Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2.png");
+            let (_, shown) = viewed_image_result(SecretRedactor::new(true), VIEW_IMAGE, &value)
+                .expect("a picture");
+            assert!(!shown.contains("sk-proj-0Aa1"), "{shown}");
+        }
     }
 
     /// `recover` as the error handler of a system that fails, run through the
