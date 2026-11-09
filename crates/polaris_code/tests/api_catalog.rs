@@ -149,3 +149,22 @@ fn extract_api_name_handles_common_shapes() {
     assert_eq!(extract_api_name("impl<T> API for Wrap<T> {}"), None);
     assert_eq!(extract_api_name("impl APIWrapper for X {}"), None);
 }
+
+/// The startup builder is a plain type rather than a framework `API`, so the
+/// scan above cannot find it. A host author looks for it in the catalogs, the
+/// embedding guide and the integration guide, so each must link to it.
+#[test]
+fn the_startup_builder_is_linked_from_the_catalogs_and_guides() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let linked = "[`startup::Host`](crate::startup::Host)";
+    for (path, needle) in [
+        ("src/docs/apis.md", linked),
+        ("src/docs/plugins.md", linked),
+        ("src/docs/embedding.md", linked),
+        ("../../docs/reference/guide.md", "`startup::Host::new()"),
+    ] {
+        let text = fs::read_to_string(manifest_dir.join(path))
+            .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
+        assert!(text.contains(needle), "{path} does not mention {needle}");
+    }
+}

@@ -117,7 +117,7 @@ MAX_OUTPUT_TOKENS_VAR = "POLARIS_CODE_MAX_OUTPUT_TOKENS"
 
 #: The binary's own defaults for the two limits above
 #: (``DEFAULT_MAX_TURNS`` in ``crates/polaris_code/src/agents/code_agent.rs``
-#: and ``DEFAULT_MAX_OUTPUT_TOKENS`` in ``crates/polaris_code/src/main.rs``). The harness always
+#: and ``DEFAULT_MAX_OUTPUT_TOKENS`` in ``crates/polaris_code/src/startup/cli.rs``). The harness always
 #: passes both, so a run's limits are in its manifest rather than implied.
 DEFAULT_MAX_TURNS = 100
 DEFAULT_MAX_OUTPUT_TOKENS = 16384

@@ -56,6 +56,13 @@ Startup configuration and `/status` add no API. The binary applies TOML defaults
 through clap and registers diagnostics through the existing
 [`CommandRegistry`](crate::terminal::CommandRegistry).
 
+Starting the agent from another program adds no API either:
+[`startup::Host`](crate::startup::Host) is a plain builder, not a handle a
+plugin publishes. It parses the command line, calls the closures a host gave
+it after every plugin `polaris` adds, and starts the server, so a host's
+plugins reach the agent through the seams above (`PermissionRules`,
+`CodeAgentSteps`) and not through the host.
+
 The shell approval contract is also an ordinary typed boundary:
 [`ApprovalReceipt`](crate::tools::approval::ApprovalReceipt) is host-issued context
 with exact arguments, directory binding, host policy validation and single use.

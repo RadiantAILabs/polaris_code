@@ -107,6 +107,10 @@ stages and their state are private to the agent.
 Startup configuration and `/status` use the existing terminal command registry;
 they add no plugin. The binary loads optional user/project TOML files before
 assembly and registers read-only diagnostics over its current session handles.
+That startup is the library's [`startup`](crate::startup) module, and the
+`polaris` binary only calls it. [`startup::Host`](crate::startup::Host) adds
+plugins in a fixed order and then the plugins a host supplies; the module
+documentation lists the order and which plugins a host plugin may depend on.
 See [startup configuration](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/configuration.md).
 
 `CodeAgentPlugin` also publishes the startup
@@ -117,5 +121,7 @@ registries preserve the stock graph exactly. For a Graph tab installed before
 startup, use
 [`GraphViewPlugin::for_code_agent_steps`](crate::graph_view::GraphViewPlugin::for_code_agent_steps):
 it publishes the completed registry's graph during `ready`, after every plugin
-has built. This keeps contributed nodes visible by their system names. See the
+has built. This keeps contributed nodes visible by their system names.
+[`tabs::add_code_agent_shell_tabs`](crate::tabs::add_code_agent_shell_tabs) adds
+the shell's tabs with that Graph tab, and `polaris` starts with it. See the
 [`steps` example](crate::agents::code_agent::steps) for a complete plugin.

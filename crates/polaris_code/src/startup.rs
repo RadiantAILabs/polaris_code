@@ -78,7 +78,7 @@
 //! ```
 //!
 //! Adding steps to the coding loop works the same way; see
-//! [`CodeAgentSteps`](crate::agents::CodeAgentSteps). The startup builds the
+//! [`CodeAgentSteps`]. The startup builds the
 //! agent from the completed step registry, so a host adds nothing to the graph
 //! itself, and the Graph tab shows the added steps.
 //!
@@ -88,28 +88,30 @@
 //! [`Host::plugins`] in the order they were added, then inserts the run's
 //! globals and calls `Server::finish`:
 //!
-//! 1. the model provider (`ModelsPlugin` and the plugin for `--provider`);
-//! 2. tools: `ToolsPlugin`, MCP, file, code-graph, memory, shell, background
-//!    task, web and approval-shell plugins;
-//! 3. [`PermissionRulesPlugin`](crate::agents::permission_rules::PermissionRulesPlugin)
-//!    and [`AutoReviewPlugin`](crate::agents::auto_review::AutoReviewPlugin);
-//! 4. `PersistencePlugin`, `SessionsPlugin`, and
-//!    [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin) with its compaction
+//! 1. the model provider: `ModelsPlugin` and the plugin for `--provider`;
+//! 2. tools: `ToolsPlugin`, the MCP client, the file tools, the ontrace store,
+//!    the code graph, memory, the shell, shell approval and background tasks;
+//! 3. [`PermissionRulesPlugin`](crate::agents::permission_rules::PermissionRulesPlugin),
+//!    [`AutoReviewPlugin`](crate::agents::auto_review::AutoReviewPlugin) and the
+//!    web tool;
+//! 4. `PersistencePlugin`, `SessionsPlugin`, then
+//!    [`CodeAgentPlugin`] with the compaction
 //!    and progress plugins;
-//! 5. topology selection: the evidence, task-queue and catalog plugins and the
-//!    topology packs;
-//! 6. one front end: [`ExecIOPlugin`](crate::exec::ExecIOPlugin) when the run is
+//! 5. topology selection: the evidence and task-queue plugins, the catalog and
+//!    the topology packs;
+//! 6. one front end: [`ExecIOPlugin`] when the run is
 //!    non-interactive; otherwise the approval plugin, the terminal UI, the Graph
 //!    and Help tabs and the conversation panel.
 //!
 //! A host's plugins are therefore added after all of these. Polaris builds
-//! plugins in an order that satisfies the dependencies each one declares, not
-//! the order they were added, so a host plugin may depend on any plugin above:
+//! plugins in an order that satisfies the dependencies each one declares, so a
+//! host plugin that declares a dependency on any plugin above is built after it.
+//! Do not rely on the order between plugins with no dependency between them:
 //!
 //! | To do this | Depend on | And use |
 //! |------------|-----------|---------|
 //! | Add a code permission rule | `PermissionRulesPlugin` | [`PermissionRules::add_code_rule`](crate::agents::permission_rules::PermissionRules::add_code_rule) |
-//! | Add a step to the coding loop | `CodeAgentPlugin` | [`CodeAgentSteps`](crate::agents::CodeAgentSteps) |
+//! | Add a step to the coding loop | `CodeAgentPlugin` | [`CodeAgentSteps`] |
 //! | Register a tool | `ToolsPlugin` | the `ToolRegistry` |
 //! | Register another model provider | `ModelsPlugin` | the `ModelRegistry` |
 //!
@@ -131,7 +133,7 @@
 //!
 //! # Lifecycle
 //!
-//! `credential` commands (`login`, `logout`) run first and need no
+//! The credential commands (`login`, `logout`) run first and need no
 //! configuration. Otherwise the command line and configuration files are
 //! resolved, the run's settings are validated, the server is assembled and
 //! started, the agent is registered, and a session is created or resumed. A
