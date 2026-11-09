@@ -358,6 +358,17 @@ canonical workspace-relative paths, including existing symlink aliases and the
 parents of new files. They apply to tools that expose a `path` argument; they
 are not a filesystem sandbox for shell scripts, search or indexing.
 
+A rule names one tool, so it covers only that tool. The `read_file` rule above
+does not stop `view_image` from showing an image at the same path. To protect
+a path from both, write a rule for each:
+
+```toml
+[[rules]]
+tool = "view_image"
+decision = "deny"
+path = "private/*"
+```
+
 Across both files, **deny wins over ask, which wins over allow**, regardless of
 file order. Mode denials, the permission ceiling, and shell hard denies remain
 authoritative. Allow rules can authorize interactive calls within that ceiling;

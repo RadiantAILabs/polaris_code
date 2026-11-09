@@ -126,6 +126,10 @@ all, so every rule above is narrow by choice. Known, accepted gaps:
   secret split across a chunk boundary can reach the terminal even though the
   final result is redacted.
 - **Cookies** (`Set-Cookie`, `Cookie`) are not covered.
+- **Pictures are not scanned.** `view_image` sends an image file's bytes to the
+  model as they are, so text inside a screenshot is never matched. Only the
+  one-line description shown to the person (`[image a.png, PNG, 34.0 KB]`) is
+  redacted.
 - **The model's own output** is not scanned. If a model echoes a secret it read
   before redaction was enabled, nothing rewrites it.
 

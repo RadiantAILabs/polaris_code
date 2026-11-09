@@ -174,6 +174,54 @@ web_fetch 'https://example.com/x' failed: no complete answer within 30s; try aga
 web_fetch 'http://10.0.0.5/' refused: 10.0.0.5 is a private-network address. web_fetch reaches public internet hosts only; for a service on this machine or network use run_command (for example curl), which asks first
 ```
 
+## Pictures
+
+`view_image` ([`tools/view_image.rs`](../crates/polaris_code/src/tools/view_image.rs))
+is the one tool whose result is not text. It reads a PNG, JPEG, GIF or WEBP file
+from the working directory and the model receives the picture itself. The type
+is decided from the file's first bytes, not its name, so a PNG called `x.txt`
+works and a text file called `x.png` is refused. It is registered only when the
+model takes images; see [`image_input`](configuration.md).
+
+The model gets a picture. The person watching gets one short line, because the
+encoded picture is large and means nothing to a reader. The line is the same in
+the activity block, the conversation and the recorded trajectory:
+
+```
+[image shots/a.png, PNG, 34.0 KB]
+```
+
+The path is redacted like any other text. The picture is not scanned; see
+[agent safety](agent-safety.md#known-gaps).
+
+A refusal is ordinary error text that ends in what to do next:
+
+```
+view_image 'src' is a directory, not an image file. Call list_files to see what it holds.
+view_image 'notes.png' is not a PNG, JPEG, GIF or WebP image; the file's contents were checked, not its name. For a text file call read_file.
+view_image 'big.png' is 4.1 MB; images are capped at 3.8 MB. Make a smaller copy (for example by resizing or compressing it with a shell command) and call view_image on that, or tell the user the image is too large to look at.
+```
+
+The cap is 3,750,000 bytes. It keeps the encoded picture under the 5 MB limit
+that providers set on one image. A path outside the working directory or through
+a symlink that leaves it is refused with the same messages as `read_file`.
+
+`read_file` and `read_span` on an image file also stop and say what the file is,
+instead of returning bytes as text. With image input on the message ends in the
+call to make; with it off it says the model takes text only, so the model tells
+the user rather than guessing what the picture shows:
+
+```
+read_file 'shots/a.png': this is a PNG image (34.0 KB), not text. Call view_image(path="shots/a.png") to see it.
+```
+
+Dispatch is in one helper, `viewed_image_result` in
+[`agents/code_agent.rs`](../crates/polaris_code/src/agents/code_agent.rs), used by
+both the single-call and the concurrent-batch lane. It makes a picture only when
+the tool name is exactly `view_image` and the result has the typed shape that
+tool returns. Every other result, including a file or web page that happens to
+hold JSON shaped like that, stays text and goes through redaction.
+
 ## Adding a tool
 
 Reuse `line_view` / `resume_footer` / `cap_footer` for anything that shows part
