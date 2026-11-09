@@ -37,6 +37,9 @@ const INTERNAL_RESOURCES: &[&str] = &[
     // How many attempts the current model call has used and when it began, read
     // by the agent's own retry stage; reset for every call.
     "AttemptLedger",
+    // How many truncation continues and unattended nudges the current turn has
+    // used, read by the agent's own continuation stage; reset for every turn.
+    "ContinuationLedger",
     // Per-response tool queue and the active invocation owned by graph nodes.
     "ToolBatch",
     "CallLifetime",

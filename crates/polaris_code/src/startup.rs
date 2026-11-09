@@ -175,7 +175,7 @@ use crate::agents::{
 use crate::cosmos::default_loop::DefaultLoopTopologyPackPlugin;
 use crate::cosmos::domains::Arm;
 use crate::cosmos::host::{
-    CodingTaskQueue, CodingTaskQueuePlugin, OperatorTopologyPin, auto_route,
+    CodingTaskQueue, CodingTaskQueuePlugin, OperatorTopologyPin, auto_route, auto_route_admits,
 };
 use crate::cosmos::inventory;
 use crate::cosmos::planner::GatePlannerMode;
@@ -200,9 +200,9 @@ use crate::usage::{RunCeiling, TaskCostLimit, TokenMeter};
 use cli::{Cli, DEFAULT_MAX_OUTPUT_TOKENS, run_max_turns, validate_context_window};
 use environment::{
     ARM_VAR, COMPOSITION_POLICY_VAR, DOMAIN_VAR, GATE_PLANNER_VAR, TASK_MAX_COST_VAR, TESTENV_VAR,
-    TOPOLOGY_PIN_VAR, env_flag_enabled, lean_composition_policy, ontology_dir,
-    resolve_composition_policy, resolve_domain_selection, resolve_gate_planner_mode,
-    resolve_topology_pin,
+    TOPOLOGY_PIN_VAR, UNATTENDED_NUDGES_VAR, env_flag_enabled, lean_composition_policy,
+    ontology_dir, resolve_composition_policy, resolve_domain_selection, resolve_gate_planner_mode,
+    resolve_topology_pin, resolve_unattended_nudges,
 };
 use headless::run_headless;
 use interactive::Driver;
@@ -743,6 +743,7 @@ struct Run {
     run_ceiling: Option<RunCeiling>,
     max_output_tokens: NonZeroU32,
     max_turns: usize,
+    unattended_nudges: u32,
     coding_tasks: CodingTaskQueue,
     topology_pin_raw: Option<String>,
     terminal_output: Option<TerminalOutput>,
@@ -912,6 +913,9 @@ async fn prepare(
     // and the non-interactive report, so they agree on the output allowance.
     let max_output_tokens = cli.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let max_turns = run_max_turns(&cli);
+    let unattended_nudges =
+        resolve_unattended_nudges(std::env::var(UNATTENDED_NUDGES_VAR).ok().as_deref())
+            .map_err(|why| refusal(headless, why))?;
     if let Err(why) = validate_context_window(cli.context_window, max_output_tokens) {
         return Err(refusal(headless, why));
     }
@@ -964,7 +968,7 @@ async fn prepare(
     // starts empty, and three things put work into it: `/topology`
     // interactively and `--topology-task` for one unattended run, both
     // through the `TopologyWork` handle built below and both an explicit,
-    // named accept; and, for a `--print` run whose prompt `auto_route`
+    // named accept; and, for a read-only `--print` run whose prompt `auto_route`
     // recognises as a light-effort question, this binding directly, below,
     // marked `TaskOrigin::AutoRouted` rather than explicit — the one
     // difference being that an inconclusive answer there falls through to
@@ -1366,6 +1370,7 @@ async fn prepare(
             run_ceiling,
             max_output_tokens,
             max_turns,
+            unattended_nudges,
             coding_tasks,
             topology_pin_raw,
             terminal_output,
@@ -1410,6 +1415,7 @@ async fn serve(server: &mut Server, run: Run) -> Result<i32, Refusal> {
         run_ceiling,
         max_output_tokens,
         max_turns,
+        unattended_nudges,
         coding_tasks,
         topology_pin_raw,
         terminal_output,
@@ -1731,7 +1737,12 @@ async fn serve(server: &mut Server, run: Run) -> Result<i32, Refusal> {
     // commands unprompted. `CodeAgent::setup` seeds the defaults while creating
     // or resuming the session, so this has to run after that and it overwrites
     // the snapshot wholesale.
-    let policy = policy_snapshot(&permission_mode, graph_search);
+    let policy = policy_snapshot(
+        &agent_config,
+        &permission_mode,
+        graph_search,
+        unattended_nudges,
+    );
     if let Err(err) = sessions
         .with_context(&session_id, move |ctx| {
             ctx.insert(policy);
@@ -1757,6 +1768,7 @@ async fn serve(server: &mut Server, run: Run) -> Result<i32, Refusal> {
                 Err(refused) => return Err(refusal(headless, refused)),
             }
         } else if allow_auto_route
+            && auto_route_admits(&permission_mode)
             && let Some(prompt) = cli.print.as_deref()
             && let Some(auto) = auto_route(&working_dir, prompt)
         {
@@ -1826,7 +1838,12 @@ async fn serve(server: &mut Server, run: Run) -> Result<i32, Refusal> {
         turn_steering.clone(),
         attachment_store.clone(),
         background_tasks.clone(),
-        policy_snapshot(&permission_mode, graph_search),
+        policy_snapshot(
+            &agent_config,
+            &permission_mode,
+            graph_search,
+            unattended_nudges,
+        ),
         driver_store,
         working_dir.clone(),
     );

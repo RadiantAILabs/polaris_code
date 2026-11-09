@@ -136,6 +136,8 @@ nothing more.
 
 **Files:** `src/agents/code_agent.rs` (`CodeAgent`, `CodeAgentPlugin`,
 `AgentLlm`), `src/agents/policy.rs` (`PolicySnapshot`),
+`src/agents/continuation.rs` (`ContinuationPolicy`, whether a reply without a
+tool call ends the turn),
 `src/agents/trajectory.rs` (the ABox write seam, not the ATIF export in
 `src/trajectory.rs`), `src/agents/project_context.rs` (`ProjectContext`),
 `src/agents/context.rs` (`ContextManager`), `src/agents/state.rs` (`LoopState`),

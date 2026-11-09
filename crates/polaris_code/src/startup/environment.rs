@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use crate::agents::continuation::DEFAULT_UNATTENDED_NUDGES;
 use crate::cosmos::composition::CompositionPolicy;
 use crate::cosmos::domains::{Arm, DomainSelection};
 use crate::cosmos::planner::GatePlannerMode;
@@ -14,6 +15,27 @@ pub(super) const TASK_MAX_COST_VAR: &str = "POLARIS_CODE_MAX_COST_USD";
 /// The environment variable that keeps the activated project runtime in shell
 /// tools.
 pub(super) const TESTENV_VAR: &str = "POLARIS_CODE_TESTENV";
+
+/// The environment variable that sets how many times an unattended run is
+/// asked to go on after a reply that calls no tool.
+pub(super) const UNATTENDED_NUDGES_VAR: &str = "POLARIS_CODE_UNATTENDED_NUDGES";
+
+/// Resolve the unattended nudge budget for this run.
+///
+/// Unset, or set to whitespace, keeps [`DEFAULT_UNATTENDED_NUDGES`]. Anything
+/// else has to be a non-negative integer; zero turns nudges off. A typo is a
+/// configuration error rather than a silent fallback.
+pub(super) fn resolve_unattended_nudges(raw: Option<&str>) -> Result<u32, String> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_UNATTENDED_NUDGES);
+    };
+    value.parse::<u32>().map_err(|_| {
+        format!(
+            "{UNATTENDED_NUDGES_VAR} must be a non-negative integer (0 turns nudges off), \
+             got {value:?}"
+        )
+    })
+}
 
 /// The environment variable that pins this whole run to one registered
 /// topology, for every accepted coding task that names none of its own.
@@ -187,6 +209,22 @@ pub(super) fn env_flag_enabled(var: Result<String, std::env::VarError>) -> bool 
 mod tests {
     use super::super::cli::parse as cli;
     use super::*;
+
+    #[test]
+    fn unattended_nudges_default_parse_and_reject_typos() {
+        assert_eq!(
+            resolve_unattended_nudges(None),
+            Ok(DEFAULT_UNATTENDED_NUDGES)
+        );
+        assert_eq!(
+            resolve_unattended_nudges(Some("  ")),
+            Ok(DEFAULT_UNATTENDED_NUDGES)
+        );
+        assert_eq!(resolve_unattended_nudges(Some("0")), Ok(0));
+        assert_eq!(resolve_unattended_nudges(Some(" 3 ")), Ok(3));
+        let error = resolve_unattended_nudges(Some("one")).unwrap_err();
+        assert!(error.contains(UNATTENDED_NUDGES_VAR), "{error}");
+    }
 
     /// A run that configures nothing pins nothing — `select_and_run` sees no
     /// `OperatorTopologyPin` at all, byte for byte as it did before this

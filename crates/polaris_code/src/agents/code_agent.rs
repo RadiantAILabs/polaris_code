@@ -4,11 +4,12 @@
 //! # Architecture
 //!
 //! ```text
-//! receive_user_input → refresh_project_docs → init_loop → loop("agent_loop") {
+//! receive_user_input → refresh_project_docs → init_loop → reset_continuations → loop("agent_loop") {
 //!     compact_context → manual ? finish_compaction :
 //!         prepare_context → begin_model_call → act → loop("model_retries") { … } →
 //!             model_answered ? (accept_response →
-//!                 has_tool_calls ? (review_tools → prepare_calls → tool_calls → finish_calls) : finalize) :
+//!                 has_tool_calls ? (review_tools → prepare_calls → tool_calls → finish_calls) :
+//!                     (decide_continuation → continues ? continue_turn : finalize)) :
 //!                 report_failure
 //!     on error → recover
 //! }
@@ -44,6 +45,10 @@ use super::config::AgentConfig;
 use super::context::{
     CacheAwareWindow, CompactionRun, ContextManager, LinearWindow, SummarizingWindow,
     compact_context, compaction_focus, finish_compaction,
+};
+use super::continuation::{
+    Continuation, ContinuationLedger, continue_turn, decide_continuation, final_answer_text,
+    reset_continuations,
 };
 use super::failure::{self, Attempts, TurnFailure};
 use super::permission_rules::{
@@ -1511,6 +1516,7 @@ fn is_placeholder(value: &str) -> bool {
         || value.starts_with('<')
         || value.starts_with("{{")
         || value.starts_with("%(")
+        || value.starts_with(REDACTION_MARKER)
     {
         return true;
     }
@@ -1739,11 +1745,12 @@ fn truncate_lines(diff: String) -> String {
 async fn finalize(
     decision: Out<LlmResponse>,
     prepared: Out<PreparedContext>,
+    context: Res<ContextManager>,
     user_io: Res<UserIO>,
     store: Res<OxigraphStore>,
     mut live: ResMut<LiveTranscript>,
 ) -> LoopState {
-    let text = decision.text();
+    let text = final_answer_text(&context.messages).unwrap_or_else(|| decision.text());
     live.close(&user_io, &text, OUTCOME_COMPLETE).await;
 
     Decision {
@@ -1987,16 +1994,7 @@ impl Agent for CodeAgent {
         // block on a short-lived runtime handle.
         let project = futures_block_on(ProjectContext::discover(&config.working_dir));
         ctx.insert(project);
-        let mut policy = PolicySnapshot::defaults();
-        if let Some(window) = config.context_window {
-            policy.retrieval.apply_model_limits(
-                window,
-                config
-                    .max_output_tokens
-                    .unwrap_or(polaris::models::anthropic::DEFAULT_MAX_TOKENS),
-            );
-        }
-        ctx.insert(policy);
+        ctx.insert(PolicySnapshot::for_agent(&config));
         ctx.insert(LiveTranscript::default());
         ctx.insert(AttemptLedger::default());
         ctx.insert(tool_calls::ToolBatch::default());
@@ -2053,6 +2051,7 @@ fn build_graph(graph: &mut Graph, steps: &steps::CodeAgentSteps) {
     graph.add_system(receive_user_input);
     graph.add_system(refresh_project_docs);
     graph.add_system(init_loop);
+    graph.add_system(reset_continuations);
 
     graph.add_loop::<LoopState, _, _>(
         "agent_loop",
@@ -2112,7 +2111,21 @@ fn build_graph(graph: &mut Graph, steps: &steps::CodeAgentSteps) {
                                     steps.build_after_tools(tool_branch);
                                 },
                                 |done_branch| {
-                                    steps.build_before_finish(done_branch);
+                                    // A reply without a tool call ends the
+                                    // turn unless the continuation policy
+                                    // says it is not an answer yet. Plugin
+                                    // finish checks run only when it ends.
+                                    done_branch.add_system(decide_continuation);
+                                    done_branch.add_conditional_branch::<Continuation, _, _, _>(
+                                        "continues",
+                                        Continuation::continues,
+                                        |go_on| {
+                                            go_on.add_system(continue_turn);
+                                        },
+                                        |finish| {
+                                            steps.build_before_finish(finish);
+                                        },
+                                    );
                                 },
                             );
                         },
@@ -2168,6 +2181,7 @@ where
 /// |----------|-------|-------------|
 /// | [`ContextManager`] | local | Full history and summary checkpoints (persisted). |
 /// | [`LoopState`] | local | Loop termination flag. |
+/// | [`ContinuationLedger`] | local | Per-turn continuation counts, reset at the start of each turn. |
 /// | [`PolicySnapshot`] | local | Per-turn decision policy (defaults in v1). |
 /// | [`steps::CodeAgentSteps`] | global | Startup graph contributions; snapshot with `CodeAgent::with_steps` after plugin builds. |
 /// | [`SecretRedactor`] | global | Withholds recognisable credentials from every consumer of a tool result. |
@@ -2331,6 +2345,7 @@ impl Plugin for CodeAgentPlugin {
         server.insert_resource(steps::CodeAgentSteps::default());
         tool_calls::install_cleanup(server);
         server.register_local(LoopState::default);
+        server.register_local(ContinuationLedger::default);
         server.register_local(PolicySnapshot::defaults);
         // Process configuration, not session state: one rule set decided at
         // the composition root and read by every turn of every session.
@@ -2693,6 +2708,20 @@ mod tests {
         let scan = scan("naïve → PASSWORD=hunter2mots ← après");
         assert!(scan.text().starts_with("naïve → PASSWORD="));
         assert!(scan.text().ends_with(" ← après"));
+    }
+
+    #[test]
+    fn scanning_redacted_text_again_changes_nothing() {
+        let raw = "OPENAI_API_KEY=sk-proj-0Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn4Oo5Pp6";
+        let once = SecretRedactor::new(true).scan(raw).into_text();
+        assert_eq!(once, "OPENAI_API_KEY=[REDACTED:openai-api-key]");
+        let twice = SecretRedactor::new(true).scan(&once);
+        assert!(
+            twice.is_clean(),
+            "a marker is not a secret: {}",
+            twice.text()
+        );
+        assert_eq!(twice.text(), once);
     }
 
     #[test]

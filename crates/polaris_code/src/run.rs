@@ -56,10 +56,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use polaris::graph::RunId;
-use polaris::models::llm::{AssistantBlock, Message};
 use polaris::plugins::{IO_TYPE, IOContent, IOMessage, IOProvider};
 use polaris::sessions::{SessionError, SessionId, SessionsAPI, TurnNumber};
 
+use crate::agents::continuation::final_answer_text;
 use crate::agents::{AgentConfig, ContextManager, LoopState, TurnFailure};
 use crate::cosmos::host::{self, TopologyTurn};
 use crate::terminal::{SessionSettings, TurnSteering, transcript};
@@ -1175,7 +1175,7 @@ async fn run_usage(sessions: &SessionsAPI, session_id: &SessionId) -> Option<Run
         .flatten()
 }
 
-/// The last assistant message's text in `session_id`'s history, if any.
+/// The last answer's text, including its output-limit continuation fragments.
 ///
 /// Reads the same [`ContextManager`] both front ends already share, rather
 /// than tapping any particular turn's `UserIO` stream, so this has no
@@ -1185,27 +1185,11 @@ async fn final_assistant_text(sessions: &SessionsAPI, session_id: &SessionId) ->
         .with_context(session_id, |ctx| {
             ctx.get_resource::<ContextManager>()
                 .ok()
-                .and_then(|history| history.messages.last().and_then(assistant_text))
+                .and_then(|history| final_answer_text(&history.messages))
         })
         .await
         .ok()
         .flatten()
-}
-
-/// The concatenated text blocks of an assistant message, or `None` for a user
-/// message or a purely non-text assistant message (e.g. tool calls only).
-fn assistant_text(message: &Message) -> Option<String> {
-    let Message::Assistant { content, .. } = message else {
-        return None;
-    };
-    let text: String = content
-        .iter()
-        .filter_map(|block| match block {
-            AssistantBlock::Text(block) => Some(block.text.as_str()),
-            _ => None,
-        })
-        .collect();
-    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -1352,16 +1336,18 @@ mod tests {
 
     #[test]
     fn assistant_text_ignores_user_messages_and_empty_content() {
-        assert_eq!(assistant_text(&Message::user("hi")), None);
+        use polaris::models::llm::Message;
+
+        assert_eq!(final_answer_text(&[Message::user("hi")]), None);
         assert_eq!(
-            assistant_text(&Message::assistant("hello")),
+            final_answer_text(&[Message::assistant("hello")]),
             Some("hello".to_string())
         );
         assert_eq!(
-            assistant_text(&Message::Assistant {
+            final_answer_text(&[Message::Assistant {
                 id: None,
                 content: vec![],
-            }),
+            }]),
             None
         );
     }

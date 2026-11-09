@@ -19,14 +19,19 @@ graph rather than read off the source.
 `CodeAgent::build` produces a graph that validates standalone (0 errors, 0
 warnings). Its derived `GraphSignature` is:
 
-- **23 resource accesses over 18 types** — five of them (`AgentLlm`,
-  `ContextManager`, the live transcript, the per-turn `PolicySnapshot`, and
-  `ProjectContext`, which the turn boundary re-reads) are both read and
-  written, and `satisfies` compares access modes exactly, so each direction is
-  its own access.
+- **39 resource accesses over 31 types** — eight of them (among them
+  `AgentLlm`, `ContextManager`, the live transcript, the per-turn
+  `PolicySnapshot`, and `ProjectContext`, which the turn boundary re-reads) are
+  both read and written, and `satisfies` compares access modes exactly, so each
+  direction is its own access.
 - **`requires_outputs = {CaughtError}`** — the error handler reads an output no
   node in the graph produces, which is exactly what a free upstream output is.
-- **`produces = {LlmResponse, LoopState, PreparedContext}`**.
+- **Eleven produced outputs**, among them `LlmResponse`, `LoopState` and
+  `PreparedContext`.
+
+These are the counts `the_sealed_catalog_lists_the_default_loop` asserts on the
+signature explanation (`tests/default_loop_publication.rs`): 39 required
+resources over 31 types, 1 required output and 11 produced outputs.
 
 The coding contract (`cosmos::topology::CONTRACT`,
 `polaris-code.coding-assessment`) requires a graph that produces an
@@ -75,7 +80,7 @@ construction.
 
 The registration is complete on the same terms as the six coding ones: a
 selection reference, a configuration schema, a requirements set, a stable
-signature explanation covering all 22 accesses and all four outputs, and
+signature explanation covering all 39 accesses, the one output it reads and the eleven it produces, and
 author priors.
 
 **The graph it registers is `CodeAgent::build`'s, verbatim** —
@@ -104,10 +109,10 @@ so each is stated rather than guessed.
   `MODEL_PROVIDER` key the coding pack uses. Nothing else about a turn is a
   capability the host either has or lacks.
 - **Availability: probed, not assumed.** `probe_availability` takes a
-  `ConversationalHost { session_resources, model_provider }` and reports 18
+  `ConversationalHost { session_resources, model_provider }` and reports 31
   resource facts, one upstream-output fact, and the provider fact only when the
   host actually has one. Both answers are proved: a wired host admits it with
-  zero exclusions; a hermetic one is refused with `provider.unavailable`, 18
+  zero exclusions; a hermetic one is refused with `provider.unavailable`, 31
   `resource.missing`, and `upstream-output.missing`.
 
 ## 4. Publication is not activation

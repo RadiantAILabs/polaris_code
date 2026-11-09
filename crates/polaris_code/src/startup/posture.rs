@@ -7,7 +7,9 @@ use polaris::shell::ShellConfig;
 use polaris::tools::ToolPermission;
 
 use super::cli::Cli;
-use crate::agents::{PermissionCeiling, PermissionMode, PolicySnapshot, UnattendedGrants};
+use crate::agents::{
+    AgentConfig, PermissionCeiling, PermissionMode, PolicySnapshot, UnattendedGrants,
+};
 use crate::tools::GraphSearchMode;
 
 /// Destructive command patterns refused outright by the shell, regardless of
@@ -107,6 +109,26 @@ pub(super) fn ceiling_notice(ceiling: &PermissionCeiling, active: &PermissionMod
     )
 }
 
+/// Default seconds a shell command may run when a person is watching: they can
+/// send a long run to the background or stop it themselves.
+const ATTENDED_COMMAND_TIMEOUT_SECS: u64 = 120;
+
+/// Default seconds a shell command may run in an unattended run. Nobody can
+/// send a long build or test run to the background there, so the default
+/// leaves room for one. A call's own `timeout_secs` still overrides it.
+const UNATTENDED_COMMAND_TIMEOUT_SECS: u64 = 600;
+
+/// The default shell command timeout for a run in `mode`.
+fn command_timeout_secs(mode: &PermissionMode) -> u64 {
+    match mode {
+        PermissionMode::Unattended(_) => UNATTENDED_COMMAND_TIMEOUT_SECS,
+        PermissionMode::Confirm
+        | PermissionMode::AutoEdit
+        | PermissionMode::Auto
+        | PermissionMode::Plan => ATTENDED_COMMAND_TIMEOUT_SECS,
+    }
+}
+
 pub(super) fn configured_shell(
     working_dir: &Path,
     mode: &PermissionMode,
@@ -123,7 +145,7 @@ pub(super) fn configured_shell(
     };
     ShellConfig::new()
         .with_working_dir(working_dir)
-        .with_timeout(120)
+        .with_timeout(command_timeout_secs(mode))
         .with_max_output_bytes(64 * 1024)
         .with_allowed_dirs(vec![working_dir.to_path_buf()])
         .with_allowed_commands(allowed_commands)
@@ -161,12 +183,24 @@ pub(super) fn project_shell_environment(config: ShellConfig, enabled: bool) -> S
     )
 }
 
+/// The policy a session of this run starts with.
+///
+/// Sized to the agent's declared model limits, with `mode`'s permissions. An
+/// unattended run gets `unattended_nudges`; an attended one never needs them,
+/// because a person answers a reply that calls no tool.
 pub(super) fn policy_snapshot(
+    config: &AgentConfig,
     mode: &PermissionMode,
     graph_search: GraphSearchMode,
+    unattended_nudges: u32,
 ) -> PolicySnapshot {
-    let mut policy = PolicySnapshot::defaults();
+    let mut policy = PolicySnapshot::for_agent(config);
     policy.permission = mode.permission_policy();
+    if matches!(mode, PermissionMode::Unattended(_)) {
+        policy.continuation = policy
+            .continuation
+            .with_unattended_nudges(unattended_nudges);
+    }
     if !graph_search.freeform_enabled() {
         policy.tool_palette.denied.push("sparql_query".to_string());
         policy
@@ -184,6 +218,60 @@ mod tests {
     use crate::agents::DEFAULT_MAX_TURNS;
     use clap::Parser;
     use polaris::shell::{ShellExecutor, ShellPermission};
+    use std::num::NonZeroU32;
+
+    #[test]
+    fn the_session_policy_keeps_model_limits_and_nudges_only_unattended_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::new("m", root.path())
+            .with_max_output_tokens(NonZeroU32::new(131_072).unwrap());
+        let unsized_policy = policy_snapshot(
+            &config,
+            &PermissionMode::Confirm,
+            GraphSearchMode::default(),
+            1,
+        );
+        assert_eq!(
+            unsized_policy.retrieval.max_tokens,
+            Some(crate::agents::policy::DEFAULT_MAX_WINDOW_TOKENS)
+        );
+        assert_eq!(unsized_policy.continuation.unattended_nudges, 0);
+
+        config.context_window = Some(NonZeroU32::new(1_048_576).unwrap());
+        let unattended = policy_snapshot(
+            &config,
+            &PermissionMode::Unattended(UnattendedGrants::default()),
+            GraphSearchMode::default(),
+            2,
+        );
+        let input = 1_048_576 - 131_072;
+        assert_eq!(unattended.retrieval.max_tokens, Some(input * 4 / 5));
+        assert_eq!(unattended.continuation.unattended_nudges, 2);
+        assert!(unattended.permission.is_unattended());
+    }
+
+    #[test]
+    fn unattended_runs_give_shell_commands_a_longer_default_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let unattended = PermissionMode::Unattended(UnattendedGrants::default());
+        assert_eq!(
+            configured_shell(root.path(), &unattended, false).default_timeout_secs,
+            UNATTENDED_COMMAND_TIMEOUT_SECS
+        );
+        for attended in [
+            PermissionMode::Confirm,
+            PermissionMode::AutoEdit,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+        ] {
+            assert_eq!(
+                configured_shell(root.path(), &attended, false).default_timeout_secs,
+                ATTENDED_COMMAND_TIMEOUT_SECS,
+                "{}",
+                attended.label()
+            );
+        }
+    }
 
     fn resolve(args: &[&str]) -> Result<(PermissionMode, Option<PermissionCeiling>), String> {
         let parsed = cli(args);

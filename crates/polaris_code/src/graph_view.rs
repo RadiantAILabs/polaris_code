@@ -854,7 +854,13 @@ mod tests {
                 "finish_calls"
             ]
         );
-        assert_eq!(labels(branch(tools, "no").steps()), ["finalize"]);
+        assert_eq!(
+            labels(branch(tools, "no").steps()),
+            ["decide_continuation", "continues"]
+        );
+        let continues = find(&model, "continues");
+        assert_eq!(labels(branch(continues, "yes").steps()), ["continue_turn"]);
+        assert_eq!(labels(branch(continues, "no").steps()), ["finalize"]);
         let calls = find(&model, "tool_calls");
         assert_eq!(calls.kind(), GraphNodeKind::Loop);
         assert_eq!(

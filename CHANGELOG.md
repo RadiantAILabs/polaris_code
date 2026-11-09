@@ -8,20 +8,14 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 ### Added
 
 - Let code permission rules supply complete call-refusal text while preserving named authorization provenance; default code-rule denials now describe the refused call.
-
 - Let host startup callbacks supply a fallback model-request timeout below explicit stock settings.
-
 - Add optional observation of collected model attempts and classified turn outcomes for host recorders.
-
 - Add an opt-in canonical conversation message ceiling, independent of context projection and the turn limit.
-
 - Let plugins extend session configuration and append system-prompt sections through the coding-agent step registry.
-
 - Let embedding hosts validate inputs before provider setup and opt out of automatic prompt routing.
-
 - Expose the pure file edit planner so plugins can preview exactly what an edit would write.
 - A plugin that depends on `PermissionRulesPlugin` can add a named permission rule written in Rust, with `PermissionRules::add_code_rule`, while the server is built. The rule is a function of the tool name, the call's arguments and the workspace root, and returns no opinion or a `RuleDecision` with a reason. It is weighed with the permission-file rules (deny over ask over allow), an allow never goes above the mode or the permission ceiling, and project trust does not apply to it. A denial reaches the model as a refusal that names the rule and is recorded as `denied` with the rule's reason. A rule that panics refuses the call. For `run_command` and `run_in_background` the rule is called with the whole command and then with each simple command. Rules cannot be added once the server is ready, and `/permissions` lists them by name. `PermissionRules` is now a mutable resource until the server is ready, and a global after that.
-- Plugin-contributed coding-agent graph steps after tool rounds and before finish through `CodeAgentSteps` and `CodeAgent::with_steps`, with ordered finish holds that continue the existing bounded loop. `GraphViewPlugin::for_code_agent_steps` publishes the completed startup graph; an empty registry preserves the stock graph and agent identity.
+- Plugin-contributed coding-agent graph steps after tool rounds and before finish through `CodeAgentSteps` and `CodeAgent::with_steps`, with ordered finish holds that continue the existing bounded loop. Finish steps run when a reply ends the turn, after the continuation check. `GraphViewPlugin::for_code_agent_steps` publishes the completed startup graph; an empty registry preserves the stock graph and agent identity.
 - `--model-request-timeout-secs` / `POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS` / `model_request_timeout_secs` configures Bedrock's native per-attempt request timeout for Converse and Responses. Accepts whole seconds from 1 to 86400; unset preserves existing defaults. Other providers refuse this setting because their builders expose no total request timeout. See the embedding guide for retry and streaming behavior.
 - `polaris_code::startup`: the `polaris` binary's startup as a library. `Host::new().arg(..).plugins(..).run(args)` starts the same agent with the same flags, configuration files, environment variables, providers, front ends and exit codes, with plugins and command-line settings of the caller's own added, so another crate no longer copies `main.rs`. A host's plugins are added after all of `polaris`'s own and can add code permission rules (`PermissionRules::add_code_rule`) and coding-loop steps (`CodeAgentSteps`). `tabs::add_code_agent_shell_tabs` adds the shell's tabs with the Graph tab drawing the agent built from the step registry. `Host::run` returns the exit code instead of exiting the process.
 
@@ -33,6 +27,22 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 - `edit_file`: an `old_string` that ends with a newline matches the end of a file that has no final newline, when the text before the newline occurs once in the file and that place is the end. The same number of newlines is left off the end of `new_string`, the file still ends without one, and the result says so. Other requests that do not match are still refused.
 - `edit_file`: a refusal now says what to do next. An `old_string` that is not in the file shows the nearest text with line numbers and the first line where it differs; one that matches several places lists their lines. An empty `old_string` is refused for a file that has content (with `replace_all` it used to insert the new text between every character).
 - A tool call whose arguments are not a JSON object (a reply cut off at the output-length limit while the call was being written) is answered with an explanation instead of `Parameters must be an object`.
+
+## [0.4.3] - 2026-11-09
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
+
+### Added
+- A model reply cut off at the output limit is continued instead of being treated as the final answer, up to three times per turn. The final answer of a `-p` run joins the continued parts.
+- A `-p` run asks the model to go on once when a reply calls no tool. `POLARIS_CODE_UNATTENDED_NUDGES` sets the number; `0` turns it off. Interactive sessions and embedding hosts are unchanged unless they opt in through `ContinuationPolicy`.
+- The model sees the first and last 5,000 characters of each long shell output stream, with the end read from the overflow file when the capture was cut. Secrets are redacted before the output is shortened. `ObservationPolicy` on `PolicySnapshot` sets the size.
+
+### Changed
+- Foreground `run_command` calls in a `-p` run time out after 600 seconds by default instead of 120. Interactive sessions keep 120, and `run_in_background` keeps its 3,600-second default.
+- A `-p` run that grants edits or commands no longer routes question-shaped prompts (`find …`, `where is …`) to the read-only question topology.
+
+### Fixed
+- `--context-window` now sizes context projection and compaction in CLI sessions. The CLI replaced the session policy with unsized defaults after the agent had sized it, so compaction always started at the 60,000-token default.
 
 ## [0.4.2] - 2026-11-08
 
@@ -157,7 +167,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...v0.4.0

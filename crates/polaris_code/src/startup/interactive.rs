@@ -228,7 +228,9 @@ impl Driver {
                     // regardless of the posture of the session being left. The model
                     // is a preference rather than a posture, so it stays on whatever
                     // `/model` last chose.
-                    let fresh_policy = policy_snapshot(&PermissionMode::Confirm, graph_search);
+                    // Confirm never nudges, so the nudge count does not matter.
+                    let fresh_policy =
+                        policy_snapshot(&driver_config, &PermissionMode::Confirm, graph_search, 0);
                     driver_settings.reset_keeping_model();
                     if let Err(err) = driver_sessions
                         .with_context(&target, move |ctx| {
