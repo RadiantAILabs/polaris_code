@@ -2,7 +2,7 @@
   "description": "The done gate holds a final message while the check fails, then lets one through once the check passes; the report cites the recorded check.",
   "workspace": "value",
   "exercises": ["gate", "report"],
-  "args": ["--protect", "test.py", "--test-command", "python3 test.py"],
+  "args": ["--protect", "test.py", "--test-command", "python3 -B test.py"],
   "runs": [
     {"name": "steps", "args": ["--rules-arm", "steps"]},
     {"name": "moved", "args": ["--rules-arm", "moved"]},

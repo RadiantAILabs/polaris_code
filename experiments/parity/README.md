@@ -102,7 +102,7 @@ a fixed message so the run still ends, and the report says so.
 
 All start from the same workspace, `_workspaces/value`: `solution.py` holds
 `VALUE = 2`, the protected `test.py` asserts `VALUE == 1`, and the test command
-is `python3 test.py`.
+is `python3 -B test.py`.
 
 | Session | Runs | What it exercises |
 |---|---|---|

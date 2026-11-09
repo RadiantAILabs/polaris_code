@@ -2,7 +2,7 @@
   "description": "The give-up route: a final message that starts with CANNOT_COMPLETE ends the run as gave_up in every setup; with --no-give-up the same message is an ordinary final message and meets the done gate where there is one.",
   "workspace": "value",
   "exercises": ["give-up", "no-give-up", "gate"],
-  "args": ["--protect", "test.py", "--test-command", "python3 test.py"],
+  "args": ["--protect", "test.py", "--test-command", "python3 -B test.py"],
   "runs": [
     {"name": "none", "args": ["--rules-arm", "none"]},
     {"name": "prompt", "args": ["--rules-arm", "prompt"]},

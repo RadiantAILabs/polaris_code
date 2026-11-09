@@ -2,7 +2,7 @@
   "description": "--max-messages ends a run as limits. The count includes the system message, the task, each reply, each tool result and each message the setup adds. A limit that never binds changes nothing.",
   "workspace": "value",
   "exercises": ["max-messages", "limits"],
-  "args": ["--protect", "test.py", "--test-command", "python3 test.py"],
+  "args": ["--protect", "test.py", "--test-command", "python3 -B test.py"],
   "runs": [
     {"name": "none-2", "args": ["--rules-arm", "none", "--max-messages", "2"]},
     {"name": "prompt-3", "args": ["--rules-arm", "prompt", "--max-messages", "3"]},
@@ -31,7 +31,7 @@
         }
       ]
     },
-    {"calls": [{"tool": "run_command", "arguments": {"command": "python3 test.py"}}]},
+    {"calls": [{"tool": "run_command", "arguments": {"command": "python3 -B test.py"}}]},
     {"text": "Fixed solution.py. The tests pass."}
   ]
 }

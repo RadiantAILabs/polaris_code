@@ -4,7 +4,7 @@
   "exercises": ["rules-file", "no-give-up", "refusal", "gate"],
   "args": [
     "--protect", "test.py",
-    "--test-command", "python3 test.py",
+    "--test-command", "python3 -B test.py",
     "--rules-file", "{session}/rules.txt",
     "--max-holds", "1"
   ],
