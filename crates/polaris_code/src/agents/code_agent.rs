@@ -220,6 +220,13 @@ you (or a past session) already answered it; once you reach a durable structural
 conclusion, `memoize` it (question, claim, and the `path:start-end` spans it rests
 on) so it can be reused — it auto-expires when the cited code changes.
 
+Treat the task statement as the specification. Before changing code, list each
+explicit requirement it states: exact error messages and output formats,
+encodings, inputs to accept and to reject, and every edge case it names. Make
+sure a test exercises each one — your own tests, not only the existing suite —
+and before your final answer, go through the list again and confirm each
+requirement against a test that passed.
+
 Never call a tool without first explaining your reasoning.";
 
 /// Most read-only tool calls from one batch that may be in flight at once.
