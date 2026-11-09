@@ -42,7 +42,7 @@ const MAX_CANDIDATES: usize = 20;
 
 /// An edit that can be made.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EditPlan {
+pub struct EditPlan {
     /// The whole file once the edit is made.
     pub updated: String,
     /// How many places changed.
@@ -54,7 +54,7 @@ pub(crate) struct EditPlan {
 
 /// Why an edit is not made.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EditRefusal {
+pub enum EditRefusal {
     /// `old_string` is empty and the file is not.
     EmptyOldString,
     /// `old_string` does not occur in the file.
@@ -72,7 +72,7 @@ pub(crate) enum EditRefusal {
 
 /// The text in a file nearest to the one a failed request asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Nearest {
+pub struct Nearest {
     /// 1-based line the text starts on.
     first_line: usize,
     /// The lines, each prefixed with its line number.
@@ -83,7 +83,7 @@ pub(crate) struct Nearest {
 
 impl EditRefusal {
     /// The refusal as the model reads it: what is wrong and what to do next.
-    pub(crate) fn message(&self, path: &str) -> String {
+    pub fn message(&self, path: &str) -> String {
         match self {
             Self::EmptyOldString => format!(
                 "old_string is empty, so it does not say where in {path} to edit; give the \
@@ -151,7 +151,26 @@ pub(crate) fn adjustment_note(path: &str) -> String {
 /// With `replace_all` unset the text must match exactly once. See the module
 /// documentation for the single request that is matched although it is not
 /// exact.
-pub(crate) fn plan_edit(
+///
+/// This function performs no I/O. Consumers can inspect the exact file an edit
+/// would produce before authorizing or applying it; the file tool uses this
+/// same planner. It neither authorizes a write nor checks path containment.
+///
+/// # Errors
+///
+/// Returns an [`EditRefusal`] when the requested text is absent, ambiguous, empty
+/// in a nonempty file, or would make no change under the final-newline allowance.
+///
+/// # Example
+///
+/// ```
+/// use polaris_code::tools::edit_match::plan_edit;
+/// let plan = plan_edit("value = 1\n", "value = 1", "value = 2", false).unwrap();
+/// assert_eq!(plan.updated, "value = 2\n");
+/// assert_eq!(plan.replacements, 1);
+/// assert!(!plan.adjusted);
+/// ```
+pub fn plan_edit(
     original: &str,
     old: &str,
     new: &str,
