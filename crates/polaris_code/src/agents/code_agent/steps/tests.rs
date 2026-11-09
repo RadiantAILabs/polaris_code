@@ -292,7 +292,7 @@ async fn run(replies: Vec<Reply>, max_turns: usize, plugins: u8) -> Outcome {
             },
         )
         .unwrap();
-    let turn = drive_turn(&sessions, &id).await;
+    let turn = drive_turn(sessions, &id).await;
     let history = sessions
         .with_context(&id, |ctx| {
             ctx.get_resource::<ContextManager>()
