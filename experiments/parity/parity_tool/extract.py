@@ -41,12 +41,18 @@ OTHER_MARKERS = [
 # -- normalising --------------------------------------------------------------
 
 
+#: Names the agent makes up at random for its own temporary folders.
+RANDOM_NAMES = [(re.compile(r"polaris-check-[A-Za-z0-9]+"), "polaris-check-<id>")]
+
+
 def normalize(value, replacements: list[tuple[str, str]]):
     """Replace run-specific strings by stable names, in every string of ``value``."""
     if isinstance(value, str):
         for needle, name in replacements:
             if needle:
                 value = value.replace(needle, name)
+        for pattern, name in RANDOM_NAMES:
+            value = pattern.sub(name, value)
         return value
     if isinstance(value, list):
         return [normalize(item, replacements) for item in value]

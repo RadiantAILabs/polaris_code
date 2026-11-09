@@ -1,0 +1,37 @@
+{
+  "description": "--max-messages ends a run as limits. The count includes the system message, the task, each reply, each tool result and each message the setup adds. A limit that never binds changes nothing.",
+  "workspace": "value",
+  "exercises": ["max-messages", "limits"],
+  "args": ["--protect", "test.py", "--test-command", "python3 test.py"],
+  "runs": [
+    {"name": "none-2", "args": ["--rules-arm", "none", "--max-messages", "2"]},
+    {"name": "prompt-3", "args": ["--rules-arm", "prompt", "--max-messages", "3"]},
+    {"name": "per-call-5", "args": ["--rules-arm", "per-call", "--max-messages", "5"]},
+    {"name": "steps-8", "args": ["--rules-arm", "steps", "--max-messages", "8"]},
+    {"name": "moved-100", "args": ["--rules-arm", "moved", "--max-messages", "100"]},
+    {"name": "prompt-gate-100", "args": ["--rules-arm", "prompt-gate", "--max-messages", "100"]}
+  ],
+  "replies": [
+    {
+      "calls": [
+        {"tool": "read_file", "arguments": {"path": "solution.py"}},
+        {"tool": "read_file", "arguments": {"path": "test.py"}}
+      ]
+    },
+    {
+      "calls": [
+        {
+          "tool": "edit_file",
+          "arguments": {
+            "path": "solution.py",
+            "old_string": "VALUE = 2",
+            "new_string": "VALUE = 1",
+            "replace_all": false
+          }
+        }
+      ]
+    },
+    {"calls": [{"tool": "run_command", "arguments": {"command": "python3 test.py"}}]},
+    {"text": "Fixed solution.py. The tests pass."}
+  ]
+}

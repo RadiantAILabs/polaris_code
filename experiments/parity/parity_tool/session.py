@@ -40,7 +40,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_TASK = "Implement add in func.py so that the tests pass."
+DEFAULT_TASK = "Make solution.py pass test.py."
 DEFAULT_MAX_TURNS = 12
 
 #: Folder under the sessions folder that holds workspaces shared by sessions.

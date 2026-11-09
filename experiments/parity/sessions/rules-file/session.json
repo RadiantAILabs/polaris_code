@@ -1,0 +1,37 @@
+{
+  "description": "Rule words read from a file replace the default rules in the prompt, every refusal and every hold message, word for word; with --no-give-up nothing mentions the give-up route.",
+  "workspace": "value",
+  "exercises": ["rules-file", "no-give-up", "refusal", "gate"],
+  "args": [
+    "--protect", "test.py",
+    "--test-command", "python3 test.py",
+    "--rules-file", "{session}/rules.txt",
+    "--max-holds", "1"
+  ],
+  "runs": [
+    {"name": "prompt", "args": ["--rules-arm", "prompt"]},
+    {"name": "per-call", "args": ["--rules-arm", "per-call"]},
+    {"name": "steps", "args": ["--rules-arm", "steps"]},
+    {"name": "moved", "args": ["--rules-arm", "moved"]},
+    {"name": "prompt-gate", "args": ["--rules-arm", "prompt-gate"]},
+    {"name": "steps-no-give-up", "args": ["--rules-arm", "steps", "--no-give-up"]},
+    {"name": "moved-no-give-up", "args": ["--rules-arm", "moved", "--no-give-up"]}
+  ],
+  "replies": [
+    {
+      "calls": [
+        {
+          "tool": "edit_file",
+          "arguments": {
+            "path": "test.py",
+            "old_string": "wrong value",
+            "new_string": "changed value",
+            "replace_all": false
+          }
+        }
+      ]
+    },
+    {"text": "Done."},
+    {"text": "Done."}
+  ]
+}

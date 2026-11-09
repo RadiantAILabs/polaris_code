@@ -1,0 +1,20 @@
+{
+  "description": "The model keeps claiming success while the check fails. The run ends as not_done on hold number N + 1, where N is --max-holds.",
+  "workspace": "value",
+  "exercises": ["max-holds", "gate", "report"],
+  "args": ["--protect", "test.py", "--test-command", "python3 test.py"],
+  "runs": [
+    {"name": "steps-default", "args": ["--rules-arm", "steps"]},
+    {"name": "steps-1", "args": ["--rules-arm", "steps", "--max-holds", "1"]},
+    {"name": "moved-2", "args": ["--rules-arm", "moved", "--max-holds", "2"]},
+    {"name": "prompt-gate-0", "args": ["--rules-arm", "prompt-gate", "--max-holds", "0"]},
+    {"name": "prompt-gate-2", "args": ["--rules-arm", "prompt-gate", "--max-holds", "2"]}
+  ],
+  "replies": [
+    {"text": "All tests pass."},
+    {"text": "All tests pass, really."},
+    {"text": "All tests pass now."},
+    {"text": "I checked again and all tests pass."},
+    {"text": "This reply should not be needed."}
+  ]
+}
