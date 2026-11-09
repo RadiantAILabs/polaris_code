@@ -137,8 +137,10 @@ A documented entry point that hides a constraint is worse than none, so:
   stdout. If you want `json` output, call
   [`RunReport`](crate::exec::RunReport) and print it yourself.
 * **The `POLARIS_CODE_*` environment variables are the binary's.** The model,
-  the graph-search mode and the prompt-cache strategy are read from the
-  environment by `main.rs` only. An embedder sets them on
+  the graph-search mode, the prompt-cache strategy and the unattended nudge
+  count (`POLARIS_CODE_UNATTENDED_NUDGES`, see
+  [Continuing unattended replies](#continuing-unattended-replies-and-bounding-shell-output))
+  are read from the environment by `main.rs` only. An embedder sets them on
   [`AgentConfig`](crate::agents::AgentConfig) (`with_graph_search`,
   `with_prompt_cache`) and on [`CodeGraphPlugin`](crate::tools::CodeGraphPlugin).
   The same config also carries the per-session settings `with_system_prompt`,
@@ -270,6 +272,71 @@ that session's existing `UserIO` and offers the same scopes as the terminal.
 Omitting the plugin denies calls that require a person, with a tool error
 explaining that no approver is registered. Modes and explicit run grants that
 allow calls without asking continue to work without the plugin.
+
+## Continuing unattended replies and bounding shell output
+
+Two parts of the per-turn [`PolicySnapshot`](crate::agents::PolicySnapshot)
+decide things the `polaris` binary sets for you and an embedder must set itself:
+
+* **Unattended replies.** In a run nobody watches, a reply that calls no tool
+  ends the turn, even if it only says what the agent will do next.
+  [`ContinuationPolicy`](crate::agents::ContinuationPolicy) can ask the model to
+  go on instead. Its library default is **0 nudges**. The binary reads
+  `POLARIS_CODE_UNATTENDED_NUDGES` and applies
+  [`DEFAULT_UNATTENDED_NUDGES`](crate::agents::continuation::DEFAULT_UNATTENDED_NUDGES)
+  (1) when it is unset; the library never reads that variable, so an embedder
+  that wants the same behaviour sets
+  [`with_unattended_nudges`](crate::agents::ContinuationPolicy::with_unattended_nudges)
+  itself. Nudges are sent only when `policy.permission` is an unattended one,
+  so set both. A reply cut off at the output limit is continued up to three
+  times per turn whatever you set here.
+* **Shell output size.** [`ObservationPolicy`](crate::agents::ObservationPolicy)
+  sets how much of each `run_command` output stream the model sees, as a
+  [`StreamView`](crate::tools::shell_render::StreamView).
+  [`PolicySnapshot::for_agent`](crate::agents::PolicySnapshot::for_agent) and
+  `defaults` bound each stream to 10,000 characters (the first and last 5,000).
+  `StreamView::FULL` shows everything the shell captured.
+
+Build the snapshot with `PolicySnapshot::for_agent`, not `defaults()`:
+`CodeAgent::setup` already seeds the session with `for_agent(&config)`, which
+sizes context projection and compaction to the `context_window` and
+`max_output_tokens` in the session's `AgentConfig`, and `defaults()` would
+replace that sizing with the unsized budgets. Insert the result after the
+session is created and before the turn starts:
+
+```rust,no_run
+# use polaris::sessions::{SessionId, SessionsAPI};
+# use polaris_code::agents::continuation::DEFAULT_UNATTENDED_NUDGES;
+# use polaris_code::agents::{AgentConfig, PermissionMode, PolicySnapshot, UnattendedGrants};
+# use polaris_code::tools::shell_render::StreamView;
+# async fn install_policy(
+#     sessions: &SessionsAPI,
+#     session_id: &SessionId,
+#     config: &AgentConfig,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let mut policy = PolicySnapshot::for_agent(config);
+
+// Nobody can answer this run: refuse what would need a person...
+policy.permission = PermissionMode::Unattended(UnattendedGrants::default()).permission_policy();
+// ...and ask the model to go on once after a reply that calls no tool.
+policy.continuation = policy
+    .continuation
+    .with_unattended_nudges(DEFAULT_UNATTENDED_NUDGES);
+
+// Show the model at most 4,000 characters of each shell output stream.
+policy.observation.shell_stream = StreamView::bounded(4_000);
+
+sessions
+    .with_context(session_id, move |ctx| {
+        ctx.insert(policy);
+    })
+    .await?;
+# Ok(())
+# }
+```
+
+The bounded text is what the model reads and what the tool block published to
+your `UserIO` shows. The trajectory still records the executor's full result.
 
 ## Running several isolated calls on one server
 

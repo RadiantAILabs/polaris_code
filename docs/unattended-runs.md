@@ -72,9 +72,11 @@ A `-p` run ends on a model reply that calls no tool, with two exceptions:
 
 Both messages start with `[continuation] `, appear in the trajectory as user
 messages, and are recorded as `continuation` decisions. Every budget is finite,
-so a model that keeps replying without tools still ends the run. A reply the
-provider stops with `pause_turn`, or because of a content filter, is not
-continued: the run ends on it.
+so a model that keeps replying without tools still ends the run. Only the
+output limit counts as a cut-off: a reply the provider stops with `pause_turn`,
+or because of a content filter, is not continued as one. In an unattended run
+it is handled like any other reply without a tool call, so it uses the nudge
+budget; in an interactive session it ends the turn.
 
 A `-p` run whose prompt starts like a question (`find …`, `where is …`,
 `show me …`) is answered by the read-only question topology only when the run

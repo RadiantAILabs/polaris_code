@@ -2091,6 +2091,32 @@ const AUTO_ROUTE_REFERENCE: &str = "auto-answer";
 /// such an answer cannot do, even when its prompt opens like a question ("find
 /// a free meeting slot … and write it to `meeting.ics`"), so it runs the full
 /// agent instead. Only a read-only unattended run is routed.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_code::agents::{PermissionMode, UnattendedGrants};
+/// use polaris_code::cosmos::host::auto_route_admits;
+///
+/// // A read-only unattended run may be routed.
+/// let read_only = UnattendedGrants::default();
+/// assert!(auto_route_admits(&PermissionMode::Unattended(read_only)));
+///
+/// // A run that granted edits or commands asked for work an answer cannot do.
+/// let edits = UnattendedGrants {
+///     edit_file: true,
+///     ..UnattendedGrants::default()
+/// };
+/// assert!(!auto_route_admits(&PermissionMode::Unattended(edits)));
+/// let commands = UnattendedGrants {
+///     run_command_patterns: vec!["cargo test*".to_string()],
+///     ..UnattendedGrants::default()
+/// };
+/// assert!(!auto_route_admits(&PermissionMode::Unattended(commands)));
+///
+/// // So is any attended mode.
+/// assert!(!auto_route_admits(&PermissionMode::Confirm));
+/// ```
 #[must_use]
 pub fn auto_route_admits(mode: &crate::agents::PermissionMode) -> bool {
     matches!(mode, crate::agents::PermissionMode::Unattended(grants) if grants.is_read_only())

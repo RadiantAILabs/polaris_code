@@ -736,6 +736,27 @@ impl Default for RetryPolicy {
 /// [`PolicySnapshot::defaults`] bounds shell output to
 /// [`DEFAULT_STREAM_VIEW_CHARS`](crate::tools::shell_render::DEFAULT_STREAM_VIEW_CHARS)
 /// characters per stream.
+///
+/// # Examples
+///
+/// ```
+/// use polaris_code::agents::{ObservationPolicy, PolicySnapshot};
+/// use polaris_code::tools::shell_render::{DEFAULT_STREAM_VIEW_CHARS, StreamView};
+///
+/// // The agent's snapshot bounds each stream.
+/// let mut policy = PolicySnapshot::defaults();
+/// assert_eq!(
+///     policy.observation.shell_stream.max_chars,
+///     Some(DEFAULT_STREAM_VIEW_CHARS)
+/// );
+///
+/// // A host that wants a smaller view assigns one.
+/// policy.observation.shell_stream = StreamView::bounded(4_000);
+/// assert_eq!(policy.observation.shell_stream.max_chars, Some(4_000));
+///
+/// // A policy built from `Default` shows every captured character.
+/// assert_eq!(ObservationPolicy::default().shell_stream, StreamView::FULL);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationPolicy {
     /// The part of each `run_command` output stream the model sees.
@@ -795,6 +816,34 @@ impl PolicySnapshot {
     /// [`defaults`](Self::defaults), with the window budgets sized to the model
     /// limits `config` declares. Without a declared context window the
     /// default budgets stay.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::num::NonZeroU32;
+    ///
+    /// use polaris_code::agents::{AgentConfig, PolicySnapshot};
+    ///
+    /// // No declared context window: the default budgets stay.
+    /// let config = AgentConfig::new("anthropic/claude-sonnet-5", ".");
+    /// assert_eq!(
+    ///     PolicySnapshot::for_agent(&config).retrieval.max_tokens,
+    ///     PolicySnapshot::defaults().retrieval.max_tokens
+    /// );
+    ///
+    /// // A declared window and output allowance size the budgets: 80% of the
+    /// // input capacity (window minus output) is the history budget.
+    /// let config = config
+    ///     .with_context_window(NonZeroU32::new(32_768).expect("non-zero"))
+    ///     .with_max_output_tokens(NonZeroU32::new(4_096).expect("non-zero"));
+    /// let mut policy = PolicySnapshot::for_agent(&config);
+    /// assert_eq!(policy.retrieval.max_tokens, Some(22_937));
+    ///
+    /// // The rest is `defaults`: unattended nudges are off until the host opts in.
+    /// assert_eq!(policy.continuation.unattended_nudges, 0);
+    /// policy.continuation = policy.continuation.with_unattended_nudges(1);
+    /// assert_eq!(policy.continuation.unattended_nudges, 1);
+    /// ```
     #[must_use]
     pub fn for_agent(config: &super::config::AgentConfig) -> Self {
         let mut policy = Self::defaults();
