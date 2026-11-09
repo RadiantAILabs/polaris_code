@@ -115,6 +115,10 @@ starting the conversational loop. Routing is conservative and preserves the
 prompt as the statement. A prompt that does not meet a supported shape stays on
 the normal conversational path.
 
+In a `-p` run, only a run that grants neither edits nor commands is routed:
+the question topology cannot change the workspace, so a run granted either
+asked for work it cannot do. Interactive sessions do not auto-route.
+
 `TaskOrigin` records whether a task was submitted explicitly or auto-routed.
 That fact can adjust selection policy without changing task contents or
 permission posture. Read-only questions remain non-mutating; edit-shaped tasks

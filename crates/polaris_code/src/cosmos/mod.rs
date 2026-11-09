@@ -57,7 +57,7 @@ pub use compare::{ArmOutcome, ComparisonArm, ComparisonReport, compare_intents};
 pub use edit::{EditError, EditOutcome, StubSite};
 pub use host::{
     AcceptedCodingTask, CodingTaskQueue, CodingTaskQueuePlugin, TaskOrigin, TopologySelectionError,
-    TopologyTurn, auto_route,
+    TopologyTurn, auto_route, auto_route_admits,
 };
 pub use inventory::{Blocker, BlockerCategory, TopologyEntry, TopologyInventory};
 pub use payload::{CodingWorkspace, EditSite};

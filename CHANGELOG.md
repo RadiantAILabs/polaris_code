@@ -5,6 +5,18 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Added
+- A model reply cut off at the output limit is continued instead of being treated as the final answer, up to three times per turn.
+- A `-p` run asks the model to go on once when a reply calls no tool. `POLARIS_CODE_UNATTENDED_NUDGES` sets the number; `0` turns it off. Interactive sessions and embedding hosts are unchanged unless they opt in through `ContinuationPolicy`.
+- The model sees the first and last 5,000 characters of each long shell output stream, with the end read from the overflow file when the capture was cut. `ObservationPolicy` on `PolicySnapshot` sets the size.
+
+### Changed
+- Foreground `run_command` calls in a `-p` run time out after 600 seconds by default instead of 120. Interactive sessions keep 120, and `run_in_background` keeps its 3,600-second default.
+- A `-p` run that grants edits or commands no longer routes question-shaped prompts (`find …`, `where is …`) to the read-only question topology.
+
+### Fixed
+- `--context-window` now sizes context projection and compaction in CLI sessions. The CLI replaced the session policy with unsized defaults after the agent had sized it, so compaction always started at the 60,000-token default.
+
 ## [0.4.2] - 2026-11-08
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.

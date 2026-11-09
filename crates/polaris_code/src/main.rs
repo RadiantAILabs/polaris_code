@@ -43,6 +43,7 @@ use polaris::system::param::SystemContext;
 use polaris::system::server::Server;
 use polaris::tools::{ToolPermission, ToolsPlugin};
 use polaris_code::accounts::{self, Account};
+use polaris_code::agents::continuation::DEFAULT_UNATTENDED_NUDGES;
 use polaris_code::agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS, PermissionCeiling, PermissionMode,
     PolicySnapshot, UnattendedGrants, load_seed_ontologies,
@@ -51,7 +52,7 @@ use polaris_code::cosmos::composition::CompositionPolicy;
 use polaris_code::cosmos::default_loop::DefaultLoopTopologyPackPlugin;
 use polaris_code::cosmos::domains::DomainSelection;
 use polaris_code::cosmos::host::{
-    CodingTaskQueue, CodingTaskQueuePlugin, OperatorTopologyPin, auto_route,
+    CodingTaskQueue, CodingTaskQueuePlugin, OperatorTopologyPin, auto_route, auto_route_admits,
 };
 use polaris_code::cosmos::inventory;
 use polaris_code::cosmos::planner::GatePlannerMode;
@@ -324,6 +325,27 @@ fn resolve_max_turns(raw: Option<&str>) -> Result<usize, String> {
                 "{MAX_TURNS_VAR} must be a non-negative integer (0 disables the cap), got {value:?}"
             )
         })
+}
+
+/// The environment variable that sets how many times an unattended run is
+/// asked to go on after a reply that calls no tool.
+const UNATTENDED_NUDGES_VAR: &str = "POLARIS_CODE_UNATTENDED_NUDGES";
+
+/// Resolve the unattended nudge budget for this run.
+///
+/// Unset, or set to whitespace, keeps [`DEFAULT_UNATTENDED_NUDGES`]. Anything
+/// else has to be a non-negative integer; zero turns nudges off. A typo is a
+/// configuration error rather than a silent fallback.
+fn resolve_unattended_nudges(raw: Option<&str>) -> Result<u32, String> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_UNATTENDED_NUDGES);
+    };
+    value.parse::<u32>().map_err(|_| {
+        format!(
+            "{UNATTENDED_NUDGES_VAR} must be a non-negative integer (0 turns nudges off), \
+             got {value:?}"
+        )
+    })
 }
 
 /// The environment variable that pins this whole run to one registered
@@ -795,6 +817,26 @@ fn ceiling_notice(ceiling: &PermissionCeiling, active: &PermissionMode) -> Strin
     )
 }
 
+/// Default seconds a shell command may run when a person is watching: they can
+/// send a long run to the background or stop it themselves.
+const ATTENDED_COMMAND_TIMEOUT_SECS: u64 = 120;
+
+/// Default seconds a shell command may run in an unattended run. Nobody can
+/// send a long build or test run to the background there, so the default
+/// leaves room for one. A call's own `timeout_secs` still overrides it.
+const UNATTENDED_COMMAND_TIMEOUT_SECS: u64 = 600;
+
+/// The default shell command timeout for a run in `mode`.
+fn command_timeout_secs(mode: &PermissionMode) -> u64 {
+    match mode {
+        PermissionMode::Unattended(_) => UNATTENDED_COMMAND_TIMEOUT_SECS,
+        PermissionMode::Confirm
+        | PermissionMode::AutoEdit
+        | PermissionMode::Auto
+        | PermissionMode::Plan => ATTENDED_COMMAND_TIMEOUT_SECS,
+    }
+}
+
 fn configured_shell(
     working_dir: &std::path::Path,
     mode: &PermissionMode,
@@ -811,7 +853,7 @@ fn configured_shell(
     };
     ShellConfig::new()
         .with_working_dir(working_dir)
-        .with_timeout(120)
+        .with_timeout(command_timeout_secs(mode))
         .with_max_output_bytes(64 * 1024)
         .with_allowed_dirs(vec![working_dir.to_path_buf()])
         .with_allowed_commands(allowed_commands)
@@ -849,9 +891,24 @@ fn project_shell_environment(config: ShellConfig, enabled: bool) -> ShellConfig 
     )
 }
 
-fn policy_snapshot(mode: &PermissionMode, graph_search: GraphSearchMode) -> PolicySnapshot {
-    let mut policy = PolicySnapshot::defaults();
+/// The policy a session of this run starts with.
+///
+/// Sized to the agent's declared model limits, with `mode`'s permissions. An
+/// unattended run gets `unattended_nudges`; an attended one never needs them,
+/// because a person answers a reply that calls no tool.
+fn policy_snapshot(
+    config: &AgentConfig,
+    mode: &PermissionMode,
+    graph_search: GraphSearchMode,
+    unattended_nudges: u32,
+) -> PolicySnapshot {
+    let mut policy = PolicySnapshot::for_agent(config);
     policy.permission = mode.permission_policy();
+    if matches!(mode, PermissionMode::Unattended(_)) {
+        policy.continuation = policy
+            .continuation
+            .with_unattended_nudges(unattended_nudges);
+    }
     if !graph_search.freeform_enabled() {
         policy.tool_palette.denied.push("sparql_query".to_string());
         policy
@@ -1173,6 +1230,11 @@ async fn main() {
     // and the non-interactive report, so they agree on the output allowance.
     let max_output_tokens = cli.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let max_turns = run_max_turns(&cli);
+    let unattended_nudges =
+        match resolve_unattended_nudges(std::env::var(UNATTENDED_NUDGES_VAR).ok().as_deref()) {
+            Ok(nudges) => nudges,
+            Err(why) => fatal(headless, &why),
+        };
     if let Err(why) = validate_context_window(cli.context_window, max_output_tokens) {
         fatal(headless, why);
     }
@@ -1225,7 +1287,7 @@ async fn main() {
     // starts empty, and three things put work into it: `/topology`
     // interactively and `--topology-task` for one unattended run, both
     // through the `TopologyWork` handle built below and both an explicit,
-    // named accept; and, for a `--print` run whose prompt `auto_route`
+    // named accept; and, for a read-only `--print` run whose prompt `auto_route`
     // recognises as a light-effort question, this binding directly, below,
     // marked `TaskOrigin::AutoRouted` rather than explicit — the one
     // difference being that an inconclusive answer there falls through to
@@ -1854,7 +1916,12 @@ async fn main() {
     // commands unprompted. `CodeAgent::setup` seeds the defaults while creating
     // or resuming the session, so this has to run after that and it overwrites
     // the snapshot wholesale.
-    let policy = policy_snapshot(&permission_mode, graph_search);
+    let policy = policy_snapshot(
+        &agent_config,
+        &permission_mode,
+        graph_search,
+        unattended_nudges,
+    );
     if let Err(err) = sessions
         .with_context(&session_id, move |ctx| {
             ctx.insert(policy);
@@ -1877,6 +1944,7 @@ async fn main() {
                 Err(refused) => fatal(headless, &refused.to_string()),
             }
         } else if let Some(prompt) = cli.print.as_deref()
+            && auto_route_admits(&permission_mode)
             && let Some(auto) = auto_route(&working_dir, prompt)
         {
             // A third, quiet acceptance path alongside `/topology` and
@@ -1949,7 +2017,12 @@ async fn main() {
         .get_global::<OxigraphStore>()
         .map(|store| OxigraphStore::clone(&store));
     let driver_working_dir = working_dir.clone();
-    let driver_policy = policy_snapshot(&permission_mode, graph_search);
+    let driver_policy = policy_snapshot(
+        &agent_config,
+        &permission_mode,
+        graph_search,
+        unattended_nudges,
+    );
     let rewind_application = RewindApplication::new(
         driver_sessions.clone(),
         driver_journal.clone(),
@@ -2110,7 +2183,12 @@ async fn main() {
                 // regardless of the posture of the session being left. The model
                 // is a preference rather than a posture, so it stays on whatever
                 // `/model` last chose.
-                let fresh_policy = policy_snapshot(&PermissionMode::Confirm, graph_search);
+                let fresh_policy = policy_snapshot(
+                    &driver_config,
+                    &PermissionMode::Confirm,
+                    graph_search,
+                    unattended_nudges,
+                );
                 driver_settings.reset_keeping_model();
                 if let Err(err) = driver_sessions
                     .with_context(&target, move |ctx| {
@@ -2724,6 +2802,75 @@ mod tests {
                 .denied_commands
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unattended_nudges_default_parse_and_reject_typos() {
+        assert_eq!(
+            resolve_unattended_nudges(None),
+            Ok(DEFAULT_UNATTENDED_NUDGES)
+        );
+        assert_eq!(
+            resolve_unattended_nudges(Some("  ")),
+            Ok(DEFAULT_UNATTENDED_NUDGES)
+        );
+        assert_eq!(resolve_unattended_nudges(Some("0")), Ok(0));
+        assert_eq!(resolve_unattended_nudges(Some(" 3 ")), Ok(3));
+        let error = resolve_unattended_nudges(Some("one")).unwrap_err();
+        assert!(error.contains(UNATTENDED_NUDGES_VAR), "{error}");
+    }
+
+    #[test]
+    fn the_session_policy_keeps_model_limits_and_nudges_only_unattended_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::new("m", root.path())
+            .with_max_output_tokens(NonZeroU32::new(131_072).unwrap());
+        let unsized_policy = policy_snapshot(
+            &config,
+            &PermissionMode::Confirm,
+            GraphSearchMode::default(),
+            1,
+        );
+        assert_eq!(
+            unsized_policy.retrieval.max_tokens,
+            Some(polaris_code::agents::policy::DEFAULT_MAX_WINDOW_TOKENS)
+        );
+        assert_eq!(unsized_policy.continuation.unattended_nudges, 0);
+
+        config.context_window = Some(NonZeroU32::new(1_048_576).unwrap());
+        let unattended = policy_snapshot(
+            &config,
+            &PermissionMode::Unattended(UnattendedGrants::default()),
+            GraphSearchMode::default(),
+            2,
+        );
+        let input = 1_048_576 - 131_072;
+        assert_eq!(unattended.retrieval.max_tokens, Some(input * 4 / 5));
+        assert_eq!(unattended.continuation.unattended_nudges, 2);
+        assert!(unattended.permission.is_unattended());
+    }
+
+    #[test]
+    fn unattended_runs_give_shell_commands_a_longer_default_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let unattended = PermissionMode::Unattended(UnattendedGrants::default());
+        assert_eq!(
+            configured_shell(root.path(), &unattended, false).default_timeout_secs,
+            UNATTENDED_COMMAND_TIMEOUT_SECS
+        );
+        for attended in [
+            PermissionMode::Confirm,
+            PermissionMode::AutoEdit,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+        ] {
+            assert_eq!(
+                configured_shell(root.path(), &attended, false).default_timeout_secs,
+                ATTENDED_COMMAND_TIMEOUT_SECS,
+                "{}",
+                attended.label()
+            );
+        }
     }
 
     #[test]

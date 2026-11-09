@@ -23,7 +23,7 @@ pub mod fileset;
 pub mod mcp;
 pub mod memory;
 pub mod policy;
-pub(crate) mod shell_render;
+pub mod shell_render;
 pub mod tasks;
 pub mod web;
 

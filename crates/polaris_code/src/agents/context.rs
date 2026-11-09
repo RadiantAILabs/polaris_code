@@ -842,8 +842,13 @@ impl ContextManager {
 }
 
 /// Whether `msg` begins a clean user-input turn — a `Message::User` carrying **no**
-/// `ToolResult` block. A window may start here without orphaning a `tool_result`.
+/// `ToolResult` block and not a continuation prompt. A window may start here
+/// without orphaning a `tool_result`.
 fn is_turn_boundary(msg: &Message) -> bool {
+    // The agent loop's own continuation prompt continues the active turn.
+    if super::continuation::is_continuation_prompt(msg) {
+        return false;
+    }
     match msg {
         Message::User { content } => !content
             .iter()
@@ -1227,6 +1232,63 @@ mod tests {
         // The active turn is never dropped, even though it exceeds the cap.
         assert_eq!(window.len(), 1);
         assert!(is_turn_boundary(&window[0]));
+    }
+
+    #[test]
+    fn continuation_prompts_keep_the_real_task_under_count_and_token_pressure() {
+        use super::super::continuation::ContinueReason;
+
+        let mut messages = vec![
+            user("older task"),
+            assistant("older answer"),
+            user("current task"),
+        ];
+        messages.extend(tool_exchange("current-tool", 1));
+        for reason in [
+            ContinueReason::Truncated,
+            ContinueReason::Unattended { last: false },
+            ContinueReason::Unattended { last: true },
+        ] {
+            messages.push(assistant("partial reply"));
+            messages.push(user(&reason.prompt()));
+        }
+        let original = serde_json::to_value(&messages).unwrap();
+        let strategies: [Arc<dyn ContextStrategy>; 3] = [
+            Arc::new(LinearWindow),
+            Arc::new(CacheAwareWindow),
+            Arc::new(SummarizingWindow::new(Arc::new(CacheAwareWindow))),
+        ];
+        for strategy in strategies {
+            let context = ContextManager {
+                strategy,
+                ..ctx(messages.clone())
+            };
+            for (max_messages, max_tokens) in [(Some(2), None), (None, Some(1))] {
+                let projected = context.project(&RetrievalPolicy {
+                    max_messages,
+                    max_tokens,
+                    ..Default::default()
+                });
+                // Cache-aware windows keep their prefix under token pressure;
+                // their message-count cap still discards older turns.
+                let start = if projected.cache_prefix && max_messages.is_none() {
+                    0
+                } else {
+                    2
+                };
+                assert_eq!(
+                    serde_json::to_value(&projected.messages).unwrap(),
+                    serde_json::to_value(&messages[start..]).unwrap()
+                );
+                if projected.cache_prefix {
+                    assert_eq!(
+                        projected.breakpoints,
+                        vec![2 - start, projected.messages.len() - 1]
+                    );
+                }
+                assert_eq!(serde_json::to_value(&context.messages).unwrap(), original);
+            }
+        }
     }
 
     fn thought(parts: &[&str]) -> AssistantBlock {
@@ -1681,6 +1743,39 @@ mod tests {
         );
         context.request_compaction("retry explicitly");
         assert!(context.plan_compaction(&policy, None).unwrap().is_some());
+    }
+
+    #[test]
+    fn summary_span_does_not_end_at_a_continuation_prompt() {
+        use super::super::continuation::ContinueReason;
+
+        for reason in [
+            ContinueReason::Truncated,
+            ContinueReason::Unattended { last: true },
+            ContinueReason::Unattended { last: false },
+        ] {
+            let mut context = summary_ctx(vec![
+                user(&"original task ".repeat(1_000)),
+                assistant("partial answer"),
+                user(&reason.prompt()),
+                assistant("continued answer"),
+            ]);
+            let policy = RetrievalPolicy {
+                compact_keep_recent: 2,
+                ..Default::default()
+            };
+            let original = serde_json::to_value(&context.messages).unwrap();
+            let plan = context
+                .plan_compaction(&policy, Some(100))
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.through_messages, 1);
+            assert_eq!(
+                serde_json::to_value(&plan.messages).unwrap(),
+                serde_json::to_value(&context.messages[..1]).unwrap()
+            );
+            assert_eq!(serde_json::to_value(&context.messages).unwrap(), original);
+        }
     }
 
     #[test]
