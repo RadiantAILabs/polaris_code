@@ -78,7 +78,7 @@ error; a session-level failure comes back as
 
 | Field | What an embedder does with it |
 |-------|-------------------------------|
-| `reason` | `Completed`, `Failed(failure)`, `Interrupted`, or `NoTopologyStarted`. A [`TurnFailure`](crate::agents::TurnFailure) carries the one message to show and its [`FailureKind`](crate::agents::FailureKind) (`auth`, `rate_limit`, `overloaded`, `timeout`, `network`, `invalid_request` or `other`); a transient failure (`rate_limit`, `overloaded`, `timeout`, `network`) has already been retried as `RetryPolicy` allows before it is reported, and `auth`, `invalid_request` and `other` are never retried. [`TurnReason::exit_code`](crate::run::TurnReason::exit_code) maps it to the CLI contract (`0`/`1`/`130`) if you are exposing one. [`run::driver_continues`](crate::run::driver_continues) says whether a looping driver should start another turn. |
+| `reason` | `Completed`, `Failed(failure)`, `Interrupted`, or `NoTopologyStarted`. A [`TurnFailure`](crate::agents::TurnFailure) carries the one message to show and its [`FailureKind`](crate::agents::FailureKind) (`auth`, `rate_limit`, `overloaded`, `timeout`, `network`, `invalid_request` or `other`); a transient failure (`rate_limit`, `overloaded`, `timeout`, `network`) has already been retried as `RetryPolicy` allows before it is reported, and `auth`, `invalid_request` and `other` are never retried, except that a reply that could not be read (`other`, from `GenerationError::InvalidResponse`) is sent again up to [`MALFORMED_REPLY_ATTEMPTS`](crate::agents::retry::MALFORMED_REPLY_ATTEMPTS) times in all, even after it showed text. [`TurnReason::exit_code`](crate::run::TurnReason::exit_code) maps it to the CLI contract (`0`/`1`/`130`) if you are exposing one. [`run::driver_continues`](crate::run::driver_continues) says whether a looping driver should start another turn. |
 | `final_text` | The turn's answer, read out of the canonical history rather than out of your IO stream — so it does not matter which provider you installed. `None` for every non-`Completed` outcome. |
 | `usage` | The run's accounting as [`RunUsage`](crate::usage::RunUsage), schema `polaris-code-run-usage/v1`. Reported for **every** outcome, including an interrupted one. `None` means unmeasured, never free. `docs/headless-usage-accounting.md` specifies the shape field by field; it is a published external contract and this is the object it describes. |
 | `run_id`, `nodes_executed`, `duration` | The trace join key into graph events, and what the turn actually did. `run_id` is `None` when the turn never reached the executor. |
@@ -284,7 +284,7 @@ decide things the `polaris` binary sets for you and an embedder must set itself:
   go on instead. Its library default is **0 nudges**. The binary reads
   `POLARIS_CODE_UNATTENDED_NUDGES` and applies
   [`DEFAULT_UNATTENDED_NUDGES`](crate::agents::continuation::DEFAULT_UNATTENDED_NUDGES)
-  (1) when it is unset; the library never reads that variable, so an embedder
+  (0, off) when it is unset; the library never reads that variable, so an embedder
   that wants the same behaviour sets
   [`with_unattended_nudges`](crate::agents::ContinuationPolicy::with_unattended_nudges)
   itself. Nudges are sent only when `policy.permission` is an unattended one,
@@ -306,7 +306,6 @@ session is created and before the turn starts:
 
 ```rust,no_run
 # use polaris::sessions::{SessionId, SessionsAPI};
-# use polaris_code::agents::continuation::DEFAULT_UNATTENDED_NUDGES;
 # use polaris_code::agents::{AgentConfig, PermissionMode, PolicySnapshot, UnattendedGrants};
 # use polaris_code::tools::shell_render::StreamView;
 # async fn install_policy(
@@ -318,10 +317,10 @@ let mut policy = PolicySnapshot::for_agent(config);
 
 // Nobody can answer this run: refuse what would need a person...
 policy.permission = PermissionMode::Unattended(UnattendedGrants::default()).permission_policy();
-// ...and ask the model to go on once after a reply that calls no tool.
-policy.continuation = policy
-    .continuation
-    .with_unattended_nudges(DEFAULT_UNATTENDED_NUDGES);
+// ...ask the model to go on once after a reply that calls no tool...
+policy.continuation = policy.continuation.with_unattended_nudges(1);
+// ...and retry a failed model call for about five minutes, as `polaris -p` does.
+policy.retry = polaris_code::agents::policy::RetryPolicy::unattended();
 
 // Show the model at most 4,000 characters of each shell output stream.
 policy.observation.shell_stream = StreamView::bounded(4_000);

@@ -46,13 +46,15 @@ use super::trajectory::Decision;
 pub const DEFAULT_TRUNCATION_CONTINUES: u32 = 3;
 
 /// Default number of times an unattended `--print` run is asked to go on
-/// after a reply without a tool call.
+/// after a reply without a tool call: none.
 ///
 /// The `polaris` binary applies it to its unattended runs
-/// (`POLARIS_CODE_UNATTENDED_NUDGES` overrides it). [`ContinuationPolicy::defaults`]
-/// leaves nudges off, so a host that embeds the agent keeps its own contract
-/// for what a reply without a tool call means.
-pub const DEFAULT_UNATTENDED_NUDGES: u32 = 1;
+/// (`POLARIS_CODE_UNATTENDED_NUDGES` overrides it). It is 0 because, on
+/// benchmark runs, every nudge came after the work was already finished and
+/// only added a model call. A model that tends to stop half-way can be given
+/// nudges with the variable, or by an embedder with
+/// [`ContinuationPolicy::with_unattended_nudges`].
+pub const DEFAULT_UNATTENDED_NUDGES: u32 = 0;
 
 /// The prefix every continuation prompt starts with.
 ///
@@ -477,8 +479,7 @@ mod tests {
 
     #[test]
     fn spent_truncation_budget_falls_back_to_the_unattended_nudge() {
-        let policy =
-            ContinuationPolicy::defaults().with_unattended_nudges(DEFAULT_UNATTENDED_NUDGES);
+        let policy = ContinuationPolicy::defaults().with_unattended_nudges(1);
         assert_eq!(
             policy.decide(
                 &StopReason::MaxOutputTokens,

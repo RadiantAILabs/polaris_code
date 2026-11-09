@@ -25,6 +25,15 @@ use super::policy::RetryPolicy;
 
 mod model_call;
 
+/// Most attempts for a call whose reply could not be read, the first included.
+///
+/// A reply the client cannot assemble, such as a tool call whose arguments are
+/// not valid JSON, is lost whatever happens next, so sending the call again
+/// costs nothing that a failed turn would keep. It is still capped below
+/// [`RetryPolicy::max_attempts`]: a provider that garbles every reply should
+/// not be called ten times.
+pub const MALFORMED_REPLY_ATTEMPTS: u32 = 3;
+
 pub(crate) use model_call::{
     AttemptLedger, AttemptOutcome, abandon, accept_response, act, begin_model_call, decide_retry,
     report_failure, wait_to_retry,
@@ -38,7 +47,9 @@ pub enum Commitment {
     /// sent again as if the attempt had not happened.
     Uncommitted,
     /// Output was shown or tokens were billed. Neither can be rolled back, so
-    /// a second attempt would show or bill the same thing twice.
+    /// a second attempt would show or bill the same thing twice. Only a reply
+    /// that could not be read is retried anyway (see
+    /// [`RetryPolicy::next_step`]).
     Committed,
 }
 
@@ -77,7 +88,16 @@ impl RetryPolicy {
     /// Decide what follows attempt number `attempt` (counting from 1), which
     /// failed with `error`.
     ///
-    /// The call is sent again only if all of these hold:
+    /// A reply that could not be read ([`GenerationError::InvalidResponse`],
+    /// for example a tool call with arguments that are not valid JSON) is sent
+    /// again while attempts remain under both
+    /// [`max_attempts`](Self::max_attempts) and [`MALFORMED_REPLY_ATTEMPTS`],
+    /// even if the attempt had already shown or billed something: nothing of
+    /// it can be kept, so a retry only replaces a failed turn. Every attempt
+    /// is billed, so such a failure can cost up to [`MALFORMED_REPLY_ATTEMPTS`]
+    /// times the output.
+    ///
+    /// Any other failure is sent again only if all of these hold:
     ///
     /// - the failure is transient: not an authentication or invalid-request
     ///   error, which a second try cannot fix;
@@ -106,6 +126,15 @@ impl RetryPolicy {
         jitter: f64,
     ) -> RetryStep {
         let attempt = attempt.max(1);
+        if matches!(error, GenerationError::InvalidResponse(_)) {
+            return if attempt < self.attempt_limit(error) {
+                RetryStep::Retry {
+                    after: self.backoff(attempt, jitter),
+                }
+            } else {
+                RetryStep::GiveUp
+            };
+        }
         if commitment.is_committed()
             || attempt >= self.max_attempts
             || !classify(error).is_transient()
@@ -118,6 +147,18 @@ impl RetryPolicy {
             None => RetryStep::Retry {
                 after: self.backoff(attempt, jitter),
             },
+        }
+    }
+
+    /// The most attempts this policy makes for a call that fails with `error`:
+    /// [`max_attempts`](Self::max_attempts), or at most
+    /// [`MALFORMED_REPLY_ATTEMPTS`] for a reply that could not be read.
+    #[must_use]
+    pub fn attempt_limit(&self, error: &GenerationError) -> u32 {
+        if matches!(error, GenerationError::InvalidResponse(_)) {
+            self.max_attempts.min(MALFORMED_REPLY_ATTEMPTS)
+        } else {
+            self.max_attempts
         }
     }
 
@@ -457,6 +498,87 @@ mod tests {
             ..defaults
         };
         assert_eq!(single.worst_case_wait(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn an_unreadable_reply_is_retried_even_after_output_but_only_twice() {
+        let error = GenerationError::InvalidResponse(
+            "failed to parse tool call arguments: EOF while parsing an object".into(),
+        );
+        let policy = RetryPolicy::unattended();
+        for attempt in [1, 2] {
+            for commitment in [Commitment::Committed, Commitment::Uncommitted] {
+                assert!(
+                    matches!(
+                        policy.next_step(attempt, &error, commitment, 0.5),
+                        RetryStep::Retry { .. }
+                    ),
+                    "attempt {attempt} ({commitment:?}) is retried"
+                );
+            }
+        }
+        assert_eq!(
+            policy.next_step(3, &error, Commitment::Committed, 0.5),
+            RetryStep::GiveUp
+        );
+        assert_eq!(policy.attempt_limit(&error), 3);
+        let twice = RetryPolicy {
+            max_attempts: 2,
+            ..RetryPolicy::default()
+        };
+        assert!(matches!(
+            twice.next_step(1, &error, Commitment::Committed, 0.5),
+            RetryStep::Retry { .. }
+        ));
+        assert_eq!(
+            twice.next_step(2, &error, Commitment::Committed, 0.5),
+            RetryStep::GiveUp,
+            "the policy's own smaller budget wins"
+        );
+        let once = RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(
+            once.next_step(1, &error, Commitment::Uncommitted, 0.5),
+            RetryStep::GiveUp,
+            "a policy that never retries does not retry this either"
+        );
+        // Other committed failures still give up at once.
+        assert_eq!(
+            policy.next_step(
+                1,
+                &GenerationError::Http("reset".into()),
+                Commitment::Committed,
+                0.5
+            ),
+            RetryStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn the_unattended_policy_keeps_retrying_for_about_five_minutes() {
+        let policy = RetryPolicy::unattended();
+        assert_eq!(policy.max_attempts, 10);
+        assert_eq!(
+            policy.attempt_timeout,
+            RetryPolicy::default().attempt_timeout
+        );
+        // With no jitter (factor 1.0 at 0.5), the computed waits add up to 302 s.
+        let error = GenerationError::Http("connection refused".into());
+        let mut total = Duration::ZERO;
+        for attempt in 1..policy.max_attempts {
+            match policy.next_step(attempt, &error, Commitment::Uncommitted, 0.5) {
+                RetryStep::Retry { after } => total += after,
+                RetryStep::GiveUp => panic!("gave up after attempt {attempt}"),
+            }
+        }
+        assert_eq!(total, Duration::from_secs(302));
+        assert_eq!(
+            policy.next_step(policy.max_attempts, &error, Commitment::Uncommitted, 0.5),
+            RetryStep::GiveUp
+        );
+        assert_eq!(policy.worst_case_wait(), Duration::from_secs(3_540));
     }
 
     #[test]

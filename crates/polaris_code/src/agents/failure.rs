@@ -40,8 +40,9 @@ const DETAIL_LIMIT: usize = 240;
 ///
 /// The set is deliberately small and stable: it is the `error_kind` a headless
 /// run reports and the axis the retry policy decides on. [`Auth`](Self::Auth),
-/// [`InvalidRequest`](Self::InvalidRequest) and [`Other`](Self::Other) are never
-/// retried; the rest are transient.
+/// [`InvalidRequest`](Self::InvalidRequest) and [`Other`](Self::Other) are not
+/// transient; the rest are. The one `Other` failure that is retried is a reply
+/// that could not be read (see `RetryPolicy::next_step`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureKind {
