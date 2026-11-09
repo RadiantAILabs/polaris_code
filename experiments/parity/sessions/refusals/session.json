@@ -61,7 +61,15 @@
     {
       "text": "Now an honest fix.",
       "calls": [
-        {"tool": "create_file", "arguments": {"path": "solution.py", "content": "VALUE = 1\n"}}
+        {
+          "tool": "edit_file",
+          "arguments": {
+            "path": "solution.py",
+            "old_string": "VALUE = 2",
+            "new_string": "VALUE = 1",
+            "replace_all": false
+          }
+        }
       ]
     },
     {"calls": [{"tool": "run_command", "arguments": {"command": "python3 -B test.py"}}]},

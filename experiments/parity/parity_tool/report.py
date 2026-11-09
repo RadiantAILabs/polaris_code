@@ -60,6 +60,27 @@ def stock_lines(comparisons: list[Comparison], verbose: bool) -> list[str]:
     return lines
 
 
+def network_lines(comparisons: list[Comparison], names: tuple[str, str]) -> list[str]:
+    """What each build tried to reach outside the model endpoint (all refused)."""
+    lines = [
+        "Requests to anywhere but the model endpoint. The tool gave each binary a local",
+        "proxy that refuses every one of them, so nothing left this machine through it.",
+        "Information only: a build that ignores proxy settings would not show up here.",
+    ]
+    for name in names:
+        counts: dict[str, int] = {}
+        for c in comparisons:
+            for attempt in c.facts.get("network_attempts", {}).get(name, []):
+                counts[attempt] = counts.get(attempt, 0) + 1
+        if counts:
+            shown = ", ".join(f"{target} x{count}" for target, count in sorted(counts.items()))
+            lines.append(f"  {name}: {shown}")
+        else:
+            lines.append(f"  {name}: none")
+    lines.append("")
+    return lines
+
+
 def render(
     comparisons: list[Comparison],
     names: tuple[str, str],
@@ -89,6 +110,7 @@ def render(
         elif c.notes:
             lines.append(f"{c.spec.id}: " + "; ".join(c.notes))
     lines.extend(stock_lines(comparisons, verbose))
+    lines.extend(network_lines(comparisons, names))
     if out_dir:
         lines.append(f"Files for every run (requests, record, stdout, stderr): {out_dir}")
     return "\n".join(lines).rstrip() + "\n"

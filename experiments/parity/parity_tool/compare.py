@@ -388,5 +388,6 @@ def compare(spec: RunSpec, labels: tuple[str, str], runs: tuple[RunResult, RunRe
         facts={
             "decisions": {labels[0]: facts[0], labels[1]: facts[1]},
             "requests": {labels[0]: len(mains[0]), labels[1]: len(mains[1])},
+            "network_attempts": {labels[0]: runs[0].network_attempts, labels[1]: runs[1].network_attempts},
         },
     )

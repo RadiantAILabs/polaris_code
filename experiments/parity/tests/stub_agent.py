@@ -11,6 +11,8 @@ refusal, a note and a hold, and a run record. Its behaviour is switched by the
 ``extra-call``     makes one request without tool definitions before the loop.
 ``stock``          has no rules options at all (``--help`` does not list them).
 ``other-record``   adds one field to the record and changes a time.
+``reach-out``      asks for a web page outside the model endpoint, as a build that
+                   fetches a price table would. The request must be refused.
 """
 
 import json
@@ -76,6 +78,11 @@ def main():
     ]
     if flavour == "extra-call":
         post(url, {"model": "m", "instructions": "summarise", "input": "hello"})
+    if flavour == "reach-out":
+        try:
+            urllib.request.urlopen("http://prices.example.test/prices.json?key=secret", timeout=10)
+        except OSError:
+            pass
 
     items = [{"type": "message", "role": "user", "content": options["-p"]}]
     record = {

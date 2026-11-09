@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
@@ -24,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from parity_tool import cli, extract, runner  # noqa: E402
 from parity_tool.endpoint import AUXILIARY_TEXT, Endpoint  # noqa: E402
+from parity_tool.network import NetworkGuard  # noqa: E402
 from parity_tool.session import SessionError, expand, load_session, load_sessions  # noqa: E402
 
 STUB = HERE / "stub_agent.py"
@@ -155,6 +157,21 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(specs[1].args, ["--rules-arm", "steps", "--no-give-up"])
 
 
+class ExtractRecordHashTests(unittest.TestCase):
+    def test_output_hash_is_left_out_when_the_output_names_a_temp_folder(self):
+        replacements = [("/tmp/run1", "<run>")]
+        record = {
+            "checks": [
+                {"output_tail": "File /tmp/run1/polaris-check-AbC123/test.py", "output_sha256": "sha256:aaa"},
+                {"output_tail": "ok\n", "output_sha256": "sha256:bbb"},
+            ]
+        }
+        fields = extract.record_fields(record, replacements, [])
+        self.assertNotIn("checks[0].output_sha256", fields)
+        self.assertEqual(fields["checks[0].output_tail"], "File <run>/polaris-check-<id>/test.py")
+        self.assertEqual(fields["checks[1].output_sha256"], "sha256:bbb")
+
+
 class ExtractTests(unittest.TestCase):
     def segment(self, text, item="message", role="user", call_id=""):
         return extract.Segment("input[1]", item, role, call_id, "", text)
@@ -219,7 +236,36 @@ class ExtractTests(unittest.TestCase):
         )
 
 
+class NetworkGuardTests(unittest.TestCase):
+    @staticmethod
+    def send(port: int, request: bytes) -> bytes:
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
+            connection.sendall(request)
+            data = b""
+            while chunk := connection.recv(4096):
+                data += chunk
+        return data
+
+    def test_a_secure_request_is_refused_and_its_target_kept(self):
+        with NetworkGuard() as guard:
+            reply = self.send(guard.port, b"CONNECT prices.example.test:443 HTTP/1.1\r\nHost: x\r\n\r\n")
+        self.assertTrue(reply.startswith(b"HTTP/1.0 502") or reply.startswith(b"HTTP/1.1 502"), reply)
+        self.assertEqual(guard.attempts, ["CONNECT prices.example.test:443"])
+
+    def test_a_plain_request_keeps_only_its_host(self):
+        with NetworkGuard() as guard:
+            self.send(guard.port, b"GET http://prices.example.test/a/b?key=secret HTTP/1.1\r\nHost: x\r\n\r\n")
+        self.assertEqual(guard.attempts, ["GET prices.example.test"])
+
+
 class RunnerTests(unittest.TestCase):
+    def test_environment_names_the_refusing_proxy_and_spares_the_endpoint(self):
+        env = runner.sandbox_env(Path("/h"), Path("/t"), "http://127.0.0.1:1", "http://127.0.0.1:2")
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            self.assertEqual(env[name], "http://127.0.0.1:2", name)
+        self.assertIn("127.0.0.1", env["NO_PROXY"].split(","))
+        self.assertEqual(env["no_proxy"], env["NO_PROXY"])
+
     def test_environment_holds_only_placeholders(self):
         env = runner.sandbox_env(Path("/h"), Path("/t"), "http://127.0.0.1:1")
         self.assertEqual(env["AWS_EC2_METADATA_DISABLED"], "true")
@@ -302,7 +348,7 @@ class EndToEndTests(unittest.TestCase):
         cls.bin.mkdir()
         cls.agents = {
             flavour: write_wrapper(cls.bin, flavour)
-            for flavour in ("base", "other-hold", "extra-call", "stock", "other-record")
+            for flavour in ("base", "other-hold", "extra-call", "stock", "other-record", "reach-out")
         }
         cls.sessions = base / "sessions"
         cls.sessions.mkdir()
@@ -381,8 +427,22 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(run["sections"]["rule text"]["agrees"])
         self.assertTrue(run["sections"]["decisions"]["agrees"])
 
+    def test_a_request_outside_the_endpoint_is_refused_and_reported(self):
+        code, report, text = self.run_tool("base", "reach-out")
+        # Trying to reach the web is information, not a difference in what was sent.
+        self.assertEqual(code, 0, text)
+        attempts = report["runs"][0]["facts"]["network_attempts"]
+        self.assertEqual(attempts["old"], [])
+        self.assertEqual(attempts["new"], ["GET prices.example.test"])
+        self.assertIn("new: GET prices.example.test x1", text)
+        self.assertIn("old: none", text)
+        self.assertNotIn("secret", text)
+
     def test_a_missing_binary_is_an_error(self):
-        code = cli.main([str(self.bin / "missing"), str(self.agents["base"]), "--sessions", str(self.sessions)])
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(
+                [str(self.bin / "missing"), str(self.agents["base"]), "--sessions", str(self.sessions)]
+            )
         self.assertEqual(code, 2)
 
     def test_listing_needs_no_binaries(self):

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .endpoint import Endpoint
+from .network import NetworkGuard
 from .session import RunSpec, expand
 
 MODEL = "aws.bedrock/global.openai.gpt-5.4"
@@ -35,13 +36,17 @@ RULES_OPTIONS = {
 ALWAYS_IGNORED = [".*", "*/.*", "__pycache__", "*/__pycache__", "*.pyc"]
 
 
-def sandbox_env(home: Path, tmp: Path, endpoint_url: str | None = None) -> dict[str, str]:
+def sandbox_env(
+    home: Path, tmp: Path, endpoint_url: str | None = None, proxy_url: str | None = None
+) -> dict[str, str]:
     """The only environment a binary is started with.
 
     The machine's own credentials and configuration are never inherited: the
     placeholder keys cannot sign for anything real, ``AWS_PROFILE`` is not
     passed, the instance metadata service is switched off, and the only
-    endpoint is a local socket.
+    endpoint is a local socket. When ``proxy_url`` is given, it is the proxy for
+    every other request, so a build's own attempt to reach the internet (a price
+    table, say) ends at a local refusal; see ``network.py``.
     """
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -65,6 +70,11 @@ def sandbox_env(home: Path, tmp: Path, endpoint_url: str | None = None) -> dict[
         # the service one. Both point at the local socket.
         env["AWS_ENDPOINT_URL"] = endpoint_url
         env["AWS_ENDPOINT_URL_BEDROCK_RUNTIME"] = endpoint_url
+    if proxy_url:
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            env[name] = proxy_url
+            env[name.lower()] = proxy_url
+        env["no_proxy"] = env["NO_PROXY"]
     return env
 
 
@@ -86,7 +96,8 @@ def probe_rules_options(path: Path, scratch: Path) -> bool:
     tmp.mkdir(parents=True, exist_ok=True)
     done = subprocess.run(
         [str(path), "--help"],
-        env=sandbox_env(home, tmp),
+        # Nothing listens on the discard port, so even here a stray request fails.
+        env=sandbox_env(home, tmp, None, "http://127.0.0.1:9"),
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -169,6 +180,9 @@ class RunResult:
     run_dir: Path | None = None
     #: Set when the binary could not be started.
     start_error: str | None = None
+    #: Requests the binary made to anywhere but the model endpoint, as
+    #: ``"<method> <target>"``. All were refused.
+    network_attempts: list[str] = field(default_factory=list)
 
 
 def run_once(binary: Binary, spec: RunSpec, out_dir: Path, timeout: float) -> RunResult:
@@ -216,8 +230,8 @@ def run_once(binary: Binary, spec: RunSpec, out_dir: Path, timeout: float) -> Ru
     exit_code: int | None = None
     timed_out = False
     start_error: str | None = None
-    with Endpoint(script) as endpoint:
-        env = sandbox_env(home, tmp, endpoint.url)
+    with Endpoint(script) as endpoint, NetworkGuard() as guard:
+        env = sandbox_env(home, tmp, endpoint.url, guard.url)
         env.update(expand(spec.env, mapping))
         stdout_path = run_dir / "stdout"
         stderr_path = run_dir / "stderr"
@@ -245,6 +259,7 @@ def run_once(binary: Binary, spec: RunSpec, out_dir: Path, timeout: float) -> Ru
         requests = list(endpoint.requests)
         beyond = endpoint.beyond_script
         port = endpoint.port
+        attempts = list(guard.attempts)
     seconds = time.monotonic() - started
 
     record: dict | None = None
@@ -270,6 +285,7 @@ def run_once(binary: Binary, spec: RunSpec, out_dir: Path, timeout: float) -> Ru
         replacements=replacements,
         run_dir=run_dir,
         start_error=start_error,
+        network_attempts=attempts,
     )
 
 

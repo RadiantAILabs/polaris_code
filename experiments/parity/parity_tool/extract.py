@@ -372,9 +372,28 @@ def flatten(value, prefix: str = "") -> dict[str, object]:
     return {prefix: value}
 
 
+def _without_path_bound_hashes(record: dict, replacements: list[tuple[str, str]]) -> dict:
+    """``record`` without the output hash of a check whose output names a temp folder.
+
+    The hash is taken over the output as the test command printed it, folder
+    name included, so it differs between two runs of the same build. The
+    check's ``output_tail`` is still compared, with the folder names replaced.
+    """
+    checks = record.get("checks")
+    if not isinstance(checks, list):
+        return record
+    kept = []
+    for check in checks:
+        tail = check.get("output_tail") if isinstance(check, dict) else None
+        if isinstance(tail, str) and normalize(tail, replacements) != tail:
+            check = {key: value for key, value in check.items() if key != "output_sha256"}
+        kept.append(check)
+    return {**record, "checks": kept}
+
+
 def record_fields(record: dict, replacements: list[tuple[str, str]], ignored: list[str]) -> dict[str, object]:
     """The record as comparable ``{path: value}``, without times, paths normalised."""
-    leaves = flatten(normalize(record, replacements))
+    leaves = flatten(normalize(_without_path_bound_hashes(record, replacements), replacements))
     return {
         path: value
         for path, value in leaves.items()
