@@ -86,6 +86,8 @@ class Binary:
     path: Path
     #: Whether it has the rules experiment's options (found with ``--help``).
     rules_options: bool = True
+    #: Arguments added to the end of every run's command line, after the session's.
+    extra_args: list[str] = field(default_factory=list)
 
 
 def probe_rules_options(path: Path, scratch: Path) -> bool:
@@ -223,6 +225,7 @@ def run_once(binary: Binary, spec: RunSpec, out_dir: Path, timeout: float) -> Ru
         "--max-turns",
         str(spec.session.max_turns),
         *session_args,
+        *binary.extra_args,
     ]
 
     script = expand(spec.session.replies, mapping)

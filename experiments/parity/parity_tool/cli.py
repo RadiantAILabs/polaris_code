@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +35,18 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--label-a", default="old", help="name for the first binary in the report")
     parser.add_argument("--label-b", default="new", help="name for the second binary in the report")
+    parser.add_argument(
+        "--args-a",
+        default="",
+        metavar="ARGS",
+        help="extra arguments (one quoted string) added to every run of the first binary",
+    )
+    parser.add_argument(
+        "--args-b",
+        default="",
+        metavar="ARGS",
+        help="extra arguments (one quoted string) added to every run of the second binary",
+    )
     parser.add_argument("--sessions", type=Path, default=DEFAULT_SESSIONS, help="folder of sessions")
     parser.add_argument(
         "--only",
@@ -90,13 +103,21 @@ def main(argv: list[str] | None = None) -> int:
         if not path.is_file():
             print(f"parity: {path}: not a file", file=sys.stderr)
             return 2
+    try:
+        extras = [shlex.split(args.args_a), shlex.split(args.args_b)]
+    except ValueError as error:
+        print(f"parity: extra arguments: {error}", file=sys.stderr)
+        return 2
 
     out_dir = (args.out or Path(tempfile.mkdtemp(prefix="parity-"))).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     binaries = []
-    for label, path in ((args.label_a, args.binary_a), (args.label_b, args.binary_b)):
+    for label, path, extra in (
+        (args.label_a, args.binary_a, extras[0]),
+        (args.label_b, args.binary_b, extras[1]),
+    ):
         path = path.resolve()
-        binaries.append(Binary(label, path, probe_rules_options(path, out_dir)))
+        binaries.append(Binary(label, path, probe_rules_options(path, out_dir), extra))
     for binary in binaries:
         if not binary.rules_options:
             print(
@@ -114,7 +135,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     names = (args.label_a, args.label_b)
-    paths = (str(binaries[0].path), str(binaries[1].path))
+    paths = tuple(
+        str(binary.path)
+        + (f" (extra arguments: {shlex.join(binary.extra_args)})" if binary.extra_args else "")
+        for binary in binaries
+    )
     text = report.render(comparisons, names, paths, args.verbose, str(out_dir))
     (out_dir / "report.txt").write_text(text, encoding="utf-8")
     (out_dir / "report.json").write_text(

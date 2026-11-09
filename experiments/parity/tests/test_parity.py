@@ -401,8 +401,8 @@ class EndToEndTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_tool(self, a: str, b: str):
-        out = Path(self.tmp.name) / f"out-{a}-{b}"
+    def run_tool(self, a: str, b: str, *more: str):
+        out = Path(self.tmp.name) / f"out-{a}-{b}{'-more' if more else ''}"
         argv = [
             str(self.agents[a]),
             str(self.agents[b]),
@@ -412,6 +412,7 @@ class EndToEndTests(unittest.TestCase):
             str(out),
             "--timeout",
             "60",
+            *more,
         ]
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = cli.main(argv)
@@ -469,6 +470,25 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("unix_ms", lines)
         self.assertTrue(run["sections"]["rule text"]["agrees"])
         self.assertTrue(run["sections"]["decisions"]["agrees"])
+
+    def test_extra_arguments_for_one_binary_make_a_real_difference_visible(self):
+        # The same build twice agrees; with one hold allowed on one side it must not.
+        code, report, text = self.run_tool("base", "base", "--args-b", "--max-holds 0")
+        self.assertEqual(code, 1, text)
+        run = report["runs"][0]
+        self.assertEqual(run["verdict"], "differ")
+        self.assertIn("(extra arguments: --max-holds 0)", text)
+        self.assertFalse(run["sections"]["decisions"]["agrees"])
+        self.assertEqual(run["facts"]["decisions"]["old"]["end reason"], "done")
+        self.assertEqual(run["facts"]["decisions"]["new"]["end reason"], "not_done")
+
+    def test_badly_quoted_extra_arguments_are_an_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(
+                [str(self.agents["base"]), str(self.agents["base"]), "--sessions", str(self.sessions)]
+                + ["--args-a", "'unclosed", "--label-b", "other"]
+            )
+        self.assertEqual(code, 2)
 
     def test_a_request_outside_the_endpoint_is_refused_and_reported(self):
         code, report, text = self.run_tool("base", "reach-out")

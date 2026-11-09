@@ -109,6 +109,7 @@ def render(
             lines.append("")
         elif c.notes:
             lines.append(f"{c.spec.id}: " + "; ".join(c.notes))
+            lines.append("")
     lines.extend(stock_lines(comparisons, verbose))
     lines.extend(network_lines(comparisons, names))
     if out_dir:

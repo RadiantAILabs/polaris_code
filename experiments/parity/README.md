@@ -19,6 +19,7 @@ Useful options:
 | Option | Meaning |
 |---|---|
 | `--label-a NAME`, `--label-b NAME` | Names used in the report (default `old` and `new`). |
+| `--args-a ARGS`, `--args-b ARGS` | Extra arguments, as one quoted string, added to the end of every run of that binary. For a build that needs a flag the other does not, or to check that the tool notices a real difference (for example `--args-b "--max-holds 1"` on the `max-holds/steps-default` run). The report header shows them. |
 | `--only TEXT` | Run only runs whose id (`session/run`) contains `TEXT`. Repeatable. |
 | `--list` | Print the run ids with their arguments and exit. No binaries are needed or started. |
 | `--out DIR` | Keep the report and every run's files here (default: a new folder under the system temp folder; its path is printed at the end of the report). |
@@ -199,7 +200,15 @@ differs:
   `only in OLD` / `only in NEW` for a field one build lacks.
 
 After the blocks comes the stock text section: differences that are not about
-the rules, grouped so that a difference shared by many runs is shown once.
+the rules, grouped so that a difference shared by many runs is shown once. For
+a tool definition that changed, it shows the stretch of each changed line with
+some text around it, as `TOOL: OLD … | NEW …`. A message that differs is shown
+with its position in the request (`input[N]`), so a message one build adds
+shows up as a shift in position.
+
+The report ends with the requests each build made to anywhere but the model
+endpoint. The tool refused all of them (see "What the tool starts"); the list
+is information only and never changes a verdict.
 
 The files behind a run are kept in `OUT/runs/<session>/<run>/<build>/`:
 `requests.json` (every request body as sent), `record.json`, `stdout`,
@@ -215,3 +224,7 @@ hold the report. A difference is easiest to follow by opening both
 - **A build that makes one more model call** than the other: reported in
   *model calls* without shifting the scripted replies of the agent loop.
 - **A build that wrote no record**: reported in *record*.
+- **A build that reaches for the internet**: the request ends at the refusing
+  proxy and is listed at the end of the report.
+- **The same build twice** (the self-check): every run must agree. Any
+  difference there comes from the tool or the sessions, not from a build.
