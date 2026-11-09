@@ -53,14 +53,14 @@ use polaris_tui::commands::{
 
 use super::SessionSettings;
 use super::mentions::{self, ContainedPrompt};
+use crate::images::{IMAGE_BYTES_MAX, base64, fmt_bytes};
+pub use crate::images::{model_accepts_images, sniff_image};
 
 /// Largest file that may be attached, in bytes.
 ///
-/// The provider limit is on the **encoded** image, and base64 costs four bytes
-/// for every three, so the raw cap is three quarters of it: 3.75 MB in gives
-/// 5 MB out. Capping the raw file is what lets the refusal quote a number the
-/// user can compare against what `ls` told them.
-pub const ATTACHMENT_BYTES_MAX: u64 = 3_750_000;
+/// The same cap the `view_image` tool applies, so an image the user may attach
+/// is an image the model may open ([`IMAGE_BYTES_MAX`] says why this number).
+pub const ATTACHMENT_BYTES_MAX: u64 = IMAGE_BYTES_MAX;
 
 /// Most attachments one session keeps resolved at a time.
 ///
@@ -183,85 +183,6 @@ pub fn user_message(store: &AttachmentStore, text: ContainedPrompt, handles: &[S
         .collect();
     content.push(UserBlock::Text(TextBlock { text }));
     Message::User { content }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Content and capability policy
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The image type `data` actually is, read from its leading bytes.
-///
-/// Extension is not consulted at all. A screenshot saved as `.txt` attaches;
-/// an archive named `.png` does not.
-#[must_use]
-pub fn sniff_image(data: &[u8]) -> Option<(ImageMediaType, &'static str)> {
-    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-    const GIF87: &[u8] = b"GIF87a";
-    const GIF89: &[u8] = b"GIF89a";
-    if data.starts_with(PNG) {
-        return Some((ImageMediaType::PNG, "image/png"));
-    }
-    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return Some((ImageMediaType::JPEG, "image/jpeg"));
-    }
-    if data.starts_with(GIF87) || data.starts_with(GIF89) {
-        return Some((ImageMediaType::GIF, "image/gif"));
-    }
-    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        return Some((ImageMediaType::WEBP, "image/webp"));
-    }
-    None
-}
-
-/// Whether this host will send image blocks to `model_id`.
-///
-/// **Fail-closed.** The framework's `ModelRegistry` carries no capability
-/// metadata, so this is a host-owned allowlist, and a model it does not
-/// recognise is treated as text-only. Refusing an attachment for a model that
-/// could in fact have read it costs the user one message; sending one to a
-/// model that cannot costs them a failed request they did not ask for and
-/// cannot diagnose.
-///
-/// The id is the registry's `provider/model` form. Known exceptions inside an
-/// otherwise vision-capable family are listed explicitly:
-/// `claude-3-5-haiku` and the `claude-2`/`claude-instant` generations take
-/// text only.
-///
-/// ```
-/// use polaris_code::terminal::model_accepts_images;
-///
-/// assert!(model_accepts_images("anthropic/claude-sonnet-4-6"));
-/// assert!(!model_accepts_images("anthropic/claude-3-5-haiku-latest"));
-/// assert!(!model_accepts_images("somevendor/brand-new-model"));
-/// ```
-#[must_use]
-pub fn model_accepts_images(model_id: &str) -> bool {
-    let model = model_id
-        .rsplit_once('/')
-        .map_or(model_id, |(_, model)| model)
-        .to_ascii_lowercase();
-    const TEXT_ONLY: &[&str] = &[
-        "claude-3-5-haiku",
-        "claude-3.5-haiku",
-        "claude-instant",
-        "claude-2",
-    ];
-    if TEXT_ONLY.iter().any(|name| model.starts_with(name)) {
-        return false;
-    }
-    const VISION: &[&str] = &[
-        "claude-3",
-        "claude-sonnet-",
-        "claude-opus-",
-        "claude-haiku-",
-        "gpt-4o",
-        "gpt-4-turbo",
-        "gpt-4.1",
-        "gpt-5",
-        "o3",
-        "o4",
-    ];
-    VISION.iter().any(|name| model.starts_with(name))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -545,46 +466,6 @@ impl AttachmentSource for WorkspaceAttachments {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Standard base64, no line breaks — the encoding the provider block wants.
-///
-/// Hand-rolled to avoid a dependency for one alphabet lookup.
-fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = chunk.get(1).copied().map_or(0, u32::from);
-        let b2 = chunk.get(2).copied().map_or(0, u32::from);
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((triple >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(triple & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// A byte count as a refusal quotes it.
-fn fmt_bytes(bytes: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let value = bytes as f64;
-    if value >= 1_000_000.0 {
-        format!("{:.1} MB", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.1} KB", value / 1_000.0)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 /// The handles a prompt carries, resolved against a store that may no longer
 /// hold them. Exposed for hosts that bridge the panel to their own queue.
 #[must_use]
@@ -637,64 +518,6 @@ mod tests {
             "anthropic/claude-sonnet-4-6",
         )
         .without_clipboard()
-    }
-
-    #[test]
-    fn base64_matches_the_standard_alphabet_and_padding() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        // Every byte value, so a lookup off by one in the high half shows up.
-        let all: Vec<u8> = (0..=255u8).collect();
-        let encoded = base64(&all);
-        assert_eq!(encoded.len(), 344);
-        assert!(
-            encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKiss")
-        );
-        assert!(encoded.ends_with("+/w=="));
-    }
-
-    #[test]
-    fn content_decides_the_type_not_the_extension() {
-        assert!(matches!(
-            sniff_image(PNG_1PX),
-            Some((ImageMediaType::PNG, "image/png"))
-        ));
-        assert!(matches!(
-            sniff_image(&[0xFF, 0xD8, 0xFF, 0xE0]),
-            Some((ImageMediaType::JPEG, "image/jpeg"))
-        ));
-        assert!(matches!(
-            sniff_image(b"GIF89a....."),
-            Some((ImageMediaType::GIF, "image/gif"))
-        ));
-        assert!(matches!(
-            sniff_image(b"RIFF\0\0\0\0WEBPVP8 "),
-            Some((ImageMediaType::WEBP, "image/webp"))
-        ));
-        assert!(sniff_image(b"PK\x03\x04").is_none());
-        assert!(sniff_image(b"").is_none());
-        // RIFF with a different payload (a WAV) is not an image.
-        assert!(sniff_image(b"RIFF\0\0\0\0WAVEfmt ").is_none());
-    }
-
-    #[test]
-    fn an_unknown_model_is_treated_as_text_only() {
-        assert!(model_accepts_images("anthropic/claude-sonnet-4-6"));
-        assert!(model_accepts_images("anthropic/claude-opus-4-1"));
-        assert!(model_accepts_images("anthropic/claude-3-7-sonnet-latest"));
-        assert!(model_accepts_images("openai/gpt-4o-mini"));
-        assert!(!model_accepts_images("anthropic/claude-3-5-haiku-latest"));
-        assert!(!model_accepts_images("anthropic/claude-2.1"));
-        assert!(!model_accepts_images("anthropic/claude-instant-1.2"));
-        assert!(
-            !model_accepts_images("somevendor/brand-new-model"),
-            "a model this host has never heard of fails closed"
-        );
     }
 
     #[tokio::test]
