@@ -29,7 +29,7 @@
 //! [`is_continuation_prompt`] lets context projection keep it from starting a
 //! window boundary, so the task statement is never dropped in favour of it.
 
-use polaris::models::llm::{LlmResponse, Message, StopReason, UserBlock};
+use polaris::models::llm::{AssistantBlock, LlmResponse, Message, StopReason, UserBlock};
 use polaris::prelude::Out;
 use polaris::system::param::{Res, ResMut};
 use polaris::system::resource::LocalResource;
@@ -65,6 +65,22 @@ pub const CONTINUATION_MARKER: &str = "[continuation] ";
 /// [`Default`] continues nothing, which is the loop's behaviour without this
 /// policy; [`PolicySnapshot::defaults`](super::PolicySnapshot::defaults) uses
 /// [`ContinuationPolicy::defaults`].
+///
+/// # Examples
+///
+/// ```
+/// use polaris::models::llm::StopReason;
+/// use polaris_code::agents::continuation::{
+///     Continuation, ContinuationLedger, ContinuationPolicy, ContinueReason,
+/// };
+///
+/// let policy = ContinuationPolicy::defaults().with_unattended_nudges(1);
+/// let used = ContinuationLedger::default();
+/// assert_eq!(
+///     policy.decide(&StopReason::EndTurn, true, &used),
+///     Continuation::Continue(ContinueReason::Unattended { last: true }),
+/// );
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContinuationPolicy {
     /// Truncated replies continued per turn, in any front end.
@@ -214,6 +230,38 @@ pub fn is_continuation_prompt(message: &Message) -> bool {
     }
 }
 
+/// Project the last answer, joining only fragments separated by output-limit
+/// continuation prompts. Canonical provider messages remain separate.
+pub(crate) fn final_answer_text(messages: &[Message]) -> Option<String> {
+    let mut start = messages.len().checked_sub(1)?;
+    let no_tools = |message: &Message| {
+        matches!(message, Message::Assistant { content, .. }
+            if !content.iter().any(|block| matches!(block, AssistantBlock::ToolCall(_))))
+    };
+    let prompt = ContinueReason::Truncated.prompt();
+    while start >= 2
+        && no_tools(&messages[start])
+        && matches!(&messages[start - 1], Message::User { content }
+            if matches!(content.as_slice(), [UserBlock::Text(block)] if block.text == prompt))
+        && no_tools(&messages[start - 2])
+    {
+        start -= 2;
+    }
+    let text: String = messages[start..]
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant { content, .. } => Some(content),
+            Message::User { .. } => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            AssistantBlock::Text(block) => Some(block.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Start the turn with every continuation budget unused.
 #[system]
 pub(crate) async fn reset_continuations(mut ledger: ResMut<ContinuationLedger>) {
@@ -286,6 +334,76 @@ mod tests {
         ContinuationLedger {
             truncations,
             nudges,
+        }
+    }
+
+    #[test]
+    fn final_answer_joins_only_the_last_output_limit_chain() {
+        let cutoff = || Message::user(ContinueReason::Truncated.prompt());
+        let nudge = || Message::user(ContinueReason::Unattended { last: true }.prompt());
+        let cases = [
+            (
+                vec![
+                    Message::user("task"),
+                    Message::assistant("I'll get started."),
+                    nudge(),
+                    Message::assistant("The answer"),
+                    cutoff(),
+                    Message::assistant(" begins"),
+                    cutoff(),
+                    Message::assistant(" here."),
+                ],
+                "The answer begins here.",
+            ),
+            (
+                vec![
+                    Message::assistant("discarded"),
+                    cutoff(),
+                    Message::assistant(" pause"),
+                    nudge(),
+                    Message::assistant("final summary"),
+                ],
+                "final summary",
+            ),
+            (
+                vec![
+                    Message::assistant("old answer"),
+                    Message::user("new task"),
+                    Message::assistant("new answer"),
+                ],
+                "new answer",
+            ),
+            (
+                vec![
+                    Message::assistant("I'll read the"),
+                    cutoff(),
+                    Message::Assistant {
+                        id: None,
+                        content: vec![
+                            AssistantBlock::text("tool narration"),
+                            AssistantBlock::tool_call(polaris::models::llm::ToolCall::new(
+                                "call",
+                                "read_file",
+                                serde_json::json!({"path": "file"}),
+                            )),
+                        ],
+                    },
+                    Message::User {
+                        content: vec![UserBlock::tool_result_with_call_id(
+                            "call",
+                            "call",
+                            polaris::models::llm::ToolResultContent::Text("file contents".into()),
+                        )],
+                    },
+                    Message::assistant("final answer"),
+                    cutoff(),
+                    Message::assistant(" suffix"),
+                ],
+                "final answer suffix",
+            ),
+        ];
+        for (messages, expected) in cases {
+            assert_eq!(final_answer_text(&messages).as_deref(), Some(expected));
         }
     }
 
@@ -395,5 +513,214 @@ mod tests {
         assert!(!is_continuation_prompt(&Message::assistant(
             ContinueReason::Truncated.prompt()
         )));
+    }
+
+    mod lifecycle {
+        use std::sync::{Arc, Mutex};
+
+        use futures_util::StreamExt;
+        use polaris::agent::Agent;
+        use polaris::graph::{GraphExecutor, MiddlewareAPI, middleware::info::SystemInfo};
+        use polaris::models::llm::{
+            ContentBlockDelta, ContentBlockStartData, GenerationError, LlmProvider, LlmRequest,
+            LlmStream, StreamEvent, Usage,
+        };
+        use polaris::models::{ModelRegistry, ModelsPlugin};
+        use polaris::plugins::{IOContent, IOMessage, PersistencePlugin};
+        use polaris::sessions::{SessionId, SessionInfo};
+        use polaris::system::plugin::{Plugin, PluginId, Version};
+        use polaris::system::server::Server;
+        use polaris::tools::ToolsPlugin;
+
+        use super::*;
+        use crate::agents::{
+            AgentConfig, CodeAgent, CodeAgentPlugin, PermissionMode, UnattendedGrants,
+        };
+        use crate::exec::{ExecIOPlugin, ExecIOProvider};
+        use crate::usage::TokenMeter;
+
+        /// Every call stops at the output limit, even after the budget expires.
+        struct CutoffProvider;
+
+        impl LlmProvider for CutoffProvider {
+            fn name(&self) -> &'static str {
+                "cutoff"
+            }
+
+            async fn generate(
+                &self,
+                _: &str,
+                _: LlmRequest,
+            ) -> Result<LlmResponse, GenerationError> {
+                panic!("the agent must use streaming");
+            }
+
+            async fn stream(&self, _: &str, _: LlmRequest) -> Result<LlmStream, GenerationError> {
+                Ok(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        block: ContentBlockStartData::Text,
+                    }),
+                    Ok(StreamEvent::ContentBlockDelta {
+                        index: 0,
+                        delta: ContentBlockDelta::Text("fragment".into()),
+                    }),
+                    Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::MaxOutputTokens,
+                        usage: Usage::default(),
+                        id: None,
+                        model: None,
+                    }),
+                ])
+                .boxed())
+            }
+        }
+
+        impl Plugin for CutoffProvider {
+            const ID: &'static str = "test::cutoff_provider";
+            const VERSION: Version = Version::new(0, 1, 0);
+
+            fn dependencies(&self) -> Vec<PluginId> {
+                vec![PluginId::of::<ModelsPlugin>()]
+            }
+
+            fn build(&self, server: &mut Server) {
+                server
+                    .get_resource_mut::<ModelRegistry>()
+                    .unwrap()
+                    .register_llm_provider(Self);
+            }
+        }
+
+        #[tokio::test]
+        async fn real_graph_exhausts_continuations_and_resets_them_on_the_next_turn() {
+            for nudges in [0, 1] {
+                let workspace = tempfile::tempdir().unwrap();
+                let (io, input, mut output) = ExecIOProvider::new(1024);
+                let mut server = Server::new();
+                server.insert_global(TokenMeter::new());
+                server.insert_global(OxigraphStore::in_memory().unwrap());
+                server
+                    .add_plugins(ModelsPlugin)
+                    .add_plugins(CutoffProvider)
+                    .add_plugins(ToolsPlugin)
+                    .add_plugins(PersistencePlugin)
+                    .add_plugins(CodeAgentPlugin::new())
+                    .add_plugins(ExecIOPlugin::new(Arc::new(io)));
+                server.finish().await.unwrap();
+                let mut ctx = server.create_context();
+                ctx.insert(polaris::graph::RunCancellation::never());
+                ctx.insert(AgentConfig::new("cutoff/model", workspace.path()));
+                ctx.insert(SessionInfo {
+                    session_id: SessionId::new(),
+                    turn_number: 0,
+                });
+                CodeAgent.setup(&mut ctx).unwrap();
+                {
+                    let mut policy = ctx.get_resource_mut::<PolicySnapshot>().unwrap();
+                    policy.permission =
+                        PermissionMode::Unattended(UnattendedGrants::default()).permission_policy();
+                    policy.continuation =
+                        ContinuationPolicy::defaults().with_unattended_nudges(nudges);
+                }
+                let graph = CodeAgent.to_graph();
+                assert!(graph.validate().is_ok());
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let middleware = MiddlewareAPI::new();
+                let recorded = seen.clone();
+                middleware.register_system(
+                    "continuation_counts",
+                    move |info: SystemInfo, ctx, next| {
+                        let recorded = recorded.clone();
+                        Box::pin(async move {
+                            let ledger = *ctx.get_resource::<ContinuationLedger>().unwrap();
+                            recorded
+                                .lock()
+                                .unwrap()
+                                .push((info.node_name.to_string(), ledger));
+                            next.run(ctx).await
+                        })
+                    },
+                );
+                for turn in 0..2 {
+                    ctx.get_resource_mut::<SessionInfo>().unwrap().turn_number = turn;
+                    input
+                        .send(IOMessage::from_external(
+                            "test",
+                            IOContent::Text(format!("task {turn}")),
+                        ))
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        GraphExecutor::new().execute(&graph, &mut ctx, None, Some(&middleware)),
+                    )
+                    .await
+                    .expect("the finite continuation budget must end the turn")
+                    .unwrap();
+                    let observed = std::mem::take(&mut *seen.lock().unwrap());
+                    let ledgers = |name: &str| {
+                        observed
+                            .iter()
+                            .filter(|(node, _)| node == name)
+                            .map(|(_, ledger)| *ledger)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(ledgers("reset_continuations").len(), 1);
+                    assert_eq!(
+                        ledgers("decide_continuation")[0],
+                        ContinuationLedger::default()
+                    );
+                    let mut expected = (0..DEFAULT_TRUNCATION_CONTINUES)
+                        .map(|truncations| used(truncations, 0))
+                        .collect::<Vec<_>>();
+                    if nudges > 0 {
+                        expected.push(used(DEFAULT_TRUNCATION_CONTINUES, 0));
+                    }
+                    assert_eq!(ledgers("continue_turn"), expected);
+                    assert_eq!(
+                        ledgers("finalize"),
+                        vec![used(DEFAULT_TRUNCATION_CONTINUES, nudges)]
+                    );
+                    assert_eq!(
+                        ledgers("act").len(),
+                        (DEFAULT_TRUNCATION_CONTINUES + nudges + 1) as usize
+                    );
+                    assert!(ledgers("recover").is_empty());
+                    assert_eq!(
+                        *ctx.get_resource::<ContinuationLedger>().unwrap(),
+                        used(DEFAULT_TRUNCATION_CONTINUES, nudges)
+                    );
+                    let history = ctx.get_resource::<ContextManager>().unwrap();
+                    assert_eq!(
+                        history
+                            .messages
+                            .iter()
+                            .filter(|message| is_continuation_prompt(message))
+                            .count(),
+                        ((turn + 1) * (DEFAULT_TRUNCATION_CONTINUES + nudges)) as usize
+                    );
+                    let expected_answer = "fragment".repeat(if nudges == 0 { 4 } else { 1 });
+                    assert_eq!(
+                        final_answer_text(&history.messages).as_deref(),
+                        Some(expected_answer.as_str())
+                    );
+                    let mut final_text = None;
+                    while let Ok(message) = output.try_recv() {
+                        if message
+                            .metadata
+                            .get("final")
+                            .is_some_and(|value| value == "true")
+                        {
+                            final_text = Some(message.content);
+                        }
+                    }
+                    assert!(
+                        matches!(final_text, Some(IOContent::Text(text)) if text == expected_answer)
+                    );
+                }
+            }
+        }
     }
 }

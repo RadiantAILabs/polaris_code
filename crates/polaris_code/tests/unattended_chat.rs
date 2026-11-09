@@ -131,6 +131,8 @@ enum Script {
     PauseThenAnswer,
     /// A reply cut off at the output limit first, then the final answer.
     TruncatedThenAnswer,
+    /// Every reply is cut off, including the one that exhausts continuation.
+    RepeatedTruncation,
 }
 
 /// A loopback server that follows a [`Script`] and records every request.
@@ -172,9 +174,11 @@ impl Mock {
                             Script::TruncatedThenAnswer if requests.len() == 1 => {
                                 serve_truncated(&mut stream)
                             }
-                            Script::PauseThenAnswer | Script::TruncatedThenAnswer => {
-                                serve_final_answer(&mut stream)
+                            Script::TruncatedThenAnswer => {
+                                stream_reply(&mut stream, json!({"content": " here."}), "stop")
                             }
+                            Script::RepeatedTruncation => serve_truncated(&mut stream),
+                            Script::PauseThenAnswer => serve_final_answer(&mut stream),
                             Script::Refuse => serve_refusal(&mut stream),
                             Script::ToolCallsThenHang if requests.len() == 1 => {
                                 serve_tool_calls(&mut stream, &outside)
@@ -251,6 +255,7 @@ impl Setup {
         address: SocketAddr,
         trajectory: &Path,
         dangerous: bool,
+        output_format: &str,
     ) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_polaris"));
         command
@@ -277,9 +282,9 @@ impl Setup {
                 "--max-output-tokens",
                 "1024",
                 "--max-turns",
-                "3",
+                "8",
                 "--output-format",
-                "json",
+                output_format,
                 "--trajectory-path",
             ])
             .arg(trajectory)
@@ -310,7 +315,7 @@ impl Setup {
         nudges: &str,
     ) -> (Output, Vec<(String, Value)>) {
         let mock = Mock::start(script, self.outside.clone());
-        let mut command = self.command(mock.address, trajectory, dangerous);
+        let mut command = self.command(mock.address, trajectory, dangerous, "json");
         command.env("POLARIS_CODE_UNATTENDED_NUDGES", nudges);
         let output = tokio::time::timeout(CLI_TIMEOUT, command.output()).await;
         let requests = mock.finish();
@@ -733,7 +738,7 @@ async fn sigterm_during_a_model_call_still_finalizes_the_trajectory() {
     let trajectory = setup.trajectory();
     let mock = Mock::start(Script::Hang, setup.outside.clone());
     let child = setup
-        .command(mock.address, &trajectory, false)
+        .command(mock.address, &trajectory, false, "json")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -774,7 +779,7 @@ async fn sigterm_after_tools_ran_still_writes_their_results() {
     let trajectory = setup.trajectory();
     let mock = Mock::start(Script::ToolCallsThenHang, setup.outside.clone());
     let child = setup
-        .command(mock.address, &trajectory, false)
+        .command(mock.address, &trajectory, false, "json")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -838,10 +843,10 @@ async fn an_unattended_reply_without_a_tool_call_is_asked_to_go_on_once() {
     let nudge = last_user_text(&requests[1].1);
     assert!(nudge.starts_with("[continuation] "), "{nudge}");
     assert!(nudge.contains("the run ends at your next reply"), "{nudge}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("done"),
-        "the final answer is the result: {stdout}"
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["result"], "done",
+        "the nudge reply is not part of the answer"
     );
     let trace = read_trace(&trajectory);
     assert_eq!(model_calls(&trace).len(), 2);
@@ -876,6 +881,48 @@ async fn a_reply_cut_off_at_the_output_limit_is_continued() {
         replayed.contains("The answer begins"),
         "the cut-off text stays in the conversation: {replayed}"
     );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"], "The answer begins here.");
+    let trace = read_trace(&trajectory);
+    let calls = model_calls(&trace);
+    assert_eq!(calls[0]["message"], "The answer begins");
+    assert_eq!(calls[1]["message"], " here.");
+}
+
+#[tokio::test]
+async fn a_reply_cut_off_at_the_output_limit_returns_the_whole_text_answer() {
+    let setup = Setup::new();
+    let mock = Mock::start(Script::TruncatedThenAnswer, setup.outside.clone());
+    let output = tokio::time::timeout(
+        CLI_TIMEOUT,
+        setup
+            .command(mock.address, &setup.trajectory(), true, "text")
+            .output(),
+    )
+    .await;
+    let requests = mock.finish();
+    let output = output.expect("CLI must terminate").unwrap();
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "The answer begins here.\n"
+    );
+}
+
+#[tokio::test]
+async fn repeated_output_limits_stop_after_the_continuation_budget_is_spent() {
+    let setup = Setup::new();
+    let (output, requests) = setup
+        .run(Script::RepeatedTruncation, &setup.trajectory(), true)
+        .await;
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(requests.len(), 4, "three continuations, then finalization");
+    for (_, request) in &requests[1..] {
+        assert!(last_user_text(request).contains("output limit"));
+    }
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"], "The answer begins".repeat(4));
 }
 
 #[tokio::test]

@@ -4,11 +4,12 @@
 //! # Architecture
 //!
 //! ```text
-//! receive_user_input → refresh_project_docs → init_loop → loop("agent_loop") {
+//! receive_user_input → refresh_project_docs → init_loop → reset_continuations → loop("agent_loop") {
 //!     compact_context → manual ? finish_compaction :
 //!         prepare_context → begin_model_call → act → loop("model_retries") { … } →
 //!             model_answered ? (accept_response →
-//!                 has_tool_calls ? (review_tools → prepare_calls → tool_calls → finish_calls) : finalize) :
+//!                 has_tool_calls ? (review_tools → prepare_calls → tool_calls → finish_calls) :
+//!                     (decide_continuation → continues ? continue_turn : finalize)) :
 //!                 report_failure
 //!     on error → recover
 //! }
@@ -45,7 +46,8 @@ use super::context::{
     compact_context, compaction_focus, finish_compaction,
 };
 use super::continuation::{
-    Continuation, ContinuationLedger, continue_turn, decide_continuation, reset_continuations,
+    Continuation, ContinuationLedger, continue_turn, decide_continuation, final_answer_text,
+    reset_continuations,
 };
 use super::failure::{self, Attempts, TurnFailure};
 use super::permission_rules::{
@@ -1728,11 +1730,12 @@ fn truncate_lines(diff: String) -> String {
 async fn finalize(
     decision: Out<LlmResponse>,
     prepared: Out<PreparedContext>,
+    context: Res<ContextManager>,
     user_io: Res<UserIO>,
     store: Res<OxigraphStore>,
     mut live: ResMut<LiveTranscript>,
 ) -> LoopState {
-    let text = decision.text();
+    let text = final_answer_text(&context.messages).unwrap_or_else(|| decision.text());
     live.close(&user_io, &text, OUTCOME_COMPLETE).await;
 
     Decision {
@@ -2118,6 +2121,7 @@ where
 /// |----------|-------|-------------|
 /// | [`ContextManager`] | local | Full history and summary checkpoints (persisted). |
 /// | [`LoopState`] | local | Loop termination flag. |
+/// | [`ContinuationLedger`] | local | Per-turn continuation counts, reset at the start of each turn. |
 /// | [`PolicySnapshot`] | local | Per-turn decision policy (defaults in v1). |
 /// | [`SecretRedactor`] | global | Withholds recognisable credentials from every consumer of a tool result. |
 ///
