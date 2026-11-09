@@ -63,6 +63,7 @@ from both is an error. Flags and environment still take precedence.
 | `max_output_tokens` | `--max-output-tokens` | `POLARIS_CODE_MAX_OUTPUT_TOKENS` |
 | `context_window` | `--context-window` | `POLARIS_CODE_CONTEXT_WINDOW` |
 | `reasoning_effort` | `--reasoning-effort` | `POLARIS_CODE_REASONING_EFFORT` |
+| — | — | `POLARIS_CODE_UNATTENDED_NUDGES` (see below) |
 
 `models` accepts an array of model IDs or the existing comma/whitespace-separated
 string format. Token limits must be positive integers. Iteration limits accept zero to disable
@@ -78,12 +79,17 @@ set in a file.
 `-p`, and cannot be enabled by configuration or environment. See
 [unattended runs](unattended-runs.md) for model limits and effort semantics.
 
-Two settings are not file keys. `--notify` (or `POLARIS_CODE_NOTIFY`) chooses
+Three settings are not file keys. `--notify` (or `POLARIS_CODE_NOTIFY`) chooses
 when the terminal bell and window title ask for attention: `off`, `approval`
 (the default; an approval is waiting), or `all` (also when a turn ends).
 Non-interactive runs ignore it. `--review-model` (or `POLARIS_CODE_REVIEW_MODEL`)
 names the model for automatic review, in `provider/model` form; without it the
-reviewer uses the session model.
+reviewer uses the session model. `POLARIS_CODE_UNATTENDED_NUDGES` is an
+environment variable only, with no flag. It sets how many times an unattended
+`-p` run is asked to go on after a reply that calls no tool: unset or empty
+means 1, `0` turns it off, and anything that is not a non-negative integer exits
+with code 2. Only the `polaris` binary reads it; see
+[unattended runs](unattended-runs.md#when-a-run-ends).
 
 ## Project files and trust
 

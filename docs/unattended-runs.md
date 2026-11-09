@@ -72,7 +72,9 @@ A `-p` run ends on a model reply that calls no tool, with two exceptions:
 
 Both messages start with `[continuation] `, appear in the trajectory as user
 messages, and are recorded as `continuation` decisions. Every budget is finite,
-so a model that keeps replying without tools still ends the run.
+so a model that keeps replying without tools still ends the run. A reply the
+provider stops with `pause_turn`, or because of a content filter, is not
+continued: the run ends on it.
 
 A `-p` run whose prompt starts like a question (`find …`, `where is …`,
 `show me …`) is answered by the read-only question topology only when the run
@@ -81,9 +83,11 @@ full agent, because the question topology cannot change the workspace.
 
 ## Shell commands
 
-Shell commands in a `-p` run time out after 600 seconds unless the call sets its
-own `timeout_secs`; interactive sessions keep 120 seconds, because a person can
-send a long run to the background there.
+Foreground `run_command` calls in a `-p` run time out after 600 seconds unless
+the call sets its own `timeout_secs`; interactive sessions keep 120 seconds,
+because a person can send a long run to the background there. A command the
+model starts with `run_in_background` keeps its own default of 3,600 seconds in
+every mode.
 
 The model sees at most 10,000 characters of each output stream: the first and
 the last 5,000, with a line saying how much was left out. When a stream is

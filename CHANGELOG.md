@@ -11,7 +11,7 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 - The model sees the first and last 5,000 characters of each long shell output stream, with the end read from the overflow file when the capture was cut. `ObservationPolicy` on `PolicySnapshot` sets the size.
 
 ### Changed
-- Shell commands in a `-p` run time out after 600 seconds by default instead of 120. Interactive sessions keep 120.
+- Foreground `run_command` calls in a `-p` run time out after 600 seconds by default instead of 120. Interactive sessions keep 120, and `run_in_background` keeps its 3,600-second default.
 - A `-p` run that grants edits or commands no longer routes question-shaped prompts (`find …`, `where is …`) to the read-only question topology.
 
 ### Fixed
