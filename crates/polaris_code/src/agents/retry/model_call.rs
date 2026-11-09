@@ -234,7 +234,8 @@ pub(crate) async fn begin_model_call(mut ledger: ResMut<AttemptLedger>) {
 /// The stream's text is forwarded to the user as it arrives and its usage is
 /// folded into the session meter as it is reported. The attempt is *committed*
 /// once either has happened: shown text and billed tokens cannot be rolled
-/// back, so a failure after that point is not worth another attempt.
+/// back, so a failure after that point is not retried, except a reply that
+/// could not be read (see `RetryPolicy::next_step`).
 ///
 /// Both the wait for the response and every gap between its events are
 /// bounded by [`attempt_timeout`](crate::agents::policy::RetryPolicy), because
@@ -328,7 +329,7 @@ pub(crate) async fn act(
     // emission, because the conversation panel adds deltas into its running
     // tally. `committed` flips true once we've emitted anything this attempt;
     // past that point the additive tally can't be rolled back, so a failed
-    // stream is terminal rather than retryable.
+    // stream is terminal, unless its reply could not be read at all.
     let last_in = Arc::new(AtomicU64::new(0));
     let last_out = Arc::new(AtomicU64::new(0));
     let last_cache_read = Arc::new(AtomicU64::new(0));
@@ -337,10 +338,10 @@ pub(crate) async fn act(
     // Whether the provider reported both token counts, so that a spend-cap
     // reservation is settled from it and not from the estimate.
     let usage_seen = Arc::new(AtomicBool::new(false));
-    // A fresh transcript block per attempt. A retry that has shown nothing
-    // reuses nothing; a retry after visible text cannot happen at all
-    // (emitting a delta marks the attempt committed, below), so one block
-    // never mixes two attempts' text.
+    // A fresh transcript block per attempt, so one block never mixes two
+    // attempts' text. A retry after visible text happens only for a reply
+    // that could not be read; `wait_to_retry` has already closed that
+    // attempt's block as failed, so the close below is a no-op for it.
     // Close the previous iteration's block first: a ReAct turn emits one
     // block per iteration (reasoning, then its tools), and an unclosed one
     // would render as still being written.
@@ -424,8 +425,8 @@ pub(crate) async fn act(
                                 cr_now,
                                 cc_now,
                             );
-                            // Anything billed to the meter makes this attempt
-                            // terminal — a retry would double-count.
+                            // Anything billed to the meter commits this
+                            // attempt: a retry bills again.
                             if cr_delta > 0 || cc_delta > 0 || in_delta > 0 || out_delta > 0 {
                                 committed.store(true, Ordering::Relaxed);
                             }
@@ -511,7 +512,7 @@ pub(crate) async fn decide_retry(
                 wait = ?after,
                 "llm attempt {} of {} failed: {}; retrying",
                 ledger.attempts,
-                policy.retry.max_attempts.max(1),
+                policy.retry.attempt_limit(&failed.error).max(1),
                 failed.error
             );
             ("retry", format!("{after:?}"))
@@ -525,6 +526,10 @@ pub(crate) async fn decide_retry(
         chosen: chosen.into(),
         policy_refs: vec![
             format!("retry.max_attempts={}", policy.retry.max_attempts),
+            format!(
+                "retry.attempt_limit={}",
+                policy.retry.attempt_limit(&failed.error)
+            ),
             format!("attempt={}", ledger.attempts),
             format!("failure.kind={}", failed.kind),
             format!("committed={}", failed.commitment.is_committed()),
@@ -549,6 +554,9 @@ pub(crate) async fn wait_to_retry(
     let RetryStep::Retry { after } = *step else {
         return Ok(());
     };
+    // The failed attempt's partial text, if any, stays on screen marked as
+    // failed; the retry opens a block of its own.
+    live.close(&user_io, "", OUTCOME_ERROR).await;
     if cancel
         .run_until_cancelled(tokio::time::sleep(after))
         .await

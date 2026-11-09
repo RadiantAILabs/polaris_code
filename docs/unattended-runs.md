@@ -85,12 +85,13 @@ full agent, because the question topology cannot change the workspace.
 
 A failed model call ends the run, so a `-p` run retries a network error,
 timeout, rate limit or overload for about five minutes: ten attempts, with
-waits starting at 2 s and doubling up to 60 s. Interactive sessions keep five
+waits starting at 2 s and doubling up to 60 s. A call that times out on every
+attempt can take up to 59 minutes. Interactive sessions keep five
 attempts, about fifteen seconds of waiting, because a person can send the
 message again. An authentication or invalid-request error is never retried.
 A reply that cannot be read, such as a tool call whose arguments are not valid
 JSON, is sent again up to two more times in every front end, even if it had
-already shown text: nothing of it can be kept.
+already shown text: nothing of it can be kept. Each attempt is billed.
 
 ## Shell commands
 

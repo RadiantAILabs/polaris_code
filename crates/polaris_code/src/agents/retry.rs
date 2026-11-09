@@ -47,7 +47,9 @@ pub enum Commitment {
     /// sent again as if the attempt had not happened.
     Uncommitted,
     /// Output was shown or tokens were billed. Neither can be rolled back, so
-    /// a second attempt would show or bill the same thing twice.
+    /// a second attempt would show or bill the same thing twice. Only a reply
+    /// that could not be read is retried anyway (see
+    /// [`RetryPolicy::next_step`]).
     Committed,
 }
 
@@ -91,7 +93,9 @@ impl RetryPolicy {
     /// again while attempts remain under both
     /// [`max_attempts`](Self::max_attempts) and [`MALFORMED_REPLY_ATTEMPTS`],
     /// even if the attempt had already shown or billed something: nothing of
-    /// it can be kept, so a retry only replaces a failed turn.
+    /// it can be kept, so a retry only replaces a failed turn. Every attempt
+    /// is billed, so such a failure can cost up to [`MALFORMED_REPLY_ATTEMPTS`]
+    /// times the output.
     ///
     /// Any other failure is sent again only if all of these hold:
     ///
@@ -123,7 +127,7 @@ impl RetryPolicy {
     ) -> RetryStep {
         let attempt = attempt.max(1);
         if matches!(error, GenerationError::InvalidResponse(_)) {
-            return if attempt < self.max_attempts.min(MALFORMED_REPLY_ATTEMPTS) {
+            return if attempt < self.attempt_limit(error) {
                 RetryStep::Retry {
                     after: self.backoff(attempt, jitter),
                 }
@@ -143,6 +147,18 @@ impl RetryPolicy {
             None => RetryStep::Retry {
                 after: self.backoff(attempt, jitter),
             },
+        }
+    }
+
+    /// The most attempts this policy makes for a call that fails with `error`:
+    /// [`max_attempts`](Self::max_attempts), or at most
+    /// [`MALFORMED_REPLY_ATTEMPTS`] for a reply that could not be read.
+    #[must_use]
+    pub fn attempt_limit(&self, error: &GenerationError) -> u32 {
+        if matches!(error, GenerationError::InvalidResponse(_)) {
+            self.max_attempts.min(MALFORMED_REPLY_ATTEMPTS)
+        } else {
+            self.max_attempts
         }
     }
 
@@ -490,18 +506,34 @@ mod tests {
             "failed to parse tool call arguments: EOF while parsing an object".into(),
         );
         let policy = RetryPolicy::unattended();
-        for attempt in 1..MALFORMED_REPLY_ATTEMPTS {
-            assert!(
-                matches!(
-                    policy.next_step(attempt, &error, Commitment::Committed, 0.5),
-                    RetryStep::Retry { .. }
-                ),
-                "attempt {attempt} is retried although it showed output"
-            );
+        for attempt in [1, 2] {
+            for commitment in [Commitment::Committed, Commitment::Uncommitted] {
+                assert!(
+                    matches!(
+                        policy.next_step(attempt, &error, commitment, 0.5),
+                        RetryStep::Retry { .. }
+                    ),
+                    "attempt {attempt} ({commitment:?}) is retried"
+                );
+            }
         }
         assert_eq!(
-            policy.next_step(MALFORMED_REPLY_ATTEMPTS, &error, Commitment::Committed, 0.5),
+            policy.next_step(3, &error, Commitment::Committed, 0.5),
             RetryStep::GiveUp
+        );
+        assert_eq!(policy.attempt_limit(&error), 3);
+        let twice = RetryPolicy {
+            max_attempts: 2,
+            ..RetryPolicy::default()
+        };
+        assert!(matches!(
+            twice.next_step(1, &error, Commitment::Committed, 0.5),
+            RetryStep::Retry { .. }
+        ));
+        assert_eq!(
+            twice.next_step(2, &error, Commitment::Committed, 0.5),
+            RetryStep::GiveUp,
+            "the policy's own smaller budget wins"
         );
         let once = RetryPolicy {
             max_attempts: 1,

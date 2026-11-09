@@ -699,9 +699,12 @@ impl PermissionCeiling {
 /// scaled by a random factor between 0.75 and 1.25. The worst case is a
 /// provider that goes silent on every attempt and asks for the longest wait
 /// in between: five silent attempts of 300 s and four waits of 60 s, which is
-/// [`RetryPolicy::worst_case_wait`], 1,740 s (29 minutes). Lower
+/// [`RetryPolicy::worst_case_wait`], 1,740 s (29 minutes). The `polaris`
+/// binary gives unattended runs [`RetryPolicy::unattended`] instead. Lower
 /// `attempt_timeout` or `max_attempts` to bound an unattended run more
-/// tightly.
+/// tightly. A reply that could not be read is tried at most
+/// [`MALFORMED_REPLY_ATTEMPTS`](super::retry::MALFORMED_REPLY_ATTEMPTS)
+/// times, whatever `max_attempts` says ([`RetryPolicy::attempt_limit`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Maximum attempts for a transient LLM failure, the first included
@@ -752,6 +755,16 @@ impl RetryPolicy {
     /// 300 s and nine waits of 60 s, 3,540 s; the caller's own time limit
     /// still applies. Failures a retry cannot fix (authentication, invalid
     /// request) are never retried.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_code::agents::policy::RetryPolicy;
+    ///
+    /// let retry = RetryPolicy::unattended();
+    /// assert_eq!(retry.max_attempts, 10);
+    /// assert_eq!(retry.worst_case_wait().as_secs(), 3_540);
+    /// ```
     #[must_use]
     pub fn unattended() -> Self {
         Self {

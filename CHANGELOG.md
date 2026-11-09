@@ -6,11 +6,11 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 ## [Unreleased]
 
 ### Changed
-- A `-p` run no longer asks the model to go on after a reply that calls no tool. On Terminal-Bench 2.1 and DeepSWE runs, every such message came after the work was already finished and only added a model call. `POLARIS_CODE_UNATTENDED_NUDGES` still turns it on.
-- A `-p` run retries a failed model call (a network error, timeout, rate limit or overload) for about five minutes instead of about fifteen seconds: ten attempts, with waits starting at 2 s and doubling up to 60 s. A failed call ends the run, so a short outage used to throw away all the work done so far. Interactive sessions keep five attempts. `RetryPolicy::unattended` gives an embedder the same numbers.
+- A `-p` run no longer asks the model to go on after a reply that calls no tool. On Terminal-Bench 2.1 and DeepSWE runs, every such message came after the work was already finished and only added a model call. `POLARIS_CODE_UNATTENDED_NUDGES` still turns it on. For embedders, `DEFAULT_UNATTENDED_NUDGES` is now 0, so code that passes it to `with_unattended_nudges` sends no nudges.
+- A `-p` run retries a failed model call (a network error, timeout, rate limit or overload) for about five minutes instead of about fifteen seconds: ten attempts, with waits starting at 2 s and doubling up to 60 s. A failed call ends the run, so a short outage used to throw away all the work done so far. Interactive sessions keep five attempts. `RetryPolicy::unattended` gives an embedder the same numbers. A call that times out on every attempt can still take up to 59 minutes.
 
 ### Fixed
-- A model reply that cannot be read, such as a tool call whose arguments are not valid JSON, no longer ends the turn. The call is sent again, up to two more times, even if the reply had already shown text. Before, one malformed tool call ended a `-p` run and lost all its work.
+- A model reply that cannot be read, such as a tool call whose arguments are not valid JSON, no longer ends the turn. The call is sent again, up to two more times, even if the reply had already shown text, in every front end. Each attempt is billed, so a reply that fails the same way each time can cost up to three times the output. The failed attempt's partial text stays on screen, marked as failed. Before, one malformed tool call ended a `-p` run and lost all its work.
 
 ## [0.4.3] - 2026-11-09
 

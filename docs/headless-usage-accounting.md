@@ -102,17 +102,21 @@ The agent retries a model call before it reports one that failed in a way that
 can pass: a rate limit (HTTP 429), an overloaded or unavailable provider (HTTP
 5xx, including 529), a connection failure, or a stall. A provider that sends
 nothing for 300 seconds, to the first event or between events, counts as a
-stall. Retries use exponential backoff with jitter, starting at 1 second and
+stall. Retries use exponential backoff with jitter, starting at 2 seconds and
 capped at 60, and wait as long as the provider asked when its client reports a
 wait (`GenerationError::RateLimited`'s `retry_after`; the Anthropic client does
 not report one today, so its retries use the backoff). A provider that asks for
 more than 60 seconds ends the retrying. A
-run makes at most 5 attempts, so a failure after retries says so ("Gave up
-after 4 retries over 38 s."). A call that goes silent on every attempt and
-whose provider asks for the longest wait in between takes at most 29 minutes:
-five 300-second silences and four 60-second waits. `auth`, `invalid_request`
-and `other` failures are never retried, and neither is one that fails after
-some of its answer was already shown. These limits are the fields of
+`-p` run makes at most 10 attempts (`RetryPolicy::unattended`), so a failure
+after retries says so ("Gave up after 9 retries over 302 s."). A call that
+goes silent on every attempt and whose provider asks for the longest wait in
+between takes at most 59 minutes: ten 300-second silences and nine 60-second
+waits. `auth`, `invalid_request` and `other` failures are never retried, and
+neither is one that fails after some of its answer was already shown, with one
+exception: a reply that could not be read (`other`, such as a tool call whose
+arguments are not valid JSON) is sent again up to two more times, even after
+it showed text. Each of those attempts is billed, so such a failure can cost
+up to three times the output. These limits are the fields of
 `RetryPolicy` in the agent's policy snapshot. Each retry is a step of the agent
 graph, not a loop inside one node: a failed attempt is followed by a decision,
 recorded on the trajectory, and then by either a wait and another attempt or

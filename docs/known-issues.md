@@ -6,13 +6,15 @@ sync with any fix.
 
 ## Agent and context
 
-- **Model-call retries are fixed, silent, and stop at the first shown token.**
+- **Model-call retries are fixed, silent, and mostly stop at the first shown token.**
   `RetryPolicy` (attempts, backoff, stall timeout) is read from the policy
   snapshot, but no flag, environment variable or settings file sets it. The wait
   before a retry is logged and recorded as a `retry` decision on the
   trajectory, not shown in the transcript or status row. A
   failure after the first output reached the screen is final, because the
-  panel's token tally cannot be rolled back. Failures are classified from the
+  panel's token tally cannot be rolled back. The exception is a reply that
+  could not be read: it is sent again up to two more times, its partial text
+  stays on screen marked as failed, and every attempt is billed. Failures are classified from the
   HTTP status and the provider's error type because the Anthropic client maps
   none of them to typed errors, and it reports no `Retry-After`, so its rate
   limits are retried on the computed backoff; see `agents/failure.rs`.
