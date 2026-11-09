@@ -69,6 +69,43 @@ recorded since the last model call; a hard kill before then can lose them. Use
 [`rebuild_request`](crate::trajectory::rebuild_request) to reconstruct a call's
 exact native input from its one-based step id, including compacted context.
 
+## Model request timeouts
+
+For Bedrock requests that need more than the Responses endpoint's default
+60 seconds, set `--model-request-timeout-secs 600`,
+`POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS=600`, or
+`model_request_timeout_secs = 600` in the user `config.toml` or project
+`polaris.toml`. Profiles accept the same key. The usual precedence applies:
+flags, environment, project file, user file, then defaults. Values must be
+whole seconds from 1 to 86400; empty, fractional, zero and out-of-range values
+are startup errors. Unset leaves all provider defaults unchanged.
+
+The setting applies to Bedrock's Converse and Responses paths, including calls
+from summaries, reviewers and topologies. Embedders can parse a
+[`ModelRequestTimeout`](crate::providers::ModelRequestTimeout) and call
+[`ReadyProvider::with_request_timeout`](crate::providers::ReadyProvider::with_request_timeout)
+before either installation method. This sets the checked AWS SDK configuration's
+`operation_attempt_timeout`; the Responses client reads its HTTP timeout from
+that same configuration. Existing connection/read limits and retry settings
+remain in force, so a shorter existing limit can still end a request earlier.
+
+The limit bounds one transport attempt, rather than a complete turn or its
+retries. Converse streaming bounds establishment of the response, not the event
+stream after headers arrive. Bedrock Responses currently buffers the full HTTP
+response before producing stream events, so its timeout covers that response.
+The SDK and Responses adapter can retry internally; each attempt gets the same
+limit. Their final transport error reaches the agent's existing retry policy
+as a transient HTTP/network failure: Polaris 0.9.1 discards the native timeout
+type, so the final report can say `network` rather than `timeout`. The agent
+retries only while attempts remain and no visible output or billed usage has
+committed the call. Its separate 300-second silence limit can fire first;
+raising this transport limit does not raise that policy limit.
+
+Anthropic and `OpenAI` expose no public request-timeout builder in Polaris 0.9.1.
+Chat Completions exposes a per-read idle timeout, which does not bound a live
+request's duration. Selecting any of those providers with this setting is
+therefore refused at startup.
+
 ## What you get back
 
 [`run::drive_turn`](crate::run::drive_turn) never panics and never returns an
