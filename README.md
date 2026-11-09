@@ -221,7 +221,9 @@ Put defaults in `config.toml` (yours) or `polaris.toml` (the project's). The
 accepted keys are `provider`, `model`, `models`, `region`, `permission_mode`
 (`confirm`, `auto-edit`, `auto`, or `plan`), `permission_ceiling`,
 `max_cost_usd`, `max_tokens`, `max_turns`, `max_output_tokens`, `context_window`,
-and `reasoning_effort`. Flags and environment variables win over both files.
+`image_input` (`auto`, `on`, or `off`; whether the model takes images, so the
+agent can look at image files with `view_image`), and `reasoning_effort`. Flags
+and environment variables win over both files.
 
 Two options are flags or environment variables only: `--notify` /
 `POLARIS_CODE_NOTIFY` (`off`, `approval`, or `all`; when the terminal bell and
