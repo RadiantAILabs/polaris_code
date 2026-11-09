@@ -1264,8 +1264,10 @@ mod tests {
         context.push(assistant("working"));
         context.push(Message::User {
             content: vec![
-                polaris::models::llm::ToolCall::new("a", "read_file", serde_json::json!({})).result(ToolResultContent::Text("first result".into())),
-                polaris::models::llm::ToolCall::new("b", "read_file", serde_json::json!({})).result(ToolResultContent::Text("second result".into())),
+                polaris::models::llm::ToolCall::new("a", "read_file", serde_json::json!({}))
+                    .result(ToolResultContent::Text("first result".into())),
+                polaris::models::llm::ToolCall::new("b", "read_file", serde_json::json!({}))
+                    .result(ToolResultContent::Text("second result".into())),
                 UserBlock::text("notice embedded in the same message"),
             ],
         });

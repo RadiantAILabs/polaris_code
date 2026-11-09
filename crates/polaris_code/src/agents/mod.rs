@@ -19,6 +19,7 @@ pub mod config;
 pub mod context;
 pub mod failure;
 pub mod human_approval;
+pub mod observation;
 pub mod permission_rules;
 pub mod policy;
 pub mod project_context;

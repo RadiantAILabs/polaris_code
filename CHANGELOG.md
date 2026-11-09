@@ -7,6 +7,8 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 
+- Add optional observation of collected model attempts and classified turn outcomes for host recorders.
+
 - Add an opt-in canonical conversation message ceiling, independent of context projection and the turn limit.
 
 - Let plugins extend session configuration and append system-prompt sections through the coding-agent step registry.

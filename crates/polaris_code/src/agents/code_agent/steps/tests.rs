@@ -269,6 +269,11 @@ async fn run(replies: Vec<Reply>, max_turns: usize, plugins: u8) -> Outcome {
     if plugins >= 2 {
         server.add_plugins(SecondPlugin);
     }
+    if plugins >= 3 {
+        server.add_plugins(SessionOptionsPlugin {
+            maximum: if plugins == 3 { 3 } else { 2 },
+        });
+    }
     server.finish().await.unwrap();
     let steps = server.get_global::<CodeAgentSteps>().unwrap();
     let agent = CodeAgent::with_steps(&steps);
@@ -522,25 +527,110 @@ fn priorities_precede_keys_and_agent_snapshots_do_not_change() {
     assert_eq!(*built.lock().unwrap(), ["b", "z", "a"]);
 }
 
+struct SessionOptionsPlugin {
+    maximum: usize,
+}
+impl polaris::system::plugin::Plugin for SessionOptionsPlugin {
+    const ID: &'static str = "test::session_options";
+    const VERSION: Version = Version::new(0, 1, 0);
+    fn dependencies(&self) -> Vec<PluginId> {
+        vec![PluginId::of::<CodeAgentPlugin>()]
+    }
+    fn build(&self, server: &mut Server) {
+        use crate::agents::observation::{ModelObserver, TurnObserver};
+        let maximum = self.maximum;
+        let mut steps = server.get_resource_mut::<CodeAgentSteps>().unwrap();
+        steps
+            .configure_session("b", move |ctx| {
+                let probe = ctx
+                    .get_resource::<Probe>()
+                    .map_err(polaris::agent::SetupError::new)?;
+                assert_eq!(probe.order.lock().unwrap().as_slice(), ["setup"]);
+                let mut context = ctx
+                    .get_resource_mut::<ContextManager>()
+                    .map_err(polaris::agent::SetupError::new)?;
+                context.set_message_limit(maximum);
+                Ok(())
+            })
+            .unwrap();
+        steps
+            .configure_session("a", |ctx| {
+                let probe = ctx
+                    .get_resource::<Probe>()
+                    .map_err(polaris::agent::SetupError::new)?;
+                probe.order.lock().unwrap().push("setup");
+                ctx.get_resource_mut::<AgentConfig>()
+                    .map_err(polaris::agent::SetupError::new)?
+                    .model_observer = Some(ModelObserver::new(|model, attempt| {
+                    assert_eq!(model, "scripted/test-model");
+                    assert!(attempt.ok);
+                    assert!(attempt.output_tokens > 0);
+                }));
+                Ok(())
+            })
+            .unwrap();
+        assert!(steps.configure_session("a", |_| Ok(())).is_err());
+        drop(steps);
+        server.insert_global(TurnObserver::new(|history, mut outcome| async move {
+            assert!(!history.is_empty());
+            outcome.final_text = Some("recorded report".into());
+            outcome
+        }));
+    }
+}
+
+#[tokio::test]
+async fn session_configuration_observation_and_an_exact_message_boundary_compose() {
+    let outcome = run(vec![Reply::Text("verified")], 10, 3).await;
+    assert_eq!(outcome.turn.reason, TurnReason::Completed);
+    assert_eq!(outcome.requests.len(), 1);
+    assert_eq!(outcome.turn.final_text.as_deref(), Some("recorded report"));
+    assert_eq!(outcome.order, ["setup", "first", "second"]);
+}
+
+#[tokio::test]
+async fn a_conversation_ceiling_stops_before_the_model_and_observes_the_failure() {
+    let outcome = run(vec![], 10, 4).await;
+    assert!(outcome.requests.is_empty());
+    assert!(
+        matches!(outcome.turn.reason, TurnReason::Failed(ref failure) if failure.to_string().contains("Message limit reached"))
+    );
+    assert_eq!(outcome.turn.final_text.as_deref(), Some("recorded report"));
+}
 
 #[test]
 fn session_initializers_are_ordered_and_snapshots_keep_their_configuration() {
     let mut steps = CodeAgentSteps::default();
-    steps.configure_session("b", |ctx| {
-        ctx.get_resource_mut::<AgentConfig>().map_err(SetupError::new)?
-            .prompt_sections.push("second".into());
-        Ok(())
-    }).unwrap();
-    steps.configure_session("a", |ctx| {
-        ctx.get_resource_mut::<AgentConfig>().map_err(SetupError::new)?
-            .prompt_sections.push("first".into());
-        Ok(())
-    }).unwrap();
+    steps
+        .configure_session("b", |ctx| {
+            ctx.get_resource_mut::<AgentConfig>()
+                .map_err(SetupError::new)?
+                .prompt_sections
+                .push("second".into());
+            Ok(())
+        })
+        .unwrap();
+    steps
+        .configure_session("a", |ctx| {
+            ctx.get_resource_mut::<AgentConfig>()
+                .map_err(SetupError::new)?
+                .prompt_sections
+                .push("first".into());
+            Ok(())
+        })
+        .unwrap();
     assert!(steps.configure_session("a", |_| Ok(())).is_err());
     let agent = CodeAgent::with_steps(&steps);
-    steps.configure_session("c", |_| panic!("snapshot must be fixed")).unwrap();
+    steps
+        .configure_session("c", |_| panic!("snapshot must be fixed"))
+        .unwrap();
     let mut ctx = SystemContext::new();
     ctx.insert(AgentConfig::new("scripted/model", "."));
-    for configure in agent.steps.setup.values() { configure(&mut ctx).unwrap(); }
-    assert_eq!(ctx.get_resource::<AgentConfig>().unwrap().prompt_sections, ["first", "second"]);
+    for configure in agent.steps.setup.values() {
+        configure(&mut ctx).unwrap();
+    }
+    assert_eq!(
+        ctx.get_resource::<AgentConfig>().unwrap().prompt_sections,
+        ["first", "second"]
+    );
 }

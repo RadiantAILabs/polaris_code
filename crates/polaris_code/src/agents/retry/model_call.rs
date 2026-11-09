@@ -468,6 +468,23 @@ pub(crate) async fn act(
         reserved.settle(&Usage::default());
     }
 
+    if let Some(observer) = &config.model_observer {
+        observer.observe(
+            &prepared.model_id,
+            super::super::observation::ModelAttempt {
+                ok: result.is_ok(),
+                input_tokens: last_in.load(Ordering::Relaxed),
+                output_tokens: last_out.load(Ordering::Relaxed),
+                cache_read_tokens: last_cache_read.load(Ordering::Relaxed),
+                cache_creation_tokens: last_cache_creation.load(Ordering::Relaxed),
+                stop_reason: result
+                    .as_ref()
+                    .ok()
+                    .map(|response| format!("{:?}", response.stop_reason)),
+            },
+        );
+    }
+
     Ok(match result {
         Ok(response) => {
             log_response(&response);
