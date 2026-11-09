@@ -3107,6 +3107,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "polaris-guards"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-util",
+ "glob",
+ "polaris-ai",
+ "polaris_code",
+ "polaris_cosmos",
+ "polaris_ontrace",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-python",
+ "walkdir",
+]
+
+[[package]]
 name = "polaris-tui"
 version = "0.3.0"
 dependencies = [
