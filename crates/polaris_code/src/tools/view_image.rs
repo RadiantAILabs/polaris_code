@@ -14,7 +14,7 @@
 //! # What the tool checks, in order
 //!
 //! 1. **Containment.** The path resolves through the same code as `read_file`
-//!    ([`CodeToolsConfig::resolve_call`]), against the session's
+//!    (`CodeTools::resolve_call`), against the session's
 //!    [`CallRoot`]: `..`, absolute paths and symlinks that leave the working
 //!    directory are refused with `escapes sandbox`.
 //! 2. **Kind.** The path must be a regular file. A directory, a pipe or a

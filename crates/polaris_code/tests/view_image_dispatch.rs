@@ -321,7 +321,7 @@ fn results(messages: &[Message]) -> Vec<Seen> {
                 if let UserBlock::ToolResult(result) = block {
                     out.push(Seen {
                         id: result.id.clone(),
-                        status: result.status.clone(),
+                        status: result.status,
                         content: result.content.clone(),
                     });
                 }

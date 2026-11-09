@@ -178,7 +178,7 @@ impl ImageInput {
     /// Whether images may go to `model_id`, a `provider/model` id.
     ///
     /// `Auto` is on only where both the route and the model are known to take
-    /// image tool results. The OpenAI Responses route and Chat Completions
+    /// image tool results. The `OpenAI` Responses route and Chat Completions
     /// routes stay off until stated: a Chat Completions server can serve any
     /// model, most of them text-only.
     #[must_use]
