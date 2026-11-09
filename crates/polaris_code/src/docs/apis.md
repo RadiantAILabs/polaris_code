@@ -29,6 +29,9 @@ Capabilities state facts about their tools (read-only or mutating, and whether
 every attended call needs a person) in the
 [`ToolPolicyRegistry`](crate::tools::ToolPolicyRegistry) resource; this is a
 registry the capability plugins fill while they build, not a framework `API`.
+Plugins add rules written in Rust the same way, with
+[`PermissionRules::add_code_rule`](crate::agents::permission_rules::PermissionRules::add_code_rule)
+while they build; the rules are fixed once the server is ready.
 
 Context compaction also extends existing seams without adding an API:
 `ContextStrategy` selects projection behavior, `ContextManager` stores summary
