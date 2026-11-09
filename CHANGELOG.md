@@ -7,6 +7,8 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 
+- Let plugins extend session configuration and append system-prompt sections through the coding-agent step registry.
+
 - Let embedding hosts validate inputs before provider setup and opt out of automatic prompt routing.
 
 - Expose the pure file edit planner so plugins can preview exactly what an edit would write.

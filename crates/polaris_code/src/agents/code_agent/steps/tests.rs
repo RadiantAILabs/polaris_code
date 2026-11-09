@@ -521,3 +521,26 @@ fn priorities_precede_keys_and_agent_snapshots_do_not_change() {
     let _ = agent.to_graph();
     assert_eq!(*built.lock().unwrap(), ["b", "z", "a"]);
 }
+
+
+#[test]
+fn session_initializers_are_ordered_and_snapshots_keep_their_configuration() {
+    let mut steps = CodeAgentSteps::default();
+    steps.configure_session("b", |ctx| {
+        ctx.get_resource_mut::<AgentConfig>().map_err(SetupError::new)?
+            .prompt_sections.push("second".into());
+        Ok(())
+    }).unwrap();
+    steps.configure_session("a", |ctx| {
+        ctx.get_resource_mut::<AgentConfig>().map_err(SetupError::new)?
+            .prompt_sections.push("first".into());
+        Ok(())
+    }).unwrap();
+    assert!(steps.configure_session("a", |_| Ok(())).is_err());
+    let agent = CodeAgent::with_steps(&steps);
+    steps.configure_session("c", |_| panic!("snapshot must be fixed")).unwrap();
+    let mut ctx = SystemContext::new();
+    ctx.insert(AgentConfig::new("scripted/model", "."));
+    for configure in agent.steps.setup.values() { configure(&mut ctx).unwrap(); }
+    assert_eq!(ctx.get_resource::<AgentConfig>().unwrap().prompt_sections, ["first", "second"]);
+}

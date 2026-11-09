@@ -39,6 +39,8 @@ pub struct AgentConfig {
     /// built-in prompt, so a session that never sets it sends the same bytes
     /// as before.
     pub system_prompt: Option<String>,
+    /// Sections appended after the role and project grounding, in order.
+    pub prompt_sections: Vec<String>,
     /// The most one model reply may produce. It sizes the worst-case cost
     /// reserved for each request when the session's meter carries a spend cap
     /// (see [`crate::usage::TokenMeter::set_task_cost_cap`]), and it is passed
@@ -78,6 +80,7 @@ impl AgentConfig {
             graph_search: GraphSearchMode::default(),
             prompt_cache: true,
             system_prompt: None,
+            prompt_sections: Vec::new(),
             max_output_tokens: None,
             context_window: None,
             command_globs: None,

@@ -128,6 +128,10 @@ fn system_prompt_for(config: &AgentConfig, project: &ProjectContext) -> String {
         prompt.push_str("\n\n");
         prompt.push_str(&command_patterns_note(globs));
     }
+    for section in &config.prompt_sections {
+        prompt.push_str("\n\n");
+        prompt.push_str(section);
+    }
     prompt
 }
 

@@ -166,6 +166,7 @@ type Contributions = BTreeMap<(i32, String), Builder>;
 pub struct CodeAgentSteps {
     after_tools: Contributions,
     before_finish: Contributions,
+    setup: std::collections::BTreeMap<String, Arc<SessionSetup>>,
 }
 
 impl GlobalResource for CodeAgentSteps {}
@@ -185,7 +186,44 @@ impl std::fmt::Display for DuplicateStep {
 
 impl std::error::Error for DuplicateStep {}
 
+type SessionSetup = dyn Fn(&mut SystemContext<'static>) -> Result<(), SetupError> + Send + Sync;
+
 impl CodeAgentSteps {
+    /// Configure session resources after stock setup, in ascending key order.
+    ///
+    /// Called on creation and resume, before any graph system runs. Use this
+    /// to extend existing configuration without replacing resource factories.
+    /// A duplicate key is rejected; a setup error refuses the session.
+    ///
+    /// ```
+    /// use polaris::agent::SetupError;
+    /// use polaris_code::agents::{AgentConfig, CodeAgentSteps};
+    /// let mut steps = CodeAgentSteps::default();
+    /// steps.configure_session("domain.prompt", |ctx| {
+    ///     ctx.get_resource_mut::<AgentConfig>().map_err(SetupError::new)?
+    ///         .prompt_sections.push("Explain the verification you performed.".into());
+    ///     Ok(())
+    /// }).unwrap();
+    /// ```
+    pub fn configure_session(
+        &mut self,
+        key: impl Into<String>,
+        configure: impl Fn(&mut SystemContext<'static>) -> Result<(), SetupError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<(), DuplicateStep> {
+        let key = key.into();
+        if self.setup.contains_key(&key) {
+            return Err(DuplicateStep {
+                key,
+                place: "session setup",
+            });
+        }
+        self.setup.insert(key, Arc::new(configure));
+        Ok(())
+    }
+
     /// Append a graph builder after each complete tool round.
     ///
     /// Builders run by ascending priority, then key; the builder's own system
@@ -305,6 +343,9 @@ impl Agent for SteppedCodeAgent {
 
     fn setup(&self, ctx: &mut SystemContext<'static>) -> Result<(), SetupError> {
         CodeAgent.setup(ctx)?;
+        for configure in self.steps.setup.values() {
+            configure(ctx)?;
+        }
         if !self.steps.before_finish.is_empty() {
             ctx.insert(FinishGate {
                 messages: Vec::new(),
