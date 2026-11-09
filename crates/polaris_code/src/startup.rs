@@ -226,6 +226,26 @@ pub use clap;
 /// The error a host's plugin closure may return to refuse startup.
 pub type HostError = Box<dyn std::error::Error + Send + Sync>;
 
+/// One early validation/configuration closure supplied by a host.
+type Configure = Box<dyn FnOnce(&Launch<'_>, &mut LaunchOptions) -> Result<(), HostError> + Send>;
+
+/// Host choices applied before providers or plugins start.
+///
+/// Defaults preserve stock routing. Host validation can also return an error
+/// here, before credential checks or filesystem side effects from plugins.
+#[derive(Debug, Clone)]
+pub struct LaunchOptions {
+    /// Recognize ordinary prompts that can be served by a coding topology.
+    /// Explicit `--topology-task` and topology pins remain available.
+    pub auto_route: bool,
+}
+
+impl Default for LaunchOptions {
+    fn default() -> Self {
+        Self { auto_route: true }
+    }
+}
+
 /// One closure a host gave to [`Host::plugins`].
 type AddPlugins = Box<dyn FnOnce(&Launch<'_>, &mut Server) -> Result<(), HostError> + Send>;
 
@@ -253,6 +273,7 @@ const TURN_STOP_GRACE: Duration = Duration::from_secs(2);
 /// |--------|---------|
 /// | [`new`](Self::new) | The stock startup, with nothing added. |
 /// | [`arg`](Self::arg) | Add a command-line setting of the host's own. |
+/// | [`configure`](Self::configure) | Validate host inputs and choose routing before provider setup. |
 /// | [`plugins`](Self::plugins) | Add plugins, with the parsed command line in view. |
 /// | [`run`](Self::run) | Parse, start, run, and return the exit code. |
 ///
@@ -284,6 +305,7 @@ const TURN_STOP_GRACE: Duration = Duration::from_secs(2);
 pub struct Host {
     args: Vec<clap::Arg>,
     plugins: Vec<AddPlugins>,
+    configure: Vec<Configure>,
 }
 
 impl Host {
@@ -305,6 +327,31 @@ impl Host {
     /// their defaults.
     pub fn arg(mut self, arg: clap::Arg) -> Self {
         self.args.push(arg);
+        self
+    }
+
+    /// Validate host settings and select launch options before provider setup.
+    ///
+    /// Called after parsing, working-directory resolution and listing commands,
+    /// before any provider is prepared. Errors use the same exit codes as
+    /// [`Self::plugins`]. Callbacks run in registration order. Use this to read
+    /// inputs or prepare immutable state shared with a later plugin closure.
+    ///
+    /// ```no_run
+    /// use polaris_code::startup::Host;
+    /// let host = Host::new().configure(|launch, options| {
+    ///     if launch.is_headless() { options.auto_route = false; }
+    ///     Ok(())
+    /// });
+    /// # let _ = host;
+    /// ```
+    pub fn configure(
+        mut self,
+        configure: impl FnOnce(&Launch<'_>, &mut LaunchOptions) -> Result<(), HostError>
+        + Send
+        + 'static,
+    ) -> Self {
+        self.configure.push(Box::new(configure));
         self
     }
 
@@ -401,6 +448,7 @@ pub struct Launch<'a> {
     matches: &'a ArgMatches,
     working_dir: &'a Path,
     headless: bool,
+    options: LaunchOptions,
 }
 
 impl Launch<'_> {
@@ -591,7 +639,7 @@ async fn resume_or_create_session(
 
 /// Run what the command line asked for, once it has parsed.
 async fn launch(
-    host: Host,
+    mut host: Host,
     cli: Cli,
     startup: Startup,
     matches: ArgMatches,
@@ -632,11 +680,17 @@ async fn launch(
         return Ok(list_models(cli.output_format));
     }
 
-    let launch = Launch {
+    let mut options = LaunchOptions::default();
+    let mut launch = Launch {
         matches: &matches,
         working_dir: &working_dir,
         headless,
+        options: options.clone(),
     };
+    for configure in std::mem::take(&mut host.configure) {
+        configure(&launch, &mut options).map_err(|error| refusal(headless, error))?;
+    }
+    launch.options = options;
     let (mut server, run) = prepare(host, cli, startup, &launch, permissions).await?;
     match serve(&mut server, run).await {
         Ok(code) => Ok(code),
@@ -651,6 +705,7 @@ async fn launch(
 
 /// What startup carries from assembling the server to running the agent.
 struct Run {
+    auto_route: bool,
     headless: bool,
     cli: Cli,
     startup: Startup,
@@ -1270,6 +1325,7 @@ async fn prepare(
     Ok((
         server,
         Run {
+            auto_route: launch.options.auto_route,
             headless,
             cli,
             startup,
@@ -1313,6 +1369,7 @@ async fn prepare(
 /// code, with plugin cleanup already done on every path that completes.
 async fn serve(server: &mut Server, run: Run) -> Result<i32, Refusal> {
     let Run {
+        auto_route: allow_auto_route,
         headless,
         cli,
         startup,
@@ -1689,7 +1746,8 @@ async fn serve(server: &mut Server, run: Run) -> Result<i32, Refusal> {
                 Ok(accepted) => tracing::info!("{}", accepted.summary()),
                 Err(refused) => return Err(refusal(headless, refused)),
             }
-        } else if let Some(prompt) = cli.print.as_deref()
+        } else if allow_auto_route
+            && let Some(prompt) = cli.print.as_deref()
             && let Some(auto) = auto_route(&working_dir, prompt)
         {
             // A third, quiet acceptance path alongside `/topology` and

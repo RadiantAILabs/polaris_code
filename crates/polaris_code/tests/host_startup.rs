@@ -436,6 +436,23 @@ async fn refusals_and_usage_errors_return_exit_codes() {
     let root = workspace();
     let script = script([]);
 
+    let checked = Arc::new(AtomicUsize::new(0));
+    let seen = checked.clone();
+    let code = Host::new()
+        .configure(move |launch, options| {
+            assert!(launch.is_headless());
+            assert!(launch.working_dir().is_absolute());
+            assert!(options.auto_route);
+            options.auto_route = false;
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err("early validation refused the host settings".into())
+        })
+        .plugins(|_, _| panic!("validation must precede plugin assembly"))
+        .run(command_line(root.path(), &[]))
+        .await;
+    assert_eq!(code, 2);
+    assert_eq!(checked.load(Ordering::SeqCst), 1);
+
     // A closure that returns an error refuses the run.
     let code = Host::new()
         .plugins(|_, _| Err("the host's own configuration is wrong".into()))
