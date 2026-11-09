@@ -25,6 +25,15 @@ use super::policy::RetryPolicy;
 
 mod model_call;
 
+/// Most attempts for a call whose reply could not be read, the first included.
+///
+/// A reply the client cannot assemble, such as a tool call whose arguments are
+/// not valid JSON, is lost whatever happens next, so sending the call again
+/// costs nothing that a failed turn would keep. It is still capped below
+/// [`RetryPolicy::max_attempts`]: a provider that garbles every reply should
+/// not be called ten times.
+pub const MALFORMED_REPLY_ATTEMPTS: u32 = 3;
+
 pub(crate) use model_call::{
     AttemptLedger, AttemptOutcome, abandon, accept_response, act, begin_model_call, decide_retry,
     report_failure, wait_to_retry,
@@ -77,7 +86,14 @@ impl RetryPolicy {
     /// Decide what follows attempt number `attempt` (counting from 1), which
     /// failed with `error`.
     ///
-    /// The call is sent again only if all of these hold:
+    /// A reply that could not be read ([`GenerationError::InvalidResponse`],
+    /// for example a tool call with arguments that are not valid JSON) is sent
+    /// again while attempts remain under both
+    /// [`max_attempts`](Self::max_attempts) and [`MALFORMED_REPLY_ATTEMPTS`],
+    /// even if the attempt had already shown or billed something: nothing of
+    /// it can be kept, so a retry only replaces a failed turn.
+    ///
+    /// Any other failure is sent again only if all of these hold:
     ///
     /// - the failure is transient: not an authentication or invalid-request
     ///   error, which a second try cannot fix;
@@ -106,6 +122,15 @@ impl RetryPolicy {
         jitter: f64,
     ) -> RetryStep {
         let attempt = attempt.max(1);
+        if matches!(error, GenerationError::InvalidResponse(_)) {
+            return if attempt < self.max_attempts.min(MALFORMED_REPLY_ATTEMPTS) {
+                RetryStep::Retry {
+                    after: self.backoff(attempt, jitter),
+                }
+            } else {
+                RetryStep::GiveUp
+            };
+        }
         if commitment.is_committed()
             || attempt >= self.max_attempts
             || !classify(error).is_transient()
@@ -457,6 +482,46 @@ mod tests {
             ..defaults
         };
         assert_eq!(single.worst_case_wait(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn an_unreadable_reply_is_retried_even_after_output_but_only_twice() {
+        let error = GenerationError::InvalidResponse(
+            "failed to parse tool call arguments: EOF while parsing an object".into(),
+        );
+        let policy = RetryPolicy::unattended();
+        for attempt in 1..MALFORMED_REPLY_ATTEMPTS {
+            assert!(
+                matches!(
+                    policy.next_step(attempt, &error, Commitment::Committed, 0.5),
+                    RetryStep::Retry { .. }
+                ),
+                "attempt {attempt} is retried although it showed output"
+            );
+        }
+        assert_eq!(
+            policy.next_step(MALFORMED_REPLY_ATTEMPTS, &error, Commitment::Committed, 0.5),
+            RetryStep::GiveUp
+        );
+        let once = RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(
+            once.next_step(1, &error, Commitment::Uncommitted, 0.5),
+            RetryStep::GiveUp,
+            "a policy that never retries does not retry this either"
+        );
+        // Other committed failures still give up at once.
+        assert_eq!(
+            policy.next_step(
+                1,
+                &GenerationError::Http("reset".into()),
+                Commitment::Committed,
+                0.5
+            ),
+            RetryStep::GiveUp
+        );
     }
 
     #[test]
