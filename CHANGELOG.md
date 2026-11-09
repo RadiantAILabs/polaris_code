@@ -5,10 +5,14 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-09
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
+
 ### Added
-- A model reply cut off at the output limit is continued instead of being treated as the final answer, up to three times per turn.
+- A model reply cut off at the output limit is continued instead of being treated as the final answer, up to three times per turn. The final answer of a `-p` run joins the continued parts.
 - A `-p` run asks the model to go on once when a reply calls no tool. `POLARIS_CODE_UNATTENDED_NUDGES` sets the number; `0` turns it off. Interactive sessions and embedding hosts are unchanged unless they opt in through `ContinuationPolicy`.
-- The model sees the first and last 5,000 characters of each long shell output stream, with the end read from the overflow file when the capture was cut. `ObservationPolicy` on `PolicySnapshot` sets the size.
+- The model sees the first and last 5,000 characters of each long shell output stream, with the end read from the overflow file when the capture was cut. Secrets are redacted before the output is shortened. `ObservationPolicy` on `PolicySnapshot` sets the size.
 
 ### Changed
 - Foreground `run_command` calls in a `-p` run time out after 600 seconds by default instead of 120. Interactive sessions keep 120, and `run_in_background` keeps its 3,600-second default.
@@ -140,7 +144,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/RadiantAILabs/polaris_code/compare/v0.3.0...v0.4.0
