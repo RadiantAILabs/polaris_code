@@ -313,7 +313,8 @@ def compare_stock(
         return Section("stock text", True, ["no request pair to compare"])
 
     def instructions(view: RequestView) -> str:
-        return "\n".join(t for where, item, _r, _n, t in view.stock if where == "instructions")
+        # Blank space at either end is not part of the prompt's wording.
+        return "\n".join(t for where, item, _r, _n, t in view.stock if where == "instructions").strip()
 
     first_a, first_b = pairs[0]
     if instructions(first_a) == instructions(first_b):
@@ -370,8 +371,8 @@ def compare_stock(
             lines.append(f"request {number}: messages and tool results differ")
             for x, y in zip(sa, sb):
                 if x != y:
-                    lines.append(f"    {x[1]}/{x[2]} {labels[0]}: {clip(x[4], 140)}")
-                    lines.append(f"    {y[1]}/{y[2]} {labels[1]}: {clip(y[4], 140)}")
+                    lines.append(f"    {x[0]} {x[1]}/{x[2]} {labels[0]}: {clip(x[4], 140)}")
+                    lines.append(f"    {y[0]} {y[1]}/{y[2]} {labels[1]}: {clip(y[4], 140)}")
                     break
             else:
                 lines.append(f"    {len(sa)} pieces in {labels[0]}, {len(sb)} in {labels[1]}")
