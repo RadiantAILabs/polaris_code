@@ -5,6 +5,10 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-09
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
+
 ### Changed
 - A `-p` run no longer asks the model to go on after a reply that calls no tool. On Terminal-Bench 2.1 and DeepSWE runs, every such message came after the work was already finished and only added a model call. `POLARIS_CODE_UNATTENDED_NUDGES` still turns it on. For embedders, `DEFAULT_UNATTENDED_NUDGES` is now 0, so code that passes it to `with_unattended_nudges` sends no nudges.
 - A `-p` run retries a failed model call (a network error, timeout, rate limit or overload) for about five minutes instead of about fifteen seconds: ten attempts, with waits starting at 2 s and doubling up to 60 s. A failed call ends the run, so a short outage used to throw away all the work done so far. Interactive sessions keep five attempts. `RetryPolicy::unattended` gives an embedder the same numbers. A call that times out on every attempt can still take up to 59 minutes.
@@ -152,7 +156,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.0...v0.4.1
