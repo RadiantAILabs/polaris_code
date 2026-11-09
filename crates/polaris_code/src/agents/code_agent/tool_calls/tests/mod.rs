@@ -514,6 +514,58 @@ async fn parallel_read_results_keep_distinct_provider_call_ids_on_success_and_er
     );
 }
 #[tokio::test]
+async fn a_cut_off_call_is_explained_in_the_one_at_a_time_lane() {
+    // A reply that stopped inside a call's arguments reaches the agent with
+    // none.
+    let cut_off = ToolCall::new("cut-0", "update_file", serde_json::Value::Null);
+    let outcome = run_calls(vec![cut_off, command(1, "ok")], false, 10).await;
+    assert_eq!(outcome.ran, ["ok"], "the cut-off call must not run");
+    let results = results(&outcome);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0);
+    assert!(
+        results[0].1.starts_with("update_file did not run:"),
+        "{}",
+        results[0].1
+    );
+    assert!(
+        results[0].1.contains("output-length limit"),
+        "{}",
+        results[0].1
+    );
+    assert!(
+        !results[0].1.contains("Parameters must be an object"),
+        "{}",
+        results[0].1
+    );
+    assert_eq!(results[1], (false, "ok".into()));
+}
+
+#[tokio::test]
+async fn a_cut_off_call_is_explained_in_the_parallel_read_lane() {
+    let calls = vec![
+        ToolCall::new("cut-0", "read_file", serde_json::Value::Null),
+        ToolCall::new("read-1", "read_file", serde_json::json!({"path": "ok"})),
+    ];
+    let outcome = run_calls(calls, false, 10).await;
+    assert_eq!(outcome.ran, ["ok"], "the cut-off call must not run");
+    let results = results(&outcome);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0);
+    assert!(
+        results[0].1.starts_with("read_file did not run:"),
+        "{}",
+        results[0].1
+    );
+    assert!(
+        !results[0].1.contains("Parameters must be an object"),
+        "{}",
+        results[0].1
+    );
+    assert_eq!(results[1], (false, "ok".into()));
+}
+
+#[tokio::test]
 async fn the_outer_turn_bound_does_not_truncate_a_batch() {
     let outcome = run_calls((0..8).map(|i| command(i, "ok")).collect(), false, 10).await;
     assert_eq!(outcome.ran.len(), 8);

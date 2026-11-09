@@ -685,7 +685,15 @@ async fn execute_read_only_batch(
                 call.result(ToolResultContent::Text(output))
             }
             Some(Err(err)) => {
-                let output = redact_tool_output(redactor, name, err.to_string());
+                let output = redact_tool_output(
+                    redactor,
+                    name,
+                    crate::tools::call_arguments::failure_text(
+                        name,
+                        &call.function.arguments,
+                        &err,
+                    ),
+                );
                 activity.finish(user_io, PHASE_ERROR, &output).await;
                 record_tool_call(
                     store,

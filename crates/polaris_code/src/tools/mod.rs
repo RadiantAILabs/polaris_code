@@ -15,10 +15,14 @@
 //! lives here rather than in the framework.
 
 pub mod approval;
+pub(crate) mod call_arguments;
 pub mod code;
 pub mod code_graph;
 #[doc(hidden)]
 pub mod command_check;
+pub(crate) mod edit_match;
+#[cfg(test)]
+mod file_tool_vectors;
 pub mod fileset;
 pub mod mcp;
 pub mod memory;

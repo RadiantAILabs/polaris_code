@@ -15,6 +15,7 @@ use super::*;
 use crate::agents::human_approval::HumanApproval;
 use crate::agents::permission_rules::{ApprovalAnswer, ApprovalReceipt};
 use crate::terminal::background::Invocation;
+use crate::tools::call_arguments::failure_text;
 
 /// Independent of the outer model-turn budget.
 const TOOL_CALLS_BOUND: usize = u32::MAX as usize;
@@ -867,7 +868,11 @@ pub(crate) async fn execute_call(
             Err(err) => {
                 // A failure message carries tool output too — a command's
                 // stderr, a parser's echo of the line it choked on.
-                let output = redact_tool_output(redactor, name, err.to_string());
+                let output = redact_tool_output(
+                    redactor,
+                    name,
+                    failure_text(name, &tool_call.function.arguments, &err),
+                );
                 activity.finish(&user_io, PHASE_ERROR, &output).await;
                 record_tool_call(
                     &store,

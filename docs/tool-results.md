@@ -66,12 +66,47 @@ plus the path tells it whether to fix the path, create the file, or give up:
 ```
 read_file 'src/run.rs' failed: No such file or directory (os error 2)
 edit_file (write) 'src/run.rs' failed: Permission denied (os error 13)
-old_string not found in src/run.rs (whitespace must match exactly); read the file and copy the text you mean to replace
-old_string is not unique in src/run.rs (3 matches); add surrounding context to disambiguate, or set replace_all = true
+old_string is not unique in src/run.rs (3 matches, starting at lines 12, 40, 77). Nothing was changed. Add the lines around the one you mean so that only one place matches, or set replace_all = true to change every match.
 ```
 
 The rejection messages end in the remedy rather than the diagnosis. The model's
 next move is the point of the message.
+
+An `old_string` that is not in the file shows the text the file really holds
+nearest to it, with line numbers and the first line where the two differ, in
+quotes so that spaces and tabs are visible:
+
+```
+old_string not found in src/run.rs. Nothing was changed. The closest text in the file starts at line 2:
+2	    if x:
+3	        return 1
+The first difference: line 2 of old_string is "      return 1" but line 3 of the file is "        return 1" (only the spaces or tabs at its start or end differ).
+Copy the text exactly as the file has it (read_file with offset 2 shows it) and send the edit again.
+```
+
+When nothing in the file resembles the first line of `old_string`, the message
+says so instead of naming a place. An empty `old_string` is refused for a file
+that has content, because it points at no place in it (the message names
+`create_file` for a new file); an empty file can still be filled with one.
+
+The nearest text is a pointer, not a match: nothing is applied from it.
+`edit_file` makes exactly the replacement asked for, with one allowance. A
+model asking for a line of text asks for it with its newline, and cannot see
+whether the file ends with one. When `old_string` ends with newlines, the text
+before them occurs once in the file and that one place is the very end of a
+file that has no final newline, there is only one place the request can mean.
+The edit is made there, the same number of newlines is left off the end of
+`new_string`, the file still ends without a newline, and the result ends with a
+note that says so. If that would leave the file as it is, the edit is refused.
+In every other case that does not match exactly, the edit is refused.
+
+A call whose arguments are not a JSON object is explained rather than reported
+with the registry's `Parameters must be an object`. In practice this is a reply
+cut off at the output-length limit in the middle of a long argument. The message
+says the call did not run, that this is the likely reason, and how to send less
+text in one call; for `edit_file` that is a shorter `old_string` and
+`new_string`, one edit per call. It applies to every tool, in the sequential
+lane and the parallel read-only lane alike.
 
 ## Searches
 

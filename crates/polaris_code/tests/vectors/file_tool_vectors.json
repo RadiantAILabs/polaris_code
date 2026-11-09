@@ -1,0 +1,797 @@
+{
+ "vectors": [
+  {
+   "id": "replace_all-missing-unique",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b",
+    "new_string": "B"
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    "changed_files": {
+     "f.txt": "a\nB\nc\n"
+    }
+   }
+  },
+  {
+   "id": "replace_all-missing-twice",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "x",
+    "new_string": "X"
+   },
+   "files": {
+    "f.txt": "x\ny\nx\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string is not unique in f.txt (2 matches, starting at lines 1, 3). Nothing was changed. Add the lines around the one you mean so that only one place matches, or set replace_all = true to change every match.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "replace_all-true-twice",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "x",
+    "new_string": "X",
+    "replace_all": true
+   },
+   "files": {
+    "f.txt": "x\ny\nx\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (2 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,3 +1,3 @@\n-x\n+X\n y\n-x\n+X\n",
+    "changed_files": {
+     "f.txt": "X\ny\nX\n"
+    }
+   }
+  },
+  {
+   "id": "replace_all-null",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b",
+    "new_string": "B",
+    "replace_all": null
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    "changed_files": {
+     "f.txt": "a\nB\nc\n"
+    }
+   }
+  },
+  {
+   "id": "replace_all-string-true",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "x",
+    "new_string": "X",
+    "replace_all": "true"
+   },
+   "files": {
+    "f.txt": "x\ny\nx\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Parameter error: Failed to deserialize parameter 'replace_all': invalid type: string \"true\", expected a boolean",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "replace_all-number-1",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "x",
+    "new_string": "X",
+    "replace_all": 1
+   },
+   "files": {
+    "f.txt": "x\ny\nx\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Parameter error: Failed to deserialize parameter 'replace_all': invalid type: integer `1`, expected a boolean",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "extra-key",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b",
+    "new_string": "B",
+    "unknown": 1
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+    "changed_files": {
+     "f.txt": "a\nB\nc\n"
+    }
+   }
+  },
+  {
+   "id": "arguments-as-json-string",
+   "tool": "edit_file",
+   "arguments": "{\"path\": \"f.txt\", \"old_string\": \"b\", \"new_string\": \"B\"}",
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "edit_file did not run: its arguments were not a complete JSON object. This usually means the reply was cut off at the output-length limit while the call was being written, so nothing was changed. Send smaller edits: an old_string of just the few lines that identify the place, a new_string of just the lines that change, one edit per call.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "arguments-null",
+   "tool": "edit_file",
+   "arguments": null,
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "edit_file did not run: its arguments were not a complete JSON object. This usually means the reply was cut off at the output-length limit while the call was being written, so nothing was changed. Send smaller edits: an old_string of just the few lines that identify the place, a new_string of just the lines that change, one edit per call.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "arguments-array",
+   "tool": "edit_file",
+   "arguments": [
+    "f.txt"
+   ],
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "edit_file did not run: its arguments were not a complete JSON object. This usually means the reply was cut off at the output-length limit while the call was being written, so nothing was changed. Send smaller edits: an old_string of just the few lines that identify the place, a new_string of just the lines that change, one edit per call.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "missing-old-string",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "new_string": "B"
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Parameter error: Missing parameter: old_string",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "missing-new-string",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b"
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Parameter error: Missing parameter: new_string",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "path-not-a-string",
+   "tool": "edit_file",
+   "arguments": {
+    "path": 3,
+    "old_string": "b",
+    "new_string": "B"
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Parameter error: Failed to deserialize parameter 'path': invalid type: integer `3`, expected a string",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "empty-new-string-deletes",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b\n",
+    "new_string": ""
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,3 +1,2 @@\n a\n-b\n c\n",
+    "changed_files": {
+     "f.txt": "a\nc\n"
+    }
+   }
+  },
+  {
+   "id": "identical-strings",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b",
+    "new_string": "b"
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: edit_file 'f.txt': old_string and new_string are identical",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "empty-old-string-nonempty-file",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "",
+    "new_string": "Z"
+   },
+   "files": {
+    "f.txt": "a\nb\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string is empty, so it does not say where in f.txt to edit; give the text to replace (use create_file to add a new file)",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "empty-old-string-replace-all-nonempty-file",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "",
+    "new_string": "Z",
+    "replace_all": true
+   },
+   "files": {
+    "f.txt": "a\nb\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string is empty, so it does not say where in f.txt to edit; give the text to replace (use create_file to add a new file)",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "empty-old-string-empty-file",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "",
+    "new_string": "Z"
+   },
+   "files": {
+    "f.txt": ""
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -0,0 +1 @@\n+Z\n\\ No newline at end of file\n",
+    "changed_files": {
+     "f.txt": "Z"
+    }
+   }
+  },
+  {
+   "id": "whole-file-minus-final-newline",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "a\nb\n",
+    "new_string": "c\nd\n"
+   },
+   "files": {
+    "f.txt": "a\nb"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,2 +1,2 @@\n-a\n-b\n\\ No newline at end of file\n+c\n+d\n\\ No newline at end of file\nNote: f.txt has no newline after this text, so the newline that ended old_string and new_string was left out. The file still ends without a final newline.",
+    "changed_files": {
+     "f.txt": "c\nd"
+    }
+   }
+  },
+  {
+   "id": "whole-file-minus-final-newline-new-has-no-newline",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "a\nb\n",
+    "new_string": "c\nd"
+   },
+   "files": {
+    "f.txt": "a\nb"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,2 +1,2 @@\n-a\n-b\n\\ No newline at end of file\n+c\n+d\n\\ No newline at end of file\nNote: f.txt has no newline after this text, so the newline that ended old_string and new_string was left out. The file still ends without a final newline.",
+    "changed_files": {
+     "f.txt": "c\nd"
+    }
+   }
+  },
+  {
+   "id": "final-newline-two-newlines-in-old-one-in-new",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "a\nb\n\n",
+    "new_string": "c\nd\n"
+   },
+   "files": {
+    "f.txt": "a\nb"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,2 +1,2 @@\n-a\n-b\n\\ No newline at end of file\n+c\n+d\n\\ No newline at end of file\nNote: f.txt has no newline after this text, so the newline that ended old_string and new_string was left out. The file still ends without a final newline.",
+    "changed_files": {
+     "f.txt": "c\nd"
+    }
+   }
+  },
+  {
+   "id": "final-newline-file-has-it",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "a\nb\n\n",
+    "new_string": "c\n"
+   },
+   "files": {
+    "f.txt": "a\nb\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string not found in f.txt. Nothing was changed. The closest text in the file starts at line 1:\n1\ta\n2\tb\nThe file ends at line 2, but old_string has more lines after that.\nCopy the text exactly as the file has it (read_file with offset 1 shows it) and send the edit again.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "final-newline-text-also-elsewhere",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b\n",
+    "new_string": "c\n"
+   },
+   "files": {
+    "f.txt": "b = 1\nb"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string not found in f.txt. Nothing was changed. The closest text in the file starts at line 2:\n2\tb\nThe lines are the same as old_string's, so the difference is in the line endings or at the end of the file.\nCopy the text exactly as the file has it (read_file with offset 2 shows it) and send the edit again.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "final-newline-no-change",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "a\nb\n",
+    "new_string": "a\nb"
+   },
+   "files": {
+    "f.txt": "a\nb"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: f.txt already ends with this text and has no final newline, so this edit would change nothing. Nothing was changed.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "crlf-file-lf-request",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "a\nb\n",
+    "new_string": "x\n"
+   },
+   "files": {
+    "f.txt": "a\r\nb\r\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string not found in f.txt. Nothing was changed. The closest text in the file starts at line 1:\n1\ta\n2\tb\nThe lines are the same as old_string's, so the difference is in the line endings or at the end of the file.\nCopy the text exactly as the file has it (read_file with offset 1 shows it) and send the edit again.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "indent-differs",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "  return 1\n",
+    "new_string": "  return 2\n"
+   },
+   "files": {
+    "f.txt": "def f():\n    return 1\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,2 +1,2 @@\n def f():\n-    return 1\n+    return 2\n",
+    "changed_files": {
+     "f.txt": "def f():\n    return 2\n"
+    }
+   }
+  },
+  {
+   "id": "create-file-new",
+   "tool": "create_file",
+   "arguments": {
+    "path": "d/g.txt",
+    "content": "hello"
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Created d/g.txt (1 lines, 5 bytes):\n--- /dev/null\n+++ d/g.txt\n@@ -0,0 +1 @@\n+hello\n\\ No newline at end of file\n",
+    "changed_files": {
+     "d/g.txt": "hello"
+    }
+   }
+  },
+  {
+   "id": "create-file-exists",
+   "tool": "create_file",
+   "arguments": {
+    "path": "f.txt",
+    "content": "hello"
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: 'f.txt' already exists; use edit_file to change an existing file",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "create-file-missing-content",
+   "tool": "create_file",
+   "arguments": {
+    "path": "g.txt"
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Parameter error: Missing parameter: content",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "path-escape",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "../f.txt",
+    "old_string": "b",
+    "new_string": "B"
+   },
+   "files": {
+    "f.txt": "a\nb\nc\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: path '../f.txt' escapes sandbox",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "create-file-empty-content",
+   "tool": "create_file",
+   "arguments": {
+    "path": "empty.txt",
+    "content": ""
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Created empty.txt (0 lines, 0 bytes):\n",
+    "changed_files": {
+     "empty.txt": ""
+    }
+   }
+  },
+  {
+   "id": "create-file-escape",
+   "tool": "create_file",
+   "arguments": {
+    "path": "../g.txt",
+    "content": "x"
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: path '../g.txt' escapes sandbox",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "create-file-adds-no-newline",
+   "tool": "create_file",
+   "arguments": {
+    "path": "g.py",
+    "content": "def f():\n    return 1"
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Created g.py (2 lines, 21 bytes):\n--- /dev/null\n+++ g.py\n@@ -0,0 +1,2 @@\n+def f():\n+    return 1\n\\ No newline at end of file\n",
+    "changed_files": {
+     "g.py": "def f():\n    return 1"
+    }
+   }
+  },
+  {
+   "id": "edit-missing-file",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "nope.txt",
+    "old_string": "a",
+    "new_string": "b"
+   },
+   "files": {
+    "f.txt": "x"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: edit_file 'nope.txt' failed: No such file or directory (os error 2)",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "edit-directory",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "d",
+    "old_string": "a",
+    "new_string": "b"
+   },
+   "files": {
+    "d/f.txt": "x"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: edit_file 'd' failed: Is a directory (os error 21)",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "only-newlines-old-string",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "\n",
+    "new_string": "x"
+   },
+   "files": {
+    "f.txt": "a"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string not found in f.txt, and nothing in the file is close to its first line. Nothing was changed. Find the text with search or read_file, then copy it exactly.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "overlapping-matches-count-as-non-overlapping",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "aa",
+    "new_string": "b",
+    "replace_all": true
+   },
+   "files": {
+    "f.txt": "aaa"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1 +1 @@\n-aaa\n\\ No newline at end of file\n+ba\n\\ No newline at end of file\n",
+    "changed_files": {
+     "f.txt": "ba"
+    }
+   }
+  },
+  {
+   "id": "overlapping-matches-unique",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "aa",
+    "new_string": "b"
+   },
+   "files": {
+    "f.txt": "aaa"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1 +1 @@\n-aaa\n\\ No newline at end of file\n+ba\n\\ No newline at end of file\n",
+    "changed_files": {
+     "f.txt": "ba"
+    }
+   }
+  },
+  {
+   "id": "case-differs",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "Return 1",
+    "new_string": "return 2"
+   },
+   "files": {
+    "f.txt": "return 1"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string not found in f.txt. Nothing was changed. The closest text in the file starts at line 1:\n1\treturn 1\nThe first difference: line 1 of old_string is \"Return 1\" but line 1 of the file is \"return 1\".\nCopy the text exactly as the file has it (read_file with offset 1 shows it) and send the edit again.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "trailing-space-differs",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "return 1 \n",
+    "new_string": "return 2\n"
+   },
+   "files": {
+    "f.txt": "return 1\n"
+   },
+   "expected": {
+    "ok": false,
+    "text": "Execution error: old_string not found in f.txt. Nothing was changed. The closest text in the file starts at line 1:\n1\treturn 1\nThe first difference: line 1 of old_string is \"return 1 \" but line 1 of the file is \"return 1\" (only the spaces or tabs at its start or end differ).\nCopy the text exactly as the file has it (read_file with offset 1 shows it) and send the edit again.",
+    "changed_files": {}
+   }
+  },
+  {
+   "id": "final-newline-left-out-for-the-last-function-of-a-longer-file",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "def g():\n    pass\n",
+    "new_string": "def g():\n    return 2\n"
+   },
+   "files": {
+    "f.txt": "def f():\n    pass\n\ndef g():\n    pass"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -2,4 +2,4 @@\n     pass\n \n def g():\n-    pass\n\\ No newline at end of file\n+    return 2\n\\ No newline at end of file\nNote: f.txt has no newline after this text, so the newline that ended old_string and new_string was left out. The file still ends without a final newline.",
+    "changed_files": {
+     "f.txt": "def f():\n    pass\n\ndef g():\n    return 2"
+    }
+   }
+  },
+  {
+   "id": "exact-match-of-an-earlier-line-wins-over-the-unterminated-last-line",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "    pass\n",
+    "new_string": "    return 1\n"
+   },
+   "files": {
+    "f.txt": "def f():\n    pass\n\ndef g():\n    pass"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,5 +1,5 @@\n def f():\n-    pass\n+    return 1\n \n def g():\n     pass\n\\ No newline at end of file\n",
+    "changed_files": {
+     "f.txt": "def f():\n    return 1\n\ndef g():\n    pass"
+    }
+   }
+  },
+  {
+   "id": "two-final-newlines-both-dropped",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b\n\n",
+    "new_string": "c\n\n"
+   },
+   "files": {
+    "f.txt": "a\nb"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+c\n\\ No newline at end of file\nNote: f.txt has no newline after this text, so the newline that ended old_string and new_string was left out. The file still ends without a final newline.",
+    "changed_files": {
+     "f.txt": "a\nc"
+    }
+   }
+  },
+  {
+   "id": "final-newline-new-longer-newline-run",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "b\n",
+    "new_string": "c\n\n\n"
+   },
+   "files": {
+    "f.txt": "a\nb"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1,2 +1,3 @@\n a\n-b\n\\ No newline at end of file\n+c\n+\nNote: f.txt has no newline after this text, so the newline that ended old_string and new_string was left out. The file still ends without a final newline.",
+    "changed_files": {
+     "f.txt": "a\nc\n\n"
+    }
+   }
+  },
+  {
+   "id": "multibyte-text",
+   "tool": "edit_file",
+   "arguments": {
+    "path": "f.txt",
+    "old_string": "é = 1",
+    "new_string": "é = 2"
+   },
+   "files": {
+    "f.txt": "é = 1\n"
+   },
+   "expected": {
+    "ok": true,
+    "text": "Edited f.txt (1 replacement(s)):\n--- f.txt\n+++ f.txt\n@@ -1 +1 @@\n-é = 1\n+é = 2\n",
+    "changed_files": {
+     "f.txt": "é = 2\n"
+    }
+   }
+  }
+ ]
+}
