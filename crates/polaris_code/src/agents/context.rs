@@ -501,6 +501,21 @@ pub struct ContextManager {
     strategy: Arc<dyn ContextStrategy>,
     #[serde(skip)]
     trajectory: Option<crate::trajectory::RunTrajectory>,
+    #[serde(skip)]
+    message_limit: Option<usize>,
+    #[serde(skip)]
+    rejected_message_count: Option<usize>,
+    #[serde(skip)]
+    message_observer: Option<MessageCountObserver>,
+}
+
+type ObserveCount = dyn Fn(usize, Option<&str>) + Send + Sync;
+#[derive(Clone)]
+struct MessageCountObserver(Arc<ObserveCount>);
+impl std::fmt::Debug for MessageCountObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MessageCountObserver(..)")
+    }
 }
 
 impl Default for ContextManager {
@@ -514,6 +529,9 @@ impl Default for ContextManager {
             last_window_chars: None,
             reasoning_history: ReasoningHistory::default(),
             trajectory: None,
+            message_limit: None,
+            rejected_message_count: None,
+            message_observer: None,
             strategy: default_strategy(),
         }
     }
@@ -573,10 +591,93 @@ impl ContextManager {
 
     /// Append a message to the history.
     pub fn push(&mut self, message: Message) {
+        if let Some(maximum) = self.message_limit {
+            let count = self
+                .message_count()
+                .saturating_add(message_weight(&message));
+            if count > maximum {
+                self.rejected_message_count.get_or_insert(count);
+                return;
+            }
+        }
         if let Some(trajectory) = &self.trajectory {
             trajectory.message(&message);
         }
         self.messages.push(message);
+    }
+
+    /// Configure a ceiling that counts one system message, every assistant or
+    /// user message, and each tool result separately, even when results share a
+    /// provider-native message. The ceiling applies to canonical history.
+    pub fn set_message_limit(&mut self, maximum: usize) {
+        self.message_limit = Some(maximum);
+        self.rejected_message_count = None;
+    }
+
+    /// Whether conversation appends are limited.
+    #[must_use]
+    pub fn has_message_limit(&self) -> bool {
+        self.message_limit.is_some()
+    }
+
+    /// Conversation count, including the attempted count of a rejected append.
+    #[must_use]
+    pub fn message_count(&self) -> usize {
+        self.rejected_message_count.unwrap_or_else(|| {
+            self.messages
+                .iter()
+                .map(message_weight)
+                .sum::<usize>()
+                .saturating_add(1)
+        })
+    }
+
+    /// The limit failure at an append or generation boundary. Appends may reach
+    /// the ceiling; generation requires the count to be strictly below it.
+    #[must_use]
+    pub fn message_limit_error(&self, before_model: bool) -> Option<String> {
+        let maximum = self.message_limit?;
+        let count = self.message_count();
+        (count > maximum || (before_model && count == maximum)).then(|| {
+            format!(
+                "Message limit {}. count: {count}; limit: {maximum}",
+                if count == maximum {
+                    "reached"
+                } else {
+                    "exceeded"
+                }
+            )
+        })
+    }
+
+    /// Check the current append or generation boundary.
+    ///
+    /// A ceiling is optional; without one this always succeeds. A rejected
+    /// append remains rejected until a new budget is configured.
+    pub fn check_message_limit(
+        &self,
+        before_model: bool,
+    ) -> Result<(), polaris::system::prelude::SystemError> {
+        let error = self.message_limit_error(before_model);
+        if let Some(observer) = &self.message_observer {
+            (observer.0)(self.message_count(), error.as_deref());
+        }
+        match error {
+            Some(message) => Err(polaris::system::prelude::SystemError::ExecutionError(
+                message,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Observe counts at checked append/generation boundaries, including rejected
+    /// appends. The callback must be quick and must not panic. It does not alter
+    /// message framing or projection and is not persisted.
+    pub fn observe_message_count(
+        &mut self,
+        observe: impl Fn(usize, Option<&str>) + Send + Sync + 'static,
+    ) {
+        self.message_observer = Some(MessageCountObserver(Arc::new(observe)));
     }
 
     /// Project the live window to send this turn — the loop-facing seam.
@@ -841,6 +942,19 @@ impl ContextManager {
     }
 }
 
+fn message_weight(message: &Message) -> usize {
+    match message {
+        Message::Assistant { .. } => 1,
+        Message::User { content } => {
+            let tools = content
+                .iter()
+                .filter(|b| matches!(b, UserBlock::ToolResult(_)))
+                .count();
+            tools.max(1)
+        }
+    }
+}
+
 /// Whether `msg` begins a clean user-input turn — a `Message::User` carrying **no**
 /// `ToolResult` block. A window may start here without orphaning a `tool_result`.
 fn is_turn_boundary(msg: &Message) -> bool {
@@ -929,7 +1043,8 @@ pub(crate) async fn compact_context(
     user_io: Res<UserIO>,
     store: Res<OxigraphStore>,
     session: Res<SessionInfo>,
-) -> CompactionRun {
+) -> Result<CompactionRun, polaris::system::prelude::SystemError> {
+    context.check_message_limit(true)?;
     let manual = context.compaction_focus.is_some();
     // Resolve the same selected model prepare_context will use. A registry
     // refusal falls back to the configured model there as well.
@@ -950,7 +1065,7 @@ pub(crate) async fn compact_context(
     context.set_model(model_id);
     let plan = context.plan_compaction(&policy.retrieval, policy.retrieval.summarize_after_tokens);
     if matches!(&plan, Ok(None)) && !manual {
-        return CompactionRun { manual };
+        return Ok(CompactionRun { manual });
     }
     settings.note_served(model_id);
 
@@ -1100,7 +1215,7 @@ pub(crate) async fn compact_context(
         };
         let _ = user_io.send(IOMessage::system_text(text)).await;
     }
-    CompactionRun { manual }
+    Ok(CompactionRun { manual })
 }
 
 #[system]
@@ -1140,6 +1255,38 @@ mod tests {
 
     fn assistant(text: &str) -> Message {
         Message::assistant(text)
+    }
+
+    #[test]
+    fn embedded_notices_add_no_message_and_each_tool_result_counts_once() {
+        let mut context = ContextManager::new("task");
+        context.set_message_limit(5);
+        context.push(assistant("working"));
+        context.push(Message::User {
+            content: vec![
+                polaris::models::llm::ToolCall::new("a", "read_file", serde_json::json!({})).result(ToolResultContent::Text("first result".into())),
+                polaris::models::llm::ToolCall::new("b", "read_file", serde_json::json!({})).result(ToolResultContent::Text("second result".into())),
+                UserBlock::text("notice embedded in the same message"),
+            ],
+        });
+        assert_eq!(context.message_count(), 5);
+        assert!(context.message_limit_error(false).is_none());
+        assert!(
+            context
+                .message_limit_error(true)
+                .unwrap()
+                .contains("reached")
+        );
+        let before = serde_json::to_value(&context.messages).unwrap();
+        context.push(user("a separate notice"));
+        assert_eq!(context.message_count(), 6);
+        assert_eq!(serde_json::to_value(&context.messages).unwrap(), before);
+        assert!(
+            context
+                .message_limit_error(false)
+                .unwrap()
+                .contains("exceeded")
+        );
     }
 
     /// An assistant turn that calls a tool, followed by its tool result — the

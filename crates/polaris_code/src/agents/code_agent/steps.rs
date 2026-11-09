@@ -421,13 +421,14 @@ async fn begin_finish_checks(mut gate: ResMut<FinishGate>) {
 async fn collect_finish_holds(
     gate: Res<FinishGate>,
     mut context: ResMut<ContextManager>,
-) -> FinishStatus {
+) -> Result<FinishStatus, polaris::system::prelude::SystemError> {
     for message in &gate.messages {
         context.push(Message::user(message.clone()));
     }
-    FinishStatus {
+    context.check_message_limit(false)?;
+    Ok(FinishStatus {
         held: gate.is_held(),
-    }
+    })
 }
 
 #[system]

@@ -7,6 +7,8 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 
+- Add an opt-in canonical conversation message ceiling, independent of context projection and the turn limit.
+
 - Let plugins extend session configuration and append system-prompt sections through the coding-agent step registry.
 
 - Let embedding hosts validate inputs before provider setup and opt out of automatic prompt routing.

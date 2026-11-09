@@ -937,7 +937,7 @@ pub(crate) async fn finish_calls(
     user_io: Res<UserIO>,
     store: Res<OxigraphStore>,
     config: Res<AgentConfig>,
-) {
+) -> Result<(), SystemError> {
     // Also runs after the last permitted iteration. A batch cap must return an
     // error for every unrun call, never silently discard the queue.
     finish_pending(
@@ -970,6 +970,7 @@ pub(crate) async fn finish_calls(
     }
 
     batch.edited.clear();
+    context.check_message_limit(false)
 }
 
 pub(crate) fn build_tool_calls(graph: &mut Graph) {

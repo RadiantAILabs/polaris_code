@@ -422,7 +422,8 @@ async fn prepare_context(
     config: Res<AgentConfig>,
     session: Res<SessionInfo>,
     user_io: Res<UserIO>,
-) -> PreparedContext {
+) -> Result<PreparedContext, SystemError> {
+    context.check_message_limit(true)?;
     // Commands can be queued while an approval is open, but this snapshot is
     // taken only after `receive_user_input` begins the next turn. The current
     // tool decision therefore keeps the policy it started with.
@@ -507,14 +508,14 @@ async fn prepare_context(
     }
     .record(&store, turn);
 
-    PreparedContext {
+    Ok(PreparedContext {
         system_prompt,
         model_id,
         messages: projected.messages,
         cache_prefix: projected.cache_prefix,
         cache_breakpoints: projected.breakpoints,
         turn,
-    }
+    })
 }
 
 /// Whether this batch may be run concurrently rather than one call at a time.
@@ -1797,6 +1798,16 @@ async fn recover(
         error.message
     );
 
+    // A conversation ceiling ends the turn without spending another model call
+    // on recovery. Check before adding an error message and again before a
+    // recovery request, because feedback itself consumes the same budget.
+    if let Err(failure) = context.check_message_limit(true) {
+        let failure = TurnFailure::from(failure.to_string());
+        loop_state.failure = Some(failure.clone());
+        loop_state.is_complete = true;
+        return LoopState { is_complete: true, failure: Some(failure) };
+    }
+
     if let Some(failure) = loop_state.failure.clone() {
         send_error(&user_io, failure.message.clone()).await;
         loop_state.is_complete = true;
@@ -1809,6 +1820,13 @@ async fn recover(
     let error_text = format!("{} failed: {}", error.system_name, error.message);
     send_error(&user_io, error_text.clone()).await;
     context.push(Message::user(format!("[System Error] {error_text}")));
+
+    if let Err(failure) = context.check_message_limit(true) {
+        let failure = TurnFailure::from(failure.to_string());
+        loop_state.failure = Some(failure.clone());
+        loop_state.is_complete = true;
+        return LoopState { is_complete: true, failure: Some(failure) };
+    }
 
     // Keep the same project grounding the loop's `prepare_context` injects, so a
     // recovery turn doesn't silently lose git/project context.
@@ -1862,6 +1880,9 @@ async fn recover(
             ))
         }
     };
+
+    let failure = failure.or_else(|| context.check_message_limit(false).err()
+        .map(|error| TurnFailure::from(error.to_string())));
 
     // The loop's own termination check reads this function's *return* value
     // (the graph's per-run output store, cleared every turn), which

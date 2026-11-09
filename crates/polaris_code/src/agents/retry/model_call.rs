@@ -635,6 +635,7 @@ pub(crate) async fn accept_response(
         content: response.content.clone(),
     });
 
+    context.check_message_limit(false)?;
     Ok(response.clone())
 }
 
