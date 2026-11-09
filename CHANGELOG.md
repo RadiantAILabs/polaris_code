@@ -6,7 +6,6 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 ## [Unreleased]
 
 ### Added
-
 - Let code permission rules supply complete call-refusal text while preserving named authorization provenance; default code-rule denials now describe the refused call.
 - Let host startup callbacks supply a fallback model-request timeout below explicit stock settings.
 - Add optional observation of collected model attempts and classified turn outcomes for host recorders.
@@ -22,11 +21,14 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 ### Changed
 - `polaris` registers the coding agent built from the step registry (`CodeAgent::with_steps`) and its Graph tab uses `GraphViewPlugin::for_code_agent_steps`. With no steps added, the agent and the graph are the stock ones.
 - A startup failure after the server has started (for example a model whose provider is not registered, or a session that cannot be created) now gives plugins their bounded cleanup before the process exits, as every other ending does. The message and exit code are unchanged.
+- A `-p` run no longer asks the model to go on after a reply that calls no tool. On Terminal-Bench 2.1 and DeepSWE runs, every such message came after the work was already finished and only added a model call. `POLARIS_CODE_UNATTENDED_NUDGES` still turns it on. For embedders, `DEFAULT_UNATTENDED_NUDGES` is now 0, so code that passes it to `with_unattended_nudges` sends no nudges.
+- A `-p` run retries a failed model call (a network error, timeout, rate limit or overload) for about five minutes instead of about fifteen seconds: ten attempts, with waits starting at 2 s and doubling up to 60 s. A failed call ends the run, so a short outage used to throw away all the work done so far. Interactive sessions keep five attempts. `RetryPolicy::unattended` gives an embedder the same numbers. A call that times out on every attempt can still take up to 59 minutes.
 
 ### Fixed
 - `edit_file`: an `old_string` that ends with a newline matches the end of a file that has no final newline, when the text before the newline occurs once in the file and that place is the end. The same number of newlines is left off the end of `new_string`, the file still ends without one, and the result says so. Other requests that do not match are still refused.
 - `edit_file`: a refusal now says what to do next. An `old_string` that is not in the file shows the nearest text with line numbers and the first line where it differs; one that matches several places lists their lines. An empty `old_string` is refused for a file that has content (with `replace_all` it used to insert the new text between every character).
 - A tool call whose arguments are not a JSON object (a reply cut off at the output-length limit while the call was being written) is answered with an explanation instead of `Parameters must be an object`.
+- A model reply that cannot be read, such as a tool call whose arguments are not valid JSON, no longer ends the turn. The call is sent again, up to two more times, even if the reply had already shown text, in every front end. Each attempt is billed, so a reply that fails the same way each time can cost up to three times the output. The failed attempt's partial text stays on screen, marked as failed. Before, one malformed tool call ended a `-p` run and lost all its work.
 
 ## [0.4.3] - 2026-11-09
 

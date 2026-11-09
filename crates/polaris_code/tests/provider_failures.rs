@@ -814,6 +814,62 @@ async fn a_failure_after_shown_text_is_recorded_as_committed() {
     assert_eq!(run.started("wait_to_retry"), 0);
 }
 
+/// A reply that could not be read, after some text was shown.
+fn unreadable() -> Step {
+    Step::TextThenFail(GenerationError::InvalidResponse(
+        "failed to parse tool call arguments: EOF while parsing an object".into(),
+    ))
+}
+
+#[tokio::test]
+async fn an_unreadable_reply_is_retried_after_shown_text_and_its_block_marked_failed() {
+    let provider = Scripted::new(|call| match call {
+        0 | 1 => unreadable(),
+        _ => Step::Answer,
+    });
+    let run = drive(&provider, fast(10)).await;
+
+    assert_eq!(run.outcome.reason, TurnReason::Completed);
+    assert_eq!(provider.streams(), 3);
+    assert_eq!(run.chosen(), ["retry", "retry"]);
+    let first = &run.retry_decisions[0];
+    assert!(first.consulted("committed=true"), "{:?}", first.consulted);
+    assert!(
+        first.consulted("retry.attempt_limit=3"),
+        "{:?}",
+        first.consulted
+    );
+    // Each failed attempt's partial text is closed as failed, not complete.
+    let failed_blocks = run
+        .shown
+        .iter()
+        .filter(|message| {
+            message
+                .metadata
+                .get(polaris_code::terminal::transcript::META_OUTCOME)
+                .map(String::as_str)
+                == Some(polaris_code::terminal::transcript::OUTCOME_ERROR)
+        })
+        .count();
+    assert_eq!(failed_blocks, 2);
+}
+
+#[tokio::test]
+async fn an_unreadable_reply_gives_up_after_three_attempts() {
+    let provider = Scripted::new(|_| unreadable());
+    let run = drive(&provider, fast(10)).await;
+
+    assert_eq!(provider.streams(), 3);
+    assert_eq!(run.chosen(), ["retry", "retry", "give-up"]);
+    let failure = run.failure();
+    assert_eq!(failure.kind, FailureKind::Other);
+    assert!(
+        failure.message.contains("Gave up after 2 retries over "),
+        "{}",
+        failure.message
+    );
+}
+
 #[tokio::test]
 async fn retries_are_not_counted_against_the_turn_limit() {
     // `--max-turns` bounds how many times the agent loop goes round. A model

@@ -709,9 +709,12 @@ impl PermissionCeiling {
 /// scaled by a random factor between 0.75 and 1.25. The worst case is a
 /// provider that goes silent on every attempt and asks for the longest wait
 /// in between: five silent attempts of 300 s and four waits of 60 s, which is
-/// [`RetryPolicy::worst_case_wait`], 1,740 s (29 minutes). Lower
+/// [`RetryPolicy::worst_case_wait`], 1,740 s (29 minutes). The `polaris`
+/// binary gives unattended runs [`RetryPolicy::unattended`] instead. Lower
 /// `attempt_timeout` or `max_attempts` to bound an unattended run more
-/// tightly.
+/// tightly. A reply that could not be read is tried at most
+/// [`MALFORMED_REPLY_ATTEMPTS`](super::retry::MALFORMED_REPLY_ATTEMPTS)
+/// times, whatever `max_attempts` says ([`RetryPolicy::attempt_limit`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Maximum attempts for a transient LLM failure, the first included
@@ -736,6 +739,48 @@ impl Default for RetryPolicy {
             base_delay: std::time::Duration::from_secs(1),
             max_delay: std::time::Duration::from_secs(60),
             attempt_timeout: std::time::Duration::from_secs(300),
+        }
+    }
+}
+
+/// Attempts per model call in an unattended run: the first call plus nine
+/// retries.
+pub const UNATTENDED_RETRY_ATTEMPTS: u32 = 10;
+
+/// The first wait between attempts in an unattended run.
+pub const UNATTENDED_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl RetryPolicy {
+    /// The retry policy for a run nobody watches.
+    ///
+    /// A failed call ends the whole turn, and in a `--print` run that throws
+    /// away all the work done so far, because nobody is there to say "try
+    /// again". So an unattended run keeps retrying a transient failure for
+    /// about five minutes instead of about fifteen seconds:
+    /// [`UNATTENDED_RETRY_ATTEMPTS`] attempts, starting at
+    /// [`UNATTENDED_RETRY_BASE_DELAY`] and doubling up to the default 60 s
+    /// cap, so the computed waits are about 2, 4, 8, 16, 32, 60, 60, 60 and
+    /// 60 s (302 s). The attempt timeout is unchanged, so the worst case
+    /// ([`worst_case_wait`](Self::worst_case_wait)) is ten silent attempts of
+    /// 300 s and nine waits of 60 s, 3,540 s; the caller's own time limit
+    /// still applies. Failures a retry cannot fix (authentication, invalid
+    /// request) are never retried.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use polaris_code::agents::policy::RetryPolicy;
+    ///
+    /// let retry = RetryPolicy::unattended();
+    /// assert_eq!(retry.max_attempts, 10);
+    /// assert_eq!(retry.worst_case_wait().as_secs(), 3_540);
+    /// ```
+    #[must_use]
+    pub fn unattended() -> Self {
+        Self {
+            max_attempts: UNATTENDED_RETRY_ATTEMPTS,
+            base_delay: UNATTENDED_RETRY_BASE_DELAY,
+            ..Self::default()
         }
     }
 }

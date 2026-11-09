@@ -87,7 +87,7 @@ names the model for automatic review, in `provider/model` form; without it the
 reviewer uses the session model. `POLARIS_CODE_UNATTENDED_NUDGES` is an
 environment variable only, with no flag. It sets how many times an unattended
 `-p` run is asked to go on after a reply that calls no tool: unset or empty
-means 1, `0` turns it off, and anything that is not a non-negative integer exits
+means 0 (off), and anything that is not a non-negative integer exits
 with code 2. Only the `polaris` binary reads it; see
 [unattended runs](unattended-runs.md#when-a-run-ends).
 

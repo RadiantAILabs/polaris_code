@@ -865,6 +865,23 @@ async fn nudges_set_to_zero_end_the_run_on_the_first_reply_without_a_tool_call()
 }
 
 #[tokio::test]
+async fn by_default_the_run_ends_on_the_first_reply_without_a_tool_call() {
+    let setup = Setup::new();
+    let mock = Mock::start(Script::PauseThenAnswer, setup.outside.clone());
+    let mut command = setup.command(mock.address, &setup.trajectory(), true, "json");
+    command.env_remove("POLARIS_CODE_UNATTENDED_NUDGES");
+    let output = tokio::time::timeout(CLI_TIMEOUT, command.output()).await;
+    let requests = mock.finish();
+    let output = output.expect("CLI must terminate").unwrap();
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        requests.len(),
+        1,
+        "no nudge is sent when the variable is unset"
+    );
+}
+
+#[tokio::test]
 async fn a_reply_cut_off_at_the_output_limit_is_continued() {
     let setup = Setup::new();
     let trajectory = setup.trajectory();

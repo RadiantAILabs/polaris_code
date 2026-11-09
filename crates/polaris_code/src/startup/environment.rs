@@ -212,14 +212,9 @@ mod tests {
 
     #[test]
     fn unattended_nudges_default_parse_and_reject_typos() {
-        assert_eq!(
-            resolve_unattended_nudges(None),
-            Ok(DEFAULT_UNATTENDED_NUDGES)
-        );
-        assert_eq!(
-            resolve_unattended_nudges(Some("  ")),
-            Ok(DEFAULT_UNATTENDED_NUDGES)
-        );
+        // Unset or empty means no nudges.
+        assert_eq!(resolve_unattended_nudges(None), Ok(0));
+        assert_eq!(resolve_unattended_nudges(Some("  ")), Ok(0));
         assert_eq!(resolve_unattended_nudges(Some("0")), Ok(0));
         assert_eq!(resolve_unattended_nudges(Some(" 3 ")), Ok(3));
         let error = resolve_unattended_nudges(Some("one")).unwrap_err();
