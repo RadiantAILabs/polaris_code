@@ -5,6 +5,15 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Added
+- A `view_image` tool lets the agent look at a PNG, JPEG, GIF or WEBP file in the working directory, in every front end including `-p`. The model receives the picture; the conversation, the activity block and the trajectory show only a short line such as `[image shots/a.png, PNG, 34.0 KB]`. The type is read from the file's first bytes, not its name. A file over 3,750,000 bytes, or one that is not one of those four types, is refused with a message that says what to do next. It follows `read_file`'s path rules, changes nothing and asks no one. Pictures are not scanned for secrets, unlike text results. A permission rule names one tool, so a rule that protects an image path needs a `view_image` rule as well as a `read_file` rule.
+- `--image-input` / `POLARIS_CODE_IMAGE_INPUT` / `image_input` (`auto`, `on` or `off`) says whether the model takes images. `auto`, the default, is on for Claude models reached through Anthropic or Bedrock and off for every other route, including `--provider openai` and `--provider openai-chat`. When it is off, `view_image` is not offered. The choice is made once from the model the session starts on; `/model` does not change it. `--provider openai-chat` needs `polaris-ai` 0.9.3 or later before an image tool result reaches the endpoint, so set `on` there only with that version.
+- For embedders, `ViewImageToolsPlugin` registers the tool, and `CodeToolsConfig::with_image_input` sets the wording of `read_file`'s refusal of an image file.
+
+### Changed
+- `read_file` and `read_span` on an image file now return an error that names the type and size instead of "stream did not contain valid UTF-8". With image input on it ends with the `view_image` call to make; with it off it says the model takes text only.
+- Bedrock Claude model ids (`anthropic.claude-…`) and `claude-fable-…` ids are now recognised as models that take images, for composer attachments as well.
+
 ## [0.4.4] - 2026-11-09
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
