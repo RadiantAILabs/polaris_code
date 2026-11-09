@@ -131,6 +131,7 @@ const KEYS: &[Key] = &[
     Key::with_flag("max_turns", "POLARIS_CODE_MAX_TURNS"),
     Key::with_flag("max_output_tokens", "POLARIS_CODE_MAX_OUTPUT_TOKENS"),
     Key::with_flag("context_window", "POLARIS_CODE_CONTEXT_WINDOW"),
+    Key::with_flag("image_input", "POLARIS_CODE_IMAGE_INPUT"),
     Key::with_flag("reasoning_effort", "POLARIS_CODE_REASONING_EFFORT"),
 ];
 
@@ -675,7 +676,7 @@ fn validate(key: &str, value: &str) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|err| err.to_string())
         }
-        "provider" | "permission_mode" | "permission_ceiling" => {
+        "provider" | "permission_mode" | "permission_ceiling" | "image_input" => {
             // Reuse clap's parser, including provider variants contributed by the host.
             let flag = key.replace('_', "-");
             super::Cli::command()
@@ -846,6 +847,35 @@ mod tests {
     }
 
     #[test]
+    fn image_input_follows_file_environment_and_flag_precedence() {
+        use polaris_code::images::ImageInput;
+
+        let fixture = Fixture::new();
+        // Unset, it follows the model.
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.image_input, ImageInput::Auto);
+        // The user file, then the project file over it.
+        fixture.user("image_input = 'off'\n");
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.image_input, ImageInput::Off);
+        fixture.project("image_input = 'on'\n");
+        let (cli, _) = fixture.load(&[], &[]).unwrap();
+        assert_eq!(cli.image_input, ImageInput::On);
+        // The environment over both files, and a flag over the environment.
+        let (cli, _) = fixture
+            .load(&[], &[("POLARIS_CODE_IMAGE_INPUT", "off")])
+            .unwrap();
+        assert_eq!(cli.image_input, ImageInput::Off);
+        let (cli, _) = fixture
+            .load(
+                &["--image-input=auto"],
+                &[("POLARIS_CODE_IMAGE_INPUT", "off")],
+            )
+            .unwrap();
+        assert_eq!(cli.image_input, ImageInput::Auto);
+    }
+
+    #[test]
     fn dangerously_skip_permissions_cannot_be_enabled_in_settings() {
         let fixture = Fixture::new();
         fixture.project("dangerously_skip_permissions = true\n");
@@ -954,6 +984,8 @@ mod tests {
             ("provider", "'unknown'"),
             ("permission_mode", "'allow-all'"),
             ("permission_ceiling", "true"),
+            ("image_input", "'sometimes'"),
+            ("image_input", "false"),
             ("models", "['ok', 3]"),
         ] {
             fixture.project(&format!("{key} = {value}"));
