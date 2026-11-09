@@ -391,9 +391,13 @@ agent treats it like a rule from a file:
   ask, which wins over allow. If a file rule and a code rule give the same
   decision, the file rule's reason is shown. Among code rules, the one added
   first is shown.
-- **Reason.** The refusal and the recorded reason read
-  `code rule "<name>": <the rule's reason>`, so a person can tell which rule
-  refused.
+- **Reason.** A code-rule refusal defaults to
+  `Call refused: code rule "<name>": <the rule's reason>`, naming the rule while
+  describing a refusal of this call. `add_code_rule_with_refusal_text` instead
+  uses the returned reason as the complete model-facing refusal, without
+  wrapping or trimming it. Authorization provenance still names the rule.
+  File-rule and tool/mode denials retain their ordinary wording. Custom text
+  does not change which rule wins or grant any permission.
 - **Limits.** A code `allow` never goes above the mode or the permission ceiling
   and never beats a deny from any source. Project trust applies only to
   `polaris.permissions.toml` and does not apply to code rules. Unattended, a code

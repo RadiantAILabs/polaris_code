@@ -107,7 +107,7 @@ impl Plugin for FixturePlugin {
 type FixtureRule = fn(&str, &serde_json::Value, &std::path::Path) -> Option<(RuleDecision, String)>;
 
 /// A plugin that adds named code rules to the permission rules while building.
-struct AddsRules(Vec<(&'static str, FixtureRule)>);
+struct AddsRules(Vec<(&'static str, FixtureRule)>, bool);
 impl Plugin for AddsRules {
     const ID: &'static str = "test::adds_rules";
     const VERSION: Version = Version::new(0, 1, 0);
@@ -121,7 +121,11 @@ impl Plugin for AddsRules {
     fn build(&self, server: &mut Server) {
         let mut rules = server.get_resource_mut::<PermissionRules>().unwrap();
         for (name, rule) in &self.0 {
-            rules.add_code_rule(*name, *rule).unwrap();
+            if self.1 {
+                rules.add_code_rule_with_refusal_text(*name, *rule).unwrap();
+            } else {
+                rules.add_code_rule(*name, *rule).unwrap();
+            }
         }
     }
 }
@@ -229,6 +233,7 @@ struct ReplyControl {
     choice: Option<&'static str>,
     unrestricted_shell: bool,
     code_rules: Vec<(&'static str, FixtureRule)>,
+    own_refusal_text: bool,
 }
 
 async fn run_controlled(
@@ -261,7 +266,10 @@ async fn run_controlled(
         PermissionRulesPlugin::default().with_unrestricted_shell(control.unrestricted_shell),
     );
     if !control.code_rules.is_empty() {
-        server.add_plugins(AddsRules(control.code_rules.clone()));
+        server.add_plugins(AddsRules(
+            control.code_rules.clone(),
+            control.own_refusal_text,
+        ));
     }
     if approver {
         server.add_plugins(crate::agents::InteractiveApprovalPlugin);

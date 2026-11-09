@@ -99,14 +99,23 @@ impl std::error::Error for CodeRuleError {}
 
 /// What a rule written in code returns: no opinion, or a decision with the reason
 /// the model and the operator are shown.
-type CodeVerdict = Option<(RuleDecision, String)>;
+type CodeVerdict = Option<ResolvedRule>;
 
-type CodeRuleFn = dyn Fn(&str, &Value, &Path) -> CodeVerdict + Send + Sync;
+/// A winning rule's provenance and its optional complete call-refusal text.
+#[derive(Clone)]
+pub(crate) struct ResolvedRule {
+    pub(crate) decision: RuleDecision,
+    pub(crate) source: String,
+    pub(crate) refusal_text: Option<String>,
+}
+
+type CodeRuleFn = dyn Fn(&str, &Value, &Path) -> Option<(RuleDecision, String)> + Send + Sync;
 
 /// One named rule written in code.
 struct CodeRule {
     name: String,
     check: Box<CodeRuleFn>,
+    own_refusal_text: bool,
 }
 
 /// The rules plugins added in code, shared by every clone of one
@@ -130,7 +139,12 @@ impl fmt::Debug for CodeRules {
 }
 
 impl CodeRules {
-    fn add(&self, name: String, check: Box<CodeRuleFn>) -> Result<(), CodeRuleError> {
+    fn add(
+        &self,
+        name: String,
+        check: Box<CodeRuleFn>,
+        own_refusal_text: bool,
+    ) -> Result<(), CodeRuleError> {
         if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {
             return Err(CodeRuleError::InvalidName(name));
         }
@@ -143,7 +157,11 @@ impl CodeRules {
         if rules.iter().any(|rule| rule.name == name) {
             return Err(CodeRuleError::Duplicate(name));
         }
-        rules.push(Arc::new(CodeRule { name, check }));
+        rules.push(Arc::new(CodeRule {
+            name,
+            check,
+            own_refusal_text,
+        }));
         Ok(())
     }
 
@@ -173,11 +191,14 @@ impl CodeRules {
         let parts = ShellParts::of(tool, args);
         let mut winner: CodeVerdict = None;
         for rule in &rules {
-            let Some((decision, reason)) = rule.evaluate(root, tool, args, &parts) else {
+            let Some(verdict) = rule.evaluate(root, tool, args, &parts) else {
                 continue;
             };
-            if winner.as_ref().is_none_or(|(held, _)| decision > *held) {
-                winner = Some((decision, reason));
+            if winner
+                .as_ref()
+                .is_none_or(|held| verdict.decision > held.decision)
+            {
+                winner = Some(verdict);
             }
         }
         winner
@@ -226,17 +247,33 @@ impl CodeRule {
     /// Run the rule once, refusing the call if it panics.
     fn ask(&self, root: &Path, tool: &str, args: &Value) -> CodeVerdict {
         match catch_unwind(AssertUnwindSafe(|| (self.check)(tool, args, root))) {
-            Ok(Some((decision, reason))) => Some((decision, self.reason(&reason))),
+            Ok(Some((decision, reason))) => {
+                let source = self.reason(&reason);
+                let refusal_text = (decision != RuleDecision::Allow).then(|| {
+                    if self.own_refusal_text {
+                        reason
+                    } else {
+                        format!("Call refused: {source}")
+                    }
+                });
+                Some(ResolvedRule {
+                    decision,
+                    source,
+                    refusal_text,
+                })
+            }
             Ok(None) => None,
             Err(_) => {
                 tracing::error!(rule = %self.name, tool, "code permission rule panicked; refusing the call");
-                Some((
-                    RuleDecision::Deny,
-                    format!(
-                        "code rule {:?} failed while checking this call, so the call is refused",
-                        self.name
-                    ),
-                ))
+                let source = format!(
+                    "code rule {:?} failed while checking this call, so the call is refused",
+                    self.name,
+                );
+                Some(ResolvedRule {
+                    decision: RuleDecision::Deny,
+                    refusal_text: Some(format!("Call refused: {source}")),
+                    source,
+                })
             }
         }
     }
@@ -257,7 +294,7 @@ impl CodeRule {
         let part_args = match parts {
             ShellParts::Whole => return whole,
             ShellParts::Opaque => {
-                return whole.filter(|(decision, _)| *decision != RuleDecision::Allow);
+                return whole.filter(|verdict| verdict.decision != RuleDecision::Allow);
             }
             ShellParts::Parsed(part_args) => part_args,
         };
@@ -265,13 +302,13 @@ impl CodeRule {
             .chain(part_args.iter().map(|part| self.ask(root, tool, part)))
             .collect();
         let mut restrictive: CodeVerdict = None;
-        for (decision, reason) in verdicts.iter().flatten() {
-            if *decision != RuleDecision::Allow
+        for verdict in verdicts.iter().flatten() {
+            if verdict.decision != RuleDecision::Allow
                 && restrictive
                     .as_ref()
-                    .is_none_or(|(held, _)| *decision > *held)
+                    .is_none_or(|held| verdict.decision > held.decision)
             {
-                restrictive = Some((*decision, reason.clone()));
+                restrictive = Some(verdict.clone());
             }
         }
         if restrictive.is_some() {
@@ -507,6 +544,11 @@ impl PermissionRules {
     /// ceiling and the unattended grants limit an `Allow` as they limit one in a
     /// file. In an unattended run an `Ask` is a refusal.
     ///
+    /// Refusals default to `Call refused: code rule "name": reason`. Use
+    /// [`Self::add_code_rule_with_refusal_text`] when the returned reason should
+    /// be the whole model-facing refusal instead. The source returned by
+    /// [`Self::resolve`] keeps its named provenance either way.
+    ///
     /// A rule that panics refuses the call, with a reason naming the rule. A rule
     /// may be called several times for one call, so it should be a pure function
     /// of its inputs. For `run_command` and `run_in_background` it is called with
@@ -557,7 +599,47 @@ impl PermissionRules {
         name: impl Into<String>,
         rule: impl Fn(&str, &Value, &Path) -> Option<(RuleDecision, String)> + Send + Sync + 'static,
     ) -> Result<(), CodeRuleError> {
-        self.code.add(name.into(), Box::new(rule))
+        self.code.add(name.into(), Box::new(rule), false)
+    }
+
+    /// Add a code rule whose returned reason is the complete refusal text.
+    ///
+    /// Use this when a call-specific policy needs to tell the model exactly why
+    /// this call cannot run. Inputs, precedence, shell-part checks, trust and
+    /// lifecycle are identical to [`Self::add_code_rule`]. For a winning `Deny`
+    /// (or an unattended `Ask`), the returned string is used whole, with no
+    /// prefix, suffix or whitespace changes. `Allow` never uses refusal text.
+    /// The rule's name and reason remain in authorization provenance and
+    /// `/permissions` still lists its name. Panics retain the safe named default.
+    ///
+    /// Register during plugin `build`, through `Server::get_resource_mut`, with
+    /// a dependency on [`PermissionRulesPlugin`](super::PermissionRulesPlugin).
+    /// Omit this method to retain the default named call-refusal presentation.
+    /// This controls presentation only; it grants no additional permissions.
+    ///
+    /// # Errors
+    ///
+    /// The same [`CodeRuleError`] conditions as [`Self::add_code_rule`]: invalid
+    /// or duplicate names, or a rule set already sealed by server startup.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polaris_code::agents::permission_rules::{PermissionRules, RuleDecision};
+    /// let mut rules = PermissionRules::default();
+    /// rules.add_code_rule_with_refusal_text("generated-output", |tool, args, _| {
+    ///     (tool == "edit_file" && args["path"] == "generated.rs").then(|| (
+    ///         RuleDecision::Deny,
+    ///         "This call edits generated output. Change the generator instead.\n".into(),
+    ///     ))
+    /// }).unwrap();
+    /// ```
+    pub fn add_code_rule_with_refusal_text(
+        &mut self,
+        name: impl Into<String>,
+        rule: impl Fn(&str, &Value, &Path) -> Option<(RuleDecision, String)> + Send + Sync + 'static,
+    ) -> Result<(), CodeRuleError> {
+        self.code.add(name.into(), Box::new(rule), true)
     }
 
     /// Fix the code rules: later calls to `add_code_rule`, on this value or any
@@ -585,8 +667,22 @@ impl PermissionRules {
         tool: &str,
         args: &Value,
     ) -> Option<(RuleDecision, String)> {
+        self.resolve_call_in(root, tool, args)
+            .map(|resolved| (resolved.decision, resolved.source))
+    }
+
+    pub(crate) fn resolve_call_in(
+        &self,
+        root: &Path,
+        tool: &str,
+        args: &Value,
+    ) -> Option<ResolvedRule> {
         if !self.snapshot.errors.is_empty() {
-            return Some((RuleDecision::Deny, self.snapshot.errors.join("\n")));
+            return Some(ResolvedRule {
+                decision: RuleDecision::Deny,
+                source: self.snapshot.errors.join("\n"),
+                refusal_text: None,
+            });
         }
         let from_files = self
             .snapshot
@@ -602,10 +698,14 @@ impl PermissionRules {
                 (decision, rule)
             })
             .max_by_key(|(decision, _)| *decision)
-            .map(|(decision, rule)| (decision, rule.describe()));
+            .map(|(decision, rule)| ResolvedRule {
+                decision,
+                source: rule.describe(),
+                refusal_text: None,
+            });
         // A file rule keeps the call when a code rule is no more restrictive.
         match (from_files, self.code.resolve(root, tool, args)) {
-            (Some((held, _)), Some(code)) if code.0 > held => Some(code),
+            (Some(held), Some(code)) if code.decision > held.decision => Some(code),
             (None, code) => code,
             (files, _) => files,
         }
@@ -1470,6 +1570,54 @@ command_prefix = "cargo test"
                 assert_eq!(decision, held, "{file}");
                 assert!(source.contains("user.toml"), "{source}");
             }
+        }
+
+        #[test]
+        fn custom_refusal_text_does_not_override_a_file_deny_or_a_mode_deny() {
+            let (dir, mut rules) =
+                files("[[rules]]\ntool = 'create_file'\ndecision = 'deny'\n", "");
+            rules
+                .add_code_rule_with_refusal_text("also-no", |_, _, _| {
+                    Some((RuleDecision::Deny, "custom refusal".into()))
+                })
+                .unwrap();
+            let mut policy = PermissionMode::AutoEdit.permission_policy();
+            policy.rules = Some(rules);
+            let args = json!({"path":"a.rs"});
+            let held = policy.resolve_call(
+                &call(
+                    dir.path(),
+                    "create_file",
+                    &args,
+                    ToolPermission::Allow,
+                    None,
+                ),
+                &SessionGrants::default(),
+            );
+            assert_eq!(held.permission, ToolPermission::Deny);
+            assert!(held.source.contains("user.toml"));
+            assert!(held.refusal_text.is_none());
+
+            let mut rules = PermissionRules::default();
+            rules
+                .add_code_rule_with_refusal_text("only-this-call", |_, _, _| {
+                    Some((RuleDecision::Deny, "custom refusal".into()))
+                })
+                .unwrap();
+            let mut policy = PermissionMode::Plan.permission_policy();
+            policy.rules = Some(rules);
+            let held = policy.resolve_call(
+                &call(
+                    dir.path(),
+                    "create_file",
+                    &args,
+                    ToolPermission::Confirm,
+                    None,
+                ),
+                &SessionGrants::default(),
+            );
+            assert_eq!(held.permission, ToolPermission::Deny);
+            assert!(held.refusal_text.is_none());
         }
 
         #[test]

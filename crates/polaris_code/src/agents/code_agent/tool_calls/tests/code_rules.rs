@@ -103,10 +103,7 @@ async fn a_code_rule_deny_reaches_the_model_and_the_trajectory_as_a_denial() {
     assert!(results[0].0, "the refusal is an error result");
     assert_eq!(
         results[0].1,
-        format!(
-            "Permission denied: tool 'update_file' is not allowed \
-             (code rule \"no-generated-edits\": {NO_GENERATED_EDITS})"
-        )
+        format!("Call refused: code rule \"no-generated-edits\": {NO_GENERATED_EDITS}")
     );
     assert!(!results[1].0, "{}", results[1].1);
     {
@@ -141,13 +138,68 @@ async fn a_code_rule_sees_each_command_of_a_chain_and_refuses_the_whole_call() {
     assert!(results[0].0);
     assert_eq!(
         results[0].1,
-        format!(
-            "Permission denied: tool 'run_command' is not allowed (code rule \"no-rm\": {NO_RM})"
-        )
+        format!("Call refused: code rule \"no-rm\": {NO_RM}")
     );
     assert_eq!(
         closing_phases(&outcome.io.messages.lock().unwrap(), "call-0"),
         ["denied"]
     );
     assert!(recorded_call(&outcome, "run_command", "denied", NO_RM));
+}
+
+const EXACT_REFUSAL: &str =
+    "  This call cannot change generated output.\nChange its generator instead.\n";
+
+fn exact_generated_refusal(
+    tool: &str,
+    args: &serde_json::Value,
+    root: &std::path::Path,
+) -> Option<(RuleDecision, String)> {
+    no_generated_edits(tool, args, root).map(|(decision, _)| (decision, EXACT_REFUSAL.into()))
+}
+
+#[tokio::test]
+async fn a_code_rule_can_supply_the_complete_refusal_without_changing_provenance() {
+    let outcome = run_controlled(
+        vec![update(0, "generated/api.rs"), update(1, "src/lib.rs")],
+        false,
+        10,
+        false,
+        false,
+        false,
+        ReplyControl {
+            code_rules: vec![("generated-output", exact_generated_refusal)],
+            own_refusal_text: true,
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert_eq!(outcome.ran, ["update src/lib.rs"]);
+    let results = results(&outcome);
+    assert!(results[0].0);
+    assert_eq!(results[0].1, EXACT_REFUSAL);
+    assert!(!results[1].0);
+    assert!(recorded_decision(
+        &outcome,
+        "deny",
+        "authorization.source=code rule"
+    ));
+    assert!(recorded_decision(&outcome, "deny", "generated-output"));
+
+    let outcome = run_controlled(
+        vec![command(0, "echo cleaning && rm -rf generated")],
+        false,
+        10,
+        false,
+        false,
+        false,
+        ReplyControl {
+            code_rules: vec![("no-rm", no_rm_commands)],
+            own_refusal_text: true,
+            ..ReplyControl::default()
+        },
+    )
+    .await;
+    assert!(outcome.ran.is_empty());
+    assert_eq!(super::results(&outcome)[0].1, NO_RM);
 }

@@ -7,6 +7,8 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 
+- Let code permission rules supply complete call-refusal text while preserving named authorization provenance; default code-rule denials now describe the refused call.
+
 - Let host startup callbacks supply a fallback model-request timeout below explicit stock settings.
 
 - Add optional observation of collected model attempts and classified turn outcomes for host recorders.

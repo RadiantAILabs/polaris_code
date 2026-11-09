@@ -396,7 +396,7 @@ async fn the_rule_and_the_steps_take_part_in_the_run() {
     assert_eq!(requests.len(), 3, "the hold made the model answer again");
     // The refusal is what the model read as the result of the refused call.
     assert!(
-        requests[1].contains("Permission denied") && requests[1].contains(REFUSAL),
+        requests[1].contains("Call refused:") && requests[1].contains(REFUSAL),
         "the refusal did not reach the model: {}",
         requests[1]
     );

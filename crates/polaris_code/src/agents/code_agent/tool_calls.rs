@@ -325,6 +325,7 @@ pub(crate) async fn authorize_call(
     if let Some(reason) = outside_command_globs(&config, name, &tool_call.function.arguments) {
         authorization.permission = ToolPermission::Deny;
         authorization.source = reason;
+        authorization.refusal_text = None;
         authorization.remember = false;
     }
     let permission = authorization.permission;
@@ -375,10 +376,14 @@ pub(crate) async fn authorize_call(
         receipt = shell_approval.receipt_for(&request, &rules, &settings);
     }
     let route = match (permission, review) {
-        (ToolPermission::Deny, _) => AuthorizationRoute::Deny(format!(
-            "Permission denied: tool '{name}' is not allowed ({})",
-            authorization.source
-        )),
+        (ToolPermission::Deny, _) => {
+            AuthorizationRoute::Deny(authorization.refusal_text.clone().unwrap_or_else(|| {
+                format!(
+                    "Permission denied: tool '{name}' is not allowed ({})",
+                    authorization.source
+                )
+            }))
+        }
         (ToolPermission::Allow, _) => AuthorizationRoute::Allow,
         (ToolPermission::Confirm, Some(r)) if r.decision == ReviewDecision::Allow => {
             AuthorizationRoute::Allow

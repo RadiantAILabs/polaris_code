@@ -106,6 +106,14 @@ use crate::tools::ToolPolicyPlugin;
 /// wins, and a `Deny` is returned to the model as the refusal text in the tool
 /// result and recorded as `denied` with that reason.
 ///
+/// A winning code-rule denial defaults to `Call refused: code rule "name": reason`.
+/// A plugin that already has a complete model-facing explanation can instead
+/// call [`PermissionRules::add_code_rule_with_refusal_text`]. Its returned reason
+/// is then the whole refusal, including whitespace, with no surrounding text.
+/// The name and reason still identify the rule in authorization provenance.
+/// This changes presentation only: file rules, mode restrictions, ceilings,
+/// panic handling and rule precedence retain their ordinary behavior.
+///
 /// - **Trust.** Code rules come from the assembly, not from the project folder,
 ///   so project trust does not apply to them. An `Allow` has the limits of an
 ///   allow in the user's own rule file: the permission mode and the operator's
@@ -450,6 +458,9 @@ pub struct AuthorizationDecision {
     pub permission: polaris::tools::ToolPermission,
     /// Winning rule, grant or mode; suitable for the prompt and trajectory.
     pub source: String,
+    /// Complete model-facing refusal for a winning code rule. `None` uses the
+    /// ordinary tool/mode denial presentation. Provenance remains in `source`.
+    pub refusal_text: Option<String>,
     /// Whether the prompt may offer session scopes under this decision.
     pub remember: bool,
     /// Whether a matching human session grant already authorized this call.
