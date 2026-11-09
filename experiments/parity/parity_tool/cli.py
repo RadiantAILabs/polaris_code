@@ -26,8 +26,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             "and the runs reach the same decisions and records."
         ),
     )
-    parser.add_argument("binary_a", type=Path, help="the first binary (for example the old one)")
-    parser.add_argument("binary_b", type=Path, help="the second binary (for example the new one)")
+    parser.add_argument(
+        "binary_a", type=Path, nargs="?", help="the first binary (for example the old one)"
+    )
+    parser.add_argument(
+        "binary_b", type=Path, nargs="?", help="the second binary (for example the new one)"
+    )
     parser.add_argument("--label-a", default="old", help="name for the first binary in the report")
     parser.add_argument("--label-b", default="new", help="name for the second binary in the report")
     parser.add_argument("--sessions", type=Path, default=DEFAULT_SESSIONS, help="folder of sessions")
@@ -42,8 +46,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=4, help="runs in parallel (default 4)")
     parser.add_argument("--timeout", type=float, default=180.0, help="seconds one run may take")
     parser.add_argument("--verbose", action="store_true", help="show every run and every stock difference")
-    parser.add_argument("--list", action="store_true", help="list the runs and exit")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--list", action="store_true", help="list the runs and exit (no binaries needed)"
+    )
+    args = parser.parse_args(argv)
+    if not args.list and (args.binary_a is None or args.binary_b is None):
+        parser.error("two binaries are required unless --list is given")
+    return args
 
 
 def _run_pair(

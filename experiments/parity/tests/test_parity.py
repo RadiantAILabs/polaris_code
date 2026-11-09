@@ -385,6 +385,18 @@ class EndToEndTests(unittest.TestCase):
         code = cli.main([str(self.bin / "missing"), str(self.agents["base"]), "--sessions", str(self.sessions)])
         self.assertEqual(code, 2)
 
+    def test_listing_needs_no_binaries(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["--list", "--sessions", str(ROOT / "sessions")])
+        self.assertEqual(code, 0)
+        self.assertIn("honest/moved\t", out.getvalue())
+
+    def test_running_without_binaries_is_a_usage_error(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cli.main(["--sessions", str(ROOT / "sessions")])
+        self.assertEqual(raised.exception.code, 2)
+
 
 class ShippedSessionTests(unittest.TestCase):
     """The sessions that ship with the tool."""

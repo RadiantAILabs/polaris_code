@@ -20,7 +20,7 @@ Useful options:
 |---|---|
 | `--label-a NAME`, `--label-b NAME` | Names used in the report (default `old` and `new`). |
 | `--only TEXT` | Run only runs whose id (`session/run`) contains `TEXT`. Repeatable. |
-| `--list` | Print the run ids with their arguments and exit. |
+| `--list` | Print the run ids with their arguments and exit. No binaries are needed or started. |
 | `--out DIR` | Keep the report and every run's files here (default: a new folder under the system temp folder; its path is printed at the end of the report). |
 | `--jobs N` | How many runs go at once (default 4). |
 | `--timeout SECONDS` | How long one run may take before it is stopped (default 180). |
