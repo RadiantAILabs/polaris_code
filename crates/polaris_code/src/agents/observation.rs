@@ -105,6 +105,11 @@ type ObserveTurn = dyn Fn(Vec<Message>, TurnOutcome) -> Pin<Box<dyn Future<Outpu
 /// ```
 /// use polaris_code::agents::observation::TurnObserver;
 /// use polaris::system::server::Server;
+/// use polaris::system::{param::Res, system};
+/// #[system]
+/// async fn audit_recorder_presence(observer: Option<Res<TurnObserver>>) {
+///     tracing::debug!(installed = observer.is_some(), "turn recorder");
+/// }
 /// let mut server = Server::new();
 /// server.insert_global(TurnObserver::new(|history, outcome| async move {
 ///     tracing::debug!(messages = history.len(), "turn completed");
