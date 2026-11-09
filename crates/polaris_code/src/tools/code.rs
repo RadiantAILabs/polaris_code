@@ -21,6 +21,7 @@
 //! two are the toolset's mutating surface and are gated as one — the same
 //! `Confirm` default, the same per-mode policy, the same journal.
 
+use crate::images::{fmt_bytes, format_name, sniff_image};
 use crate::terminal::EditJournal;
 use crate::tools::fileset::{PathGlob, Selection, WalkLimits, select_files, slashed};
 use polaris::system::plugin::{Plugin, PluginId, Version};
@@ -255,7 +256,7 @@ pub(crate) fn raw_truncated(path: &str, content: &str) -> String {
 /// — a bare `err.to_string()` reaches the model as "No such file or directory
 /// (os error 2)", which after three reads in one turn does not say which file
 /// was missing.
-fn io_failure(op: &str, path: &str, err: &std::io::Error) -> ToolError {
+pub(crate) fn io_failure(op: &str, path: &str, err: &std::io::Error) -> ToolError {
     ToolError::execution_error(format!("{op} '{path}' failed: {err}"))
 }
 
@@ -311,6 +312,10 @@ pub struct CodeToolsConfig {
     /// Permit absolute paths, parent traversal and symlinks outside the working
     /// directory. Enable only for explicitly unrestricted disposable containers.
     pub unrestricted_paths: bool,
+    /// Whether the model takes images, which `view_image` is registered for.
+    /// `read_file` reads it to say what to do about an image file: use
+    /// `view_image` when it is on, or that this model takes text only.
+    pub image_input: bool,
 }
 
 impl CodeToolsConfig {
@@ -320,7 +325,17 @@ impl CodeToolsConfig {
             working_dir: working_dir.into(),
             edit_journal: None,
             unrestricted_paths: false,
+            image_input: false,
         }
+    }
+
+    /// State whether the model takes images. Only the wording of `read_file`'s
+    /// refusal of an image file depends on it; registering `view_image` is a
+    /// separate act ([`ViewImageToolsPlugin`](crate::tools::ViewImageToolsPlugin)).
+    #[must_use]
+    pub fn with_image_input(mut self, enabled: bool) -> Self {
+        self.image_input = enabled;
+        self
     }
 
     /// Permit file tools to access any path reachable by this process. Relative
@@ -348,6 +363,26 @@ impl CodeToolsConfig {
     /// non-existent leaf can't slip past the check.
     pub fn resolve_path(&self, path: &str) -> Option<PathBuf> {
         resolve_with_access(&self.working_dir, path, self.unrestricted_paths)
+    }
+
+    /// The directory one invocation works in: its [`CallRoot`] when it has
+    /// one, otherwise [`working_dir`](Self::working_dir).
+    pub(crate) fn root_of<'a>(&'a self, call: &'a Option<CallRoot>) -> &'a Path {
+        call.as_ref()
+            .map_or(self.working_dir.as_path(), CallRoot::path)
+    }
+
+    /// [`resolve_path`](Self::resolve_path) for one tool invocation: against
+    /// its [`CallRoot`] when it has one, refused with `escapes sandbox` when
+    /// the result leaves it. Every file tool resolves through here, so a path
+    /// is contained the same way whichever tool opens it.
+    pub(crate) fn resolve_call(
+        &self,
+        call: &Option<CallRoot>,
+        path: &str,
+    ) -> Result<PathBuf, ToolError> {
+        resolve_with_access(self.root_of(call), path, self.unrestricted_paths)
+            .ok_or_else(|| ToolError::execution_error(format!("path '{path}' escapes sandbox")))
     }
 }
 
@@ -444,13 +479,42 @@ impl CodeTools {
     /// The directory this invocation works in: its [`CallRoot`] when it has
     /// one, otherwise the directory the toolset was built with.
     fn root_of<'a>(&'a self, call: &'a Option<CallRoot>) -> &'a Path {
-        call.as_ref()
-            .map_or(self.config.working_dir.as_path(), CallRoot::path)
+        self.config.root_of(call)
     }
 
     fn resolve(&self, call: &Option<CallRoot>, path: &str) -> Result<PathBuf, ToolError> {
-        resolve_with_access(self.root_of(call), path, self.config.unrestricted_paths)
-            .ok_or_else(|| ToolError::execution_error(format!("path '{path}' escapes sandbox")))
+        self.config.resolve_call(call, path)
+    }
+
+    /// Read `resolved` as UTF-8 text for `tool`.
+    ///
+    /// A file that is not text is not an opaque I/O failure. When it is an
+    /// image, the model is told so and told what to do about it, instead of
+    /// being shown "stream did not contain valid UTF-8" and left to guess.
+    async fn read_text(
+        &self,
+        tool: &str,
+        resolved: &Path,
+        path: &str,
+    ) -> Result<String, ToolError> {
+        match tokio::fs::read_to_string(resolved).await {
+            Ok(content) => Ok(content),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                // Only a file that failed as text is sniffed, so a text file
+                // that happens to begin `GIF89a` is still read as text.
+                match sniff_file(resolved).await {
+                    Some((mime, bytes)) => Err(ToolError::execution_error(image_refusal(
+                        tool,
+                        path,
+                        mime,
+                        bytes,
+                        self.config.image_input,
+                    ))),
+                    None => Err(io_failure(tool, path, &err)),
+                }
+            }
+            Err(err) => Err(io_failure(tool, path, &err)),
+        }
     }
 
     /// The canonical working directory. The walking tools report paths inside
@@ -463,6 +527,38 @@ impl CodeTools {
                 working_dir.display()
             ))
         })
+    }
+}
+
+/// The image type and size of the file at `path`, read from its first bytes, or
+/// `None` when it is not a PNG, JPEG, GIF or WebP.
+async fn sniff_file(path: &Path) -> Option<(&'static str, u64)> {
+    use tokio::io::AsyncReadExt as _;
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let bytes = file.metadata().await.ok()?.len();
+    let mut head = Vec::with_capacity(12);
+    file.take(12).read_to_end(&mut head).await.ok()?;
+    sniff_image(&head).map(|(_, mime)| (mime, bytes))
+}
+
+/// What `tool` says when asked to read an image as text.
+///
+/// Written for a model choosing its next call, so it ends in that call: the
+/// tool to use when the model can see images, or the plain fact that it cannot
+/// when it cannot.
+fn image_refusal(tool: &str, path: &str, mime: &str, bytes: u64, image_input: bool) -> String {
+    let what = format!("{} image ({})", format_name(mime), fmt_bytes(bytes));
+    if image_input {
+        format!(
+            "{tool} '{path}': this is a {what}, not text. \
+             Call view_image(path=\"{path}\") to see it."
+        )
+    } else {
+        format!(
+            "{tool} '{path}': this is a {what}, not text, and this model takes text only, \
+             so you cannot look at it. Say so rather than guessing what it shows; \
+             the user can start polaris with --image-input on if the model accepts images."
+        )
     }
 }
 
@@ -533,9 +629,7 @@ impl CodeTools {
         #[context] call_root: Option<CallRoot>,
     ) -> Result<String, ToolError> {
         let resolved = self.resolve(&call_root, &path)?;
-        let content = tokio::fs::read_to_string(&resolved)
-            .await
-            .map_err(|err| io_failure("read_file", &path, &err))?;
+        let content = self.read_text("read_file", &resolved, &path).await?;
         // A ranged read is line-numbered so coordinates round-trip to
         // `read_span`/`edit_file`; an unscoped read stays raw to preserve the
         // file's exact bytes.
@@ -585,9 +679,7 @@ impl CodeTools {
             )));
         }
         let resolved = self.resolve(&call_root, &path)?;
-        let content = tokio::fs::read_to_string(&resolved)
-            .await
-            .map_err(|err| io_failure("read_span", &path, &err))?;
+        let content = self.read_text("read_span", &resolved, &path).await?;
         Ok(
             read_view(&path, &content, start, Some(end - start + 1), cap_footer).unwrap_or_else(
                 || {
@@ -1662,6 +1754,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "alpha\nbeta\n");
+    }
+
+    const PNG_1PX: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
+    ];
+
+    #[tokio::test]
+    async fn reading_an_image_as_text_names_view_image_when_the_model_takes_images() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.png"), PNG_1PX)
+            .await
+            .unwrap();
+        let tools = CodeTools::new(CodeToolsConfig::new(dir.path()).with_image_input(true));
+        for result in [
+            tools.read_file("a.png".into(), None, None, None).await,
+            tools.read_span("a.png".into(), 1, 5, None).await,
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("this is a PNG image (29 B), not text"),
+                "{error}"
+            );
+            assert!(error.contains("view_image(path=\"a.png\")"), "{error}");
+            assert!(
+                !error.contains("valid UTF-8"),
+                "the raw error is gone: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_an_image_as_text_says_the_model_takes_text_only_when_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.png"), PNG_1PX)
+            .await
+            .unwrap();
+        // Image input is off unless the host says otherwise.
+        let tools = CodeTools::new(CodeToolsConfig::new(dir.path()));
+        let error = tools
+            .read_file("a.png".into(), None, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("this is a PNG image (29 B), not text"),
+            "{error}"
+        );
+        assert!(error.contains("this model takes text only"), "{error}");
+        assert!(
+            !error.contains("Call view_image"),
+            "it must not name a tool that is not registered: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_that_is_not_an_image_keeps_the_plain_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.bin"), [0xFFu8, 0xFE, 0x00, 0x80])
+            .await
+            .unwrap();
+        let tools = CodeTools::new(CodeToolsConfig::new(dir.path()).with_image_input(true));
+        let error = tools
+            .read_file("a.bin".into(), None, None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("read_file 'a.bin' failed: stream did not contain valid UTF-8"),
+            "{error}"
+        );
+        assert!(!error.contains("image"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_text_file_that_starts_like_an_image_is_still_text() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("note.txt"), "GIF89a is a format name\n")
+            .await
+            .unwrap();
+        let tools = CodeTools::new(CodeToolsConfig::new(dir.path()).with_image_input(true));
+        let out = tools
+            .read_file("note.txt".into(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out, "GIF89a is a format name\n");
     }
 
     /// The line number a resumption footer points at, or a failure naming what

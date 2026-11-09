@@ -25,6 +25,7 @@ pub mod memory;
 pub mod policy;
 pub mod shell_render;
 pub mod tasks;
+pub mod view_image;
 pub mod web;
 
 pub use code::{CallRoot, CodeTools, CodeToolsConfig, CodeToolsPlugin, FILE_WRITE_TOOLS};
@@ -37,6 +38,7 @@ pub use fileset::{PathGlob, Selection, WalkLimits, select_files};
 pub use memory::{MEMORY_GRAPH_IRI, MemoryTools, MemoryToolsPlugin};
 pub use policy::{AttendedApproval, ToolEffect, ToolPolicy, ToolPolicyPlugin, ToolPolicyRegistry};
 pub use tasks::{RUN_IN_BACKGROUND, STOP_TASK, TASK_OUTPUT, TaskTools, TaskToolsPlugin};
+pub use view_image::{VIEW_IMAGE, ViewImageTools, ViewImageToolsPlugin, ViewedImage};
 pub use web::{WEB_FETCH, WebTools, WebToolsConfig, WebToolsPlugin};
 
 /// Whether a tool only reads state (vs. mutating files or the store).
@@ -50,7 +52,7 @@ pub use web::{WEB_FETCH, WebTools, WebToolsConfig, WebToolsPlugin};
 /// navigation tools, the `concepts`/`find_by_role`/`resources`/`accessors_of`
 /// concept queries, `recall_memory`, `task_output`, and `sparql_query`, and
 /// `web_fetch` (it changes nothing on this machine; the permission policy, not
-/// this list, decides whether the network may be used).
+/// this list, decides whether the network may be used), and `view_image`.
 /// Mutating: `edit_file`, `create_file`, `run_command`, `run_in_background`,
 /// `stop_task`, `memoize`, `sparql_update`, `load_ontology_turtle`.
 #[must_use]
@@ -78,6 +80,7 @@ pub fn tool_is_read_only(name: &str) -> bool {
             | "sparql_query"
             | "describe_resource"
             | "web_fetch"
+            | "view_image"
     )
 }
 
@@ -96,6 +99,7 @@ mod tests {
         assert!(!tool_is_read_only("create_file"));
         assert!(tool_is_read_only("task_output"));
         assert!(tool_is_read_only("web_fetch"));
+        assert!(tool_is_read_only("view_image"));
         assert!(!tool_is_read_only("run_command"));
         assert!(!tool_is_read_only("run_in_background"));
         assert!(!tool_is_read_only("stop_task"));
