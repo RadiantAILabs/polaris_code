@@ -60,13 +60,13 @@ A `-p` run ends on a model reply that calls no tool, with two exceptions:
   the reply because it reached `--max-output-tokens`, the agent asks the model
   to continue from where it stopped, up to three times per turn. This applies
   to interactive sessions too.
-- **An unattended reply that calls no tool is asked to go on once.** Nobody can
+- **An unattended reply that calls no tool can be asked to go on.** Nobody can
   answer a `-p` run, so a reply that only describes its next step would end the
-  run with the work undone. The agent sends one message saying the run is
-  unattended and that the next reply without a tool call ends it.
-  `POLARIS_CODE_UNATTENDED_NUDGES` sets how many such messages a turn may send;
-  `0` turns them off, and a value that is not a non-negative integer is a
-  configuration error (exit `2`). Interactive sessions never send them, and
+  run with the work undone. `POLARIS_CODE_UNATTENDED_NUDGES` sets how many times
+  a turn sends a message saying the run is unattended and asking the model to
+  keep working. It is `0` (off) by default: on benchmark runs, every such
+  message came after the work was finished. A value that is not a non-negative
+  integer is a configuration error (exit `2`). Interactive sessions never send them, and
   neither does a host that embeds the agent unless it sets
   `ContinuationPolicy::unattended_nudges` itself.
 
@@ -82,6 +82,12 @@ A `-p` run whose prompt starts like a question (`find …`, `where is …`,
 `show me …`) is answered by the read-only question topology only when the run
 grants neither edits nor commands. A run that grants either always runs the
 full agent, because the question topology cannot change the workspace.
+
+A failed model call ends the run, so a `-p` run retries a network error,
+timeout, rate limit or overload for about five minutes: ten attempts, with
+waits starting at 2 s and doubling up to 60 s. Interactive sessions keep five
+attempts, about fifteen seconds of waiting, because a person can send the
+message again. An authentication or invalid-request error is never retried.
 
 ## Shell commands
 

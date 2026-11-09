@@ -44,6 +44,7 @@ use polaris::system::server::Server;
 use polaris::tools::{ToolPermission, ToolsPlugin};
 use polaris_code::accounts::{self, Account};
 use polaris_code::agents::continuation::DEFAULT_UNATTENDED_NUDGES;
+use polaris_code::agents::policy::RetryPolicy;
 use polaris_code::agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS, PermissionCeiling, PermissionMode,
     PolicySnapshot, UnattendedGrants, load_seed_ontologies,
@@ -908,6 +909,7 @@ fn policy_snapshot(
         policy.continuation = policy
             .continuation
             .with_unattended_nudges(unattended_nudges);
+        policy.retry = RetryPolicy::unattended();
     }
     if !graph_search.freeform_enabled() {
         policy.tool_palette.denied.push("sparql_query".to_string());
@@ -2836,6 +2838,7 @@ mod tests {
             Some(polaris_code::agents::policy::DEFAULT_MAX_WINDOW_TOKENS)
         );
         assert_eq!(unsized_policy.continuation.unattended_nudges, 0);
+        assert_eq!(unsized_policy.retry, RetryPolicy::default());
 
         config.context_window = Some(NonZeroU32::new(1_048_576).unwrap());
         let unattended = policy_snapshot(
@@ -2847,6 +2850,7 @@ mod tests {
         let input = 1_048_576 - 131_072;
         assert_eq!(unattended.retrieval.max_tokens, Some(input * 4 / 5));
         assert_eq!(unattended.continuation.unattended_nudges, 2);
+        assert_eq!(unattended.retry, RetryPolicy::unattended());
         assert!(unattended.permission.is_unattended());
     }
 

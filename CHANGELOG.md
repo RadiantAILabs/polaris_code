@@ -5,6 +5,10 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+### Changed
+- A `-p` run no longer asks the model to go on after a reply that calls no tool. On Terminal-Bench 2.1 and DeepSWE runs, every such message came after the work was already finished and only added a model call. `POLARIS_CODE_UNATTENDED_NUDGES` still turns it on.
+- A `-p` run retries a failed model call (a network error, timeout, rate limit or overload) for about five minutes instead of about fifteen seconds: ten attempts, with waits starting at 2 s and doubling up to 60 s. A failed call ends the run, so a short outage used to throw away all the work done so far. Interactive sessions keep five attempts. `RetryPolicy::unattended` gives an embedder the same numbers.
+
 ## [0.4.3] - 2026-11-09
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.

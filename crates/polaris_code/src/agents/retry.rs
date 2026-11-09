@@ -460,6 +460,31 @@ mod tests {
     }
 
     #[test]
+    fn the_unattended_policy_keeps_retrying_for_about_five_minutes() {
+        let policy = RetryPolicy::unattended();
+        assert_eq!(policy.max_attempts, 10);
+        assert_eq!(
+            policy.attempt_timeout,
+            RetryPolicy::default().attempt_timeout
+        );
+        // With no jitter (factor 1.0 at 0.5), the computed waits add up to 302 s.
+        let error = GenerationError::Http("connection refused".into());
+        let mut total = Duration::ZERO;
+        for attempt in 1..policy.max_attempts {
+            match policy.next_step(attempt, &error, Commitment::Uncommitted, 0.5) {
+                RetryStep::Retry { after } => total += after,
+                RetryStep::GiveUp => panic!("gave up after attempt {attempt}"),
+            }
+        }
+        assert_eq!(total, Duration::from_secs(302));
+        assert_eq!(
+            policy.next_step(policy.max_attempts, &error, Commitment::Uncommitted, 0.5),
+            RetryStep::GiveUp
+        );
+        assert_eq!(policy.worst_case_wait(), Duration::from_secs(3_540));
+    }
+
+    #[test]
     fn a_commitment_reads_from_a_flag() {
         assert_eq!(Commitment::from(true), Commitment::Committed);
         assert_eq!(Commitment::from(false), Commitment::Uncommitted);
