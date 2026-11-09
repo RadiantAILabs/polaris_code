@@ -29,6 +29,7 @@
 //! model on the next turn, and changes nothing — leaving the cached prompt
 //! prefix byte-identical — on the turns where no document moved.
 
+pub mod steps;
 pub(crate) mod tool_calls;
 
 use std::future::Future;
@@ -131,6 +132,10 @@ fn system_prompt_for(config: &AgentConfig, project: &ProjectContext) -> String {
     if let Some(globs) = config.command_globs.as_deref().filter(|g| !g.is_empty()) {
         prompt.push_str("\n\n");
         prompt.push_str(&command_patterns_note(globs));
+    }
+    for section in &config.prompt_sections {
+        prompt.push_str("\n\n");
+        prompt.push_str(section);
     }
     prompt
 }
@@ -429,7 +434,8 @@ async fn prepare_context(
     config: Res<AgentConfig>,
     session: Res<SessionInfo>,
     user_io: Res<UserIO>,
-) -> PreparedContext {
+) -> Result<PreparedContext, SystemError> {
+    context.check_message_limit(true)?;
     // Commands can be queued while an approval is open, but this snapshot is
     // taken only after `receive_user_input` begins the next turn. The current
     // tool decision therefore keeps the policy it started with.
@@ -514,14 +520,14 @@ async fn prepare_context(
     }
     .record(&store, turn);
 
-    PreparedContext {
+    Ok(PreparedContext {
         system_prompt,
         model_id,
         messages: projected.messages,
         cache_prefix: projected.cache_prefix,
         cache_breakpoints: projected.breakpoints,
         turn,
-    }
+    })
 }
 
 /// Whether this batch may be run concurrently rather than one call at a time.
@@ -615,7 +621,7 @@ async fn execute_read_only_batch(
         if let Some((_, source)) = policy
             .rules
             .as_ref()
-            .and_then(|rules| rules.resolve(&call.function.name, &call.function.arguments))
+            .and_then(|rules| rules.resolve_in(root, &call.function.name, &call.function.arguments))
         {
             recorded
                 .policy_refs
@@ -696,7 +702,15 @@ async fn execute_read_only_batch(
                 call.result(ToolResultContent::Text(output))
             }
             Some(Err(err)) => {
-                let output = redact_tool_output(redactor, name, err.to_string());
+                let output = redact_tool_output(
+                    redactor,
+                    name,
+                    crate::tools::call_arguments::failure_text(
+                        name,
+                        &call.function.arguments,
+                        &err,
+                    ),
+                );
                 activity.finish(user_io, PHASE_ERROR, &output).await;
                 record_tool_call(
                     store,
@@ -1798,6 +1812,19 @@ async fn recover(
         error.message
     );
 
+    // A conversation ceiling ends the turn without spending another model call
+    // on recovery. Check before adding an error message and again before a
+    // recovery request, because feedback itself consumes the same budget.
+    if let Err(failure) = context.check_message_limit(true) {
+        let failure = TurnFailure::from(failure.to_string());
+        loop_state.failure = Some(failure.clone());
+        loop_state.is_complete = true;
+        return LoopState {
+            is_complete: true,
+            failure: Some(failure),
+        };
+    }
+
     if let Some(failure) = loop_state.failure.clone() {
         send_error(&user_io, failure.message.clone()).await;
         loop_state.is_complete = true;
@@ -1810,6 +1837,16 @@ async fn recover(
     let error_text = format!("{} failed: {}", error.system_name, error.message);
     send_error(&user_io, error_text.clone()).await;
     context.push(Message::user(format!("[System Error] {error_text}")));
+
+    if let Err(failure) = context.check_message_limit(true) {
+        let failure = TurnFailure::from(failure.to_string());
+        loop_state.failure = Some(failure.clone());
+        loop_state.is_complete = true;
+        return LoopState {
+            is_complete: true,
+            failure: Some(failure),
+        };
+    }
 
     // Keep the same project grounding the loop's `prepare_context` injects, so a
     // recovery turn doesn't silently lose git/project context.
@@ -1864,6 +1901,13 @@ async fn recover(
         }
     };
 
+    let failure = failure.or_else(|| {
+        context
+            .check_message_limit(false)
+            .err()
+            .map(|error| TurnFailure::from(error.to_string()))
+    });
+
     // The loop's own termination check reads this function's *return* value
     // (the graph's per-run output store, cleared every turn), which
     // `run_one_turn` cannot see afterward — it reads the *resource* instead
@@ -1902,6 +1946,16 @@ pub const DEFAULT_MAX_TURNS: usize = 100;
 pub struct CodeAgent;
 
 impl CodeAgent {
+    /// Snapshot plugin contributions for an agent with ordinary, inspectable step nodes.
+    ///
+    /// Call after all contributing plugins have built. Register the returned agent
+    /// with `SessionsAPI` and pass it to `GraphViewPlugin::for_agent` when used.
+    /// The unit `CodeAgent` remains the unextended agent.
+    #[must_use]
+    pub fn with_steps(steps: &steps::CodeAgentSteps) -> steps::SteppedCodeAgent {
+        steps::SteppedCodeAgent::new(steps.clone())
+    }
+
     /// Stable agent name.
     pub const NAME: &'static str = "CodeAgent";
 }
@@ -1992,102 +2046,107 @@ impl Agent for CodeAgent {
     }
 
     fn build(&self, graph: &mut Graph) {
-        graph.add_system(receive_user_input);
-        graph.add_system(refresh_project_docs);
-        graph.add_system(init_loop);
-        graph.add_system(reset_continuations);
-
-        graph.add_loop::<LoopState, _, _>(
-            "agent_loop",
-            |state| state.is_complete,
-            |g| {
-                g.add_system(apply_steering);
-                g.add_system(compact_context);
-                g.add_conditional_branch::<CompactionRun, _, _, _>(
-                    "manual_compaction",
-                    |run| run.manual,
-                    |manual| {
-                        manual.add_system(finish_compaction);
-                    },
-                    |normal| {
-                        normal.add_system(prepare_context);
-                        normal.add_system(begin_model_call);
-                        normal.add_system(act);
-                        // A failed attempt is retried here, not inside `act`:
-                        // the policy decides, a branch routes, and the edge
-                        // back into `act` is the retry. The loop's own bound is
-                        // `RetryPolicy::max_attempts`, which `decide_retry`
-                        // enforces; the iteration limit below only exists
-                        // because every loop needs one, and sits above any
-                        // policy so `--max-turns` never shortens a retry.
-                        normal.add_loop::<AttemptOutcome, _, _>(
-                            "model_retries",
-                            AttemptOutcome::is_settled,
-                            |retry| {
-                                retry.add_system(decide_retry);
-                                retry.add_conditional_branch::<RetryStep, _, _, _>(
-                                    "retry_or_give_up",
-                                    |step| matches!(step, RetryStep::Retry { .. }),
-                                    |again| {
-                                        again.add_system(wait_to_retry);
-                                        again.add_system(act);
-                                    },
-                                    |stop| {
-                                        stop.add_system(abandon);
-                                    },
-                                );
-                            },
-                        );
-                        if let Some(retries) = normal.last_node() {
-                            normal.set_loop_max_iterations(retries, MODEL_RETRIES_BOUND);
-                        }
-                        normal.add_conditional_branch::<AttemptOutcome, _, _, _>(
-                            "model_answered",
-                            AttemptOutcome::is_success,
-                            |answered| {
-                                answered.add_system(accept_response);
-                                answered.add_conditional_branch::<LlmResponse, _, _, _>(
-                                    "has_tool_calls",
-                                    |response| response.has_tool_calls(),
-                                    |tool_branch| {
-                                        tool_branch.add_system(review_tools);
-                                        tool_calls::build_tool_calls(tool_branch);
-                                    },
-                                    |done_branch| {
-                                        // A reply without a tool call ends the
-                                        // turn unless the continuation policy
-                                        // says it is not an answer yet.
-                                        done_branch.add_system(decide_continuation);
-                                        done_branch
-                                            .add_conditional_branch::<Continuation, _, _, _>(
-                                                "continues",
-                                                Continuation::continues,
-                                                |go_on| {
-                                                    go_on.add_system(continue_turn);
-                                                },
-                                                |finish| {
-                                                    finish.add_system(finalize);
-                                                },
-                                            );
-                                    },
-                                );
-                            },
-                            |unanswered| {
-                                unanswered.add_system(report_failure);
-                            },
-                        );
-                    },
-                );
-                g.add_error_handler(|h| {
-                    h.add_system(recover);
-                });
-            },
-        );
+        build_graph(graph, &steps::CodeAgentSteps::default());
     }
 
     fn name(&self) -> &'static str {
         Self::NAME
     }
+}
+
+fn build_graph(graph: &mut Graph, steps: &steps::CodeAgentSteps) {
+    graph.add_system(receive_user_input);
+    graph.add_system(refresh_project_docs);
+    graph.add_system(init_loop);
+    graph.add_system(reset_continuations);
+
+    graph.add_loop::<LoopState, _, _>(
+        "agent_loop",
+        |state| state.is_complete,
+        |g| {
+            g.add_system(apply_steering);
+            g.add_system(compact_context);
+            g.add_conditional_branch::<CompactionRun, _, _, _>(
+                "manual_compaction",
+                |run| run.manual,
+                |manual| {
+                    manual.add_system(finish_compaction);
+                },
+                |normal| {
+                    normal.add_system(prepare_context);
+                    normal.add_system(begin_model_call);
+                    normal.add_system(act);
+                    // A failed attempt is retried here, not inside `act`:
+                    // the policy decides, a branch routes, and the edge
+                    // back into `act` is the retry. The loop's own bound is
+                    // `RetryPolicy::max_attempts`, which `decide_retry`
+                    // enforces; the iteration limit below only exists
+                    // because every loop needs one, and sits above any
+                    // policy so `--max-turns` never shortens a retry.
+                    normal.add_loop::<AttemptOutcome, _, _>(
+                        "model_retries",
+                        AttemptOutcome::is_settled,
+                        |retry| {
+                            retry.add_system(decide_retry);
+                            retry.add_conditional_branch::<RetryStep, _, _, _>(
+                                "retry_or_give_up",
+                                |step| matches!(step, RetryStep::Retry { .. }),
+                                |again| {
+                                    again.add_system(wait_to_retry);
+                                    again.add_system(act);
+                                },
+                                |stop| {
+                                    stop.add_system(abandon);
+                                },
+                            );
+                        },
+                    );
+                    if let Some(retries) = normal.last_node() {
+                        normal.set_loop_max_iterations(retries, MODEL_RETRIES_BOUND);
+                    }
+                    normal.add_conditional_branch::<AttemptOutcome, _, _, _>(
+                        "model_answered",
+                        AttemptOutcome::is_success,
+                        |answered| {
+                            answered.add_system(accept_response);
+                            answered.add_conditional_branch::<LlmResponse, _, _, _>(
+                                "has_tool_calls",
+                                |response| response.has_tool_calls(),
+                                |tool_branch| {
+                                    tool_branch.add_system(review_tools);
+                                    tool_calls::build_tool_calls(tool_branch);
+                                    steps.build_after_tools(tool_branch);
+                                },
+                                |done_branch| {
+                                    // A reply without a tool call ends the
+                                    // turn unless the continuation policy
+                                    // says it is not an answer yet. Plugin
+                                    // finish checks run only when it ends.
+                                    done_branch.add_system(decide_continuation);
+                                    done_branch.add_conditional_branch::<Continuation, _, _, _>(
+                                        "continues",
+                                        Continuation::continues,
+                                        |go_on| {
+                                            go_on.add_system(continue_turn);
+                                        },
+                                        |finish| {
+                                            steps.build_before_finish(finish);
+                                        },
+                                    );
+                                },
+                            );
+                        },
+                        |unanswered| {
+                            unanswered.add_system(report_failure);
+                        },
+                    );
+                },
+            );
+            g.add_error_handler(|h| {
+                h.add_system(recover);
+            });
+        },
+    );
 }
 
 /// Block on a future from within the synchronous `setup`, regardless of the
@@ -2131,6 +2190,7 @@ where
 /// | [`LoopState`] | local | Loop termination flag. |
 /// | [`ContinuationLedger`] | local | Per-turn continuation counts, reset at the start of each turn. |
 /// | [`PolicySnapshot`] | local | Per-turn decision policy (defaults in v1). |
+/// | [`steps::CodeAgentSteps`] | global | Startup graph contributions; snapshot with `CodeAgent::with_steps` after plugin builds. |
 /// | [`SecretRedactor`] | global | Withholds recognisable credentials from every consumer of a tool result. |
 ///
 /// # APIs Provided
@@ -2178,7 +2238,8 @@ where
 ///
 /// - `build` registers the local resources, the hook and the middleware, and
 ///   publishes [`SecretRedactor`].
-/// - `ready` registers the [`ContextManager`] serializer with `PersistenceAPI`
+/// - `ready` freezes [`steps::CodeAgentSteps`] into a global and registers the
+///   [`ContextManager`] serializer with `PersistenceAPI`
 ///   when [`PersistencePlugin`] provides it.
 ///
 /// # Extends
@@ -2288,6 +2349,7 @@ impl Plugin for CodeAgentPlugin {
                 ))))
             });
         }
+        server.insert_resource(steps::CodeAgentSteps::default());
         tool_calls::install_cleanup(server);
         server.register_local(LoopState::default);
         server.register_local(ContinuationLedger::default);
@@ -2298,6 +2360,10 @@ impl Plugin for CodeAgentPlugin {
     }
 
     async fn ready(&self, server: &mut Server) {
+        let steps = server
+            .remove_resource::<steps::CodeAgentSteps>()
+            .expect("CodeAgentPlugin installed the startup step registry");
+        server.insert_global(steps);
         if let Some(api) = server.api::<PersistenceAPI>() {
             api.register::<ContextManager>(Self::ID);
         }

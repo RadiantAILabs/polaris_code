@@ -88,7 +88,7 @@ the indexer's language set drift apart.
 | Plugin | What it enables |
 |--------|-----------------|
 | [`CodeAgentPlugin`](crate::CodeAgentPlugin) | Registers the reflective [`CodeAgent`](crate::CodeAgent): a `ReAct` loop whose control decisions read a per-turn [`PolicySnapshot`](crate::PolicySnapshot) and write a reified `Decision`/`ToolCall` into the Session `ABox`. Depends on `ModelsPlugin`, `ToolsPlugin` and `PersistencePlugin`, and on `PermissionRulesPlugin` and `AutoReviewPlugin`, which are added with their defaults when missing. |
-| [`PermissionRulesPlugin`](crate::agents::permission_rules::PermissionRulesPlugin) | Loads immutable user/project allow, ask and deny rules; publishes scoped human grants, launch-time tool grants and exact-call shell authorization; registers `/permissions` (`trust-project` can be remembered per project through `with_project_trust`). `PermissionRulesPlugin::default()` loads no files, so an embedding that omits `new(root)` also omits the operator's deny rules. |
+| [`PermissionRulesPlugin`](crate::agents::permission_rules::PermissionRulesPlugin) | Loads immutable user/project allow, ask and deny rules; publishes scoped human grants, launch-time tool grants and exact-call shell authorization; registers `/permissions` (`trust-project` can be remembered per project through `with_project_trust`). `PermissionRulesPlugin::default()` loads no files, so an embedding that omits `new(root)` also omits the operator's deny rules. A plugin that depends on it can add a named rule written in Rust with `PermissionRules::add_code_rule` while it builds; the agent treats it like a file rule, and `/permissions` lists it by name. |
 | [`AutoReviewPlugin`](crate::agents::auto_review::AutoReviewPlugin) | Installs bounded attended review configuration and real-user intent/denial state. The explicit graph review step uses the model registry and shared token meter, defers failures to human approval, and leaves deterministic policy and exact-call receipts authoritative. A call that only a person may approve (an `ask` rule, an untrusted project allow rule, a tool declared as needing a person) never reaches the reviewer. Requires `ModelsPlugin` and `PermissionRulesPlugin`. |
 | [`CompactionPlugin`](crate::agents::context::CompactionPlugin) | Adds `/compact`, which asks the agent graph for a summary checkpoint now. It requires `CodeAgentPlugin`, the consumer of the typed [`AgentRequest`](crate::terminal::AgentRequest) it makes, so the command is advertised only where the agent that reads it is installed. Without it the agent still summarizes automatically past its threshold. |
 
@@ -107,4 +107,21 @@ stages and their state are private to the agent.
 Startup configuration and `/status` use the existing terminal command registry;
 they add no plugin. The binary loads optional user/project TOML files before
 assembly and registers read-only diagnostics over its current session handles.
+That startup is the library's [`startup`](crate::startup) module, and the
+`polaris` binary only calls it. [`startup::Host`](crate::startup::Host) adds
+plugins in a fixed order and then the plugins a host supplies; the module
+documentation lists the order and which plugins a host plugin may depend on.
 See [startup configuration](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/configuration.md).
+
+`CodeAgentPlugin` also publishes the startup
+[`CodeAgentSteps`](crate::agents::code_agent::steps::CodeAgentSteps) registry.
+A contributing plugin depends on `CodeAgentPlugin` and appends graph builders
+during `build`; the host registers `CodeAgent::with_steps` after startup. Empty
+registries preserve the stock graph exactly. For a Graph tab installed before
+startup, use
+[`GraphViewPlugin::for_code_agent_steps`](crate::graph_view::GraphViewPlugin::for_code_agent_steps):
+it publishes the completed registry's graph during `ready`, after every plugin
+has built. This keeps contributed nodes visible by their system names.
+[`tabs::add_code_agent_shell_tabs`](crate::tabs::add_code_agent_shell_tabs) adds
+the shell's tabs with that Graph tab, and `polaris` starts with it. See the
+[`steps` example](crate::agents::code_agent::steps) for a complete plugin.

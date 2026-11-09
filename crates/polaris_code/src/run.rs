@@ -405,6 +405,34 @@ pub async fn drive_turn_step(
     session_id: &SessionId,
     status: Option<&StatusEmitter>,
 ) -> (TurnOutcome, DriverStep) {
+    let (outcome, step) = drive_turn_inner(sessions, session_id, status).await;
+    let observation = sessions
+        .with_context(session_id, |ctx| {
+            let observer = ctx
+                .get_resource::<crate::agents::observation::TurnObserver>()
+                .ok()?
+                .clone();
+            let history = ctx
+                .get_resource::<crate::agents::ContextManager>()
+                .map(|context| context.messages.clone())
+                .unwrap_or_default();
+            Some((observer, history))
+        })
+        .await
+        .ok()
+        .flatten();
+    let outcome = match observation {
+        Some((observer, history)) => observer.observe(history, outcome).await,
+        None => outcome,
+    };
+    (outcome, step)
+}
+
+async fn drive_turn_inner(
+    sessions: &SessionsAPI,
+    session_id: &SessionId,
+    status: Option<&StatusEmitter>,
+) -> (TurnOutcome, DriverStep) {
     // ── Spend-ceiling point ─────────────────────────────────────────────
     // Above the topology-selection point, so a run already at its limit
     // starts nothing at all: no selection, no graph, no provider call.

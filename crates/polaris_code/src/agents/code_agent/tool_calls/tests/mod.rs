@@ -1,14 +1,17 @@
 //! Run the production tool graph with deterministic tools.
 use super::*;
+use crate::agents::permission_rules::RuleDecision;
 use polaris::graph::{GraphExecutor, cancel::CancellationSource};
 use polaris::models::llm::{AssistantBlock, StopReason, Usage};
 use polaris::plugins::{CONFIRMED, IOError, IOProvider};
 use polaris::sessions::SessionId;
+use polaris::system::plugin::{Contract, PluginAccess, VersionReq};
 use polaris::tools::toolset;
 use polaris_tui::{APPROVAL_NOTE, APPROVAL_SUBJECT};
 use std::sync::Mutex;
 
 mod call_ids;
+mod code_rules;
 
 struct Choose {
     messages: Mutex<Vec<IOMessage>>,
@@ -97,6 +100,33 @@ impl Plugin for FixturePlugin {
             .get_resource_mut::<ToolRegistry>()
             .unwrap()
             .register_toolset(self.0.clone());
+    }
+}
+
+/// A rule written in code, as a plugin would add it.
+type FixtureRule = fn(&str, &serde_json::Value, &std::path::Path) -> Option<(RuleDecision, String)>;
+
+/// A plugin that adds named code rules to the permission rules while building.
+struct AddsRules(Vec<(&'static str, FixtureRule)>, bool);
+impl Plugin for AddsRules {
+    const ID: &'static str = "test::adds_rules";
+    const VERSION: Version = Version::new(0, 1, 0);
+    fn dependencies(&self) -> Vec<PluginId> {
+        vec![PluginId::of::<PermissionRulesPlugin>()]
+    }
+    fn access(&self) -> PluginAccess {
+        PluginAccess::new()
+            .extends::<PermissionRules>(VersionReq::caret(PermissionRules::CONTRACT_VERSION))
+    }
+    fn build(&self, server: &mut Server) {
+        let mut rules = server.get_resource_mut::<PermissionRules>().unwrap();
+        for (name, rule) in &self.0 {
+            if self.1 {
+                rules.add_code_rule_with_refusal_text(*name, *rule).unwrap();
+            } else {
+                rules.add_code_rule(*name, *rule).unwrap();
+            }
+        }
     }
 }
 
@@ -202,6 +232,8 @@ struct ReplyControl {
     prompt_fails: bool,
     choice: Option<&'static str>,
     unrestricted_shell: bool,
+    code_rules: Vec<(&'static str, FixtureRule)>,
+    own_refusal_text: bool,
 }
 
 async fn run_controlled(
@@ -233,6 +265,12 @@ async fn run_controlled(
     server.add_plugins(ToolsPlugin).add_plugins(
         PermissionRulesPlugin::default().with_unrestricted_shell(control.unrestricted_shell),
     );
+    if !control.code_rules.is_empty() {
+        server.add_plugins(AddsRules(
+            control.code_rules.clone(),
+            control.own_refusal_text,
+        ));
+    }
     if approver {
         server.add_plugins(crate::agents::InteractiveApprovalPlugin);
     }
@@ -483,6 +521,58 @@ async fn parallel_read_results_keep_distinct_provider_call_ids_on_success_and_er
         results[1].1
     );
 }
+#[tokio::test]
+async fn a_cut_off_call_is_explained_in_the_one_at_a_time_lane() {
+    // A reply that stopped inside a call's arguments reaches the agent with
+    // none.
+    let cut_off = ToolCall::new("cut-0", "update_file", serde_json::Value::Null);
+    let outcome = run_calls(vec![cut_off, command(1, "ok")], false, 10).await;
+    assert_eq!(outcome.ran, ["ok"], "the cut-off call must not run");
+    let results = results(&outcome);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0);
+    assert!(
+        results[0].1.starts_with("update_file did not run:"),
+        "{}",
+        results[0].1
+    );
+    assert!(
+        results[0].1.contains("output-length limit"),
+        "{}",
+        results[0].1
+    );
+    assert!(
+        !results[0].1.contains("Parameters must be an object"),
+        "{}",
+        results[0].1
+    );
+    assert_eq!(results[1], (false, "ok".into()));
+}
+
+#[tokio::test]
+async fn a_cut_off_call_is_explained_in_the_parallel_read_lane() {
+    let calls = vec![
+        ToolCall::new("cut-0", "read_file", serde_json::Value::Null),
+        ToolCall::new("read-1", "read_file", serde_json::json!({"path": "ok"})),
+    ];
+    let outcome = run_calls(calls, false, 10).await;
+    assert_eq!(outcome.ran, ["ok"], "the cut-off call must not run");
+    let results = results(&outcome);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0);
+    assert!(
+        results[0].1.starts_with("read_file did not run:"),
+        "{}",
+        results[0].1
+    );
+    assert!(
+        !results[0].1.contains("Parameters must be an object"),
+        "{}",
+        results[0].1
+    );
+    assert_eq!(results[1], (false, "ok".into()));
+}
+
 #[tokio::test]
 async fn the_outer_turn_bound_does_not_truncate_a_batch() {
     let outcome = run_calls((0..8).map(|i| command(i, "ok")).collect(), false, 10).await;

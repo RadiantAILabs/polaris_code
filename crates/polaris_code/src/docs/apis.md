@@ -29,6 +29,9 @@ Capabilities state facts about their tools (read-only or mutating, and whether
 every attended call needs a person) in the
 [`ToolPolicyRegistry`](crate::tools::ToolPolicyRegistry) resource; this is a
 registry the capability plugins fill while they build, not a framework `API`.
+Plugins add rules written in Rust the same way, with
+[`PermissionRules::add_code_rule`](crate::agents::permission_rules::PermissionRules::add_code_rule)
+while they build; the rules are fixed once the server is ready.
 
 Context compaction also extends existing seams without adding an API:
 `ContextStrategy` selects projection behavior, `ContextManager` stores summary
@@ -52,6 +55,13 @@ Reviewer calls use the existing `ModelRegistry` and `TokenMeter` contracts.
 Startup configuration and `/status` add no API. The binary applies TOML defaults
 through clap and registers diagnostics through the existing
 [`CommandRegistry`](crate::terminal::CommandRegistry).
+
+Starting the agent from another program adds no API either:
+[`startup::Host`](crate::startup::Host) is a plain builder, not a handle a
+plugin publishes. It parses the command line, calls the closures a host gave
+it after every plugin `polaris` adds, and starts the server, so a host's
+plugins reach the agent through the seams above (`PermissionRules`,
+`CodeAgentSteps`) and not through the host.
 
 The shell approval contract is also an ordinary typed boundary:
 [`ApprovalReceipt`](crate::tools::approval::ApprovalReceipt) is host-issued context
@@ -82,3 +92,13 @@ empty list is not offered `task_output` or the other shell tools. Neither adds a
 API: for the tools above, two sessions on one server differ only in the
 `AgentConfig` they were created with, and in the `TokenMeter` when one of them
 carries a spend cap.
+
+Coding-loop graph extensions likewise use a typed startup resource rather than
+a framework `API`: plugins fill
+[`CodeAgentSteps`](crate::agents::code_agent::steps::CodeAgentSteps) in `build`,
+then the host calls [`CodeAgent::with_steps`](crate::agents::CodeAgent::with_steps).
+Builders append ordinary graph nodes after tools or before finish. A local
+[`FinishGate`](crate::agents::code_agent::steps::FinishGate) accumulates holds;
+existing `ContextManager` and `Out<LlmResponse>` provide conversation and answer
+access. The unit `CodeAgent` and the published default-loop signature are
+unchanged. The configured agent has the same name and session identity.

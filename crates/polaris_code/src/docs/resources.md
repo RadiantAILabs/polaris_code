@@ -19,6 +19,7 @@ provider, access pattern, and a real-shape consuming system per the
 |----------|-------|-----------------|
 | [`RunTrajectory`](crate::trajectory::RunTrajectory) | Global | Optional complete unattended-run ATIF recorder. The host creates a fresh destination, the model provider records new messages and inference metadata with shared, reconstructable request histories, and the coding context attaches redacted tool results. Atomic checkpoints preserve evidence across compaction and cooperative cancellation; `check`/`finish` expose persistence failure. |
 | [`TokenMeter`](crate::TokenMeter) | Global + Local | Running token counts (input / output / cache tiers) and an estimated USD cost; `summary(model_id)` formats the exit report. The session's meter is global, because it accrues across the whole session. The same type is also local: the host inserts a fresh meter into each topology run context, where it shadows the global one, so a graph that calls a model bills the run and leaves the session's total alone. |
+| [`TurnObserver`](crate::agents::observation::TurnObserver) | Global | Optional host-provided completed-turn recorder and report projection. Called after the shared driver classifies the result, with canonical history and the original outcome. No stock plugin installs it; graph hooks remain the ordinary graph instrumentation seam. |
 | [`RunCeiling`](crate::RunCeiling) | Global | The operator's spend limit for the run — money, tokens, or both — installed only when one was asked for, so its *absence* means no limit was set. Decides nothing itself: `evaluate(&RunUsage)` reports a [`CeilingStatus`](crate::usage::CeilingStatus) and [`run::drive_turn`](crate::run::drive_turn) consults it on the turn boundary. Global for the same reason the meter is: the limit bounds the whole run, not one turn. |
 | [`TaskCostLimit`](crate::usage::TaskCostLimit) | Global | The validated USD limit installed when explicitly set or when the lean arm supplies its $1.50 default. Each accepted coding task gets a fresh local meter and reads this limit before its model calls; the same limit applies to each task independently. |
 
@@ -101,7 +102,7 @@ constructed on demand inside the existing background indexing task.
 
 | Resource | Scope | What it exposes |
 |----------|-------|-----------------|
-| [`PermissionRules`](crate::agents::permission_rules::PermissionRules) | Global | Immutable parsed user/project rules, source paths, fail-closed errors and explicit project trust (this process, optionally remembered per project). Provided by `PermissionRulesPlugin`; read by `PolicySnapshot::load` and the argument-aware permission gate. |
+| [`PermissionRules`](crate::agents::permission_rules::PermissionRules) | Global | Immutable parsed user/project rules, source paths, fail-closed errors and explicit project trust (this process, optionally remembered per project), plus the named rules plugins added in code while the server built (fixed once it is ready; project trust does not apply to them). Provided by `PermissionRulesPlugin`; read by `PolicySnapshot::load` and the argument-aware permission gate. |
 | [`HumanApproval`](crate::agents::human_approval::HumanApproval) | Global | Optional human input transport provided by `InteractiveApprovalPlugin` or a replacement `HumanApprover`. The graph's `ask_human` node reads `Option<Res<HumanApproval>>`; absence denies with a result block. Each call passes its session's `UserIO` and grants. The transport returns an `ApprovalAnswer` with its scope and optional informational note, validates the offered scope, records grants, and resolves cancelled prompts before another receive. Notes accompany only that call’s result and trajectory; they never authorize it. |
 | [`SessionGrants`](crate::agents::permission_rules::SessionGrants) | Global handle, session lifetime | Exact command/directory and decomposed prefix scopes explicitly selected by a human. Every access checks `SessionSettings::approval_generation`; session reset invalidates all prior scopes. Shared with `/permissions` for inspection and revocation. |
 | [`ShellApproval`](crate::agents::permission_rules::ShellApproval) | Global | Agent-policy shell restriction resolution and registered-tool dispatch. Issues tool-layer receipts bound to the current rule revision and session generation; the registered shell tool consumes them, preserving hard denies and the foreground/background wait lifecycle. |
@@ -134,3 +135,16 @@ credential source names remain immutable launch inputs owned by the binary.
 foreground and background tools consume the same lower-layer contract.
 [`CallRoot`](crate::tools::CallRoot), the folder one tool call works in, is
 likewise per-invocation `ToolContext` and not a resource.
+
+# Coding agent graph extensions
+
+| Resource | Scope | What it exposes |
+|----------|-------|-----------------|
+| [`CodeAgentSteps`](crate::agents::code_agent::steps::CodeAgentSteps) | Global | Startup builders contributed during plugin `build`, ordered by ascending priority then namespaced key. `CodeAgentPlugin` installs an empty registry; the host snapshots it with `CodeAgent::with_steps` after startup. Runtime systems do not mutate this registry. |
+| [`FinishGate`](crate::agents::code_agent::steps::FinishGate) | Local | A before-finish system calls `hold(message)` to continue the coding loop. Every hold becomes a separate user message after the candidate assistant answer, in step order. Reset before each candidate; later checks cannot remove an earlier hold. Provided by the stepped agent only when before-finish builders are installed. |
+
+Extension systems may also read the existing `AgentConfig` for the session's
+working directory, inspect `Out<LlmResponse>` for the current answer, and read
+or append to `ContextManager`. Those types remain owned and initialized by the
+coding agent; appended messages pass through its ordinary projection and
+compaction. See [`steps`](crate::agents::code_agent::steps) for plugin wiring.

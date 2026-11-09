@@ -379,8 +379,50 @@ changing a file requires restarting. Trust is never inferred from model text,
 and an unattended run never trusts a project on its own. Saving a remembered
 grant to a project file is not offered.
 
-`/permissions` lists every rule, its source, project trust status and current
-session grants. The deterministic authorization seam is
+### Rules written in code
+
+A plugin that depends on `PermissionRulesPlugin` can add a named rule written in
+Rust while the server is built, with `PermissionRules::add_code_rule`. The rule
+is a function. It gets the tool name, the call's arguments and the workspace
+root, and returns `None` for no opinion or a `RuleDecision` with a reason. The
+agent treats it like a rule from a file:
+
+- **Precedence.** Code rules and file rules are weighed together. Deny wins over
+  ask, which wins over allow. If a file rule and a code rule give the same
+  decision, the file rule's reason is shown. Among code rules, the one added
+  first is shown.
+- **Reason.** A code-rule refusal defaults to
+  `Call refused: code rule "<name>": <the rule's reason>`, naming the rule while
+  describing a refusal of this call. `add_code_rule_with_refusal_text` instead
+  uses the returned reason as the complete model-facing refusal, without
+  wrapping or trimming it. Authorization provenance still names the rule.
+  File-rule and tool/mode denials retain their ordinary wording. Custom text
+  does not change which rule wins or grant any permission.
+- **Limits.** A code `allow` never goes above the mode or the permission ceiling
+  and never beats a deny from any source. Project trust applies only to
+  `polaris.permissions.toml` and does not apply to code rules. Unattended, a code
+  `ask` is a refusal, as for a file rule.
+- **Failure.** A rule that panics refuses the call. The reason names the rule and
+  does not show the panic text, which goes to the log.
+- **Shell calls.** For `run_command` and `run_in_background`, the rule is called
+  with the whole command text and then with each simple command of it, such as
+  both sides of `a && b`. The arguments are the call's own, with only `command`
+  replaced. Heredoc bodies are not checked as commands. A code `allow` stands only
+  if the rule allowed the whole text and every part. If the command cannot be
+  split (for example `$(...)` or a subshell), no code `allow` applies, but `deny`
+  and `ask` on the whole text still do.
+- **Fixed at ready.** Rules can only be added while plugins build. After the
+  server is ready, `add_code_rule` is refused, and clones of `PermissionRules`
+  see the same rules.
+- **Pure rules.** The agent may call a rule more than once for one call, so a
+  rule should depend only on its arguments.
+
+See the [plugin catalog](../crates/polaris_code/src/docs/plugins.md) and the
+`PermissionRulesPlugin` rustdoc for a full example plugin.
+
+`/permissions` lists every file rule, its source, project trust status and
+current session grants. It also lists the names of code rules added by plugins,
+including those from plugins built after `PermissionRulesPlugin`. The deterministic authorization seam is
 `PermissionPolicy::resolve_call`, followed by shell checks in
 `ShellApproval::resolve`. A remaining `Confirm` goes to a person in `confirm`
 and `auto-edit`. In `auto`, the `review_tools` graph step first sends it to the

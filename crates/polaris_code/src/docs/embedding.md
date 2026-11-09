@@ -4,7 +4,9 @@ This is the starting point for a program that is **not** the `polaris`
 binary and wants to drive a coding turn itself: an evaluation runner, a test
 harness, a protocol server, another front end.
 
-There is no `Harness` type, no builder and no `init()`. Embedding is three
+There is no `Harness` type, no builder and no `init()` for composing a server
+yourself. (A program that wants the stock agent with additions uses
+[`startup::Host`](crate::startup::Host) instead; see below.) Embedding is three
 things in order:
 
 1. compose the plugins you want on a [`Server`](polaris::system::server::Server);
@@ -14,7 +16,11 @@ things in order:
 The run surface is three free functions — [`drive_turn`](crate::run::drive_turn),
 [`drive_until`](crate::run::drive_until) and
 [`request_interrupt`](crate::run::request_interrupt) — and they hold no state.
-The composition root is yours, exactly as `src/main.rs` is the binary's.
+The composition root is yours, exactly as [`startup`](crate::startup) is the binary's.
+
+If what you want is the `polaris` agent itself, with a few plugins or settings
+added, you do not need to compose a server: see
+[Starting polaris with plugins of your own](#starting-polaris-with-plugins-of-your-own).
 
 `polaris_code` exposes the agent as a library package. Add it from crates.io
 and compose the plugins your application needs; the dependency list below
@@ -68,6 +74,43 @@ another with `Server::insert_global` so tool results are recorded, and call
 recorded since the last model call; a hard kill before then can lose them. Use
 [`rebuild_request`](crate::trajectory::rebuild_request) to reconstruct a call's
 exact native input from its one-based step id, including compacted context.
+
+## Model request timeouts
+
+For Bedrock requests that need more than the Responses endpoint's default
+60 seconds, set `--model-request-timeout-secs 600`,
+`POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS=600`, or
+`model_request_timeout_secs = 600` in the user `config.toml` or project
+`polaris.toml`. Profiles accept the same key. The usual precedence applies:
+flags, environment, project file, user file, then defaults. Values must be
+whole seconds from 1 to 86400; empty, fractional, zero and out-of-range values
+are startup errors. Unset leaves all provider defaults unchanged.
+
+The setting applies to Bedrock's Converse and Responses paths, including calls
+from summaries, reviewers and topologies. Embedders can parse a
+[`ModelRequestTimeout`](crate::providers::ModelRequestTimeout) and call
+[`ReadyProvider::with_request_timeout`](crate::providers::ReadyProvider::with_request_timeout)
+before either installation method. This sets the checked AWS SDK configuration's
+`operation_attempt_timeout`; the Responses client reads its HTTP timeout from
+that same configuration. Existing connection/read limits and retry settings
+remain in force, so a shorter existing limit can still end a request earlier.
+
+The limit bounds one transport attempt, rather than a complete turn or its
+retries. Converse streaming bounds establishment of the response, not the event
+stream after headers arrive. Bedrock Responses currently buffers the full HTTP
+response before producing stream events, so its timeout covers that response.
+The SDK and Responses adapter can retry internally; each attempt gets the same
+limit. Their final transport error reaches the agent's existing retry policy
+as a transient HTTP/network failure: Polaris 0.9.1 discards the native timeout
+type, so the final report can say `network` rather than `timeout`. The agent
+retries only while attempts remain and no visible output or billed usage has
+committed the call. Its separate 300-second silence limit can fire first;
+raising this transport limit does not raise that policy limit.
+
+Anthropic and `OpenAI` expose no public request-timeout builder in Polaris 0.9.1.
+Chat Completions exposes a per-read idle timeout, which does not bound a live
+request's duration. Selecting any of those providers with this setting is
+therefore refused at startup.
 
 ## What you get back
 
@@ -132,15 +175,15 @@ A documented entry point that hides a constraint is worse than none, so:
   together to get "both". Pick one when you build the `Server`.
 * **The CLI is not part of the library.** `--print`, `--output-format`,
   `--session`, `--allow-edit`, the exit codes and the identity line live in
-  `src/main.rs`. [`exec::report`](crate::exec::report) *renders* those formats
-  and is public, but nothing in this crate prints: the composition root owns
-  stdout. If you want `json` output, call
+  [`startup`](crate::startup). [`exec::report`](crate::exec::report) *renders*
+  those formats and is public, but nothing in the run surface prints: the
+  startup module owns stdout. If you want `json` output, call
   [`RunReport`](crate::exec::RunReport) and print it yourself.
 * **The `POLARIS_CODE_*` environment variables are the binary's.** The model,
   the graph-search mode, the prompt-cache strategy and the unattended nudge
   count (`POLARIS_CODE_UNATTENDED_NUDGES`, see
   [Continuing unattended replies](#continuing-unattended-replies-and-bounding-shell-output))
-  are read from the environment by `main.rs` only. An embedder sets them on
+  are read from the environment by [`startup`](crate::startup) only. An embedder sets them on
   [`AgentConfig`](crate::agents::AgentConfig) (`with_graph_search`,
   `with_prompt_cache`) and on [`CodeGraphPlugin`](crate::tools::CodeGraphPlugin).
   The same config also carries the per-session settings `with_system_prompt`,
@@ -148,7 +191,8 @@ A documented entry point that hides a constraint is worse than none, so:
   [Running several isolated calls on one server](#running-several-isolated-calls-on-one-server).
 * **Terminal behaviour is front-end policy, not agent behaviour.** `/commands`,
   `@` mentions, session switching, rewind, background tasks and turn steering
-  are wired by `main.rs` out of [`terminal`](crate::terminal) parts. An embedder
+  are wired by [`startup`](crate::startup) out of [`terminal`](crate::terminal)
+  parts. An embedder
   gets none of them by default and must wire what it wants.
 * **[`drive_until`](crate::run::drive_until) is for an interactive front end.**
   It is paced by `UserIO::receive`, so it returns only when a turn genuinely
@@ -418,3 +462,80 @@ What a call's folder and command list do **not** cover:
 * **A spend cap works inside the turn only.** It is a different mechanism from
   the operator's `--max-cost-usd` ceiling; `docs/run-cost-ceiling.md` says how
   the two differ.
+
+## Starting polaris with plugins of your own
+
+A program that wants the `polaris` agent as it is, plus plugins of its own, does
+not compose a server. It builds a [`startup::Host`](crate::startup::Host), adds
+what it needs, and runs it on a command line. The host gets the binary's flags,
+configuration files, environment variables, providers, both front ends and exit
+codes, and no startup code is copied.
+
+```no_run
+use polaris_code::startup::{Host, clap};
+
+#[tokio::main]
+async fn main() {
+    let code = Host::new()
+        // A setting of the host's own, read from the command line or the
+        // environment and listed in `--help` with the binary's.
+        .arg(clap::Arg::new("experiment").long("experiment").env("MY_EXPERIMENT"))
+        // Plugins, added after every plugin `polaris` adds and before the
+        // server starts. They see the parsed command line.
+        .plugins(|launch, _server| {
+            let _name = launch.matches().get_one::<String>("experiment");
+            // `_server.add_plugins(MyPlugin::new(_name))` goes here.
+            Ok(())
+        })
+        .run(std::env::args_os())
+        .await;
+    std::process::exit(code);
+}
+```
+
+Plugins added this way can do what any plugin can while the server builds. Two
+seams exist for changing the agent's behaviour, and the startup wires both:
+
+* a plugin that depends on
+  [`PermissionRulesPlugin`](crate::agents::permission_rules::PermissionRulesPlugin)
+  adds a rule written in Rust with
+  [`PermissionRules::add_code_rule`](crate::agents::permission_rules::PermissionRules::add_code_rule);
+* a plugin that depends on [`CodeAgentPlugin`](crate::agents::CodeAgentPlugin)
+  adds steps to the coding loop through
+  [`CodeAgentSteps`](crate::agents::CodeAgentSteps). The startup registers the
+  agent built from the finished registry, and the Graph tab draws it, so a host
+  does neither itself.
+
+With no plugin added, the agent is the stock `polaris` agent. The
+[module documentation](crate::startup) gives the order startup adds its own
+plugins in, which of them a host plugin may depend on, and a complete host with
+a rule. `tests/host_startup.rs` runs a host with a rule and steps against a
+scripted model.
+
+A host setting is a command-line argument and, with `Arg::env`, an environment
+variable. It is not a configuration-file key: the files supply defaults only for
+`polaris`'s own settings. Startup does not let a host replace the model provider
+the command line selects; a host that wants a different one composes its own
+server as described above.
+
+## Adding coding-agent graph steps
+
+A host can let plugins extend the coding loop without replacing its graph.
+Each contributing plugin depends on `CodeAgentPlugin` and fills the
+[`CodeAgentSteps`](crate::agents::CodeAgentSteps) startup resource during
+`build`. Its `after_tools` builders append ordinary graph systems after a full
+tool round; its `before_finish` builders append systems that may call
+[`FinishGate::hold`](crate::agents::FinishGate::hold) on a candidate answer.
+Builders run by ascending priority, then stable namespaced key.
+
+A host that starts through [`startup::Host`](crate::startup::Host) does this
+already. A host that composes its own server reads
+`server.get_global::<CodeAgentSteps>()` after `server.finish().await` and
+registers [`CodeAgent::with_steps`](crate::agents::CodeAgent::with_steps) with
+`SessionsAPI`, using `CodeAgent::NAME` for sessions as before. The registry is
+frozen at startup; an empty registry builds exactly the stock graph. For a
+Graph tab installed before startup, use
+[`GraphViewPlugin::for_code_agent_steps`](crate::graph_view::GraphViewPlugin::for_code_agent_steps)
+with `GraphPanelPlugin`; it publishes the complete graph during `ready`.
+The [step-extension module](crate::agents::code_agent::steps) has a complete
+plugin and host example, along with hold ordering and budget semantics.

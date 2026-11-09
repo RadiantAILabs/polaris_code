@@ -28,6 +28,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       run_rust: ${{ steps.changes.outputs.run_rust }}
+      # Changes only under experiments/ are checked by experiments.yml instead.
+      experiments_only: ${{ steps.changes.outputs.experiments_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,6 +60,7 @@ jobs:
   format:
     name: Quick checks
     needs: prepare
+    if: needs.prepare.outputs.experiments_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -74,6 +77,8 @@ jobs:
 
   harbor-adapter:
     name: Harbor adapter tests
+    needs: prepare
+    if: needs.prepare.outputs.experiments_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -336,7 +341,9 @@ jobs:
           import os
 
           jobs = json.loads(os.environ["JOB_RESULTS"])
-          required = ["prepare", "format", "harbor-adapter"]
+          required = ["prepare"]
+          if jobs["prepare"]["outputs"].get("experiments_only") != "true":
+              required += ["format", "harbor-adapter"]
           if jobs["prepare"]["outputs"].get("run_rust") == "true":
               required += ["test", "build", "homebrew", "homebrew-test"]
           unsuccessful = {

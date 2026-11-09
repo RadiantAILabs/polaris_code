@@ -47,7 +47,7 @@
 //!   payload, the sandbox, the verifiers, and graph execution.
 //! - [`run`] — the run surface: [`run::drive_turn`] runs one turn,
 //!   [`run::drive_until`] loops it. The interactive and non-interactive front
-//!   ends in `main.rs` are two thin callers over these same functions; there
+//!   ends in [`startup`] are two thin callers over these same functions; there
 //!   is exactly one agent loop. Its first act each turn is the
 //!   topology-selection point ([`cosmos::host::select_and_run`]), inert unless
 //!   the host accepted a coding task — see `docs/topology-selection.md`. The
@@ -62,10 +62,16 @@
 //!   ([`state::state_dir`]): where saved sessions and the rewind journal live,
 //!   and the self-ignore marker that keeps them out of anything git builds from
 //!   the working tree.
+//! - [`startup`] — the `polaris` binary's startup as a library:
+//!   [`startup::Host`] parses the command line and configuration, assembles
+//!   the server, runs the agent and returns the exit code. A program that wants
+//!   the same agent with more plugins (permission rules, coding-loop steps,
+//!   tools) or more command-line settings adds them to a `Host` instead of
+//!   copying the startup code. Proved by `tests/host_startup.rs`.
 //! - [`docs::embedding`] — the entry point for a program that is **not** the
-//!   `polaris` binary: what an embedder must supply, what a turn hands
-//!   back, and what the binary's composition root keeps to itself. Proved by
-//!   `tests/embedding_entry_point.rs` and `examples/embed_turn.rs`.
+//!   `polaris` binary and composes its own server: what an embedder must
+//!   supply, what a turn hands back, and what [`startup`] keeps to itself.
+//!   Proved by `tests/embedding_entry_point.rs` and `examples/embed_turn.rs`.
 //! - [`exec`] — the non-interactive front end: [`exec::ExecIOPlugin`] installs
 //!   a channel-backed `UserIO` instead of the TUI panels, and
 //!   [`exec::report`] renders what the run prints — the `--output-format`
@@ -86,6 +92,7 @@ pub mod project_trust;
 pub mod providers;
 pub mod run;
 pub mod sparql;
+pub mod startup;
 pub mod state;
 pub mod tabs;
 pub mod terminal;
@@ -117,6 +124,7 @@ pub mod docs {
     pub mod resources {}
 }
 
+pub use agents::code_agent::steps::{CodeAgentSteps, DuplicateStep, FinishGate, SteppedCodeAgent};
 pub use agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, ContextManager, Decision, LoopState, PolicySnapshot,
     ProjectContext,

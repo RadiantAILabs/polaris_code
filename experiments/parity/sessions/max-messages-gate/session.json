@@ -1,0 +1,16 @@
+{
+  "description": "--max-messages together with the done gate: the message the gate adds when it holds counts, and it can take the count to or past the limit.",
+  "workspace": "value",
+  "exercises": ["max-messages", "limits", "gate"],
+  "args": ["--protect", "test.py", "--test-command", "python3 -B test.py"],
+  "runs": [
+    {"name": "moved-3", "args": ["--rules-arm", "moved", "--no-give-up", "--max-messages", "3"]},
+    {"name": "moved-4", "args": ["--rules-arm", "moved", "--no-give-up", "--max-messages", "4"]},
+    {"name": "prompt-gate-4", "args": ["--rules-arm", "prompt-gate", "--max-messages", "4"]},
+    {"name": "steps-5", "args": ["--rules-arm", "steps", "--max-messages", "5"]}
+  ],
+  "replies": [
+    {"text": "Done."},
+    {"text": "Done again."}
+  ]
+}

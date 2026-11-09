@@ -40,9 +40,18 @@
 //! `AnthropicPlugin` has neither a setter nor a variable, so a custom
 //! `ANTHROPIC_BASE_URL` is refused rather than ignored: ignoring it would send
 //! the key to Anthropic instead of the gateway the operator named.
+//!
+//! # Request timeouts
+//!
+//! [`ReadyProvider::with_request_timeout`] configures Bedrock's native SDK
+//! timeout for both Converse and Responses before either installation method.
+//! Other providers cannot enforce a total request timeout through their public
+//! builders. See the [embedding guide](crate::docs::embedding#model-request-timeouts)
+//! for the CLI, environment and config-file forms, streaming limits and retries.
 
 use std::fmt;
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::time::Duration;
 
 use aws_credential_types::credential_feature::AwsCredentialFeature;
@@ -83,6 +92,33 @@ const AWS_PROFILE_VAR: &str = "AWS_PROFILE";
 /// How long resolving AWS credentials may take before the check gives up. The
 /// SDK's own providers have shorter timeouts; this bounds the chain as a whole.
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A model request limit in whole seconds, from 1 through 86400.
+///
+/// Parse the same value used by `--model-request-timeout-secs` to configure
+/// [`ReadyProvider::with_request_timeout`]. No limit is applied unless set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelRequestTimeout(Duration);
+
+impl FromStr for ModelRequestTimeout {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let text = raw.trim();
+        if !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && let Ok(seconds @ 1..=86_400) = text.parse::<u64>()
+        {
+            return Ok(Self(Duration::from_secs(seconds)));
+        }
+        Err(
+            "model_request_timeout_secs (--model-request-timeout-secs / \
+             POLARIS_CODE_MODEL_REQUEST_TIMEOUT_SECS) must be a whole number of seconds \
+             from 1 to 86400; omit it to keep the provider defaults"
+                .to_string(),
+        )
+    }
+}
 
 /// A source of named values, so a check can be run against a stand-in for the
 /// process environment.
@@ -310,6 +346,11 @@ impl ReasoningHistory {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum StartupError {
+    /// The selected provider cannot enforce a total request timeout.
+    UnsupportedRequestTimeout {
+        /// The provider selected for this run.
+        provider: Provider,
+    },
     /// The retired provider-specific effort variable was set.
     RetiredReasoningSetting,
     /// The provider's key variable is unset or blank.
@@ -353,6 +394,13 @@ pub enum StartupError {
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedRequestTimeout { provider } => write!(
+                f,
+                "--model-request-timeout-secs is supported only with --provider bedrock; \
+                 --provider {} has no total request timeout setting in this build. \
+                 Omit model_request_timeout_secs or select bedrock.",
+                provider.flag()
+            ),
             Self::RetiredReasoningSetting => f.write_str("POLARIS_CODE_EXP_REASONING_EFFORT was retired; unset it and use --reasoning-effort or POLARIS_CODE_REASONING_EFFORT"),
             Self::MissingKey { provider, var } => {
                 let flag = provider.flag();
@@ -577,6 +625,43 @@ impl fmt::Debug for ReadyProvider {
 }
 
 impl ReadyProvider {
+    /// Set the native request timeout for Bedrock Converse and Responses.
+    ///
+    /// Both registration methods use this checked SDK configuration. Existing
+    /// connect/read timeouts and retry settings are preserved. The limit applies
+    /// to each transport attempt; it does not bound retries or stream lifetime
+    /// after Converse has returned its event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupError::UnsupportedRequestTimeout`] for other providers:
+    /// their builders do not expose a total request timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prepared Bedrock provider has no checked SDK configuration.
+    pub fn with_request_timeout(
+        mut self,
+        timeout: ModelRequestTimeout,
+    ) -> Result<Self, StartupError> {
+        if self.report.provider != Provider::Bedrock {
+            return Err(StartupError::UnsupportedRequestTimeout {
+                provider: self.report.provider,
+            });
+        }
+        let config = self.sdk_config.take().expect("checked Bedrock SDK config");
+        let timeouts = config
+            .timeout_config()
+            .map_or_else(
+                aws_config::timeout::TimeoutConfig::builder,
+                aws_config::timeout::TimeoutConfig::to_builder,
+            )
+            .operation_attempt_timeout(timeout.0)
+            .build();
+        self.sdk_config = Some(config.to_builder().timeout_config(timeouts).build());
+        Ok(self)
+    }
+
     /// What the provider is running as.
     #[must_use]
     pub fn report(&self) -> &ProviderReport {
@@ -1185,6 +1270,252 @@ mod tests {
 
     /// What a run sees when nothing was saved with `polaris login`.
     const NOTHING_STORED: Option<CredentialStore> = None;
+
+    #[test]
+    fn request_timeout_requires_whole_seconds_in_range() {
+        for (text, seconds) in [("1", 1), (" 300 ", 300), ("86400", 86_400)] {
+            assert_eq!(
+                text.parse::<ModelRequestTimeout>().unwrap().0,
+                Duration::from_secs(seconds)
+            );
+        }
+        for text in [
+            "",
+            " ",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            "1s",
+            "86401",
+            "18446744073709551616",
+        ] {
+            let error = text.parse::<ModelRequestTimeout>().unwrap_err();
+            assert!(
+                error.contains("whole number of seconds from 1 to 86400"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_timeout_preserves_sdk_defaults_and_other_settings() {
+        use aws_config::timeout::TimeoutConfig;
+
+        let original = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .read_timeout(Duration::from_secs(9))
+            .operation_timeout(Duration::from_secs(30))
+            .build();
+        let config = sdk_config(Some("us-east-1"), Some(credentials_tagged(vec![])))
+            .to_builder()
+            .timeout_config(original.clone())
+            .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(2))
+            .build();
+        let ready = check(config, &[]).await.unwrap();
+        assert_eq!(
+            ready.sdk_config.as_ref().unwrap().timeout_config(),
+            Some(&original)
+        );
+        let ready = ready.with_request_timeout("300".parse().unwrap()).unwrap();
+        let config = ready.sdk_config.unwrap();
+        let changed = config.timeout_config().unwrap();
+        assert_eq!(
+            changed.operation_attempt_timeout(),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(changed.operation_timeout(), original.operation_timeout());
+        assert_eq!(changed.connect_timeout(), original.connect_timeout());
+        assert_eq!(changed.read_timeout(), original.read_timeout());
+        assert_eq!(config.retry_config().unwrap().max_attempts(), 2);
+
+        let ready = check(
+            sdk_config(Some("us-east-1"), Some(credentials_tagged(vec![]))),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(ready.sdk_config.unwrap().timeout_config().is_none());
+    }
+
+    #[tokio::test]
+    async fn providers_without_total_timeout_builders_refuse_the_setting() {
+        for provider in [Provider::Anthropic, Provider::OpenAi, Provider::OpenAiChat] {
+            let ready = ready_with_key(provider, KeyOrigin::Stored("test-key".to_string()), None);
+            let error = ready
+                .with_request_timeout("1".parse().unwrap())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                StartupError::UnsupportedRequestTimeout { .. }
+            ));
+            assert!(error.to_string().contains("only with --provider bedrock"));
+        }
+    }
+
+    /// A silent loopback server demonstrates the native timeout without any
+    /// service credentials. A delayed 401 proves unset requests keep waiting.
+    async fn delayed_bedrock_request(
+        model: &'static str,
+        streaming: bool,
+        options: bool,
+        limited: bool,
+    ) {
+        use polaris::models::ModelsPlugin;
+        use polaris::models::llm::{GenerationError, LlmRequest, Message};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = sdk_config(Some("us-east-1"), Some(credentials_tagged(vec![])))
+            .to_builder()
+            .endpoint_url(endpoint)
+            .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(1))
+            .build();
+        let ready = check(config, &[]).await.unwrap();
+        let ready = if limited {
+            ready.with_request_timeout("1".parse().unwrap()).unwrap()
+        } else {
+            ready
+        };
+        let mut server = Server::new();
+        server.add_plugins(ModelsPlugin);
+        if options {
+            ready.install_with_options(
+                &mut server,
+                NonZeroU32::new(64).unwrap(),
+                PriceStore::builtin(),
+                crate::model_run::ModelRunOptions::default(),
+            );
+        } else {
+            ready.install(
+                &mut server,
+                NonZeroU32::new(64).unwrap(),
+                PriceStore::builtin(),
+            );
+        }
+        server.finish().await.unwrap();
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 16 * 1024];
+            let read = socket.read(&mut bytes).await.unwrap();
+            assert!(read > 0);
+            // Drain the body so closing the socket cannot replace the 401
+            // with a connection reset when a request arrives in several reads.
+            let mut received = read;
+            loop {
+                if let Some(end) = bytes[..received]
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                {
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if received >= end + 4 + length {
+                        break;
+                    }
+                }
+                let read = socket.read(&mut bytes[received..]).await.unwrap();
+                assert!(read > 0);
+                received += read;
+            }
+            let request = String::from_utf8_lossy(&bytes[..received]);
+            if model.contains("openai") {
+                assert!(
+                    request.starts_with("POST /openai/v1/responses "),
+                    "{request}"
+                );
+            } else {
+                let path = if streaming {
+                    "converse-stream"
+                } else {
+                    "converse"
+                };
+                assert!(request.lines().next().unwrap().contains(path), "{request}");
+            }
+            let delay = if limited {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_millis(1500)
+            };
+            tokio::time::sleep(delay).await;
+            let body = r#"{"__type":"AccessDeniedException","message":"delayed denial"}"#;
+            let reply = format!(
+                "HTTP/1.1 401 Unauthorized\r\nx-amzn-errortype: AccessDeniedException\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let registry = server.get_global::<ModelRegistry>().unwrap();
+        let llm = registry
+            .llm(format!("{}/{model}", Provider::Bedrock.registry_name()))
+            .unwrap();
+        let request = LlmRequest {
+            messages: vec![Message::user("hello")],
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            if streaming {
+                llm.stream(request)
+                    .await
+                    .err()
+                    .expect("the server never sends a stream")
+            } else {
+                llm.generate(request).await.unwrap_err()
+            }
+        })
+        .await
+        .expect("the test request must finish");
+        if limited {
+            assert!(started.elapsed() >= Duration::from_secs(1));
+            assert!(
+                !serving.is_finished(),
+                "the timeout must fire before the server replies: {error}"
+            );
+            assert!(matches!(error, GenerationError::Http(_)), "{error:?}");
+            assert!(crate::agents::failure::classify(&error).is_transient());
+            assert!(matches!(
+                crate::agents::policy::RetryPolicy::default().next_step(
+                    1,
+                    &error,
+                    crate::agents::retry::Commitment::Uncommitted,
+                    0.5,
+                ),
+                crate::agents::retry::RetryStep::Retry { .. }
+            ));
+            serving.abort();
+            let _ = serving.await;
+        } else {
+            serving.await.unwrap();
+            assert_eq!(
+                crate::agents::failure::classify(&error),
+                crate::agents::FailureKind::Auth,
+                "{error:?}"
+            );
+        }
+        drop(llm);
+        drop(registry);
+        server.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn native_request_timeout_covers_bedrock_routes_and_registration_paths() {
+        for model in ["anthropic.claude-sonnet-4-6", "global.openai.gpt-5.4"] {
+            for streaming in [false, true] {
+                for options in [false, true] {
+                    delayed_bedrock_request(model, streaming, options, true).await;
+                    delayed_bedrock_request(model, streaming, options, false).await;
+                }
+            }
+        }
+    }
 
     fn env_of<const N: usize>(
         pairs: [(&'static str, &'static str); N],

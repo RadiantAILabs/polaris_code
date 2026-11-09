@@ -199,3 +199,19 @@ fn catalog_mentions_respects_word_boundaries() {
     assert!(!catalog_mentions(catalog, "okenMeter"));
     assert!(!catalog_mentions(catalog, "TokenMet"));
 }
+
+/// Extension authors need the resource contract, not only a mention in prose.
+#[test]
+fn coding_graph_extension_resources_link_to_their_contracts() {
+    let catalog = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CATALOG_PATH))
+        .expect("resource catalog");
+    for name in ["CodeAgentSteps", "FinishGate"] {
+        assert!(
+            catalog.contains(&format!(
+                "[`{name}`](crate::agents::code_agent::steps::{name})"
+            )),
+            "missing linked contract for {name}"
+        );
+        assert!(!INTERNAL_RESOURCES.contains(&name));
+    }
+}

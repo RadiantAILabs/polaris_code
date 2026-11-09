@@ -17,6 +17,7 @@ use super::*;
 use crate::agents::human_approval::HumanApproval;
 use crate::agents::permission_rules::{ApprovalAnswer, ApprovalReceipt};
 use crate::terminal::background::Invocation;
+use crate::tools::call_arguments::failure_text;
 
 /// Independent of the outer model-turn budget.
 const TOOL_CALLS_BOUND: usize = u32::MAX as usize;
@@ -326,6 +327,7 @@ pub(crate) async fn authorize_call(
     if let Some(reason) = outside_command_globs(&config, name, &tool_call.function.arguments) {
         authorization.permission = ToolPermission::Deny;
         authorization.source = reason;
+        authorization.refusal_text = None;
         authorization.remember = false;
     }
     let permission = authorization.permission;
@@ -376,10 +378,14 @@ pub(crate) async fn authorize_call(
         receipt = shell_approval.receipt_for(&request, &rules, &settings);
     }
     let route = match (permission, review) {
-        (ToolPermission::Deny, _) => AuthorizationRoute::Deny(format!(
-            "Permission denied: tool '{name}' is not allowed ({})",
-            authorization.source
-        )),
+        (ToolPermission::Deny, _) => {
+            AuthorizationRoute::Deny(authorization.refusal_text.clone().unwrap_or_else(|| {
+                format!(
+                    "Permission denied: tool '{name}' is not allowed ({})",
+                    authorization.source
+                )
+            }))
+        }
         (ToolPermission::Allow, _) => AuthorizationRoute::Allow,
         (ToolPermission::Confirm, Some(r)) if r.decision == ReviewDecision::Allow => {
             AuthorizationRoute::Allow
@@ -884,7 +890,11 @@ pub(crate) async fn execute_call(
             Err(err) => {
                 // A failure message carries tool output too — a command's
                 // stderr, a parser's echo of the line it choked on.
-                let output = redact_tool_output(redactor, name, err.to_string());
+                let output = redact_tool_output(
+                    redactor,
+                    name,
+                    failure_text(name, &tool_call.function.arguments, &err),
+                );
                 activity.finish(&user_io, PHASE_ERROR, &output).await;
                 record_tool_call(
                     &store,
@@ -949,7 +959,7 @@ pub(crate) async fn finish_calls(
     user_io: Res<UserIO>,
     store: Res<OxigraphStore>,
     config: Res<AgentConfig>,
-) {
+) -> Result<(), SystemError> {
     // Also runs after the last permitted iteration. A batch cap must return an
     // error for every unrun call, never silently discard the queue.
     finish_pending(
@@ -982,6 +992,7 @@ pub(crate) async fn finish_calls(
     }
 
     batch.edited.clear();
+    context.check_message_limit(false)
 }
 
 pub(crate) fn build_tool_calls(graph: &mut Graph) {

@@ -54,6 +54,7 @@ enum Step {
     Stall,
     /// The call streams some text and then fails, so the text has been shown.
     TextThenFail(GenerationError),
+    BilledThenFail(GenerationError),
 }
 
 /// A provider that follows a script and records how it was used.
@@ -135,6 +136,19 @@ impl LlmProvider for Handle {
                 events.push(Err(error));
                 Ok(futures_util::stream::iter(events).boxed())
             }
+            Step::BilledThenFail(error) => Ok(futures_util::stream::iter([
+                Ok(StreamEvent::MessageDelta {
+                    usage: Usage {
+                        input_tokens: Some(11),
+                        output_tokens: Some(2),
+                        cache_read_tokens: Some(3),
+                        cache_creation_tokens: Some(4),
+                        ..Default::default()
+                    },
+                }),
+                Err(error),
+            ])
+            .boxed()),
             Step::Answer => {
                 let mut events = text_events(ANSWER);
                 events.push(Ok(StreamEvent::ContentBlockStop { index: 0 }));
@@ -196,6 +210,7 @@ struct Run {
     nodes: Vec<String>,
     /// Every `retry` decision the turn wrote to the session graph, in order.
     retry_decisions: Vec<RetryDecision>,
+    attempts: Vec<polaris_code::agents::observation::ModelAttempt>,
 }
 
 /// One `retry` decision as recorded on the trajectory.
@@ -390,7 +405,15 @@ async fn drive_with(provider: &Arc<Scripted>, retry: RetryPolicy, setup: Setup) 
     sessions.register_agent(CodeAgent).unwrap();
 
     let session_id = SessionId::new();
-    let config = AgentConfig::new("anthropic/test-model", workspace.path().to_path_buf());
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let observed = attempts.clone();
+    let mut config = AgentConfig::new("anthropic/test-model", workspace.path().to_path_buf());
+    config.model_observer = Some(polaris_code::agents::observation::ModelObserver::new(
+        move |model, attempt| {
+            assert_eq!(model, "anthropic/test-model");
+            observed.lock().unwrap().push(attempt);
+        },
+    ));
     sessions
         .create_session_with_executor(
             server.create_context(),
@@ -452,6 +475,7 @@ async fn drive_with(provider: &Arc<Scripted>, retry: RetryPolicy, setup: Setup) 
         report,
         nodes,
         retry_decisions: retry_decisions(&store),
+        attempts: attempts.lock().unwrap().clone(),
     }
 }
 
@@ -859,4 +883,39 @@ async fn retries_are_not_counted_against_the_turn_limit() {
 
     assert_eq!(provider.streams(), 4, "the whole attempt budget was used");
     assert_eq!(run.failure().kind, FailureKind::Overloaded);
+}
+
+#[tokio::test]
+async fn attempt_observation_retains_failed_usage_and_every_retry() {
+    let provider = Scripted::new(|call| match call {
+        0 | 1 => Step::Fail(http(529, "overloaded_error", "Overloaded")),
+        _ => Step::Answer,
+    });
+    let run = drive(&provider, fast(5)).await;
+    assert_eq!(
+        run.attempts
+            .iter()
+            .map(|attempt| attempt.ok)
+            .collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    assert_eq!(run.attempts[2].input_tokens, 10);
+    assert_eq!(run.attempts[2].output_tokens, 5);
+    assert_eq!(run.attempts[2].stop_reason.as_deref(), Some("EndTurn"));
+    let provider =
+        Scripted::new(|_| Step::BilledThenFail(http(529, "overloaded_error", "Overloaded")));
+    let run = drive(&provider, fast(5)).await;
+    assert_eq!(run.attempts.len(), 1);
+    let attempt = &run.attempts[0];
+    assert!(!attempt.ok);
+    assert_eq!(
+        (
+            attempt.input_tokens,
+            attempt.output_tokens,
+            attempt.cache_read_tokens,
+            attempt.cache_creation_tokens
+        ),
+        (11, 2, 3, 4)
+    );
+    assert!(attempt.stop_reason.is_none());
 }

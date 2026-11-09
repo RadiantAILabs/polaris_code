@@ -1,0 +1,30 @@
+[package]
+name = "polaris-guards"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Experiments in enforcing coding-agent rules through plugins"
+
+[dependencies]
+polaris.workspace = true
+polaris_code = { path = "../../crates/polaris_code", version = "0.4.2" }
+polaris_cosmos.workspace = true
+polaris_ontrace.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+clap = { version = "4", features = ["derive", "env", "string"] }
+regex = "1"
+glob = "0.3"
+walkdir = "2"
+tempfile = "3"
+tree-sitter = "=0.25.10"
+tree-sitter-python = "=0.25.0"
+futures-util = "0.3"
+
+[[bin]]
+name = "polaris-guards"
+path = "src/main.rs"

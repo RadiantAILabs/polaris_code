@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use polaris_code::providers::ProviderReport;
-use polaris_code::terminal::{
+use crate::providers::ProviderReport;
+use crate::terminal::{
     CommandError, CommandOutcome, CommandRegistry, SessionNavigation, SessionSettings,
 };
 use polaris_tui::commands::CommandSpec;
@@ -39,7 +39,7 @@ pub(super) fn register(
             let dotenv = startup.dotenv.as_ref().map_or_else(|| "none".to_string(), |path| path.display().to_string());
             CommandOutcome::Reply(format!(
                 "- Version: {}\n- Provider: {}\n- Model: {}\n- Region: {region}\n- Endpoint: {endpoint}\n- Permission mode: {}\n- Permission ceiling: {ceiling}\n- Key source: {}\n- Config directory: {config_directory}\n- Config files: {files}\n- Profile: {}\n- Environment file: {dotenv}\n- Session: {}\n- Workspace: {}",
-                env!("CARGO_PKG_VERSION"), report.provider().flag(), snapshot.model_id, polaris_code::terminal::status::permission_posture(&permission),
+                env!("CARGO_PKG_VERSION"), report.provider().flag(), snapshot.model_id, crate::terminal::status::permission_posture(&permission),
                 report.credential_source(), startup.profile.as_deref().unwrap_or("none"), navigation.current(), workspace.display(),
             ))
         },
@@ -66,11 +66,11 @@ mod tests {
 
     #[tokio::test]
     async fn status_reads_current_session_settings_and_navigation() {
-        use polaris::sessions::{SessionId, SessionsAPI, store::memory::InMemoryStore};
-        use polaris_code::{
+        use crate::{
             agents::{PermissionCeiling, PermissionMode},
             config::ModelCatalog,
         };
+        use polaris::sessions::{SessionId, SessionsAPI, store::memory::InMemoryStore};
         use polaris_tui::commands::CommandInvocation;
         use std::sync::Arc;
 
@@ -94,7 +94,7 @@ mod tests {
                 ..Startup::default()
             },
             ProviderReport::new(
-                polaris_code::providers::Provider::Anthropic,
+                crate::providers::Provider::Anthropic,
                 None,
                 Some("https://gateway.example/v1".to_string()),
                 "stored key (polaris login)",
@@ -143,8 +143,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_uses_the_resolved_bedrock_region_and_role() {
+        use crate::{agents::PermissionMode, config::ModelCatalog, providers::Provider};
         use polaris::sessions::{SessionId, SessionsAPI, store::memory::InMemoryStore};
-        use polaris_code::{agents::PermissionMode, config::ModelCatalog, providers::Provider};
         use polaris_tui::commands::CommandInvocation;
         use std::sync::Arc;
 

@@ -82,7 +82,7 @@ Every fixture's route is one of:
 | `conversational` | Yes | The ordinary agent loop decides what to do and how, which is a model call by construction. |
 
 `polaris-code` itself refuses to start at all without `ANTHROPIC_API_KEY` set
-(`crates/polaris_code/src/main.rs`), regardless of whether the turn it is
+(`crates/polaris_code/src/startup.rs`), regardless of whether the turn it is
 about to run needs a model — so a `topology-*`/`deterministic` fixture still
 needs the variable *present*, just not valid. `runner.py` supplies the
 deliberately invalid placeholder `not-a-real-key` whenever the environment has

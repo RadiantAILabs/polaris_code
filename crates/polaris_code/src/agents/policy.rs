@@ -298,7 +298,7 @@ impl PermissionPolicy {
         let matched = self
             .rules
             .as_ref()
-            .and_then(|rules| rules.resolve(call.tool, call.args));
+            .and_then(|rules| rules.resolve_call_in(call.root, call.tool, call.args));
         let ceiling = call.ceiling.map(|ceiling| {
             let mut held = ceiling.mode().permission_policy();
             held.tools = self.tools.clone();
@@ -307,6 +307,7 @@ impl PermissionPolicy {
         let mut result = AuthorizationDecision {
             permission: base,
             source: format!("permission mode: {}", self.mode_label()),
+            refusal_text: None,
             remember: !self.is_unattended(),
             session_grant: false,
             review: if human_only_tool {
@@ -320,24 +321,32 @@ impl PermissionPolicy {
             return result;
         }
         match matched {
-            Some((RuleDecision::Deny, source)) => {
+            Some(resolved) if resolved.decision == RuleDecision::Deny => {
                 result.permission = ToolPermission::Deny;
-                result.source = source;
+                result.source = resolved.source;
+                result.refusal_text = resolved.refusal_text;
                 result.remember = false;
             }
-            Some((RuleDecision::Ask, source)) => {
+            Some(resolved) if resolved.decision == RuleDecision::Ask => {
                 result.permission = if self.is_unattended() {
                     ToolPermission::Deny
                 } else {
                     ToolPermission::Confirm
                 };
-                result.source = source;
+                result.source = resolved.source;
+                if self.is_unattended() {
+                    result.refusal_text = resolved.refusal_text;
+                }
                 result.remember = false;
                 result.review = ReviewEligibility::HumanOnly;
             }
-            Some((RuleDecision::Allow, source)) if !self.is_unattended() && !human_only_tool => {
+            Some(resolved)
+                if resolved.decision == RuleDecision::Allow
+                    && !self.is_unattended()
+                    && !human_only_tool =>
+            {
                 result.permission = ToolPermission::Allow;
-                result.source = source;
+                result.source = resolved.source;
                 result.session_grant =
                     grants.allows(call.generation, call.tool, call.args, call.root);
             }
@@ -356,6 +365,7 @@ impl PermissionPolicy {
             && let Some(held) = call.ceiling
         {
             result.source = format!("{} permission ceiling", held.label());
+            result.refusal_text = None;
         }
         result.permission = bounded;
         if matches!(

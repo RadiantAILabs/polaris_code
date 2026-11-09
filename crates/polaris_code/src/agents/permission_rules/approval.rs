@@ -709,6 +709,7 @@ impl ShellApproval {
             if call_directory(call.args, call.root).is_none() {
                 decision.permission = ToolPermission::Deny;
                 decision.source = "shell directory is invalid or outside the workspace".into();
+                decision.refusal_text = None;
                 decision.remember = false;
                 return decision;
             }
@@ -743,6 +744,7 @@ impl ShellApproval {
                 Some(ShellPermission::Deny) => {
                     decision.permission = ToolPermission::Deny;
                     decision.source = "this command is on the shell's deny list".into();
+                    decision.refusal_text = None;
                     decision.remember = false;
                 }
                 Some(ShellPermission::Confirm)

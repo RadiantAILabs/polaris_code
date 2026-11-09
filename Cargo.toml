@@ -6,6 +6,7 @@ members = [
     "crates/polaris_ontrace",
     "crates/polaris-tui",
     "crates/polaris-tui-examples",
+    "experiments/guards",
 ]
 
 [workspace.package]

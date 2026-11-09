@@ -545,6 +545,7 @@ async fn changed_arguments_policy_directory_or_generation_invalidate_an_allow() 
     let authorization = AuthorizationDecision {
         permission: ToolPermission::Confirm,
         source: "permission mode: auto".into(),
+        refusal_text: None,
         remember: true,
         session_grant: false,
         review: ReviewEligibility::Eligible,
@@ -924,6 +925,7 @@ async fn a_changed_symlink_directory_invalidates_the_review_and_receipt() {
     let authorization = AuthorizationDecision {
         permission: ToolPermission::Confirm,
         source: "permission mode: auto".into(),
+        refusal_text: None,
         remember: true,
         session_grant: false,
         review: ReviewEligibility::Eligible,

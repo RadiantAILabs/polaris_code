@@ -20,6 +20,7 @@ pub mod context;
 pub mod continuation;
 pub mod failure;
 pub mod human_approval;
+pub mod observation;
 pub mod permission_rules;
 pub mod policy;
 pub mod project_context;
@@ -29,6 +30,7 @@ pub mod trajectory;
 
 pub use polaris::agent::{Agent, SetupError};
 
+pub use code_agent::steps::{CodeAgentSteps, DuplicateStep, FinishGate, SteppedCodeAgent};
 pub use code_agent::{AgentLlm, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS};
 pub use config::AgentConfig;
 pub use context::{ContextManager, ContextStrategy, LinearWindow};

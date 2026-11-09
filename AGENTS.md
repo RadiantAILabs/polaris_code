@@ -47,8 +47,8 @@ The shared principles come from
 - **The graph is the agent.** Compose systems and edges to change behavior.
   Contribute topologies through packs and the shared catalog rather than
   special cases in the host's selection loop.
-- **Keep the composition root thin.** `main.rs` chooses and wires plugins,
-  configuration, and front ends. Tool behavior belongs in capabilities; agent
+- **Keep the composition root thin.** `startup` (which `main.rs` only calls)
+  chooses and wires plugins, configuration, and front ends. Tool behavior belongs in capabilities; agent
   decisions belong in systems and policy seams. Tools must not depend on the
   agent's `LoopState`.
 - **Make experiments observable.** Preserve the policy-read and
@@ -91,7 +91,16 @@ the workspace checkout.
 
 Within `crates/polaris_code/src/`:
 
-- `main.rs` assembles the server, providers, front end, tools, and agent.
+- `main.rs` calls `startup::Host` and exits with its code.
+- `startup.rs` and `startup/` are the startup as a library: the public `Host`
+  builder a host crate adds plugins and settings to, then the assembly of the
+  server, providers, front end, tools, and agent. `startup/cli.rs` holds the
+  flags, `startup/settings_file.rs` the configuration files,
+  `startup/environment.rs` the environment settings, `startup/posture.rs` the
+  permission posture and shell setup, and `startup/headless.rs` and
+  `startup/interactive.rs` the two front ends' turn drivers. A host's plugins
+  are added after every plugin startup adds; keep that order, and the list of
+  it in the `startup` module documentation, in step with `prepare`.
 - `providers.rs` owns the provider choice, its startup check (credentials,
   region, endpoint), its model catalog, and `--list-models`. Adding a provider is
   one variant and one arm in each `match` there.
@@ -136,7 +145,7 @@ so new registrations should not need hand-maintained listing entries.
 - Build custom TUI widgets against the `polaris_tui::ratatui` re-export to keep
   the UI stack on one version.
 
-The composition root has four intentional stdout surfaces: the headless result
+The startup module has four intentional stdout surfaces: the headless result
 emitter, the post-TUI usage summary, `--list-topologies` and `--list-models`.
 Their bytes are rendered inside `exec` (`exec::report`, `exec::models`). The
 credential commands (`login`, `logout`) are dialogue and write to stderr.
