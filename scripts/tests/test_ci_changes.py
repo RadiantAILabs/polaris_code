@@ -43,6 +43,51 @@ class CiChangesTests(unittest.TestCase):
             "refs/heads/main", self.repository,
         )
 
+    def push_only_experiments(self, head, base=None):
+        return ci_changes.only_experiments(
+            "push", {"before": base or self.base, "after": head},
+            "refs/heads/main", self.repository,
+        )
+
+    def test_experiment_changes_skip_every_other_job(self):
+        self.commit("experiments/guards/src/lib.rs", "pub fn guard() {}\n")
+        self.commit("experiments/guards/Cargo.toml", "[package]\n")
+        self.commit("experiments/guards/scripts/convert.py", "print()\n")
+        head = self.commit("experiments/parity/README.md", "comparison tool\n")
+        self.assertFalse(self.push_requires_ci(head))
+        self.assertTrue(self.push_only_experiments(head))
+
+    def test_experiments_with_any_other_change_keep_the_usual_jobs(self):
+        self.commit("experiments/guards/src/lib.rs", "pub fn guard() {}\n")
+        head = self.commit("README.md", "documentation\n")
+        self.assertFalse(self.push_requires_ci(head))
+        self.assertFalse(self.push_only_experiments(head))
+        head = self.commit("Cargo.lock", "# lockfile\n")
+        self.assertTrue(self.push_requires_ci(head))
+        self.assertFalse(self.push_only_experiments(head))
+
+    def test_experiments_only_pr_ignores_changes_only_on_target_branch(self):
+        self.git("checkout", "--quiet", "-b", "experiment")
+        head = self.commit("experiments/parity/parity.py", "print()\n")
+        self.git("checkout", "--quiet", "main")
+        base = self.commit("crates/polaris_code/src/main.rs", "fn main() {}\n")
+        event = {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}}
+        self.assertTrue(ci_changes.only_experiments(
+            "pull_request", event, "refs/pull/1/merge", self.repository,
+        ))
+
+    def test_unknown_or_empty_ranges_are_never_experiments_only(self):
+        self.assertFalse(self.push_only_experiments(self.base, "1" * 40))
+        self.assertFalse(self.push_only_experiments(self.base, self.base))
+        for event_name, ref in (
+            ("push", "refs/tags/v0.1.1"),
+            ("workflow_dispatch", "refs/heads/main"),
+        ):
+            with self.subTest(event_name=event_name):
+                self.assertFalse(ci_changes.only_experiments(
+                    event_name, {}, ref, self.repository,
+                ))
+
     def test_documentation_and_branding_skip_full_ci(self):
         self.commit("README.md", "updated documentation\n")
         self.commit("docs/publishing.md", "release instructions\n")

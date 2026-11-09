@@ -1,0 +1,72 @@
+name: Experiments
+
+# Checks the crates and tools under experiments/. The main workflow skips its own
+# jobs when a push or PR changes only experiments/ files. Changes to shared source,
+# manifests or the lockfile run the main workflow, whose workspace jobs also build
+# and test the experiment crates.
+on:
+  pull_request:
+    paths:
+      - "experiments/**"
+      - .github/workflows/experiments.yml
+  push:
+    branches: [main]
+    paths:
+      - "experiments/**"
+      - .github/workflows/experiments.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experiments-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: "1.97.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TEST_THREADS: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # The tests start the agent against local endpoints only; never look up
+  # instance credentials.
+  AWS_EC2_METADATA_DISABLED: "true"
+
+jobs:
+  guards:
+    name: Guard experiments
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang libclang-dev cmake pkg-config
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: experiments-1.97.0
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check formatting
+        run: cargo +1.97.0 fmt -p polaris-guards -- --check
+      - name: Lint all targets
+        run: cargo +1.97.0 clippy -p polaris-guards --all-targets --locked -- -D warnings
+      - name: Test including doctests
+        run: cargo +1.97.0 test -p polaris-guards --locked
+
+  parity:
+    name: Comparison tool tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the comparison tool's tests
+        run: python3 -B experiments/parity/tests/test_parity.py
