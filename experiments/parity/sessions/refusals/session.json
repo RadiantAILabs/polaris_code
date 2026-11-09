@@ -1,5 +1,5 @@
 {
-  "description": "Refused calls: every kind of write to the protected test in one batch, then code that games the tests (two kinds only the moved setup refuses), then an honest fix.",
+  "description": "Refused calls: every kind of write to the protected test in one batch, then code that games the tests (a test-run check and an equality trick, refused by every setup that checks calls, and a branch on fixed input values, refused only by the moved setup), then an honest fix.",
   "workspace": "value",
   "exercises": ["refusal", "report"],
   "args": ["--protect", "test.py", "--test-command", "python3 -B test.py"],

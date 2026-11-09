@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 PROMPT_HEADING = re.compile(r"(?m)^## Rules for this task[ \t]*$")
 NEXT_HEADING = re.compile(r"(?m)^#{1,2} \S")
@@ -178,7 +178,9 @@ def split_rule_text(segment: Segment) -> tuple[str, list[RuleItem]]:
         end = after.start() if after else len(text)
         section = text[heading.start() : end].rstrip("\n")
         items.append(RuleItem("prompt", segment.where, segment.call_id, section))
-        return text[: heading.start()] + text[end:], items
+        # The blank lines that set the section off belong to it, not to the stock text.
+        before, after = text[: heading.start()].rstrip("\n"), text[end:].lstrip("\n")
+        return (before + "\n\n" + after if before and after else before + after), items
 
     if REFUSAL_START.match(text):
         return "", [RuleItem("refusal", segment.where, segment.call_id, text)]
@@ -210,6 +212,8 @@ class RequestView:
     params: dict[str, str]
     #: Map of call id to (tool name, hash of arguments), from the calls replayed.
     calls: dict[str, tuple[str, str]]
+    #: Each tool's definition as indented JSON, by name, to show how one changed.
+    tool_text: dict[str, str] = field(default_factory=dict)
 
 
 def view_request(request: dict, number: int, replacements: list[tuple[str, str]]) -> RequestView:
@@ -226,9 +230,11 @@ def view_request(request: dict, number: int, replacements: list[tuple[str, str]]
         if segment.item == "call":
             calls[segment.call_id] = (segment.name, short_hash(segment.text))
     tools = []
+    tool_text: dict[str, str] = {}
     for tool in body.get("tools") or []:
         name = tool.get("name") or (tool.get("function") or {}).get("name") or ""
         tools.append((name, short_hash(json.dumps(tool, sort_keys=True))))
+        tool_text[name] = json.dumps(tool, sort_keys=True, indent=1)
     params = {
         key: json.dumps(value, sort_keys=True)
         for key, value in body.items()
@@ -242,6 +248,7 @@ def view_request(request: dict, number: int, replacements: list[tuple[str, str]]
         tools=tools,
         params=params,
         calls=calls,
+        tool_text=tool_text,
     )
 
 

@@ -61,6 +61,46 @@ def text_diff(a: str, b: str, labels: tuple[str, str], limit: int = 24) -> list[
     return lines
 
 
+def line_change(a: str, b: str, context: int = 50) -> tuple[str, str]:
+    """The stretch where two similar lines differ, with some text on each side."""
+    start = 0
+    while start < min(len(a), len(b)) and a[start] == b[start]:
+        start += 1
+    end_a, end_b = len(a), len(b)
+    while end_a > start and end_b > start and a[end_a - 1] == b[end_b - 1]:
+        end_a -= 1
+        end_b -= 1
+    low = max(0, start - context)
+
+    def cut(text: str, end: int) -> str:
+        high = min(len(text), end + context)
+        return ("…" if low else "") + text[low:high] + ("…" if high < len(text) else "")
+
+    return cut(a, end_a), cut(b, end_b)
+
+
+def tool_changes(
+    name: str, a_text: str, b_text: str, labels: tuple[str, str], limit: int = 6
+) -> list[str]:
+    """How one tool definition differs, line by line, cut to ``limit`` lines."""
+    a_lines, b_lines = a_text.splitlines(), b_text.splitlines()
+    found: list[str] = []
+    matcher = difflib.SequenceMatcher(None, a_lines, b_lines, autojunk=False)
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "replace" and a2 - a1 == b2 - b1:
+            for x, y in zip(a_lines[a1:a2], b_lines[b1:b2]):
+                shown_a, shown_b = line_change(x.strip(), y.strip())
+                found.append(f"{name}: {labels[0]} {shown_a}  |  {labels[1]} {shown_b}")
+            continue
+        found.extend(f"{name}: only {labels[0]}: {clip(x.strip(), 140)}" for x in a_lines[a1:a2])
+        found.extend(f"{name}: only {labels[1]}: {clip(y.strip(), 140)}" for y in b_lines[b1:b2])
+    if len(found) > limit:
+        found = found[:limit] + [f"{name}: … {len(found) - limit} more changed lines"]
+    return found
+
+
 # -- model calls ----------------------------------------------------------------
 
 
@@ -297,6 +337,16 @@ def compare_stock(
             f"only {labels[0]}: {only_a or 'none'}; only {labels[1]}: {only_b or 'none'}; "
             f"changed: {changed or 'none'}"
         )
+        for name in changed:
+            lines.extend(
+                "    " + change
+                for change in tool_changes(
+                    name,
+                    first_a.tool_text.get(name, ""),
+                    first_b.tool_text.get(name, ""),
+                    labels,
+                )
+            )
     param_diffs = []
     for key in sorted(set(first_a.params) | set(first_b.params)):
         if first_a.params.get(key) != first_b.params.get(key):

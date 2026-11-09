@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
-from parity_tool import cli, extract, runner  # noqa: E402
+from parity_tool import cli, compare, extract, runner  # noqa: E402
 from parity_tool.endpoint import AUXILIARY_TEXT, Endpoint  # noqa: E402
 from parity_tool.network import NetworkGuard  # noqa: E402
 from parity_tool.session import SessionError, expand, load_session, load_sessions  # noqa: E402
@@ -157,6 +157,31 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(specs[1].args, ["--rules-arm", "steps", "--no-give-up"])
 
 
+class ToolChangeTests(unittest.TestCase):
+    LABELS = ("old", "new")
+
+    def test_the_differing_stretch_of_a_line_is_shown_with_its_surroundings(self):
+        a = "Edit a file. " + "x" * 120 + " Fails if the text is not found. " + "y" * 120
+        b = "Edit a file. " + "x" * 120 + " Fails if the text is found twice. " + "y" * 120
+        shown_a, shown_b = compare.line_change(a, b, context=10)
+        self.assertIn("not found", shown_a)
+        self.assertIn("found twice", shown_b)
+        self.assertLess(len(shown_a), len(a))
+        self.assertTrue(shown_a.startswith("…") and shown_a.endswith("…"))
+
+    def test_a_changed_description_and_an_added_property_are_listed(self):
+        old = '{"name": "glob", "description": "Find files", "parameters": {"a": 1}}'
+        new = '{"name": "glob", "description": "Find files fast", "parameters": {"a": 1, "b": 2}}'
+        def pretty(text):
+            return json.dumps(json.loads(text), sort_keys=True, indent=1)
+
+        found = compare.tool_changes("glob", pretty(old), pretty(new), self.LABELS)
+        joined = "\n".join(found)
+        self.assertIn("glob: old", joined)
+        self.assertIn("Find files fast", joined)
+        self.assertIn('only new: "b": 2', joined)
+
+
 class ExtractRecordHashTests(unittest.TestCase):
     def test_output_hash_is_left_out_when_the_output_names_a_temp_folder(self):
         replacements = [("/tmp/run1", "<run>")]
@@ -184,6 +209,13 @@ class ExtractTests(unittest.TestCase):
         self.assertTrue(items[0].text.endswith("3. Report what ran."))
         self.assertIn("## Other", rest)
         self.assertNotIn("Do not change tests", rest)
+
+    def test_a_prompt_section_at_the_end_leaves_no_blank_lines_behind(self):
+        text = f"You are an agent.\n\nWorking directory: x\n\n## Rules for this task\n\n{RULES}\n\n"
+        segment = extract.Segment("instructions", "instructions", "system", "", "", text)
+        rest, items = extract.split_rule_text(segment)
+        self.assertEqual(rest, "You are an agent.\n\nWorking directory: x")
+        self.assertEqual(len(items), 1)
 
     def test_refusal_is_a_whole_tool_result(self):
         segment = self.segment("Refused before it ran: no. Nothing was run.", "result", "tool", "call_1")
