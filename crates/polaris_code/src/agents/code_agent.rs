@@ -1502,6 +1502,7 @@ fn is_placeholder(value: &str) -> bool {
         || value.starts_with('<')
         || value.starts_with("{{")
         || value.starts_with("%(")
+        || value.starts_with(REDACTION_MARKER)
     {
         return true;
     }
@@ -2641,6 +2642,20 @@ mod tests {
         let scan = scan("naïve → PASSWORD=hunter2mots ← après");
         assert!(scan.text().starts_with("naïve → PASSWORD="));
         assert!(scan.text().ends_with(" ← après"));
+    }
+
+    #[test]
+    fn scanning_redacted_text_again_changes_nothing() {
+        let raw = "OPENAI_API_KEY=sk-proj-0Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn4Oo5Pp6";
+        let once = SecretRedactor::new(true).scan(raw).into_text();
+        assert_eq!(once, "OPENAI_API_KEY=[REDACTED:openai-api-key]");
+        let twice = SecretRedactor::new(true).scan(&once);
+        assert!(
+            twice.is_clean(),
+            "a marker is not a secret: {}",
+            twice.text()
+        );
+        assert_eq!(twice.text(), once);
     }
 
     #[test]
