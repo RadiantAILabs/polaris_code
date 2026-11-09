@@ -96,7 +96,7 @@ async fn interrupt_after_new_targets_only_the_current_session() {
     // Keep this behavioral proof coupled to the real composition root. The
     // regression originated there: the old wiring captured `session_id` once,
     // while navigation changed the driver's current identity later.
-    let composition = include_str!("../src/main.rs");
+    let composition = include_str!("../src/startup.rs");
     assert!(
         composition.contains("callback_navigation.get()"),
         "the terminal interrupt callback must resolve SessionNavigation at interrupt time"

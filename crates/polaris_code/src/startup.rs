@@ -78,9 +78,9 @@
 //! ```
 //!
 //! Adding steps to the coding loop works the same way; see
-//! [`CodeAgentSteps`]. The startup builds the
-//! agent from the completed step registry, so a host adds nothing to the graph
-//! itself, and the Graph tab shows the added steps.
+//! [`CodeAgentSteps`]. The startup builds the agent from the completed step
+//! registry, so a host adds nothing to the graph itself, and the Graph tab shows
+//! the added steps.
 //!
 //! # Plugin order
 //!
@@ -94,14 +94,13 @@
 //! 3. [`PermissionRulesPlugin`](crate::agents::permission_rules::PermissionRulesPlugin),
 //!    [`AutoReviewPlugin`](crate::agents::auto_review::AutoReviewPlugin) and the
 //!    web tool;
-//! 4. `PersistencePlugin`, `SessionsPlugin`, then
-//!    [`CodeAgentPlugin`] with the compaction
-//!    and progress plugins;
+//! 4. `PersistencePlugin`, `SessionsPlugin`, then [`CodeAgentPlugin`] with the
+//!    compaction and progress plugins;
 //! 5. topology selection: the evidence and task-queue plugins, the catalog and
 //!    the topology packs;
-//! 6. one front end: [`ExecIOPlugin`] when the run is
-//!    non-interactive; otherwise the approval plugin, the terminal UI, the Graph
-//!    and Help tabs and the conversation panel.
+//! 6. one front end: [`ExecIOPlugin`] when the run is non-interactive;
+//!    otherwise the approval plugin, the terminal UI, the Graph and Help tabs and
+//!    the conversation panel.
 //!
 //! A host's plugins are therefore added after all of these. Polaris builds
 //! plugins in an order that satisfies the dependencies each one declares, so a
