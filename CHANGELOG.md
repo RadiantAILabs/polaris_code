@@ -5,6 +5,9 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+Requires `polaris-tui` 0.4.0 and `polaris-ai` 0.9.1. Release `polaris-tui` 0.4.0 first.
+The next `polaris_code` release must be 0.5.0 because of the breaking API changes below.
+
 ### Added
 - Harbor adapter (`evals/packs/terminal_bench_harbor`): the agent keyword `image_input` (`auto`, `on` or `off`) is passed as `--image-input`, so a job can say whether the model takes images. Release 0.4.5 or later understands the flag.
 - ChatGPT provider with browser sign-in, account-specific models, and eligible ChatGPT plan usage.
@@ -15,6 +18,9 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 - `polaris login` without `--with-api-key` opens the full-screen setup. Line-based setup (`--with-api-key`, `accounts::run`) does not offer ChatGPT.
 - Connection setup saves provider, model, and region defaults while preserving a compatible saved user model. Scripted `--with-api-key` login requires an explicit provider.
 - `credentials.toml` is refused when it is a symlink on read as well as on write, and on Unix when it is not owned by the current user.
+- Project `.env` files may no longer set `BROWSER` or `PATH`. If a variable is absent from the launching environment, its presence in `.env` stops startup before any entries are applied; existing shell values still win. Set these variables in your shell before starting `polaris`.
+- For embedders, `SessionSettings::catalog()` now returns an owned `ModelCatalog` instead of a reference; `StoredCredentials` and `providers::Lookup` now require `Sync`; `Provider::ChatGpt` is added and `Provider::ALL` is now `[Provider; 5]`; `ReadyProvider::install` and `ReadyProvider::install_with_options` now return `ConnectionRuntime`.
+- For embedders, `accounts::register_login_command` is deprecated. New public APIs include the `connection` and `onboarding` modules, `terminal::SessionAccounts`, and `accounts::run_from_args_with_defaults`. `polaris-tui` adds `dialogs`, `TuiPanel::is_modal`, `TuiHandle::request_clipboard_copy`, `ConversationPanelPlugin::with_dialogs`, and `ConversationPanelPlugin::with_status_context`.
 
 ## [0.4.5] - 2026-11-10
 

@@ -180,14 +180,17 @@ pub(crate) fn load() -> (super::Cli, Startup) {
     let path = cwd.join(".env");
     let dotenv = match read_dotenv(&cwd).unwrap_or_else(|err| fail(err)) {
         Some(file) => {
-            let is_set = |key: &str| std::env::var_os(key).is_some();
+            // Match dotenvy's preservation check: a non-Unicode value would
+            // otherwise be replaced by the project file.
+            let is_set = |key: &str| std::env::var(key).is_ok();
             // The launch directory is project-controlled. Refuse before applying
             // anything, so the file cannot choose where the user's own
-            // configuration, credentials and trust decisions are read from.
+            // configuration, credentials and trust decisions are read from,
+            // or which programs connection setup launches.
             if let Some(key) = reserved_key(&file.entries, is_set) {
                 fail(format!(
-                    "{}: the environment file may not set {key}; set it in your shell or in \
-                     your user configuration instead",
+                    "{}: the environment file may not set {key}; set it in your shell before \
+                     starting polaris instead",
                     path.display()
                 ));
             }
@@ -210,9 +213,11 @@ pub(crate) fn load() -> (super::Cli, Startup) {
 }
 
 /// Variables a project's `.env` may not set: they choose where user-owned
-/// configuration lives or what permissions a session opens with, so only the
-/// user may set them.
+/// configuration lives, what permissions a session opens with, or which programs
+/// connection setup launches, so only the user may set them.
 const RESERVED_ENVIRONMENT: &[&str] = &[
+    "BROWSER",
+    "PATH",
     "POLARIS_CONFIG_DIR",
     "XDG_CONFIG_HOME",
     "HOME",
@@ -1163,6 +1168,37 @@ mod tests {
         }
         let ordinary = BTreeMap::from([("OPENAI_API_KEY".to_string(), "x".to_string())]);
         assert_eq!(reserved_key(&ordinary, |_| false), None);
+    }
+
+    #[test]
+    fn dotenv_cannot_choose_browser_or_executable_search_path() {
+        let fixture = Fixture::new();
+        for key in ["BROWSER", "PATH"] {
+            std::fs::write(
+                fixture.workspace.join(".env"),
+                format!("OPENAI_API_KEY=test-key\n{key}=./project-helper\n"),
+            )
+            .unwrap();
+            let file = read_dotenv(&fixture.workspace).unwrap().unwrap();
+            assert_eq!(reserved_key(&file.entries, |_| false), Some(key));
+            // A shell value (including an empty one) wins over the file.
+            assert_eq!(reserved_key(&file.entries, |name| name == key), None);
+        }
+        std::fs::write(
+            fixture.workspace.join(".env"),
+            "BROWSER=./project-helper\nPATH=./project-bin\n",
+        )
+        .unwrap();
+        let file = read_dotenv(&fixture.workspace).unwrap().unwrap();
+        assert_eq!(
+            reserved_key(&file.entries, |key| key == "PATH"),
+            Some("BROWSER")
+        );
+        assert_eq!(
+            reserved_key(&file.entries, |key| key == "BROWSER"),
+            Some("PATH")
+        );
+        assert_eq!(reserved_key(&file.entries, |_| true), None);
     }
 
     #[test]

@@ -93,8 +93,15 @@ Within `crates/polaris_code/src/`:
 
 - `main.rs` assembles the server, providers, front end, tools, and agent.
 - `providers.rs` owns the provider choice, its startup check (credentials,
-  region, endpoint), its model catalog, and `--list-models`. Adding a provider is
-  one variant and one arm in each `match` there.
+  region, endpoint), its model catalog, and `--list-models`. Adding a provider
+  updates its variant and matches there, the matches and wrapper macro in
+  `connection.rs`, `onboarding/setup.rs`'s `CONNECTIONS` and setup matches,
+  and the provider matches in `accounts.rs` and `terminal/account_commands.rs`.
+- `connection.rs` registers model routes and owns the switchable connection runtime.
+- `onboarding/` prepares connections through guided setup dialogs.
+- `chatgpt/` implements ChatGPT sign-in, account storage, and the plan-backed provider.
+- `redaction.rs` redacts credential-shaped text in tool output and diagnostics.
+- `private_file.rs` enforces private credential file reads and writes.
 - `credentials.rs` and `accounts.rs` own the credentials file and the
   `login`, `logout` and `login status` commands; `config_dir.rs` locates the
   user configuration directory.
