@@ -88,7 +88,8 @@ enum Kind {
 /// This is the typed payload the agent's dispatch looks for. It carries the
 /// whole picture as base64, so nothing but the dispatch may turn it into text:
 /// [`summary`](Self::summary) is the line the transcript, the log and the
-/// trajectory show instead.
+/// Session record show instead. Saved session history and the ATIF export keep
+/// the whole picture.
 ///
 /// # Examples
 ///
