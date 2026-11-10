@@ -15,6 +15,7 @@ use super::{AccountSummary, ChatGptError, ChatGptStore, ISSUER, RESOURCE, now};
 
 const SCOPES: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+const MAX_CALLBACK_CONNECTIONS: usize = 8;
 
 /// Handles `ChatGPT` authorization and token refresh against fixed `OpenAI` endpoints.
 #[derive(Clone)]
@@ -23,6 +24,8 @@ pub struct ChatGptClient {
     pub(super) inference: Client,
     pub(super) store: ChatGptStore,
     identity_keys: Arc<Mutex<IdentityKeys>>,
+    #[cfg(test)]
+    token_endpoint: Option<String>,
 }
 
 /// OIDC discovery and signing keys, cached for the client's lifetime.
@@ -116,7 +119,17 @@ impl ChatGptClient {
             inference,
             store,
             identity_keys: Arc::default(),
+            #[cfg(test)]
+            token_endpoint: None,
         })
+    }
+
+    fn token_endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.token_endpoint {
+            return endpoint;
+        }
+        "https://auth.openai.com/api/accounts/oauth/token"
     }
 
     /// Start browser sign-in for a saved registration, or a new one if `account` is `None`.
@@ -262,7 +275,7 @@ impl ChatGptClient {
             })?;
         let response = self
             .http
-            .post(format!("{ISSUER}/api/accounts/oauth/token"))
+            .post(self.token_endpoint())
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("client_id", client_id.as_str()),
@@ -393,6 +406,9 @@ impl ChatGptClient {
     }
 
     /// Return a valid access token, refreshing it under a cross-process lock if needed.
+    ///
+    /// # Panics
+    /// Panics if polled outside a `tokio` runtime.
     pub(super) async fn access_token(&self, id: &str) -> Result<String, ChatGptError> {
         // Finish saving a rotated refresh token even if the requesting turn is
         // cancelled: the previous token may already be invalid.
@@ -430,7 +446,7 @@ impl ChatGptClient {
         })?;
         let response = self
             .http
-            .post(format!("{ISSUER}/api/accounts/oauth/token"))
+            .post(self.token_endpoint())
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("client_id", id),
@@ -580,6 +596,9 @@ impl ChatGptClient {
     }
 
     /// Revoke a refresh token without delaying the caller. Best effort.
+    ///
+    /// # Panics
+    /// Panics if a token is supplied outside a `tokio` runtime.
     fn revoke_in_background(&self, id: &str, refresh: Option<String>) {
         if let Some(refresh) = refresh {
             let client = self.clone();
@@ -677,8 +696,8 @@ impl PendingLogin {
         self.url.as_str()
     }
 
-    /// Wait for the browser redirect. Connections are served concurrently, so
-    /// a stalled or unrelated client cannot delay the real callback.
+    /// Wait for the browser redirect. Connections are served concurrently with
+    /// a fixed cap and per-connection timeouts.
     async fn callback(&self) -> Result<BTreeMap<String, String>, ChatGptError> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         // Dropping the set aborts connections still being served.
@@ -688,6 +707,9 @@ impl PendingLogin {
                 accepted = self.listener.accept() => {
                     let (socket, _) = accepted?;
                     while connections.try_join_next().is_some() {}
+                    if connections.len() >= MAX_CALLBACK_CONNECTIONS {
+                        continue;
+                    }
                     let state = self.state.clone();
                     let sender = sender.clone();
                     connections.spawn(async move {
@@ -761,7 +783,14 @@ fn parse_callback(bytes: &[u8], state: &str) -> Result<BTreeMap<String, String>,
             return Err(());
         }
     }
-    if pairs.get("state").map(String::as_str) != Some(state) {
+    let supplied = pairs.get("state").ok_or(())?.as_bytes();
+    if supplied.len() != state.len()
+        || supplied
+            .iter()
+            .zip(state.as_bytes())
+            .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+            != 0
+    {
         return Err(());
     }
     Ok(pairs)
@@ -1089,6 +1118,404 @@ mod tests {
         store.write(records).expect("seed records");
         let client = ChatGptClient::new(store.clone()).expect("build client");
         (dir, store, client)
+    }
+
+    struct TokenFixture {
+        task: tokio::task::JoinHandle<String>,
+        received: tokio::sync::oneshot::Receiver<()>,
+        respond: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for TokenFixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl TokenFixture {
+        fn release(&mut self) {
+            self.respond
+                .take()
+                .unwrap()
+                .send(())
+                .expect("release response");
+        }
+
+        async fn finish(&mut self) -> BTreeMap<String, String> {
+            let request = within(&mut self.task).await.expect("token server finishes");
+            let (head, body) = request.split_once("\r\n\r\n").expect("HTTP request");
+            assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+            url_form(body)
+        }
+    }
+
+    fn url_form(body: &str) -> BTreeMap<String, String> {
+        Url::parse(&format!("http://localhost/?{body}"))
+            .unwrap()
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("operation completes promptly")
+    }
+
+    async fn token_service(
+        client: &mut ChatGptClient,
+        status: &str,
+        body: &serde_json::Value,
+    ) -> TokenFixture {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("http://{address}/token");
+        client.token_endpoint = Some(endpoint.clone());
+        client.http = Client::builder().no_proxy().build().unwrap();
+        // Invalid grants may trigger background revocation; keep that on loopback too.
+        client.cached_keys().discovery = Some(Arc::new(Discovery {
+            jwks_uri: endpoint.clone(),
+            revocation_endpoint: endpoint,
+        }));
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (received_tx, received) = tokio::sync::oneshot::channel();
+        let (respond, respond_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "request must be complete");
+                request.extend_from_slice(&buffer[..count]);
+                assert!(request.len() < 32 * 1024, "bounded fixture request");
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let head = std::str::from_utf8(&request[..end]).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = received_tx.send(());
+            respond_rx.await.expect("test releases response");
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        TokenFixture {
+            task,
+            received,
+            respond: Some(respond),
+        }
+    }
+
+    fn expired_records() -> Records {
+        let mut account = saved_account();
+        account.tokens.as_mut().unwrap().expires_at = now().saturating_sub(120);
+        Records {
+            active: Some(account.client_id.clone()),
+            accounts: vec![account],
+            ..Records::default()
+        }
+    }
+
+    fn assert_permanent(error: ChatGptError) {
+        assert!(
+            !error.is_network(),
+            "identity or credential rejection is permanent: {error}"
+        );
+        assert!(!crate::agents::failure::classify(&error.into_generation()).is_transient());
+    }
+
+    async fn browser_callback(pending: &PendingLogin) -> tokio::net::TcpStream {
+        let mut socket = tokio::net::TcpStream::connect(pending.listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        socket.write_all(format!("GET /auth/callback?state={}&code=one-use-code&client_id=registered-client HTTP/1.1\r\n\r\n", pending.state).as_bytes()).await.unwrap();
+        socket
+    }
+
+    #[tokio::test]
+    async fn complete_exchanges_code_and_persists_only_the_verified_account() {
+        let (jwks, encoding) = signing_key();
+        for case in ["new", "returning", "nonce-mismatch", "subject-mismatch"] {
+            let returning = matches!(case, "returning" | "subject-mismatch");
+            let records = if returning {
+                Records {
+                    accounts: vec![saved_account()],
+                    ..Records::default()
+                }
+            } else {
+                Records::default()
+            };
+            let (_dir, store, mut client) = client_with(&records).await;
+            client.cached_keys().keys = Some(Arc::new(jwks.clone()));
+            let pending = client
+                .begin(returning.then_some("registered-client"), false)
+                .await
+                .unwrap();
+            let before = serde_json::to_value(store.read().unwrap()).unwrap();
+            let nonce = if case == "nonce-mismatch" {
+                "other-attempt"
+            } else {
+                &pending.nonce
+            };
+            let subject = if case == "subject-mismatch" {
+                "different-user"
+            } else {
+                "original-user"
+            };
+            let id_token = sign(
+                &serde_json::json!({"sub":subject,"email":"verified@example.test","aud":"registered-client","iss":ISSUER,"exp":now()+300,"nonce":nonce}),
+                &encoding,
+            );
+            let mut server = token_service(
+                &mut client,
+                "200 OK",
+                &serde_json::json!({
+                    "access_token":"new-access","refresh_token":"new-refresh","id_token":id_token,
+                    "scope":SCOPES,"token_type":"Bearer","expires_in":300
+                }),
+            )
+            .await;
+            server.release();
+            let verifier = pending.verifier.clone();
+            let redirect = pending.redirect_uri.clone();
+            let _browser = browser_callback(&pending).await;
+            let result = within(client.complete(pending)).await;
+            let form = server.finish().await;
+            assert_eq!(
+                form,
+                BTreeMap::from([
+                    ("grant_type".into(), "authorization_code".into()),
+                    ("client_id".into(), "registered-client".into()),
+                    ("code".into(), "one-use-code".into()),
+                    ("code_verifier".into(), verifier),
+                    ("redirect_uri".into(), redirect),
+                    ("resource".into(), RESOURCE.into()),
+                ])
+            );
+            let persisted = store.read_async().await.unwrap();
+            if matches!(case, "nonce-mismatch" | "subject-mismatch") {
+                let error = result.expect_err("unbound identity must be rejected");
+                assert!(error.to_string().contains(if case == "nonce-mismatch" {
+                    "nonce did not match"
+                } else {
+                    "different ChatGPT identity"
+                }));
+                assert_permanent(error);
+                assert_eq!(
+                    serde_json::to_value(&persisted).unwrap(),
+                    before,
+                    "{case}: no credentials are persisted"
+                );
+                continue;
+            }
+            let summary = result.expect("verified login completes");
+            assert_eq!(summary.id, "registered-client");
+            assert!(summary.signed_in && summary.plan_enabled);
+            assert!(
+                !summary.active,
+                "sign-in does not implicitly select the account"
+            );
+            assert_eq!(
+                persisted.accounts.len(),
+                1,
+                "returning sign-in replaces its registration"
+            );
+            assert_eq!(persisted.active, None);
+            let account = &persisted.accounts[0];
+            assert_eq!(account.subject, "original-user");
+            assert_eq!(account.email, "verified@example.test");
+            assert!(!account.identity_pending);
+            assert_eq!(account.usage_acknowledged, returning);
+            let tokens = account.tokens.as_ref().unwrap();
+            assert_eq!(tokens.access_token, "new-access");
+            assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh"));
+            assert_eq!(tokens.id_token.as_deref(), Some(id_token.as_str()));
+            assert_eq!(tokens.scope, SCOPES);
+            assert!(tokens.expires_at > now());
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_access_refreshes_and_persists_replaced_or_omitted_fields() {
+        let (jwks, encoding) = signing_key();
+        for replacement in [Some("rotated-refresh"), None] {
+            let mut records = expired_records();
+            records.accounts[0].tokens.as_mut().unwrap().id_token = Some("old-id-token".into());
+            let (_dir, store, mut client) = client_with(&records).await;
+            client.cached_keys().keys = Some(Arc::new(jwks.clone()));
+            let mut body = serde_json::json!({"access_token":"rotated-access","token_type":"Bearer","expires_in":300,"earliest_refresh_at":now()+120});
+            let id_token = sign(
+                &serde_json::json!({"sub":"original-user","aud":"registered-client","iss":ISSUER,"exp":now()+300}),
+                &encoding,
+            );
+            if let Some(refresh) = replacement {
+                body["refresh_token"] = serde_json::json!(refresh);
+                body["id_token"] = serde_json::json!(id_token);
+                body["scope"] = serde_json::json!(SCOPES);
+            }
+            let mut server = token_service(&mut client, "200 OK", &body).await;
+            server.release();
+            assert_eq!(
+                within(client.access_token("registered-client"))
+                    .await
+                    .unwrap(),
+                "rotated-access"
+            );
+            assert_eq!(
+                server.finish().await,
+                BTreeMap::from([
+                    ("grant_type".into(), "refresh_token".into()),
+                    ("client_id".into(), "registered-client".into()),
+                    ("refresh_token".into(), "old-refresh".into()),
+                    ("resource".into(), RESOURCE.into()),
+                ])
+            );
+            let persisted = store.read_async().await.unwrap();
+            assert_eq!(persisted.active, records.active);
+            let account = &persisted.accounts[0];
+            assert!(
+                !account.identity_pending,
+                "rotated identity was verified before serving access"
+            );
+            assert_eq!(account.subject, "original-user");
+            let tokens = account.tokens.as_ref().unwrap();
+            assert_eq!(tokens.access_token, "rotated-access");
+            assert_eq!(
+                tokens.refresh_token.as_deref(),
+                Some(replacement.unwrap_or("old-refresh"))
+            );
+            assert_eq!(
+                tokens.id_token.as_deref(),
+                Some(if replacement.is_some() {
+                    id_token.as_str()
+                } else {
+                    "old-id-token"
+                })
+            );
+            assert_eq!(
+                tokens.scope,
+                if replacement.is_some() {
+                    SCOPES
+                } else {
+                    super::super::PLAN_SCOPE
+                }
+            );
+            assert!(tokens.expires_at > now() + 60);
+            assert_eq!(
+                tokens.earliest_refresh_at,
+                body["earliest_refresh_at"].as_u64().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_keeps_old_credentials_or_signs_out_on_invalid_grant() {
+        for (status, code, transient) in [
+            ("503 Service Unavailable", "server_error", true),
+            ("429 Too Many Requests", "rate_limited", true),
+            ("400 Bad Request", "invalid_grant", false),
+        ] {
+            let records = expired_records();
+            let before = serde_json::to_value(&records).unwrap();
+            let (_dir, store, mut client) = client_with(&records).await;
+            let mut server =
+                token_service(&mut client, status, &serde_json::json!({"error":code})).await;
+            server.release();
+            let error = within(client.access_token("registered-client"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.is_expired(), !transient);
+            assert_eq!(error.is_network(), transient);
+            assert_eq!(
+                crate::agents::failure::classify(&error.into_generation()).is_transient(),
+                transient
+            );
+            server.finish().await;
+            let persisted = store.read_async().await.unwrap();
+            if transient {
+                assert_eq!(
+                    serde_json::to_value(&persisted).unwrap(),
+                    before,
+                    "all old credentials are kept"
+                );
+            } else {
+                assert_eq!(persisted.active, None);
+                assert_eq!(persisted.accounts.len(), 1);
+                assert_eq!(persisted.accounts[0].subject, "original-user");
+                assert_eq!(persisted.accounts[0].client_id, "registered-client");
+                assert!(persisted.accounts[0].tokens.is_none());
+                assert!(!persisted.accounts[0].identity_pending);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_expired_access_callers_share_one_refresh() {
+        let (_dir, store, mut client) = client_with(&expired_records()).await;
+        let mut server = token_service(&mut client, "200 OK", &serde_json::json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":300})).await;
+        server.release();
+        let other = client.clone();
+        let (first, second) = within(async {
+            tokio::join!(
+                client.access_token("registered-client"),
+                other.access_token("registered-client")
+            )
+        })
+        .await;
+        assert_eq!(first.unwrap(), "rotated-access");
+        assert_eq!(second.unwrap(), "rotated-access");
+        server.finish().await;
+        assert_eq!(
+            refresh_token(&store.read_async().await.unwrap()),
+            Some("rotated-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_access_caller_still_saves_server_rotation() {
+        let (_dir, store, mut client) = client_with(&expired_records()).await;
+        let mut server = token_service(&mut client, "200 OK", &serde_json::json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":300})).await;
+        let caller = tokio::spawn(async move { client.access_token("registered-client").await });
+        within(&mut server.received).await.unwrap();
+        // The service consumed the old refresh token; delay delivery of its replacement.
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        server.release();
+        server.finish().await;
+        within(async {
+            loop {
+                let records = store.read_async().await.unwrap();
+                if refresh_token(&records) == Some("rotated-refresh") {
+                    assert_eq!(
+                        valid_access(&records, "registered-client")
+                            .unwrap()
+                            .as_deref(),
+                        Some("rotated-access")
+                    );
+                    assert!(!records.accounts[0].identity_pending);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
     }
 
     fn pending_records() -> Records {
@@ -1494,9 +1921,10 @@ mod tests {
             Some("attempt-nonce"),
             "the nonce is read"
         );
-        assert!(
-            validate_identity(&token, "another-client", &jwks, current).is_err(),
-            "the audience must be the issued client"
+        assert_permanent(
+            validate_identity(&token, "another-client", &jwks, current)
+                .err()
+                .expect("the audience must be the issued client"),
         );
         for (field, value) in [
             ("iss", serde_json::json!("https://example.test")),
@@ -1506,9 +1934,10 @@ mod tests {
             let mut invalid = claims.clone();
             invalid[field] = value;
             let signed = sign(&invalid, &encoding);
-            assert!(
-                validate_identity(&signed, "issued-client", &jwks, current).is_err(),
-                "a sign-in must validate {field}"
+            assert_permanent(
+                validate_identity(&signed, "issued-client", &jwks, current)
+                    .err()
+                    .unwrap_or_else(|| panic!("a sign-in must validate {field}")),
             );
             let recovered = validate_identity(
                 &signed,
@@ -1523,16 +1952,21 @@ mod tests {
                     "pending rotations may recover after the ID token expires"
                 );
             } else {
-                assert!(recovered.is_err(), "recovery must still validate {field}");
+                assert_permanent(
+                    recovered
+                        .err()
+                        .unwrap_or_else(|| panic!("recovery must still validate {field}")),
+                );
             }
         }
         let mut altered = token.into_bytes();
         let index = altered.len() - 8;
         altered[index] = if altered[index] == b'A' { b'B' } else { b'A' };
         let altered = String::from_utf8(altered).expect("token stays ASCII");
-        assert!(
-            validate_identity(&altered, "issued-client", &jwks, current).is_err(),
-            "a tampered signature is rejected"
+        assert_permanent(
+            validate_identity(&altered, "issued-client", &jwks, current)
+                .err()
+                .expect("a tampered signature is rejected"),
         );
     }
 
@@ -1557,6 +1991,10 @@ mod tests {
         for target in [
             "/callback?state=expected&code=x",
             "/auth/callback?state=wrong&code=x",
+            "/auth/callback?state=expectee&code=x",
+            "/auth/callback?state=expecte&code=x",
+            "/auth/callback?state=expectedx&code=x",
+            "/auth/callback?code=x",
             "/auth/callback?state=expected&state=wrong&code=x",
         ] {
             assert!(
@@ -1640,6 +2078,52 @@ mod tests {
             response.starts_with(b"HTTP/1.1 200"),
             "the browser is told sign-in succeeded"
         );
+    }
+
+    #[tokio::test]
+    async fn callback_caps_stalled_connections_and_recovers_for_the_browser() {
+        let (_dir, _store, client) = client_with(&Records::default()).await;
+        let pending = client.begin(None, false).await.unwrap();
+        let address = pending.listener.local_addr().unwrap();
+        let state = pending.state.clone();
+        let callback = tokio::spawn(async move { pending.callback().await });
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+            stalled.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        for _ in 0..3 {
+            let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+                    .await
+                    .expect("excess connections close before the two-second read timeout")
+                    .unwrap(),
+                0
+            );
+        }
+        // Free one admitted slot while the other peers remain stalled.
+        let mut finished = stalled.pop().unwrap();
+        finished
+            .write_all(b"GET /auth/callback?state=wrong&code=x HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        within(finished.read_to_end(&mut response)).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400"));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(
+                format!("GET /auth/callback?state={state}&code=real-code HTTP/1.1\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        response.clear();
+        within(browser.read_to_end(&mut response)).await.unwrap();
+        let result = within(callback).await.unwrap().unwrap();
+        assert_eq!(result["code"], "real-code");
+        assert!(response.starts_with(b"HTTP/1.1 200"));
     }
 
     #[tokio::test]

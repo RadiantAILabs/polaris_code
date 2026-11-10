@@ -704,8 +704,16 @@ mod tests {
         }
     }
 
-    /// Serve one HTTP response with `head` and `body` and return what a client receives.
-    async fn reply(head: &str, body: &str) -> reqwest::Response {
+    struct ReplyGuard(tokio::task::JoinHandle<()>);
+
+    impl Drop for ReplyGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// Serve one HTTP response with `head` and `body` and return it with its task guard.
+    async fn reply(head: &str, body: &str) -> (reqwest::Response, ReplyGuard) {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind test server");
@@ -714,7 +722,7 @@ mod tests {
             "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        tokio::spawn(async move {
+        let guard = ReplyGuard(tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept request");
             let mut request = [0; 4096];
             let _ = socket.read(&mut request).await.expect("read request");
@@ -722,17 +730,43 @@ mod tests {
                 .write_all(response.as_bytes())
                 .await
                 .expect("write response");
-        });
-        reqwest::get(format!("http://{address}"))
+        }));
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
             .await
-            .expect("reach test server")
+            .expect("reach test server");
+        (response, guard)
     }
 
     async fn stream_error(head: &str, body: &str) -> GenerationError {
-        response_stream(reply(head, body).await, "scope:".into())
+        let (response, mut guard) = reply(head, body).await;
+        let error = response_stream(response, "scope:".into())
             .await
             .err()
-            .expect("a failed status is an error")
+            .expect("a failed status is an error");
+        (&mut guard.0).await.expect("server finishes");
+        error
+    }
+
+    #[tokio::test]
+    async fn bounded_json_accepts_one_mib_and_rejects_one_byte_more() {
+        for size in [1024 * 1024, 1024 * 1024 + 1] {
+            let body = format!("\"{}\"", "x".repeat(size - 2));
+            let (response, mut guard) = reply("200 OK", &body).await;
+            let result = super::super::http::bounded_json::<String>(response).await;
+            (&mut guard.0).await.expect("server finishes");
+            if size == 1024 * 1024 {
+                assert_eq!(result.expect("the limit is inclusive").len(), size - 2);
+            } else {
+                assert!(
+                    matches!(result, Err(GenerationError::InvalidResponse(message)) if message == "the service JSON response exceeds 1 MiB")
+                );
+            }
+        }
     }
 
     #[test]
@@ -942,9 +976,16 @@ mod tests {
             Some(40),
             "cached input is reported"
         );
-        let AssistantBlock::ToolCall(call) = &response.content[1] else {
-            panic!("the tool call is retained after the text");
+        let [AssistantBlock::Text(text), AssistantBlock::ToolCall(call)] =
+            response.content.as_slice()
+        else {
+            panic!("the complete block sequence is text followed by a tool call");
         };
+        assert_eq!(text.text, "Hello", "the decoded text is kept");
+        assert_eq!(call.function.name, "read_file", "the tool name is kept");
+        assert_eq!(response.id.as_deref(), Some("resp-1"));
+        assert_eq!(response.model.as_deref(), Some("model-1"));
+        assert_eq!(response.usage.output_tokens, Some(12));
         assert_eq!(
             call.call_id.as_deref(),
             Some("call-1"),
@@ -953,6 +994,19 @@ mod tests {
         assert_eq!(
             call.function.arguments["path"], "README.md",
             "arguments are assembled"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoder_completes_text_only_with_end_turn() {
+        let response = collect(decode(&mut Decoder::default(), &[
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"Hello"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}),
+            json!({"type":"response.completed","response":{}}),
+        ])).await;
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(
+            matches!(response.content.as_slice(), [AssistantBlock::Text(text)] if text.text == "Hello")
         );
     }
 
@@ -1116,13 +1170,12 @@ mod tests {
     #[tokio::test]
     async fn response_stream_fails_without_completion() {
         let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
-        let stream = response_stream(
-            reply("200 OK\r\nContent-Type: text/event-stream", body).await,
-            "scope:".into(),
-        )
-        .await
-        .expect("a success status streams");
+        let (response, mut guard) = reply("200 OK\r\nContent-Type: text/event-stream", body).await;
+        let stream = response_stream(response, "scope:".into())
+            .await
+            .expect("a success status streams");
         let events: Vec<_> = stream.collect().await;
+        (&mut guard.0).await.expect("server finishes");
         assert!(
             matches!(
                 events.last(),

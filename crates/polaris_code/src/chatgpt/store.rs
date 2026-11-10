@@ -395,6 +395,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_refuses_ineligible_accounts_without_changing_records() {
+        for reason in ["unknown", "signed-out", "identity-pending", "missing-plan"] {
+            let (_dir, store) = two_account_store().await;
+            store
+                .select("client-one")
+                .await
+                .expect("select original account");
+            let mut records = store.read().expect("read accounts");
+            let candidate = &mut records.accounts[1];
+            match reason {
+                "signed-out" => candidate.tokens = None,
+                "identity-pending" => candidate.identity_pending = true,
+                "missing-plan" => {
+                    candidate.tokens.as_mut().unwrap().scope = "openid profile".into()
+                }
+                _ => {}
+            }
+            store.write(&records).expect("save candidate state");
+            let before = std::fs::read(&store.path).expect("saved records");
+            let id = if reason == "unknown" {
+                "unknown-client"
+            } else {
+                "client-two"
+            };
+            let error = store
+                .select(id)
+                .await
+                .expect_err("ineligible account is refused");
+            assert_eq!(
+                error.to_string(),
+                "sign in and enable ChatGPT plan usage for this account first",
+                "{reason}"
+            );
+            assert_eq!(
+                store.read().unwrap().active.as_deref(),
+                Some("client-one"),
+                "{reason}: previous selection is retained"
+            );
+            assert_eq!(
+                std::fs::read(&store.path).unwrap(),
+                before,
+                "{reason}: every stored record is unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn acknowledge_usage_is_per_registration() {
         let (_dir, store) = two_account_store().await;
         store
