@@ -61,6 +61,39 @@ struct Active {
     account_id: Option<String>,
 }
 
+/// Builds the provider that serves a prepared connection.
+type ProviderFactory =
+    dyn Fn(&ReadyProvider, NonZeroU32, &PriceStore) -> Arc<dyn DynLlmProvider> + Send + Sync;
+
+/// A connection for a provider without a registered route was activated.
+///
+/// Returned by [`ConnectionRuntime::activate`], which leaves the active
+/// connection unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnregisteredRouteError {
+    provider: Provider,
+}
+
+impl UnregisteredRouteError {
+    /// The provider whose route is not registered.
+    #[must_use]
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+}
+
+impl std::fmt::Display for UnregisteredRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no model route is registered for the {} connection",
+            self.provider.name()
+        )
+    }
+}
+
+impl std::error::Error for UnregisteredRouteError {}
+
 /// Holds the active connection for registered model routes.
 ///
 /// The host switches connections between turns. Requests already in progress
@@ -74,6 +107,8 @@ pub struct ConnectionRuntime {
     pricing: PriceStore,
     usage_paused: Arc<AtomicBool>,
     usage_notice: Arc<AtomicBool>,
+    routes: Arc<RwLock<Vec<Provider>>>,
+    factory: Arc<ProviderFactory>,
 }
 
 impl std::fmt::Debug for ConnectionRuntime {
@@ -88,46 +123,101 @@ impl std::fmt::Debug for ConnectionRuntime {
 
 impl ConnectionRuntime {
     /// Create a runtime with the given connection active.
+    ///
+    /// Only that connection's provider has a route until
+    /// [`ConnectionPlugin::with_switching`] registers the others.
     pub fn new(ready: &ReadyProvider, max_tokens: NonZeroU32, pricing: PriceStore) -> Self {
+        Self::with_factory(
+            ready,
+            max_tokens,
+            pricing,
+            Arc::new(|ready, max_tokens, pricing| {
+                ready.implementation(max_tokens, pricing.clone())
+            }),
+        )
+    }
+
+    /// Like [`Self::new`], with `factory` building each connection's provider.
+    fn with_factory(
+        ready: &ReadyProvider,
+        max_tokens: NonZeroU32,
+        pricing: PriceStore,
+        factory: Arc<ProviderFactory>,
+    ) -> Self {
         Self {
-            active: Arc::new(RwLock::new(Self::active_for(ready, max_tokens, &pricing))),
+            active: Arc::new(RwLock::new(Self::active_for(
+                &*factory, ready, max_tokens, &pricing,
+            ))),
             max_tokens,
             pricing,
             usage_paused: Arc::default(),
             usage_notice: Arc::default(),
+            routes: Arc::new(RwLock::new(vec![ready.report().provider()])),
+            factory,
         }
     }
 
-    fn active_for(ready: &ReadyProvider, max_tokens: NonZeroU32, pricing: &PriceStore) -> Active {
+    fn active_for(
+        factory: &ProviderFactory,
+        ready: &ReadyProvider,
+        max_tokens: NonZeroU32,
+        pricing: &PriceStore,
+    ) -> Active {
         Active {
-            provider: Some(ready.implementation(max_tokens, pricing.clone())),
+            provider: Some(factory(ready, max_tokens, pricing)),
             report: ready.report().clone(),
             account_id: ready.chatgpt_account_id().map(str::to_string),
         }
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Active> {
-        self.active.read().unwrap_or_else(|e| e.into_inner())
+        self.active.read().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// The providers whose routes this runtime serves.
+    fn routes(&self) -> Vec<Provider> {
+        self.routes
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    /// Whether `provider` has a registered route, so it can be activated.
+    pub(crate) fn has_route(&self, provider: Provider) -> bool {
+        self.routes
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .contains(&provider)
     }
 
     /// Replace the active connection and clear any usage-limit pause.
     /// Call between turns, after setup and validation have completed.
-    /// The destination must be among the routes registered for this runtime.
-    /// Use [`ConnectionPlugin::with_switching`] to share it across all built-in
-    /// routes. Handles from [`ReadyProvider::install`] can replace an account
-    /// or credentials only for the same [`Provider`].
-    pub fn activate(&self, ready: &ReadyProvider) {
-        let active = Self::active_for(ready, self.max_tokens, &self.pricing);
-        *self.active.write().unwrap_or_else(|e| e.into_inner()) = active;
+    /// Use [`ConnectionPlugin::with_switching`] to register the routes of all
+    /// built-in providers. Handles from [`ReadyProvider::install`] serve only
+    /// their own [`Provider`], so they can replace its account or credentials
+    /// but cannot move to another provider.
+    ///
+    /// # Errors
+    /// [`UnregisteredRouteError`] when the destination provider has no route
+    /// registered for this runtime. The active connection and any usage-limit
+    /// pause are left unchanged.
+    pub fn activate(&self, ready: &ReadyProvider) -> Result<(), UnregisteredRouteError> {
+        let provider = ready.report().provider();
+        if !self.has_route(provider) {
+            return Err(UnregisteredRouteError { provider });
+        }
+        let active = Self::active_for(&*self.factory, ready, self.max_tokens, &self.pricing);
+        *self.active.write().unwrap_or_else(|err| err.into_inner()) = active;
         self.usage_paused.store(false, Ordering::Release);
         self.usage_notice.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Stop serving model requests, even if environment credentials remain set.
     pub fn disconnect(&self) {
         self.active
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|err| err.into_inner())
             .provider = None;
     }
 
@@ -198,14 +288,32 @@ impl ConnectionRuntime {
 
 /// Registers model providers that share a switchable connection.
 ///
+/// Add it when a session should move to another account or provider between
+/// turns without restarting. See the
+/// [integration guide](https://github.com/RadiantAILabs/polaris_code/blob/main/docs/reference/guide.md)
+/// for how it fits with the account commands.
+///
 /// # Resources Provided
-/// None. The caller retains a [`ConnectionRuntime`] handle.
+///
+/// | Resource | Scope | Description |
+/// |----------|-------|-------------|
+/// | _none_ | — | Registers providers with the [`ModelRegistry`] that [`ModelsPlugin`](polaris::models::ModelsPlugin) owns. The caller retains a [`ConnectionRuntime`] handle. |
 ///
 /// # APIs Provided
-/// None. Extends [`ModelRegistry`].
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | _none_ | Contributes providers to [`ModelRegistry`] rather than publishing an API. |
 ///
 /// # Dependencies
-/// Requires the [`ModelRegistry`] capability from `ModelsPlugin`.
+/// Requires the [`ModelRegistry`] capability from [`ModelsPlugin`](polaris::models::ModelsPlugin).
+///
+/// # Extends
+///
+/// - [`ModelsPlugin`](polaris::models::ModelsPlugin) / [`ModelRegistry`]:
+///   registers one forwarding route for the initial connection's provider, or,
+///   with [`Self::with_switching`], one for every built-in provider. Each route
+///   serves requests only while its provider is the active connection.
 ///
 /// # Lifecycle
 /// Registers the initial provider at build time. [`Self::with_switching`] also
@@ -246,7 +354,7 @@ impl ConnectionRuntime {
 ///
 /// runtime.disconnect();
 /// assert!(!runtime.is_connected());
-/// runtime.activate(&ready);
+/// runtime.activate(&ready)?;
 /// assert!(runtime.is_connected());
 /// # Ok(())
 /// # }
@@ -255,7 +363,6 @@ impl ConnectionRuntime {
 pub struct ConnectionPlugin {
     runtime: ConnectionRuntime,
     options: ModelRunOptions,
-    routes: Vec<Provider>,
 }
 
 impl ConnectionPlugin {
@@ -264,15 +371,37 @@ impl ConnectionPlugin {
         Self {
             runtime: ConnectionRuntime::new(ready, max_tokens, pricing),
             options: ModelRunOptions::default(),
-            routes: vec![ready.report().provider()],
+        }
+    }
+
+    /// A plugin whose connections build their provider with `factory`, so tests
+    /// can observe which connection serves a request.
+    #[cfg(test)]
+    pub(crate) fn with_test_factory(
+        ready: &ReadyProvider,
+        factory: impl Fn(&ReadyProvider) -> Arc<dyn DynLlmProvider> + Send + Sync + 'static,
+    ) -> Self {
+        let runtime = ConnectionRuntime::with_factory(
+            ready,
+            NonZeroU32::MIN,
+            PriceStore::builtin(),
+            Arc::new(move |ready, _, _| factory(ready)),
+        );
+        Self {
+            runtime,
+            options: ModelRunOptions::default(),
         }
     }
 
     /// Register all built-in provider names to allow connection switching.
     /// These names must not be registered by another plugin.
     #[must_use]
-    pub fn with_switching(mut self) -> Self {
-        self.routes = Provider::ALL.to_vec();
+    pub fn with_switching(self) -> Self {
+        *self
+            .runtime
+            .routes
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = Provider::ALL.to_vec();
         self
     }
 
@@ -289,7 +418,7 @@ impl ConnectionPlugin {
     }
 
     fn register_routes(&self, registry: &mut ModelRegistry) {
-        for &route in &self.routes {
+        for route in self.runtime.routes() {
             let provider: Arc<dyn DynLlmProvider> = Arc::new(Route {
                 route,
                 runtime: self.runtime.clone(),
@@ -440,9 +569,10 @@ impl LlmProvider for Route {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     use polaris::models::ModelsPlugin;
-    use polaris::models::llm::ReasoningBlock;
+    use polaris::models::llm::{ReasoningBlock, StreamEvent};
 
     use super::*;
     use crate::chatgpt::responses::{PlanUsageLimit, REASONING_PREFIX};
@@ -588,24 +718,51 @@ mod tests {
         );
     }
 
+    /// Why `runtime` refuses requests on `route`.
+    fn refusal(runtime: &ConnectionRuntime, route: Provider) -> GenerationError {
+        runtime
+            .provider(route)
+            .err()
+            .expect("the route refuses requests")
+    }
+
     #[tokio::test]
     async fn runtime_serves_only_the_active_route_and_fails_closed_when_signed_out() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let runtime = runtime_for(&dir, Provider::OpenAi).await;
+        runtime
+            .routes
+            .write()
+            .expect("routes lock")
+            .push(Provider::Anthropic);
         assert!(
             runtime.provider(Provider::OpenAi).is_ok(),
             "the active route serves"
         );
         assert!(
-            runtime.provider(Provider::Anthropic).is_err(),
-            "an inactive route refuses"
+            matches!(
+                refusal(&runtime, Provider::Anthropic),
+                GenerationError::InvalidRequest(message)
+                    if message.contains("inactive Anthropic connection")
+            ),
+            "an inactive route is an invalid request that names the route"
         );
 
         runtime.disconnect();
         assert!(!runtime.is_connected(), "disconnect clears the connection");
         assert!(
-            runtime.provider(Provider::OpenAi).is_err(),
-            "a signed-out route refuses"
+            matches!(
+                refusal(&runtime, Provider::OpenAi),
+                GenerationError::Auth(message) if message.contains("no connection")
+            ),
+            "a signed-out route is an authentication failure"
+        );
+        assert!(
+            matches!(
+                refusal(&runtime, Provider::Anthropic),
+                GenerationError::InvalidRequest(_)
+            ),
+            "a signed-out runtime still reports other routes as inactive"
         );
         assert_eq!(
             runtime.report().credential_source(),
@@ -613,14 +770,55 @@ mod tests {
             "the report says the session is signed out"
         );
 
-        runtime.activate(&ready_for(&dir, Provider::Anthropic).await);
+        runtime
+            .activate(&ready_for(&dir, Provider::Anthropic).await)
+            .expect("the Anthropic route is registered");
         assert!(
             runtime.provider(Provider::Anthropic).is_ok(),
             "the new route serves"
         );
         assert!(
-            runtime.provider(Provider::OpenAi).is_err(),
-            "the old route refuses"
+            matches!(
+                refusal(&runtime, Provider::OpenAi),
+                GenerationError::InvalidRequest(message)
+                    if message.contains("inactive OpenAI connection")
+            ),
+            "the old route refuses as inactive"
+        );
+    }
+
+    #[tokio::test]
+    async fn activating_an_unregistered_route_fails_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let runtime = runtime_for(&dir, Provider::OpenAi).await;
+        runtime.observe(&Err::<(), _>(plan_limit()));
+        let anthropic = ready_for(&dir, Provider::Anthropic).await;
+
+        let error = runtime
+            .activate(&anthropic)
+            .expect_err("a runtime registered for one provider refuses another");
+        assert_eq!(error.provider(), Provider::Anthropic);
+        assert_eq!(
+            error.to_string(),
+            "no model route is registered for the Anthropic connection"
+        );
+        assert_eq!(runtime.report().provider(), Provider::OpenAi);
+        assert!(
+            runtime.is_usage_paused(),
+            "a refused activation does not resume a paused connection"
+        );
+        assert!(
+            runtime.take_usage_notice(),
+            "a refused activation keeps the pending notice"
+        );
+
+        let own = ready_for(&dir, Provider::OpenAi).await;
+        runtime
+            .activate(&own)
+            .expect("the registered provider can reconnect");
+        assert!(
+            !runtime.is_usage_paused(),
+            "activating a registered provider resumes"
         );
     }
 
@@ -640,13 +838,18 @@ mod tests {
         assert!(runtime.is_usage_paused(), "a plan limit pauses requests");
         assert!(runtime.is_connected(), "a pause does not disconnect");
         assert!(
-            runtime.provider(Provider::OpenAi).is_err(),
-            "paused requests are refused"
+            matches!(
+                refusal(&runtime, Provider::OpenAi),
+                GenerationError::InvalidRequest(message) if message.contains("paused")
+            ),
+            "paused requests are refused with the pause as the reason"
         );
         assert!(runtime.take_usage_notice(), "the pause is announced once");
         assert!(!runtime.take_usage_notice(), "the notice is taken");
 
-        runtime.activate(&ready_for(&dir, Provider::OpenAi).await);
+        runtime
+            .activate(&ready_for(&dir, Provider::OpenAi).await)
+            .expect("the same provider can reconnect");
         assert!(
             !runtime.is_usage_paused(),
             "activating a connection resumes"
@@ -696,7 +899,9 @@ mod tests {
             openai_runtime.is_usage_paused(),
             "the installed route observes plan limits"
         );
-        openai_runtime.activate(&openai);
+        openai_runtime
+            .activate(&openai)
+            .expect("the installed route accepts its own provider");
         assert!(
             !openai_runtime.is_usage_paused(),
             "an embedder can resume an installed route after a usage pause"
@@ -728,15 +933,11 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().expect("temporary directory");
-        let runtime = runtime_for(&dir, Provider::Anthropic).await;
+        let ready = ready_for(&dir, Provider::Anthropic).await;
         let captured = Arc::new(Mutex::new(Vec::new()));
-        runtime.active.write().expect("active lock").provider =
-            Some(Arc::new(Capture(captured.clone())));
-        let connections = ConnectionPlugin {
-            runtime,
-            options: ModelRunOptions::default(),
-            routes: vec![Provider::Anthropic],
-        };
+        let sink = captured.clone();
+        let connections =
+            ConnectionPlugin::with_test_factory(&ready, move |_| Arc::new(Capture(sink.clone())));
         let mut server = Server::new();
         server.add_plugins(ModelsPlugin).add_plugins(connections);
         server.finish().await.expect("the server starts");
@@ -769,5 +970,121 @@ mod tests {
                 "ChatGPT reasoning never reaches Anthropic"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_registers_routes_when_added_before_the_model_registry_owner() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let ready = ready_for(&dir, Provider::OpenAi).await;
+        let connections = ConnectionPlugin::new(
+            &ready,
+            NonZeroU32::new(128).expect("nonzero output limit"),
+            PriceStore::builtin(),
+        )
+        .with_switching();
+        let runtime = connections.runtime();
+        let mut server = Server::new();
+        server.add_plugins(connections).add_plugins(ModelsPlugin);
+        server
+            .finish()
+            .await
+            .expect("registration order does not matter");
+
+        let registry = server
+            .get_global::<ModelRegistry>()
+            .expect("the model registry is installed");
+        let mut names = registry.llm_provider_names();
+        names.sort_unstable();
+        let mut expected: Vec<_> = Provider::ALL.map(Provider::registry_name).to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected, "every built-in route is registered");
+        assert!(runtime.is_connected(), "the handle controls the routes");
+    }
+
+    /// Answers a stream with one event, then a plan-limit error, and counts calls.
+    struct LimitedStream(Arc<AtomicUsize>);
+    impl LlmProvider for LimitedStream {
+        fn name(&self) -> &'static str {
+            "openai"
+        }
+        async fn generate(&self, _: &str, _: LlmRequest) -> Result<LlmResponse, GenerationError> {
+            Err(GenerationError::UnsupportedOperation("unused".into()))
+        }
+        async fn stream(&self, _: &str, _: LlmRequest) -> Result<LlmStream, GenerationError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ContentBlockStop { index: 0 }),
+                Err(plan_limit()),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_that_hits_a_plan_limit_pauses_later_calls_until_reactivated() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let ready = ready_for(&dir, Provider::OpenAi).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let connections = ConnectionPlugin::with_test_factory(&ready, move |_| {
+            Arc::new(LimitedStream(counter.clone()))
+        });
+        let runtime = connections.runtime();
+        let mut server = Server::new();
+        server.add_plugins(ModelsPlugin).add_plugins(connections);
+        server.finish().await.expect("the server starts");
+        let llm = server
+            .get_global::<ModelRegistry>()
+            .expect("the model registry is installed")
+            .llm("openai/model")
+            .expect("the route resolves a model");
+
+        let mut stream = llm
+            .stream(history(None))
+            .await
+            .expect("the stream opens before the limit is reported");
+        assert!(
+            !runtime.is_usage_paused(),
+            "opening the stream does not pause"
+        );
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first event arrives"
+        );
+        assert!(!runtime.is_usage_paused(), "a good event does not pause");
+        assert!(
+            matches!(stream.next().await, Some(Err(error)) if crate::chatgpt::responses::is_plan_limit(&error)),
+            "the stream ends with the plan limit"
+        );
+        assert!(runtime.is_usage_paused(), "the limit pauses the route");
+        assert!(runtime.take_usage_notice(), "the pause is announced once");
+        assert!(!runtime.take_usage_notice(), "the notice is taken");
+
+        let refused = llm
+            .stream(history(None))
+            .await
+            .err()
+            .expect("a paused route refuses the next call");
+        assert!(
+            matches!(&refused, GenerationError::InvalidRequest(message) if message.contains("paused")),
+            "the next call is refused because of the pause: {refused}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no call reached the provider"
+        );
+        assert!(
+            !runtime.take_usage_notice(),
+            "a refusal does not announce again"
+        );
+
+        runtime
+            .activate(&ready)
+            .expect("the same provider can reconnect");
+        assert!(
+            llm.stream(history(None)).await.is_ok(),
+            "requests flow again"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the new call is served");
     }
 }

@@ -164,7 +164,7 @@ impl SessionSettings {
     pub fn catalog(&self) -> ModelCatalog {
         self.catalog
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|err| err.into_inner())
             .clone()
     }
 
@@ -244,7 +244,9 @@ impl SessionSettings {
     }
 
     /// Replace the selected model and catalog, keeping the session's permissions.
-    /// Call between turns, before activating the prepared connection.
+    /// Call between turns, with the activation of the prepared connection.
+    /// The catalog and the model are replaced one after the other, so a reader
+    /// running concurrently could see the new catalog with the old model.
     ///
     /// # Errors
     /// Returns an error without changing settings if the catalog cannot resolve the model.
