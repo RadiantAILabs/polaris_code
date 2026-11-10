@@ -5,7 +5,7 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
-Requires `polaris-tui` 0.4.0 and `polaris-ai` 0.9.1. Release `polaris-tui` 0.4.0 first.
+Requires `polaris-tui` 0.4.0 and `polaris-ai` 0.9.3. Release `polaris-tui` 0.4.0 first.
 The next `polaris_code` release must be 0.5.0 because of the breaking API changes below.
 
 ### Added
