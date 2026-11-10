@@ -1608,7 +1608,7 @@ fn redact_tool_output(redactor: SecretRedactor, tool: &str, output: String) -> S
 }
 
 /// The picture `view_image` returned, as the result block's content, with the
-/// summary shown live and recorded in the Session ABox; `None` when `value`
+/// summary shown live and recorded in the Session `ABox`; `None` when `value`
 /// is not one.
 ///
 /// Both result lanes call this first, so there is one rule for when the model
