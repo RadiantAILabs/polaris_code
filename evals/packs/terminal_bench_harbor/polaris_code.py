@@ -166,6 +166,7 @@ class PolarisCode(BaseInstalledAgent):
         reasoning_effort: str | None = None,
         context_window: int | str | None = None,
         max_output_tokens: int | str | None = None,
+        image_input: str | None = None,
         unattended: bool | str = False,
         **kwargs: Any,
     ) -> None:
@@ -206,6 +207,9 @@ class PolarisCode(BaseInstalledAgent):
         self._reasoning_effort = reasoning_effort
         self._context_window = _positive_int("context_window", context_window)
         self._max_output_tokens = _positive_int("max_output_tokens", max_output_tokens)
+        if image_input not in (None, "auto", "on", "off"):
+            raise ValueError("image_input must be auto, on, or off")
+        self._image_input = image_input
         if (
             self._context_window is not None
             and self._max_output_tokens is not None
@@ -266,6 +270,7 @@ class PolarisCode(BaseInstalledAgent):
             ("--reasoning-effort", self._reasoning_effort),
             ("--context-window", self._context_window),
             ("--max-output-tokens", self._max_output_tokens),
+            ("--image-input", self._image_input),
         ):
             if value is not None:
                 argv.extend((flag, str(value)))

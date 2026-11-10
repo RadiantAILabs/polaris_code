@@ -304,6 +304,29 @@ class PolarisCodeInstalledAgent(unittest.IsolatedAsyncioTestCase):
             "--dangerously-skip-permissions", str(environment.execs[-1]["command"])
         )
 
+    async def test_image_input_reaches_the_executable_only_when_set(self) -> None:
+        for value in ("on", "off", "auto"):
+            with self.subTest(image_input=value):
+                environment = RecordingEnvironment()
+                await self._agent(image_input=value).run(
+                    "x",
+                    environment,
+                    AgentContext(),  # type: ignore[arg-type]
+                )
+                argv = shlex.split(str(environment.execs[-1]["command"]))
+                self.assertEqual(argv[argv.index("--image-input") + 1], value)
+        environment = RecordingEnvironment()
+        await self._agent().run("x", environment, AgentContext())  # type: ignore[arg-type]
+        self.assertNotIn("--image-input", str(environment.execs[-1]["command"]))
+
+    def test_image_input_must_be_auto_on_or_off(self) -> None:
+        for value in ("maybe", "", "ON", True, 1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "image_input"),
+            ):
+                self._agent(image_input=value)
+
     def test_model_limits_are_positive_integers(self) -> None:
         for name in ("context_window", "max_output_tokens"):
             for value in (0, -1, True, 1.5, "not-a-number", 2**32):

@@ -64,6 +64,7 @@ The adapter accepts these agent keywords in addition to `version` or `binary`:
 | `reasoning_effort` | Native `--reasoning-effort`; name it explicitly for comparable evaluations. |
 | `context_window` | Positive context-window override (up to 4294967295) for an unfamiliar model. |
 | `max_output_tokens` | Positive per-request ceiling (up to 4294967295); must be at least two tokens below `context_window`. |
+| `image_input` | Optional `auto`, `on` or `off`, passed as `--image-input`. `on` gives the agent the `view_image` tool for image files; `off` leaves it out. Left unset, the application's `auto` applies, which is off for `openai-chat`, so set `on` for a model that takes images. Needs release 0.4.5 or later. |
 | `unattended` | Explicit opt-in to `--dangerously-skip-permissions` inside a disposable environment; default `false`. Not allowed together with `allow_command`. |
 | `allow_command` | Explicit shell-policy pattern or sequence of patterns. Refused when `unattended` is true, which already allows every command. |
 | `sha256` | Optional SHA-256 of the release archive, with `version`; see [Installation](#installation). |
