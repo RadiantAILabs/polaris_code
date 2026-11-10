@@ -29,7 +29,9 @@ pub mod trajectory;
 
 pub use polaris::agent::{Agent, SetupError};
 
-pub use code_agent::{AgentLlm, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS};
+pub use code_agent::{
+    AgentLlm, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS, built_in_system_prompt,
+};
 pub use config::AgentConfig;
 pub use context::{ContextManager, ContextStrategy, LinearWindow};
 pub use continuation::{Continuation, ContinuationPolicy, ContinueReason};

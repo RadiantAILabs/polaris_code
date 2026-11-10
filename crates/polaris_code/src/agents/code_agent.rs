@@ -181,6 +181,18 @@ pub struct PreparedContext {
     pub turn: usize,
 }
 
+/// The built-in system prompt: what a session sends when its
+/// [`AgentConfig::system_prompt`] is `None`, before the project grounding
+/// block.
+///
+/// A host that adds text to the prompt rather than replacing it passes
+/// `format!("{}\n\n{extra}", built_in_system_prompt())` to
+/// [`AgentConfig::with_system_prompt`].
+#[must_use]
+pub fn built_in_system_prompt() -> &'static str {
+    SYSTEM_PROMPT
+}
+
 const SYSTEM_PROMPT: &str = "\
 You are a precise terminal coding agent operating in a sandboxed repository.
 
