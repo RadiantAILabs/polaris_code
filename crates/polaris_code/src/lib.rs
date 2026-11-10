@@ -28,6 +28,10 @@
 //! - [`images`] — what counts as an image, its size cap, whether a model takes
 //!   one ([`images::model_accepts_images`]) and the operator's `--image-input`
 //!   choice ([`images::ImageInput`]); shared by attachments and `view_image`.
+//! - [`providers`] prepares credentials and model catalogs; [`connection`]
+//!   serves them through fixed or switchable model routes.
+//! - [`onboarding`] prepares connections through dialogs. [`accounts`] owns
+//!   CLI account commands and [`credentials`] stores API keys and AWS profiles.
 //! - [`sparql`] — shared SPARQL string helpers ([`esc`](sparql::esc) for literals,
 //!   [`enc`](sparql::enc) for IRI components) used by both graph writers.
 //! - [`usage`] — session token accounting + cost estimation ([`TokenMeter`]),
@@ -77,17 +81,22 @@
 
 pub mod accounts;
 pub mod agents;
+mod chatgpt;
 pub mod config;
 pub mod config_dir;
+pub mod connection;
 pub mod cosmos;
 pub mod credentials;
 pub mod exec;
 pub mod graph_view;
 pub mod images;
 pub mod model_run;
+pub mod onboarding;
+mod private_file;
 pub mod progress;
 pub mod project_trust;
 pub mod providers;
+mod redaction;
 pub mod run;
 pub mod sparql;
 pub mod state;

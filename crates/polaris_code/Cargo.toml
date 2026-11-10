@@ -24,7 +24,7 @@ polaris = { workspace = true, features = ["anthropic", "openai", "chat-completio
 polaris_cosmos.workspace = true
 polaris-tui.workspace = true
 polaris_ontrace.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
 # `.then` stream combinator for live token accounting in the agent loop.
 futures-util = "0.3"
 # Official MCP client and its stdio / Streamable HTTP transports.
@@ -86,7 +86,12 @@ tree-sitter-typescript = "=0.23.2"
 tempfile = "3"
 # The `web_fetch` tool's HTTP client, shared with the direct provider clients.
 # The transitive async-openai client currently uses reqwest 0.12 separately.
-reqwest = "0.13"
+reqwest = { version = "0.13", features = ["json", "form", "stream"] }
+base64 = "0.23.1"
+sha2 = "0.11.1"
+getrandom = "0.4.3"
+uuid = { version = "1.29.2", features = ["v4"] }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 # Decodes a fetched page from the charset it declares (already in-tree through
 # `reqwest`'s `charset` feature).
 encoding_rs = "0.8"
@@ -97,6 +102,14 @@ encoding_rs = "0.8"
 htmd = "0.5"
 html5ever = "0.38"
 markup5ever_rcdom = "0.38"
+
+[target.'cfg(unix)'.dependencies]
+# Owner-only credential files (`O_NOFOLLOW`, `geteuid`).
+libc = "0.2.191"
+
+[dev-dependencies]
+rsa = "0.10.0"
+rand = "0.10.3"
 
 [[bin]]
 name = "polaris"

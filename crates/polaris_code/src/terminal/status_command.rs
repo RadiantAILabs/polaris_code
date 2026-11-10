@@ -16,7 +16,7 @@ pub(super) fn register(
     navigation: &SessionNavigation,
     workspace: &Path,
     startup: Startup,
-    report: ProviderReport,
+    report: impl Fn() -> ProviderReport + Send + Sync + 'static,
 ) -> Result<(), CommandError> {
     let settings = settings.clone();
     let navigation = navigation.clone();
@@ -28,6 +28,7 @@ pub(super) fn register(
                 return CommandOutcome::Error("Usage: /status".to_string());
             }
             let snapshot = settings.snapshot();
+            let report = report();
             let permission = snapshot.permission_mode.permission_policy();
             let ceiling = settings.permission_ceiling().map_or("none", |ceiling| ceiling.label());
             let region = report.region().unwrap_or("not applicable");
@@ -82,6 +83,13 @@ mod tests {
             SessionId::from_string("first-session"),
         );
         let commands = CommandRegistry::new();
+        let report = Arc::new(std::sync::RwLock::new(ProviderReport::new(
+            polaris_code::providers::Provider::Anthropic,
+            None,
+            Some("https://gateway.example/v1".to_string()),
+            "stored key (polaris login)",
+        )));
+        let live_report = report.clone();
         register(
             &commands,
             &settings,
@@ -93,12 +101,7 @@ mod tests {
                 config_dir_explicit: true,
                 ..Startup::default()
             },
-            ProviderReport::new(
-                polaris_code::providers::Provider::Anthropic,
-                None,
-                Some("https://gateway.example/v1".to_string()),
-                "stored key (polaris login)",
-            ),
+            move || live_report.read().expect("read connection report").clone(),
         )
         .unwrap();
         let CommandOutcome::Reply(first) = commands
@@ -122,6 +125,12 @@ mod tests {
         }
         assert!(first.contains(&format!("Session: {}", navigation.current())));
         settings.reset("fake/second");
+        *report.write().expect("replace connection report") = ProviderReport::new(
+            polaris_code::providers::Provider::OpenAi,
+            None,
+            None,
+            "OPENAI_API_KEY",
+        );
         navigation.set_current(SessionId::from_string("second-session"));
         let CommandOutcome::Reply(second) = commands
             .dispatch(&CommandInvocation::new("status", ""))
@@ -129,7 +138,12 @@ mod tests {
         else {
             panic!("expected local reply");
         };
-        for expected in ["Model: fake/second", "Permission mode: confirm"] {
+        for expected in [
+            "Model: fake/second",
+            "Permission mode: confirm",
+            "Provider: openai",
+            "Key source: OPENAI_API_KEY",
+        ] {
             assert!(second.contains(expected), "{second}");
         }
         assert!(second.contains(&format!("Session: {}", navigation.current())));
@@ -162,12 +176,14 @@ mod tests {
             &navigation,
             Path::new("/workspace"),
             Startup::default(),
-            ProviderReport::new(
-                Provider::Bedrock,
-                Some("eu-west-1".into()),
-                None,
-                "EC2 instance role",
-            ),
+            || {
+                ProviderReport::new(
+                    Provider::Bedrock,
+                    Some("eu-west-1".into()),
+                    None,
+                    "EC2 instance role",
+                )
+            },
         )
         .unwrap();
         let CommandOutcome::Reply(reply) = commands

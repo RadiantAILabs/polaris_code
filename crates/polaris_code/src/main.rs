@@ -560,17 +560,15 @@ struct Cli {
     /// arbitrary remote ids, with or without its provider prefix.
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
-    /// Model provider to run on. `anthropic` (the default) needs
-    /// `ANTHROPIC_API_KEY`. `openai` needs `OPENAI_API_KEY` and also reaches
-    /// any server that speaks the same API (Ollama, LM Studio, vLLM, a
-    /// gateway) when `OPENAI_BASE_URL` names it; declare that server's models
-    /// with `POLARIS_CODE_MODELS`. `openai-chat` uses Chat Completions at the
-    /// same key/base-URL settings and accepts arbitrary model ids. `bedrock` uses the AWS Bedrock Converse API
-    /// through the default AWS credential chain (an EC2/ECS instance role,
-    /// `AWS_PROFILE`, or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) and
-    /// needs a region. A run checks its provider's credentials before
-    /// starting and says what is missing. `--list-models` shows what each
-    /// provider offers.
+    /// Model provider. `chatgpt` uses browser sign-in and `ChatGPT` plan usage
+    /// (`polaris login chatgpt`). `anthropic` (default) uses `ANTHROPIC_API_KEY`;
+    /// `openai` and `openai-chat` use `OPENAI_API_KEY`. Keys can also be saved
+    /// with `polaris login`.
+    ///
+    /// `OPENAI_BASE_URL` selects a compatible server. Declare its Responses API
+    /// models with `POLARIS_CODE_MODELS`, or use `openai-chat` for Chat Completions
+    /// with arbitrary model IDs. `bedrock` uses the AWS credential chain and
+    /// requires a region. Use `--list-models` to see available models.
     #[arg(
         long,
         env = "POLARIS_CODE_PROVIDER",
@@ -939,12 +937,18 @@ fn policy_snapshot(
     policy
 }
 
-/// Report a startup failure and end the process.
-///
-/// A non-interactive run exits `2` — the contract's "usage or configuration
-/// error", kept distinct from `1`, which means the turn itself
-/// ran and failed. The interactive front end keeps the plain failure code it
-/// has always exited with, so the TUI path's behaviour is unchanged.
+/// Save one user default (`provider`, `model`, `region`) to the user configuration file.
+fn save_user_value(key: &str, value: &str) -> Result<(), accounts::SaveDefaultError> {
+    settings_file::set_user_value(key, value).map_err(Into::into)
+}
+
+fn save_connection_defaults(
+    result: &polaris_code::onboarding::SetupResult,
+) -> Result<(), accounts::SaveDefaultError> {
+    settings_file::save_connection_defaults(result).map_err(Into::into)
+}
+
+/// Exit with the headless configuration-error code (2) or interactive failure code (1).
 fn fatal(headless: bool, message: &str) -> ! {
     eprintln!("polaris: {message}");
     std::process::exit(if headless { 2 } else { 1 });
@@ -1082,15 +1086,20 @@ async fn resume_or_create_session(
 
 #[tokio::main]
 async fn main() {
-    // Credential commands run before any configuration is read, so a settings
+    // Credential commands run before startup configuration is loaded, so a settings
     // file that fails to load cannot stand in the way of fixing credentials.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if accounts::is_account_command(&argv) {
-        let save =
-            |key: &str, value: &str| settings_file::set_user_value(key, value).map_err(Into::into);
-        std::process::exit(accounts::run_from_args(argv, &save).await);
+        std::process::exit(
+            accounts::run_from_args_with_defaults(
+                argv,
+                &save_user_value,
+                &save_connection_defaults,
+            )
+            .await,
+        );
     }
-    let (cli, startup) = settings_file::load();
+    let (mut cli, startup) = settings_file::load();
     if cli.account.is_some() {
         fatal(false, "`login` and `logout` take no other options");
     }
@@ -1126,13 +1135,67 @@ async fn main() {
         list_models(cli.output_format);
     }
 
-    // Which models this run can reach, and which one it starts on. Resolved
-    // here — before the server is built, before a session exists and before a
-    // provider is ever called — so a name nothing can serve ends the process
-    // with the set that would have worked, not with a provider error at the
-    // first token. The set is narrowed to the registered providers once the
-    // registry exists, further down.
-    let declared_models = startup.catalog(cli.provider.catalog(&providers::process_env));
+    // Check before the TUI takes over the terminal. Recoverable setup errors may
+    // open dialogs only in an attended terminal; unattended runs must fail.
+    let mut setup_notice = None;
+    let ready_provider = match providers::prepare(
+        cli.provider,
+        cli.region.as_deref(),
+        &providers::process_env,
+        &CredentialStore::user(),
+    )
+    .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            use std::io::IsTerminal as _;
+            let at_terminal =
+                !headless && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+            if !(error.needs_setup() && at_terminal) {
+                fatal(headless, &error.to_string());
+            }
+            let catalog_config = startup.clone();
+            let Some(result) = polaris_code::onboarding::run_terminal_with_catalog(
+                startup.provider_is_explicit().then_some(cli.provider),
+                move |ready| catalog_config.connection_catalog(ready),
+            )
+            .await
+            .unwrap_or_else(|error| fatal(false, &error.to_string())) else {
+                eprintln!("Connection setup cancelled. Run `polaris login` to try again.");
+                return;
+            };
+            cli.provider = result.ready.report().provider();
+            let requested = cli
+                .model
+                .as_deref()
+                .map(|model| cli.provider.qualify_model(model));
+            let catalog = cli
+                .provider
+                .launch_catalog(result.catalog.clone(), requested.as_deref());
+            if let Some(requested) = &requested
+                && catalog.resolve_noting(requested).is_err()
+            {
+                eprintln!(
+                    "Requested model {requested} is unavailable for this connection. Using {}.",
+                    result.model
+                );
+            }
+            cli.model = Some(result.launch_model(cli.model.as_deref()));
+            cli.region.clone_from(&result.region);
+            if let Err(error) = save_connection_defaults(&result) {
+                eprintln!(
+                    "Polaris Code: connection configured, but defaults could not be saved: {error}"
+                );
+            }
+            setup_notice = Some(result.notice);
+            result.ready
+        }
+    };
+    let dialogs = polaris_tui::dialogs::DialogHost::default();
+
+    // Resolve model choices before building the server or starting a session,
+    // so an unavailable model is reported as a startup configuration error.
+    let declared_models = startup.connection_catalog(&ready_provider);
     let requested_model = cli
         .model
         .as_deref()
@@ -1149,6 +1212,7 @@ async fn main() {
     // session.
     let mut startup_notes: Vec<String> = selected_model.note().into_iter().collect();
     startup_notes.extend(startup.notices().iter().cloned());
+    startup_notes.extend(setup_notice);
 
     // Config gate: `POLARIS_CODE_GRAPH_SEARCH` selects which
     // graph-search surface the agent sees — `curated`, `freeform`, or `both`
@@ -1384,26 +1448,9 @@ async fn main() {
         terminal::TurnSteering::enabled()
     };
 
-    // The provider's plugins panic when their key is missing, which exits `101`
-    // through a backtrace, and a Bedrock run with no region or credentials only
-    // fails at the first request. Neither front end should meet that: the
-    // non-interactive contract owes its caller exit code `2` and an explanation
-    // for a configuration error, and an interactive run owes a person the same
-    // fact before the TUI takes the screen. One check serves both, and what it
-    // finds out — which region, which credential source — is reported, never
-    // the credential itself.
-    let ready_provider = match providers::prepare(
-        cli.provider,
-        cli.region.as_deref(),
-        &providers::process_env,
-        &CredentialStore::user(),
-    )
-    .await
-    {
-        Ok(ready) => ready,
-        Err(err) => fatal(headless, &err.to_string()),
-    };
-    startup_notes.push(ready_provider.report().line());
+    if headless {
+        startup_notes.push(ready_provider.report().line());
+    }
     let trajectory = cli.trajectory_path.as_ref().map(|path| {
         polaris_code::trajectory::RunTrajectory::create(
             path,
@@ -1445,16 +1492,27 @@ async fn main() {
 
     let mut server = Server::new();
     server.add_plugins(ModelsPlugin);
-    ready_provider.install_with_options(
-        &mut server,
+    let run_options = polaris_code::model_run::ModelRunOptions {
+        max_output_tokens: Some(max_output_tokens),
+        reasoning_effort: cli.reasoning_effort.clone(),
+        trajectory: trajectory.clone(),
+    };
+    // One connection serves every model call. An interactive session registers
+    // every provider's route so `/login` can switch between them; a headless
+    // run keeps the one it was started with.
+    let connections = polaris_code::connection::ConnectionPlugin::new(
+        &ready_provider,
         max_output_tokens,
         pricing_store.clone(),
-        polaris_code::model_run::ModelRunOptions {
-            max_output_tokens: Some(max_output_tokens),
-            reasoning_effort: cli.reasoning_effort.clone(),
-            trajectory: trajectory.clone(),
-        },
-    );
+    )
+    .with_options(run_options);
+    let connections = if headless {
+        connections
+    } else {
+        connections.with_switching()
+    };
+    let connection_runtime = connections.runtime();
+    server.add_plugins(connections);
     if let Some(trace) = &trajectory {
         server.insert_global(trace.clone());
     }
@@ -1566,6 +1624,11 @@ async fn main() {
         // cancellation path emits `interrupting`/`cancelled` through.
         let (conversation, output) = terminal::attach_with_status(
             ConversationPanelPlugin::default()
+                .with_dialogs(dialogs.clone())
+                .with_status_context({
+                    let runtime = connection_runtime.clone();
+                    move || terminal::connection_status(&runtime)
+                })
                 .with_log_buffer(log_buffer.clone())
                 .with_history_source(history.clone())
                 .with_attachment_source(Arc::new(
@@ -1668,19 +1731,7 @@ async fn main() {
         fatal(headless, &format!("failed to start the server: {err}"));
     }
 
-    // The reachable catalog: the declared set, less every model whose provider
-    // this run did not register. Re-resolving the startup model against it
-    // turns "the plugin that serves this model is not installed" into the same
-    // startup refusal as an unknown name, rather than a first-token failure.
-    let catalog = {
-        let Some(models) = server.get_global::<polaris::models::ModelRegistry>() else {
-            fatal(headless, "ModelRegistry missing");
-        };
-        declared_models.restricted_to_providers(&models.llm_provider_names())
-    };
-    if let Err(err) = catalog.resolve(&agent_config.model_id) {
-        fatal(headless, &err.to_string());
-    }
+    let catalog = declared_models;
     // The ceiling is installed on the settings rather than checked at each
     // surface: these settings are the only mutable holder of the session's
     // mode, and `prepare_context` reads exactly this snapshot back to build the
@@ -1697,14 +1748,49 @@ async fn main() {
         }
     };
     let _ = attachment_settings.set(settings.clone());
-    if !headless && let Err(err) = settings.register(&commands) {
+    if !headless && let Err(err) = settings.register_with_dialogs(&commands, dialogs.clone()) {
         fatal(
             headless,
             &format!("failed to register settings commands: {err}"),
         );
     }
-    if !headless && let Err(err) = accounts::register_login_command(&commands) {
-        fatal(headless, &format!("failed to register /login: {err}"));
+    let mut account_controls = None;
+    if !headless {
+        let registered = match polaris_code::onboarding::SetupService::user(dialogs.clone()) {
+            Ok(setup) => {
+                let catalog_config = startup.clone();
+                let clipboard = server.api::<TuiHandle>().cloned().unwrap_or_else(|| {
+                    fatal(false, "TUI runtime is unavailable for account controls")
+                });
+                let dollar_cap = run_ceiling.is_some_and(|c| c.max_cost_usd().is_some())
+                    || task_cost_limit.is_some();
+                let accounts = terminal::SessionAccounts::new(
+                    setup
+                        .with_catalog(move |ready| catalog_config.connection_catalog(ready))
+                        .with_clipboard(move |text| {
+                            let clipboard = clipboard.clone();
+                            async move { clipboard.request_clipboard_copy(text).await }
+                        }),
+                    connection_runtime.clone(),
+                    settings.clone(),
+                    token_meter.clone(),
+                )
+                .with_spend_guard(pricing_store.clone(), dollar_cap)
+                .with_defaults(|result| {
+                    save_connection_defaults(result).map_err(|error| error.to_string())
+                });
+                let registered = accounts.register(&commands);
+                account_controls = Some(accounts);
+                registered
+            }
+            Err(error) => terminal::SessionAccounts::register_unavailable(&commands, &error),
+        };
+        if let Err(error) = registered {
+            fatal(
+                false,
+                &format!("failed to register account controls: {error}"),
+            );
+        }
     }
 
     // The sealed catalog this server just built, read back once,
@@ -1853,7 +1939,7 @@ async fn main() {
             &settings,
             &navigation,
             &working_dir,
-            ready_provider.report().clone(),
+            connection_runtime.clone(),
         )
     {
         fatal(headless, &format!("failed to register /status: {err}"));
@@ -2142,6 +2228,11 @@ async fn main() {
                         .with_tasks_running(driver_tasks.running()),
                 ))
                 .await;
+            if let Some(accounts) = &account_controls
+                && let Some(outcome) = accounts.show_usage_limit_if_needed().await
+            {
+                let _ = driver_output.send(outcome.into_message("account")).await;
+            }
             if let Some(request) = driver_rewind.take_pending() {
                 let outcome = rewind_application.apply(&driver_id, &request).await;
                 let report = RewindApplication::report(&request, &outcome);

@@ -31,7 +31,8 @@ shell knowing the panel's type, and without panels knowing about each other.
 **Files:** `src/plugin.rs` (`TuiPlugin`, `TuiHandle`), `src/registry.rs`
 (`TuiRegistry`), `src/panel.rs` (the `TuiPanel` trait), `src/runtime.rs`,
 `src/app.rs`, `src/layout.rs`, `src/nav.rs`, `src/event.rs`, `src/widgets.rs`,
-`src/composer/`, `src/config.rs`.
+`src/composer/`, `src/config.rs`, `src/dialogs.rs`, `src/dialogs/`,
+`src/stray.rs`, `src/text.rs`.
 
 The fixed shell every panel plugs into:
 
@@ -40,12 +41,16 @@ The fixed shell every panel plugs into:
 - **The panel contract.** The `TuiPanel` trait is the single interface a panel
   implements; `TuiRegistry` (an `API`) is where panels register, and
   `TuiHandle` (an `API`) is the handle other plugins use to drive the shell.
+  `TuiPanel::is_modal` lets a panel temporarily own the screen and input while
+  the shell retains its exit and selection-mode shortcuts.
 - **Shared primitives.** Layout, navigation, event routing, and the reusable
   widgets and editing buffers panels render with. `src/composer/` is one: a
   grapheme- and display-column-aware text buffer, bounded history navigation
   over a host-supplied store, and editor draft/argv preparation. These know
   nothing about coding policy. The runtime alone hands the terminal to an
-  interactive child through `TuiHandle::run_in_terminal`; it never names a panel.
+  interactive child through `TuiHandle::run_in_terminal`; it also serializes
+  terminal clipboard requests through `TuiHandle::request_clipboard_copy`.
+  It never names a panel.
 
 These define *how a panel attaches to the shell and how the shell drives it*.
 Changing them is a breaking change to every panel. **Scope:** Layer 1 owns no

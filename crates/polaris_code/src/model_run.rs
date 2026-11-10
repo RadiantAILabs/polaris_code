@@ -277,12 +277,30 @@ impl ModelRunPlugin {
 #[plugin(id = "polaris_code::model_run", version = "0.1.0")]
 impl Plugin for ModelRunPlugin {
     fn build(&self, mut registry: Extends<ModelRegistry>) {
-        registry.register_llm_provider(RunProvider {
-            inner: self.provider.clone(),
-            name: self.name,
-            options: self.options.clone(),
-        });
+        register(
+            &mut registry,
+            self.provider.clone(),
+            self.name,
+            &self.options,
+        );
     }
+}
+
+/// Register `provider` under `name` with `options` applied to every request.
+///
+/// The decoration [`ModelRunPlugin`] installs, for capabilities that register
+/// several routes from one plugin.
+pub(crate) fn register(
+    registry: &mut ModelRegistry,
+    provider: Arc<dyn DynLlmProvider>,
+    name: &'static str,
+    options: &ModelRunOptions,
+) {
+    registry.register_llm_provider(RunProvider {
+        inner: provider,
+        name,
+        options: options.clone(),
+    });
 }
 
 #[cfg(test)]

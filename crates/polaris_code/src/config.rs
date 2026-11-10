@@ -179,17 +179,19 @@ impl fmt::Display for ModelSelectionError {
 
 impl std::error::Error for ModelSelectionError {}
 
-/// The `provider/model` ids one run may select between, and the one it
+/// The `provider/model` ids one connection may select between, and the one it
 /// defaults to.
 ///
-/// A value, not a registry: it is built once at launch, handed to the pieces
-/// that need it ([`SessionSettings`](crate::terminal::SessionSettings) for the
-/// `/model` chooser, the composition root for the launch flag), and never
-/// mutated.
+/// A value, not a registry: it is built when a connection is prepared and
+/// handed to the pieces that need it ([`SessionSettings`](crate::terminal::SessionSettings)
+/// for the `/model` chooser, the composition root for the launch flag). A
+/// session that switches connection replaces its catalog whole rather than
+/// mutating it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCatalog {
     default_model: String,
     models: Vec<String>,
+    display_names: std::collections::BTreeMap<String, String>,
 }
 
 impl ModelCatalog {
@@ -215,6 +217,21 @@ impl ModelCatalog {
         Self {
             default_model,
             models,
+            display_names: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A catalog with no models, for a provider whose models are only known
+    /// after sign-in.
+    ///
+    /// Selecting from it fails with [`ModelSelectionError`], so a run cannot
+    /// start on a model nobody has discovered.
+    #[must_use]
+    pub fn undiscovered() -> Self {
+        Self {
+            default_model: String::new(),
+            models: Vec::new(),
+            display_names: std::collections::BTreeMap::new(),
         }
     }
 
@@ -279,6 +296,7 @@ impl ModelCatalog {
         };
         Self {
             default_model: self.default_model.clone(),
+            display_names: self.display_names.clone(),
             models: self
                 .models
                 .iter()
@@ -292,6 +310,22 @@ impl ModelCatalog {
     #[must_use]
     pub fn models(&self) -> &[String] {
         &self.models
+    }
+
+    /// Set display names for models in the catalog. Unknown IDs are ignored.
+    #[must_use]
+    pub fn with_display_names(mut self, names: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.display_names = names
+            .into_iter()
+            .filter(|(id, _)| self.contains(id))
+            .collect();
+        self
+    }
+
+    /// Display name for a model, or its ID if no name is set.
+    #[must_use]
+    pub fn display_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.display_names.get(id).map(String::as_str).unwrap_or(id)
     }
 
     /// The distinct provider prefixes of [`Self::models`], in first-seen order.

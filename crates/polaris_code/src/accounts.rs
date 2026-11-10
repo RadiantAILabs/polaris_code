@@ -161,11 +161,12 @@ pub enum Account {
 /// Arguments of `polaris login`.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Login {
-    /// Provider to log in to: `anthropic`, `openai` or `bedrock`.
+    /// Connection to set up: `chatgpt`, `openai`, `openai-chat`, `anthropic`, or `bedrock`.
     #[arg(value_enum)]
     pub provider: Option<Provider>,
     /// Read the API key from standard input instead of asking for it, for
     /// scripts: `printf %s "$KEY" | polaris login openai --with-api-key`.
+    /// Requires an explicit provider so the key cannot be read as a menu answer.
     #[arg(long)]
     pub with_api_key: bool,
     /// What to do instead of logging in.
@@ -203,9 +204,28 @@ pub fn is_account_command(argv: &[OsString]) -> bool {
 /// it fails, `2` for a command line it cannot read.
 ///
 /// `save_default` writes one setting to the user configuration file.
+/// Interactive setup writes every selected default, including the model,
+/// without reading existing host preferences. Use [`run_from_args_with_defaults`]
+/// when the host needs to preserve a compatible saved model.
 pub async fn run_from_args(
     argv: Vec<OsString>,
     save_default: &dyn Fn(&str, &str) -> Result<(), SaveDefaultError>,
+) -> i32 {
+    run_from_args_with_defaults(argv, save_default, &|result| {
+        result.save_defaults(save_default)
+    })
+    .await
+}
+
+/// Run account commands with a host-owned writer for connection defaults.
+///
+/// `save_connection` receives the prepared connection so the host can preserve
+/// compatible user preferences. `save_default` handles scripted API-key setup.
+/// Returns the same exit codes as [`run_from_args`].
+pub async fn run_from_args_with_defaults(
+    argv: Vec<OsString>,
+    save_default: &dyn Fn(&str, &str) -> Result<(), SaveDefaultError>,
+    save_connection: &dyn Fn(&crate::onboarding::SetupResult) -> Result<(), SaveDefaultError>,
 ) -> i32 {
     let account = match AccountCli::try_parse_from(argv) {
         Ok(cli) => cli.command,
@@ -215,6 +235,73 @@ pub async fn run_from_args(
             return code;
         }
     };
+    if let Account::Login(Login {
+        provider,
+        with_api_key: false,
+        action: None,
+    }) = &account
+    {
+        return match crate::onboarding::run_terminal(*provider).await {
+            Ok(Some(result)) => {
+                eprintln!("Polaris Code: {}", result.notice);
+                match save_connection(&result) {
+                    Ok(()) => {
+                        eprintln!("Run `polaris` to start.");
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Credentials were saved, but defaults could not be saved: {error}"
+                        );
+                        1
+                    }
+                }
+            }
+            Ok(None) => {
+                eprintln!("Connection setup cancelled. Run `polaris login` to try again.");
+                0
+            }
+            Err(error) => {
+                eprintln!("Polaris Code: {error}");
+                1
+            }
+        };
+    }
+    let mut chatgpt_logout_failed = false;
+    if matches!(
+        &account,
+        Account::Logout {
+            provider: None | Some(Provider::ChatGpt)
+        }
+    ) {
+        match sign_out_chatgpt_accounts().await {
+            Ok(messages) => {
+                for message in messages {
+                    eprintln!("{message}");
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                if matches!(
+                    &account,
+                    Account::Logout {
+                        provider: Some(Provider::ChatGpt)
+                    }
+                ) {
+                    return 1;
+                }
+                chatgpt_logout_failed = true;
+            }
+        }
+    }
+    if matches!(
+        &account,
+        Account::Logout {
+            provider: Some(Provider::ChatGpt)
+        }
+    ) {
+        return 0;
+    }
     let store = CredentialStore::user();
     let dotenv = dotenv_lookup();
     let env = crate::providers::process_env;
@@ -239,8 +326,20 @@ pub async fn run_from_args(
         save_default,
         check_bedrock: &check_bedrock,
     };
+    let show_chatgpt_status = matches!(
+        &account,
+        Account::Login(Login {
+            action: Some(LoginAction::Status),
+            ..
+        })
+    );
     match run(account, &mut TerminalIo, &setup).await {
-        Ok(()) => 0,
+        Ok(()) => {
+            if show_chatgpt_status {
+                TerminalIo.say(&chatgpt_status());
+            }
+            i32::from(chatgpt_logout_failed)
+        }
         Err(err) => {
             eprintln!("polaris: {err}");
             1
@@ -248,11 +347,22 @@ pub async fn run_from_args(
     }
 }
 
-/// Run one account command.
+/// Run one account command through line-based input and output.
+///
+/// This is the scripted path: `polaris login <provider> --with-api-key`,
+/// `login status`, `logout`, and hosts that drive setup through an
+/// [`AccountIo`]. The `polaris` binary sends an interactive `login` to the
+/// full-screen setup in [`crate::onboarding`] instead, which is the only way to
+/// sign in to `ChatGPT`.
+/// `logout(None)` removes API keys and the saved AWS profile from [`Setup::store`].
+/// `ChatGPT` accounts use a separate store and are signed out by [`run_from_args`].
+/// Status reads only the supplied API-key and AWS configuration; the CLI adds
+/// `ChatGPT` account status from its separate store.
 ///
 /// # Errors
 ///
-/// [`AccountError`] with a message ready to print.
+/// [`AccountError`] with a message ready to print, including when explicitly
+/// asked to sign out a `ChatGPT` account through this local-key API.
 pub async fn run(
     account: Account,
     io: &mut dyn AccountIo,
@@ -273,9 +383,13 @@ pub async fn run(
         }) => {
             let provider = match provider {
                 Some(provider) => provider,
+                None if with_api_key => return Err(AccountError::message(
+                    "Choose a provider explicitly when using --with-api-key, for example: polaris login openai --with-api-key.".into(),
+                )),
                 None => pick_provider(io)?,
             };
             match provider {
+                Provider::ChatGpt => Err(AccountError::message("This connection requires interactive setup. Run `polaris login` in a terminal.".into())),
                 Provider::Bedrock if with_api_key => Err(AccountError::message(
                     "Bedrock has no API key; it uses your AWS credentials. Run \
                      `polaris login bedrock` without --with-api-key."
@@ -301,31 +415,35 @@ fn store<'a>(setup: &Setup<'a>) -> Result<&'a CredentialStore, AccountError> {
     })
 }
 
-/// Ask which provider, by number or name.
 fn pick_provider(io: &mut dyn AccountIo) -> Result<Provider, AccountError> {
+    // ChatGPT needs a browser, so line-based setup never offers it.
+    let providers: Vec<_> = Provider::ALL
+        .into_iter()
+        .filter(|&provider| provider != Provider::ChatGpt)
+        .collect();
     io.say("Which provider do you want to use?");
-    for (index, provider) in Provider::ALL.into_iter().enumerate() {
+    for (index, provider) in providers.iter().copied().enumerate() {
         io.say(&format!("  {}) {}", index + 1, provider.name()));
     }
-    let answer = io.ask(&format!(
-        "Choose 1-{}, or type a name: ",
-        Provider::ALL.len()
-    ))?;
+    let answer = io.ask(&format!("Choose 1-{}, or type a name: ", providers.len()))?;
     let answer = answer.trim();
     if let Ok(number) = answer.parse::<usize>() {
-        if let Some(provider) = number
-            .checked_sub(1)
-            .and_then(|index| Provider::ALL.get(index))
-        {
+        if let Some(provider) = number.checked_sub(1).and_then(|index| providers.get(index)) {
             return Ok(*provider);
         }
-    } else if let Ok(provider) = Provider::from_str(answer, true) {
+    } else if let Ok(provider) = Provider::from_str(answer, true)
+        && providers.contains(&provider)
+    {
         return Ok(provider);
     }
     Err(AccountError::message(format!(
-        "`{answer}` is not a provider; choose 1-{} or one of: {}",
-        Provider::ALL.len(),
-        Provider::ALL.map(Provider::flag).join(", ")
+        "Invalid provider; choose 1-{} or one of: {}",
+        providers.len(),
+        providers
+            .iter()
+            .map(|provider| provider.flag())
+            .collect::<Vec<_>>()
+            .join(", ")
     )))
 }
 
@@ -439,8 +557,22 @@ fn logout(
     io: &mut dyn AccountIo,
     setup: &Setup<'_>,
 ) -> Result<(), AccountError> {
+    if provider == Some(Provider::ChatGpt) {
+        return Err(AccountError::message(
+            "ChatGPT accounts use a separate account store; run `polaris logout chatgpt` to sign out"
+                .into(),
+        ));
+    }
     let store = store(setup)?;
-    let providers = provider.map_or_else(|| Provider::ALL.to_vec(), |provider| vec![provider]);
+    let providers = provider.map_or_else(
+        || {
+            Provider::ALL
+                .into_iter()
+                .filter(|provider| *provider != Provider::ChatGpt)
+                .collect()
+        },
+        |provider| vec![provider],
+    );
     for provider in providers {
         let what = if provider == Provider::Bedrock {
             "profile"
@@ -489,7 +621,10 @@ fn status(io: &mut dyn AccountIo, setup: &Setup<'_>) {
              polaris a place for it"
         )),
     }
-    for provider in Provider::ALL {
+    for provider in Provider::ALL
+        .into_iter()
+        .filter(|provider| *provider != Provider::ChatGpt)
+    {
         let line = match provider.key_var() {
             Some(var) => key_status(provider, var, setup),
             None => bedrock_status(setup),
@@ -568,11 +703,58 @@ fn dotenv_lookup() -> impl Fn(&str) -> Option<String> {
     move |name| entries.get(name).cloned()
 }
 
-/// The `/login` command: where to go to change credentials.
+/// The `login status` line for `ChatGPT`: each stored account and its state.
+fn chatgpt_status() -> String {
+    let accounts = match crate::chatgpt::ChatGptStore::user().and_then(|store| store.accounts()) {
+        Ok(accounts) => accounts,
+        Err(error) => return format!("chatgpt    {error}"),
+    };
+    chatgpt_status_line(&accounts)
+}
+
+fn chatgpt_status_line(accounts: &[crate::chatgpt::AccountSummary]) -> String {
+    if accounts.is_empty() {
+        return "chatgpt    not signed in; run `polaris login chatgpt`".into();
+    }
+    let listed: Vec<String> = accounts
+        .iter()
+        .map(|account| {
+            let state = if account.plan_enabled {
+                "plan usage enabled"
+            } else if account.signed_in {
+                "plan usage off"
+            } else {
+                "signed out"
+            };
+            let active = if account.active { " (active)" } else { "" };
+            format!("{}{active} · {state}", account.label)
+        })
+        .collect();
+    format!("chatgpt    {}", listed.join("; "))
+}
+
+async fn sign_out_chatgpt_accounts() -> Result<Vec<String>, crate::chatgpt::ChatGptError> {
+    let store = crate::chatgpt::ChatGptStore::user()?;
+    let accounts = store.accounts_async().await?;
+    let client = crate::chatgpt::ChatGptClient::new(store)?;
+    let mut messages = Vec::new();
+    for account in accounts {
+        let confirmed = client.sign_out(&account.id).await?;
+        messages.push(crate::onboarding::prompts::sign_out_notice(
+            &account.label,
+            confirmed,
+        ));
+    }
+    Ok(messages)
+}
+
+/// Legacy `/login` help for hosts that do not install live account controls.
+/// Prefer [`crate::terminal::SessionAccounts`] for interactive account switching.
 ///
 /// # Errors
 ///
 /// [`CommandError`] when `/login` is already registered.
+#[deprecated(note = "use terminal::SessionAccounts for live account controls")]
 pub fn register_login_command(commands: &CommandRegistry) -> Result<(), CommandError> {
     commands.register_sync(
         CommandSpec::new("login", "How to set up or change provider credentials"),
@@ -805,8 +987,10 @@ mod tests {
 
         async fn run(&self, account: Account, io: &mut Script) -> Result<(), AccountError> {
             let store = self.store();
-            let env = |name: &str| self.env.get(name).cloned();
-            let dotenv = |name: &str| self.dotenv.get(name).cloned();
+            let environment = &self.env;
+            let env = |name: &str| environment.get(name).cloned();
+            let environment_file = &self.dotenv;
+            let dotenv = |name: &str| environment_file.get(name).cloned();
             let save = |key: &str, value: &str| {
                 if self.save_fails {
                     return Err(io::Error::other("the configuration file is not valid").into());
@@ -912,6 +1096,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_api_key_requires_a_provider_without_consuming_or_echoing_input() {
+        let world = World::new();
+        let secret = "sk-private-piped-key";
+        let mut io = Script::piping(secret);
+        io.answers.push_back(secret.into());
+        let error = world
+            .run(login(None, true), &mut io)
+            .await
+            .expect_err("piped login needs an explicit provider");
+        assert!(error.to_string().contains("Choose a provider explicitly"));
+        assert!(!error.to_string().contains(secret));
+        assert!(io.said.is_empty(), "no prompt reads the piped key");
+        assert_eq!(io.answers.len(), 1);
+        assert!(world.saved().is_empty());
+    }
+
+    #[tokio::test]
     async fn an_unusable_key_is_refused_and_nothing_is_saved() {
         let world = World::new();
         for bad in ["", "   \n", "two words", "line one\nline two"] {
@@ -998,7 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_provider_asks_with_a_numbered_picker() {
+    async fn pick_provider_numbered_menu() {
         for (answer, expected) in [
             ("2", Provider::OpenAi),
             (" 1 \n", Provider::Anthropic),
@@ -1009,22 +1210,30 @@ mod tests {
         ] {
             let mut io = Script::default();
             io.answers.push_back(answer.to_string());
-            assert_eq!(pick_provider(&mut io).unwrap(), expected, "{answer:?}");
+            assert_eq!(
+                pick_provider(&mut io).expect("a valid answer picks a provider"),
+                expected,
+                "answer {answer:?} picks the matching provider"
+            );
             let said = io.said();
-            assert!(said.contains("1) Anthropic"), "{said}");
-            assert!(said.contains("2) OpenAI"), "{said}");
-            assert!(said.contains("3) Amazon Bedrock"), "{said}");
-            assert!(said.contains("4) OpenAI Chat Completions"), "{said}");
+            for option in [
+                "1) Anthropic",
+                "2) OpenAI",
+                "3) Amazon Bedrock",
+                "4) OpenAI Chat Completions",
+            ] {
+                assert!(said.contains(option), "menu lists {option}: {said}");
+            }
         }
-        for bad in ["0", "5", "gemini", ""] {
+        for bad in ["0", "7", "gemini", ""] {
             let mut io = Script::default();
             io.answers.push_back(bad.to_string());
-            let error = pick_provider(&mut io).expect_err(bad);
+            let error = pick_provider(&mut io).expect_err("an invalid answer is refused");
             assert!(
                 error
                     .to_string()
                     .contains("anthropic, openai, bedrock, openai-chat"),
-                "{error}"
+                "refusal of {bad:?} lists the valid names: {error}"
             );
         }
     }
@@ -1202,6 +1411,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scripted_chatgpt_logout_reports_unsupported_account_storage() {
+        let world = World::new();
+        let mut io = Script::default();
+        let error = world
+            .run(
+                Account::Logout {
+                    provider: Some(Provider::ChatGpt),
+                },
+                &mut io,
+            )
+            .await
+            .expect_err("the local-key API cannot silently sign out a ChatGPT account");
+        assert!(
+            error.to_string().contains("polaris logout chatgpt"),
+            "the error directs callers to the account-store sign-out path"
+        );
+    }
+
+    #[tokio::test]
     async fn logout_with_no_provider_forgets_everything() {
         let world = World::new();
         world
@@ -1261,6 +1489,10 @@ mod tests {
             .unwrap();
 
         let said = io.said();
+        assert!(
+            !said.lines().any(|line| line.starts_with("chatgpt ")),
+            "the scripted API reports only the credential stores supplied by its caller"
+        );
         assert!(
             said.contains("anthropic  key from ANTHROPIC_API_KEY in the environment, ending …1111"),
             "{said}"
@@ -1339,6 +1571,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_chatgpt_status_formats_supplied_account_summaries() {
+        use crate::chatgpt::AccountSummary;
+
+        assert_eq!(
+            chatgpt_status_line(&[]),
+            "chatgpt    not signed in; run `polaris login chatgpt`",
+            "the CLI offers a sign-in command when no account is saved"
+        );
+        let accounts = [
+            AccountSummary {
+                id: "enabled-id".into(),
+                label: "enabled".into(),
+                plan_enabled: true,
+                active: true,
+                signed_in: true,
+            },
+            AccountSummary {
+                id: "limited-id".into(),
+                label: "limited".into(),
+                plan_enabled: false,
+                active: false,
+                signed_in: true,
+            },
+            AccountSummary {
+                id: "expired-id".into(),
+                label: "expired".into(),
+                plan_enabled: false,
+                active: false,
+                signed_in: false,
+            },
+        ];
+        assert_eq!(
+            chatgpt_status_line(&accounts),
+            "chatgpt    enabled (active) · plan usage enabled; limited · plan usage off; expired · signed out",
+            "CLI formatting preserves every supplied account's activation and plan state"
+        );
+    }
+
+    #[test]
     fn the_subcommands_parse_with_their_arguments() {
         assert_eq!(parse(&["login"]).unwrap(), login(None, false));
         assert_eq!(
@@ -1388,6 +1659,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated, reason = "verify the retained legacy helper")]
     fn the_login_command_points_at_the_terminal_command() {
         let commands = CommandRegistry::with_builtins();
         register_login_command(&commands).unwrap();

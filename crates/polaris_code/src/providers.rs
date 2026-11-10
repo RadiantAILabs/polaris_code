@@ -1,21 +1,19 @@
 //! Which model provider a run talks to, and whether it can start.
 //!
-//! [`Provider`] is the operator's choice (`--provider`). Everything that varies
-//! by provider is answered in this module, so adding one is one variant and one
-//! arm in each `match` below rather than an edit scattered through the
-//! composition root:
+//! [`Provider`] is the operator's choice (`--provider`). This module prepares
+//! credentials, clients, and model catalogs. [`crate::connection`] registers and
+//! routes requests; [`crate::onboarding`] owns interactive connection setup.
 //!
 //! | Question | Answered by |
 //! |----------|-------------|
-//! | Which models can it serve? | [`Provider::catalog`] |
+//! | Which models can it serve? | [`ReadyProvider::model_catalog`] |
 //! | Can it start — credentials, region, endpoint? | [`prepare`], giving a [`ReadyProvider`] or a [`StartupError`] |
-//! | Register it with the server | [`ReadyProvider::install`] |
+//! | Register it with the server | [`crate::connection::ConnectionPlugin`] or [`ReadyProvider::install`] |
 //! | What is it running as? | [`ProviderReport`], one line and a [`GlobalResource`] |
 //!
 //! The check runs before any front end starts, for the interactive and the
-//! non-interactive path alike, and every failure says what to do next. No
-//! value it reads or prints is a secret: it reports *where* a credential came
-//! from, never the credential.
+//! non-interactive path alike, and every failure says what to do next.
+//! Credential reports name their source without printing keys or tokens.
 //!
 //! No check here makes a model call. A key that is present but wrong is only
 //! found out by the provider, at the first request.
@@ -33,11 +31,11 @@
 //!
 //! # Endpoints
 //!
-//! `OpenAiPlugin` takes its endpoint from `OPENAI_BASE_URL`, which the
-//! underlying client reads when the provider is built, so
-//! `--provider openai` reaches any server that speaks the same Responses API
-//! (Ollama, LM Studio, vLLM, a gateway). The plugin has no setter of its own.
-//! `AnthropicPlugin` has neither a setter nor a variable, so a custom
+//! `OPENAI_BASE_URL` selects an endpoint for `openai` (Responses) or
+//! `openai-chat` (Chat Completions). The Responses client reads the process
+//! environment when built; the Chat Completions client receives the validated
+//! endpoint from preparation. The destination must support the selected protocol.
+//! The Anthropic provider has no custom-endpoint setter, so a custom
 //! `ANTHROPIC_BASE_URL` is refused rather than ignored: ignoring it would send
 //! the key to Anthropic instead of the gateway the operator named.
 
@@ -48,13 +46,12 @@ use std::time::Duration;
 use aws_credential_types::credential_feature::AwsCredentialFeature;
 use aws_credential_types::provider::ProvideCredentials;
 use clap::ValueEnum;
+use polaris::models::ModelRegistry;
 use polaris::models::openai::OpenAiProvider;
 use polaris::models::pricing::PriceStore;
-use polaris::models::{AnthropicPlugin, BedrockPlugin, ModelRegistry, OpenAiPlugin};
 use polaris::system::plugin;
 use polaris::system::plugin::{Extends, Plugin};
 use polaris::system::resource::GlobalResource;
-use polaris::system::server::Server;
 use serde::Serialize;
 
 use crate::config::{
@@ -64,10 +61,10 @@ use crate::config::{
 use crate::credentials::StoredCredentials;
 use crate::usage::{Price, price_for};
 
-/// The variable `AnthropicPlugin` reads the model key from.
+/// Environment source for an Anthropic API key.
 const ANTHROPIC_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
-/// The variable `OpenAiPlugin` reads the model key from.
+/// Environment source for an `OpenAI` API key.
 const OPENAI_KEY_VAR: &str = "OPENAI_API_KEY";
 
 /// The variable the `OpenAI` client reads its endpoint from.
@@ -86,7 +83,7 @@ const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A source of named values, so a check can be run against a stand-in for the
 /// process environment.
-pub type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+pub type Lookup<'a> = &'a (dyn Fn(&str) -> Option<String> + Sync);
 
 /// The process environment as a [`Lookup`].
 #[must_use]
@@ -109,6 +106,9 @@ fn present(value: Option<String>) -> Option<String> {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Provider {
+    /// The Responses API using the user's `ChatGPT` plan authorization.
+    #[value(name = "chatgpt")]
+    ChatGpt,
     /// The Anthropic API, with `ANTHROPIC_API_KEY`.
     Anthropic,
     /// The `OpenAI` Responses API, or a server that speaks it, with
@@ -126,17 +126,19 @@ pub enum Provider {
 
 impl Provider {
     /// Every provider, in the order listings show them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Anthropic,
         Self::OpenAi,
         Self::Bedrock,
         Self::OpenAiChat,
+        Self::ChatGpt,
     ];
 
     /// The name `--provider` takes.
     #[must_use]
     pub const fn flag(self) -> &'static str {
         match self {
+            Self::ChatGpt => "chatgpt",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::OpenAiChat => "openai-chat",
@@ -148,6 +150,7 @@ impl Provider {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::ChatGpt => "ChatGPT",
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::OpenAiChat => "OpenAI Chat Completions",
@@ -167,21 +170,40 @@ impl Provider {
     /// What this provider authenticates with, for user-facing diagnostics.
     #[must_use]
     pub const fn credential(self) -> &'static str {
-        match self.key_var() {
-            Some(_) => "API key",
-            None => "AWS credentials",
+        match self {
+            Self::Anthropic | Self::OpenAi | Self::OpenAiChat => "API key",
+            Self::Bedrock => "AWS credentials",
+            Self::ChatGpt => "ChatGPT sign-in",
+        }
+    }
+
+    /// Whether operator-declared models (`POLARIS_CODE_MODELS`, or `models` in
+    /// the configuration file) apply to this provider.
+    ///
+    /// A provider whose models depend on the signed-in account lists only what
+    /// that account offers.
+    #[must_use]
+    pub const fn accepts_declared_models(self) -> bool {
+        match self {
+            Self::Anthropic | Self::OpenAi | Self::OpenAiChat | Self::Bedrock => true,
+            Self::ChatGpt => false,
         }
     }
 
     /// What to check after this provider rejects authentication.
     #[must_use]
     pub fn credential_hint(self) -> String {
-        match self.key_var() {
-            Some(var) => format!(
+        match (self, self.key_var()) {
+            (_, Some(var)) => format!(
                 "Check the key saved by `polaris login {}` or supplied through {var}.",
                 self.flag()
             ),
-            None => "Check your AWS credentials and the model access granted to them.".to_string(),
+            (Self::ChatGpt, None) => {
+                "Sign in again with `polaris login chatgpt` or open /account.".to_string()
+            }
+            (_, None) => {
+                "Check your AWS credentials and the model access granted to them.".to_string()
+            }
         }
     }
 
@@ -199,6 +221,7 @@ impl Provider {
     #[must_use]
     pub const fn registry_name(self) -> &'static str {
         match self {
+            Self::ChatGpt => "chatgpt",
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::OpenAiChat => "openai-chat",
@@ -214,6 +237,7 @@ impl Provider {
             Self::Anthropic => Some(ANTHROPIC_KEY_VAR),
             Self::OpenAi | Self::OpenAiChat => Some(OPENAI_KEY_VAR),
             Self::Bedrock => None,
+            Self::ChatGpt => None,
         }
     }
 
@@ -249,6 +273,7 @@ impl Provider {
     #[must_use]
     pub fn catalog(self, env: Lookup<'_>) -> ModelCatalog {
         match self {
+            Self::ChatGpt => ModelCatalog::undiscovered(),
             Self::Anthropic => ModelCatalog::from_lookup(DEFAULT_MODEL, BUILTIN_MODELS, env),
             Self::OpenAi => {
                 ModelCatalog::from_lookup(DEFAULT_OPENAI_MODEL, BUILTIN_OPENAI_MODELS, env)
@@ -312,6 +337,15 @@ impl ReasoningHistory {
 pub enum StartupError {
     /// The retired provider-specific effort variable was set.
     RetiredReasoningSetting,
+    /// The selected connection has not been configured.
+    NotConfigured(Provider),
+    /// A configured connection is invalid.
+    Connection(String),
+    /// Account storage, authentication, or discovery failed.
+    Account {
+        /// Underlying account error.
+        source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+    },
     /// The provider's key variable is unset or blank.
     MissingKey {
         /// The provider that needs it.
@@ -350,10 +384,29 @@ pub enum StartupError {
     },
 }
 
+impl StartupError {
+    /// Whether interactive setup can resolve the missing configuration.
+    #[must_use]
+    pub const fn needs_setup(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingKey { .. } | Self::NoRegion | Self::NotConfigured(_)
+        )
+    }
+}
+
 impl fmt::Display for StartupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RetiredReasoningSetting => f.write_str("POLARIS_CODE_EXP_REASONING_EFFORT was retired; unset it and use --reasoning-effort or POLARIS_CODE_REASONING_EFFORT"),
+            Self::NotConfigured(provider) => write!(
+                f,
+                "{} is not connected; run `polaris login {}`",
+                provider.name(),
+                provider.flag()
+            ),
+            Self::Connection(message) => f.write_str(message),
+            Self::Account { source } => write!(f, "{source}"),
             Self::MissingKey { provider, var } => {
                 let flag = provider.flag();
                 let (name, where_to_get_one, example, more) = match provider {
@@ -375,6 +428,7 @@ impl fmt::Display for StartupError {
                         ),
                     ),
                     Provider::Bedrock => ("AWS", "", "", String::new()),
+                    Provider::ChatGpt => ("ChatGPT", "", "", String::new()),
                 };
                 write!(
                     f,
@@ -429,6 +483,7 @@ impl std::error::Error for StartupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::StoredCredentials { source } => Some(source.as_ref()),
+            Self::Account { source } => Some(source.as_ref()),
             Self::NoCredentials { source, .. } => source.as_deref().map(|source| source as _),
             _ => None,
         }
@@ -455,8 +510,9 @@ fn other_providers(provider: Provider) -> String {
 ///
 /// # Scope
 ///
-/// Global, because one provider serves the whole process: every session the
-/// host opens runs on the provider that passed the check at launch.
+/// Global launch snapshot. Interactive sessions can change connections through
+/// [`crate::connection::ConnectionRuntime`]; this report retains the provider
+/// and credential source checked at startup.
 ///
 /// # Provided By
 ///
@@ -542,7 +598,7 @@ impl ProviderReport {
     }
 
     /// The report as one line, for example
-    /// `bedrock · region us-east-1 · credentials from EC2 instance role`.
+    /// `bedrock · region us-east-1 · using AWS credentials from EC2 instance role`.
     #[must_use]
     pub fn line(&self) -> String {
         let mut parts = vec![self.provider.flag().to_string()];
@@ -552,7 +608,22 @@ impl ProviderReport {
         if let Some(endpoint) = &self.endpoint {
             parts.push(format!("endpoint {endpoint}"));
         }
-        parts.push(format!("credentials from {}", self.credential_source));
+        let usage = if self.credential_source == SIGNED_OUT_SOURCE {
+            SIGNED_OUT_SOURCE.to_string()
+        } else if self.provider == Provider::ChatGpt {
+            let account = self
+                .credential_source
+                .strip_prefix(CHATGPT_ACCOUNT_SOURCE_PREFIX)
+                .unwrap_or(&self.credential_source);
+            format!("using ChatGPT account usage ({account})")
+        } else if self.credential_source == STORED_KEY_SOURCE {
+            "using stored API key".to_string()
+        } else if self.provider.key_var().is_some() {
+            format!("using API key from {}", self.credential_source)
+        } else {
+            format!("using AWS credentials from {}", self.credential_source)
+        };
+        parts.push(usage);
         parts.join(" · ")
     }
 }
@@ -561,9 +632,28 @@ impl ProviderReport {
 #[derive(Clone)]
 pub struct ReadyProvider {
     report: ProviderReport,
-    sdk_config: Option<aws_config::SdkConfig>,
-    /// The key `polaris login` stored, when no environment variable held one.
-    stored_key: Option<String>,
+    prepared: Prepared,
+}
+
+/// What [`prepare`] checked, ready to build the provider from.
+#[derive(Clone)]
+enum Prepared {
+    Anthropic {
+        key: String,
+    },
+    OpenAi {
+        key: String,
+    },
+    OpenAiChat {
+        key: String,
+        base_url: Option<String>,
+    },
+    Bedrock(Box<aws_config::SdkConfig>),
+    ChatGpt {
+        client: crate::chatgpt::ChatGptClient,
+        account_id: String,
+        catalog: ModelCatalog,
+    },
 }
 
 // By hand, so what a debug print shows is the report and never a stored key or
@@ -577,134 +667,74 @@ impl fmt::Debug for ReadyProvider {
 }
 
 impl ReadyProvider {
+    pub(crate) fn chatgpt_account_id(&self) -> Option<&str> {
+        match &self.prepared {
+            Prepared::ChatGpt { account_id, .. } => Some(account_id),
+            _ => None,
+        }
+    }
+
+    /// Available models for this provider and, for `ChatGPT`, the signed-in account.
+    #[must_use]
+    pub fn model_catalog(&self, env: Lookup<'_>) -> ModelCatalog {
+        match &self.prepared {
+            Prepared::ChatGpt { catalog, .. } => catalog.clone(),
+            _ => self.report.provider.catalog(env),
+        }
+    }
+
+    /// Build the model provider from the prepared credentials and clients.
+    pub(crate) fn implementation(
+        &self,
+        max_tokens: NonZeroU32,
+        pricing: PriceStore,
+    ) -> std::sync::Arc<dyn polaris::models::llm::DynLlmProvider> {
+        use polaris::models::{anthropic::AnthropicProvider, bedrock::BedrockProvider};
+        match &self.prepared {
+            Prepared::ChatGpt {
+                client, account_id, ..
+            } => std::sync::Arc::new(crate::chatgpt::ChatGptProvider::new(
+                client.clone(),
+                account_id.clone(),
+            )),
+            Prepared::Bedrock(config) => std::sync::Arc::new(
+                BedrockProvider::new(std::sync::Arc::new(aws_sdk_bedrockruntime::Client::new(
+                    config,
+                )))
+                .with_sdk_config(config.as_ref().clone())
+                .with_max_tokens(max_tokens)
+                .with_pricing_store(pricing),
+            ),
+            Prepared::Anthropic { key } => std::sync::Arc::new(
+                AnthropicProvider::new(key.clone())
+                    .with_max_tokens(max_tokens)
+                    .with_pricing_store(pricing),
+            ),
+            Prepared::OpenAi { key } => {
+                std::sync::Arc::new(OpenAiProvider::new(key.clone()).with_pricing_store(pricing))
+            }
+            Prepared::OpenAiChat { key, base_url } => {
+                let mut provider =
+                    polaris::models::chat_completions::ChatCompletionsProvider::new(key.clone())
+                        .with_pricing_store(pricing);
+                if let Some(url) = base_url {
+                    provider = provider.with_base_url(url.clone());
+                }
+                std::sync::Arc::new(provider)
+            }
+        }
+    }
+
     /// What the provider is running as.
     #[must_use]
     pub fn report(&self) -> &ProviderReport {
         &self.report
     }
-
-    /// Register this provider with immutable policy on every model call,
-    /// including auxiliary calls and optional complete-run trajectory capture.
-    ///
-    /// # Panics
-    ///
-    /// Panics if preparation loaded no stored key and the checked credential
-    /// is absent from the process environment, including when preparation used
-    /// an injected lookup. Also panics if an internal invariant is broken and
-    /// a prepared Bedrock provider has no checked SDK configuration.
-    pub fn install_with_options(
-        &self,
-        server: &mut Server,
-        max_output_tokens: NonZeroU32,
-        pricing: PriceStore,
-        options: crate::model_run::ModelRunOptions,
-    ) {
-        use crate::model_run::ModelRunPlugin;
-        let key = || {
-            self.stored_key.clone().unwrap_or_else(|| {
-                std::env::var(self.report.provider.key_var().expect("key provider"))
-                    .expect("provider credentials were checked at startup")
-            })
-        };
-        match self.report.provider {
-            Provider::Anthropic => {
-                server.add_plugins(ModelRunPlugin::new(
-                    polaris::models::anthropic::AnthropicProvider::new(key())
-                        .with_max_tokens(max_output_tokens)
-                        .with_pricing_store(pricing),
-                    options,
-                ));
-            }
-            Provider::OpenAi => {
-                server.add_plugins(ModelRunPlugin::new(
-                    OpenAiProvider::new(key()).with_pricing_store(pricing),
-                    options,
-                ));
-            }
-            Provider::OpenAiChat => {
-                let mut provider =
-                    polaris::models::chat_completions::ChatCompletionsProvider::new(key())
-                        .with_pricing_store(pricing);
-                if let Some(url) = present(process_env(OPENAI_BASE_URL_VAR)) {
-                    provider = provider.with_base_url(url);
-                }
-                server.add_plugins(
-                    ModelRunPlugin::new(provider, options).with_registry_name("openai-chat"),
-                );
-            }
-            Provider::Bedrock => {
-                let config = self.sdk_config.clone().expect("checked Bedrock SDK config");
-                let provider = polaris::models::bedrock::BedrockProvider::new(std::sync::Arc::new(
-                    aws_sdk_bedrockruntime::Client::new(&config),
-                ))
-                .with_sdk_config(config)
-                .with_max_tokens(max_output_tokens)
-                .with_pricing_store(pricing);
-                server.add_plugins(ModelRunPlugin::new(provider, options));
-            }
-        }
-    }
-
-    /// Register the provider's plugin with `server`.
-    ///
-    /// `max_output_tokens` is the per-request output limit for the providers
-    /// that take one at registration — Anthropic and Bedrock. `OpenAiPlugin`
-    /// has no such setting, so it is not applied there.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an internal invariant is broken and a prepared Bedrock
-    /// provider has no checked SDK configuration.
-    pub fn install(&self, server: &mut Server, max_output_tokens: NonZeroU32, pricing: PriceStore) {
-        match (self.report.provider, &self.stored_key) {
-            (Provider::Anthropic, None) => {
-                server.add_plugins(
-                    AnthropicPlugin::from_env(ANTHROPIC_KEY_VAR)
-                        .with_max_tokens(max_output_tokens)
-                        .with_pricing_store(pricing),
-                );
-            }
-            (Provider::Anthropic, Some(key)) => {
-                server.add_plugins(
-                    AnthropicPlugin::new(key.clone())
-                        .with_max_tokens(max_output_tokens)
-                        .with_pricing_store(pricing),
-                );
-            }
-            (Provider::OpenAi, None) => {
-                server.add_plugins(
-                    OpenAiPlugin::from_env(OPENAI_KEY_VAR).with_pricing_store(pricing),
-                );
-            }
-            (Provider::OpenAi, Some(key)) => {
-                server.add_plugins(StoredKeyOpenAiPlugin::new(key.clone(), pricing));
-            }
-            (Provider::OpenAiChat, _) => {
-                self.install_with_options(
-                    server,
-                    max_output_tokens,
-                    pricing,
-                    crate::model_run::ModelRunOptions::default(),
-                );
-            }
-            (Provider::Bedrock, _) => {
-                // The SDK config was loaded and checked in `prepare`; handing
-                // it over means the plugin does not load it a second time.
-                let sdk_config = self
-                    .sdk_config
-                    .clone()
-                    .expect("a Bedrock provider is prepared with its SDK config");
-                let plugin = BedrockPlugin::from_sdk_config(sdk_config)
-                    .with_max_tokens(max_output_tokens)
-                    .with_pricing_store(pricing);
-                server.add_plugins(plugin);
-            }
-        }
-    }
 }
 
 /// Check that `provider` can start, reading credentials through `env` and,
-/// when the environment has none, from `stored`.
+/// when the environment has none, from `stored`. `ChatGPT` reads its account
+/// registrations from the user configuration directory instead of these key sources.
 ///
 /// `region` is `--region`; only Bedrock uses it. The same function serves the
 /// interactive and the non-interactive front end, so both refuse to start on
@@ -712,7 +742,10 @@ impl ReadyProvider {
 ///
 /// # Errors
 ///
-/// [`StartupError`] naming what is missing and how to supply it.
+/// [`StartupError`] for missing or invalid configuration, inaccessible
+/// credentials or account storage, failed account refresh, or model-catalog
+/// discovery. `ChatGPT` preparation can contact its authentication and model
+/// services; transient service failures are returned rather than starting setup.
 pub async fn prepare(
     provider: Provider,
     region: Option<&str>,
@@ -723,6 +756,7 @@ pub async fn prepare(
         return Err(StartupError::RetiredReasoningSetting);
     }
     match provider {
+        Provider::ChatGpt => prepare_chatgpt().await,
         Provider::Anthropic => {
             let origin = resolve_key(provider, env, stored)?;
             if let Some(url) = present(env(ANTHROPIC_BASE_URL_VAR)) {
@@ -731,21 +765,30 @@ pub async fn prepare(
                     value: redact_url(&url),
                 });
             }
-            Ok(ready_with_key(provider, origin, None))
+            Ok(ready_with_key(provider, origin, None, |key| {
+                Prepared::Anthropic { key }
+            }))
         }
         Provider::OpenAi | Provider::OpenAiChat => {
             let origin = resolve_key(provider, env, stored)?;
-            let endpoint = match present(env(OPENAI_BASE_URL_VAR)) {
-                Some(url) if is_http_url(&url) => Some(redact_url(&url)),
+            let base_url = present(env(OPENAI_BASE_URL_VAR));
+            let endpoint = match &base_url {
+                Some(url) if is_http_url(url) => Some(redact_url(url)),
                 Some(url) => {
                     return Err(StartupError::BadBaseUrl {
                         var: OPENAI_BASE_URL_VAR,
-                        value: redact_url(&url),
+                        value: redact_url(url),
                     });
                 }
                 None => None,
             };
-            Ok(ready_with_key(provider, origin, endpoint))
+            Ok(ready_with_key(provider, origin, endpoint, |key| {
+                if provider == Provider::OpenAi {
+                    Prepared::OpenAi { key }
+                } else {
+                    Prepared::OpenAiChat { key, base_url }
+                }
+            }))
         }
         Provider::Bedrock => {
             // `AWS_PROFILE` wins, as it does for every AWS tool; the stored
@@ -779,13 +822,17 @@ pub async fn prepare(
 /// Where a provider's key was found.
 enum KeyOrigin {
     /// In this environment variable, `.env` included.
-    Variable(&'static str),
+    Variable { var: &'static str, key: String },
     /// In the credentials file, because no variable held one.
     Stored(String),
 }
 
 /// What the report says for a key `polaris login` stored.
 const STORED_KEY_SOURCE: &str = "stored key (polaris login)";
+/// What the report says when no connection is active.
+const SIGNED_OUT_SOURCE: &str = "signed out";
+/// Prefix identifying a connected `ChatGPT` account in the report.
+const CHATGPT_ACCOUNT_SOURCE_PREFIX: &str = "ChatGPT account ";
 
 /// Find `provider`'s key: its variable first, then the credentials file.
 fn resolve_key(
@@ -796,8 +843,8 @@ fn resolve_key(
     let var = provider
         .key_var()
         .expect("this provider authenticates with a key");
-    if present(env(var)).is_some() {
-        return Ok(KeyOrigin::Variable(var));
+    if let Some(key) = present(env(var)) {
+        return Ok(KeyOrigin::Variable { var, key });
     }
     match stored.api_key(provider) {
         Ok(Some(key)) => Ok(KeyOrigin::Stored(key)),
@@ -812,10 +859,11 @@ fn ready_with_key(
     provider: Provider,
     origin: KeyOrigin,
     endpoint: Option<String>,
+    prepared: impl FnOnce(String) -> Prepared,
 ) -> ReadyProvider {
-    let (credential_source, stored_key) = match origin {
-        KeyOrigin::Variable(var) => (var.to_string(), None),
-        KeyOrigin::Stored(key) => (STORED_KEY_SOURCE.to_string(), Some(key)),
+    let (credential_source, key) = match origin {
+        KeyOrigin::Variable { var, key } => (var.to_string(), key),
+        KeyOrigin::Stored(key) => (STORED_KEY_SOURCE.to_string(), key),
     };
     ReadyProvider {
         report: ProviderReport {
@@ -824,18 +872,17 @@ fn ready_with_key(
             endpoint,
             credential_source,
         },
-        sdk_config: None,
-        stored_key,
+        prepared: prepared(key),
     }
 }
 
-/// Registers the `OpenAI` provider with a key that `polaris login` stored —
-/// add it instead of [`OpenAiPlugin`] when the key is not in the environment.
+/// Registers the `OpenAI` provider with an explicitly supplied key.
+/// [`ReadyProvider::install`] is the usual path for credentials resolved by
+/// [`prepare`], including keys saved by `polaris login`.
 ///
-/// [`OpenAiPlugin`] can only read its key from an environment variable, and this
-/// process never writes one. This plugin does what that plugin's `build` does
-/// — register an [`OpenAiProvider`] under `openai/<model>` — with the key it
-/// was given, using only the framework's public provider type and registry.
+/// [`OpenAiPlugin`](polaris::models::OpenAiPlugin) can only read its key from an environment variable, and this
+/// process never writes one. This compatibility plugin registers an
+/// [`OpenAiProvider`] under `openai/<model>` with the key it was given.
 /// The provider reads `OPENAI_BASE_URL` itself, exactly as it does under
 /// `OpenAiPlugin`.
 ///
@@ -854,7 +901,14 @@ fn ready_with_key(
 /// # Dependencies
 ///
 /// [`ModelsPlugin`](polaris::models::ModelsPlugin), which owns the [`ModelRegistry`] this plugin extends. Do not
-/// add it together with [`OpenAiPlugin`]: both register the `openai` provider.
+/// add it together with another registration of `openai`, such as
+/// [`OpenAiPlugin`](polaris::models::OpenAiPlugin), [`ReadyProvider::install`],
+/// or [`crate::connection::ConnectionPlugin::with_switching`].
+///
+/// # Extends
+///
+/// Registers the `openai` provider in the [`ModelRegistry`] owned by
+/// [`ModelsPlugin`](polaris::models::ModelsPlugin), serving `openai/<model>`.
 ///
 /// # Example
 ///
@@ -950,8 +1004,7 @@ async fn check_bedrock(
             endpoint: None,
             credential_source: credential_source(features, profile.as_deref()),
         },
-        sdk_config: Some(sdk_config),
-        stored_key: None,
+        prepared: Prepared::Bedrock(Box::new(sdk_config)),
     })
 }
 
@@ -1108,6 +1161,9 @@ impl ModelListing {
                         }
                     }
                     Some(variable) => CredentialStatus::Missing { variable },
+                    None if provider == Provider::ChatGpt => CredentialStatus::Unchecked {
+                        note: "account-specific models are discovered after ChatGPT sign-in; run polaris login chatgpt",
+                    },
                     None => CredentialStatus::Unchecked {
                         note: "resolved at startup from the AWS default credential chain",
                     },
@@ -1146,7 +1202,12 @@ impl ModelListing {
                 listing.provider.flag()
             ));
             if listing.models.is_empty() {
-                out.push_str("  (no models declared; set POLARIS_CODE_MODELS)\n");
+                out.push_str(match listing.provider {
+                    Provider::ChatGpt => {
+                        "  (sign in to discover the models available to your account)\n"
+                    }
+                    _ => "  (no models declared; set POLARIS_CODE_MODELS)\n",
+                });
             }
             for model in &listing.models {
                 let price = model.price.map_or_else(
@@ -1172,8 +1233,77 @@ impl ModelListing {
     }
 }
 
+async fn prepare_chatgpt() -> Result<ReadyProvider, StartupError> {
+    let store = crate::chatgpt::ChatGptStore::user().map_err(account_startup_error)?;
+    let account = store
+        .accounts_async()
+        .await
+        .map_err(account_startup_error)?
+        .into_iter()
+        .find(|account| account.active && account.signed_in && account.plan_enabled)
+        .ok_or(StartupError::NotConfigured(Provider::ChatGpt))?;
+    prepare_chatgpt_account(&store, &account.id).await
+}
+
+pub(crate) fn account_startup_error(source: crate::chatgpt::ChatGptError) -> StartupError {
+    // Signing in can repair expiry; other failures need their original diagnostics.
+    if source.is_expired() {
+        StartupError::NotConfigured(Provider::ChatGpt)
+    } else {
+        StartupError::Account {
+            source: std::sync::Arc::new(source),
+        }
+    }
+}
+
+pub(crate) async fn prepare_chatgpt_account(
+    store: &crate::chatgpt::ChatGptStore,
+    account_id: &str,
+) -> Result<ReadyProvider, StartupError> {
+    let account = store
+        .accounts_async()
+        .await
+        .map_err(account_startup_error)?
+        .into_iter()
+        .find(|account| account.id == account_id && account.signed_in && account.plan_enabled)
+        .ok_or(StartupError::NotConfigured(Provider::ChatGpt))?;
+    let client =
+        crate::chatgpt::ChatGptClient::new(store.clone()).map_err(account_startup_error)?;
+    let models = client
+        .models(&account.id)
+        .await
+        .map_err(account_startup_error)?;
+    let ids: Vec<_> = models
+        .iter()
+        .map(|(slug, _)| format!("chatgpt/{slug}"))
+        .collect();
+    let refs: Vec<_> = ids.iter().map(String::as_str).collect();
+    let default_model = ids.first().ok_or_else(|| {
+        StartupError::Connection("ChatGPT offered no models to this account".into())
+    })?;
+    let catalog = ModelCatalog::from_lookup(default_model, &refs, &|_| None).with_display_names(
+        models
+            .into_iter()
+            .map(|(slug, name)| (format!("chatgpt/{slug}"), name)),
+    );
+    Ok(ReadyProvider {
+        prepared: Prepared::ChatGpt {
+            client,
+            account_id: account.id,
+            catalog,
+        },
+        report: ProviderReport::new(
+            Provider::ChatGpt,
+            None,
+            None,
+            format!("{CHATGPT_ACCOUNT_SOURCE_PREFIX}{}", account.label),
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use polaris::system::server::Server;
     use std::collections::HashMap;
 
     use aws_credential_types::Credentials;
@@ -1182,6 +1312,19 @@ mod tests {
 
     use super::*;
     use crate::credentials::CredentialStore;
+
+    #[test]
+    fn account_usage_and_sign_out_reports_name_the_active_state() {
+        let report = ProviderReport::new(Provider::ChatGpt, None, None, "ChatGPT account personal");
+        assert_eq!(
+            report.line(),
+            "chatgpt · using ChatGPT account usage (personal)"
+        );
+        for provider in [Provider::Anthropic, Provider::ChatGpt, Provider::Bedrock] {
+            let report = ProviderReport::new(provider, None, None, "signed out");
+            assert_eq!(report.line(), format!("{} · signed out", provider.flag()));
+        }
+    }
 
     /// What a run sees when nothing was saved with `polaris login`.
     const NOTHING_STORED: Option<CredentialStore> = None;
@@ -1237,6 +1380,10 @@ mod tests {
         }
         assert_eq!(Provider::from_str("openai", false), Ok(Provider::OpenAi));
         assert!(Provider::from_str("open-ai", false).is_err());
+        assert!(
+            Provider::from_str("local", false).is_err(),
+            "an unknown provider name is rejected"
+        );
     }
 
     #[test]
@@ -1276,6 +1423,13 @@ mod tests {
         let none = |_: &str| None;
         for provider in Provider::ALL {
             let catalog = provider.catalog(&none);
+            if matches!(provider, Provider::ChatGpt) {
+                assert!(
+                    catalog.models().is_empty(),
+                    "chatgpt models come from the account catalog"
+                );
+                continue;
+            }
             let reachable = catalog.restricted_to_providers(&[provider.registry_name()]);
             assert_eq!(
                 reachable.select(None).as_deref(),
@@ -1332,6 +1486,46 @@ mod tests {
             .restricted_to_providers(&["openai"]);
         assert_eq!(catalog.select(None).unwrap(), "openai/qwen3");
         assert_eq!(catalog.resolve("llama3").unwrap(), "openai/llama3");
+    }
+
+    #[test]
+    fn startup_error_needs_setup() {
+        for (error, expected) in [
+            (StartupError::NotConfigured(Provider::ChatGpt), true),
+            (StartupError::NoRegion, true),
+            (
+                StartupError::MissingKey {
+                    provider: Provider::OpenAi,
+                    var: OPENAI_KEY_VAR,
+                },
+                true,
+            ),
+            (StartupError::RetiredReasoningSetting, false),
+            (
+                StartupError::BadBaseUrl {
+                    var: OPENAI_BASE_URL_VAR,
+                    value: "invalid".into(),
+                },
+                false,
+            ),
+            (
+                StartupError::Connection("network unavailable".into()),
+                false,
+            ),
+            (
+                StartupError::NoCredentials {
+                    detail: "timeout".into(),
+                    source: None,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(
+                error.needs_setup(),
+                expected,
+                "only missing configuration offers setup: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1395,7 +1589,7 @@ mod tests {
             .await
             .expect("a key is enough");
         let line = ready.report().line();
-        assert_eq!(line, "anthropic · credentials from ANTHROPIC_API_KEY");
+        assert_eq!(line, "anthropic · using API key from ANTHROPIC_API_KEY");
         assert!(!format!("{ready:?}").contains(secret));
     }
 
@@ -1415,7 +1609,7 @@ mod tests {
         .expect("a key and a base url are enough");
         assert_eq!(
             ready.report().line(),
-            "openai · endpoint http://localhost:11434/v1 · credentials from OPENAI_API_KEY"
+            "openai · endpoint http://localhost:11434/v1 · using API key from OPENAI_API_KEY"
         );
         assert_eq!(ready.report().endpoint(), Some("http://localhost:11434/v1"));
         let rendered = format!("{ready:?}");
@@ -1433,7 +1627,7 @@ mod tests {
         assert_eq!(ready.report().endpoint(), None);
         assert_eq!(
             ready.report().line(),
-            "openai · credentials from OPENAI_API_KEY"
+            "openai · using API key from OPENAI_API_KEY"
         );
     }
 
@@ -1590,30 +1784,30 @@ mod tests {
         for (features, expected) in [
             (
                 vec![AwsCredentialFeature::CredentialsImds],
-                "bedrock · region us-east-1 · credentials from EC2 instance role",
+                "bedrock · region us-east-1 · using AWS credentials from EC2 instance role",
             ),
             (
                 vec![AwsCredentialFeature::CredentialsEnvVars],
-                "bedrock · region us-east-1 · credentials from environment variables (AWS_ACCESS_KEY_ID)",
+                "bedrock · region us-east-1 · using AWS credentials from environment variables (AWS_ACCESS_KEY_ID)",
             ),
             (
                 vec![
                     AwsCredentialFeature::CredentialsSso,
                     AwsCredentialFeature::CredentialsProfile,
                 ],
-                "bedrock · region us-east-1 · credentials from AWS SSO (profile `work`)",
+                "bedrock · region us-east-1 · using AWS credentials from AWS SSO (profile `work`)",
             ),
             (
                 vec![AwsCredentialFeature::CredentialsProfile],
-                "bedrock · region us-east-1 · credentials from shared AWS profile `work`",
+                "bedrock · region us-east-1 · using AWS credentials from shared AWS profile `work`",
             ),
             (
                 vec![AwsCredentialFeature::CredentialsHttp],
-                "bedrock · region us-east-1 · credentials from container credentials endpoint",
+                "bedrock · region us-east-1 · using AWS credentials from container credentials endpoint",
             ),
             (
                 vec![],
-                "bedrock · region us-east-1 · credentials from the AWS default credential chain",
+                "bedrock · region us-east-1 · using AWS credentials from the AWS default credential chain",
             ),
         ] {
             let config = sdk_config(
@@ -1762,18 +1956,18 @@ mod tests {
             None,
         );
         for (provider, source) in [
-            (
-                Provider::Anthropic,
-                "anthropic · credentials from stored key (polaris login)",
-            ),
-            (
-                Provider::OpenAi,
-                "openai · credentials from stored key (polaris login)",
-            ),
+            (Provider::Anthropic, "anthropic · using stored API key"),
+            (Provider::OpenAi, "openai · using stored API key"),
         ] {
             let ready = prepare_stored(provider, &[], &stored).await.unwrap();
             assert_eq!(ready.report().line(), source);
-            assert!(ready.stored_key.is_some());
+            assert!(
+                matches!(
+                    &ready.prepared,
+                    Prepared::Anthropic { key } | Prepared::OpenAi { key } if key.contains("stored-key")
+                ),
+                "preparation retains the stored key for {provider:?}"
+            );
             let shown = format!("{ready:?} {}", ready.report().line());
             assert!(
                 !shown.contains("stored-key"),
@@ -1799,8 +1993,8 @@ mod tests {
         .unwrap();
         assert_eq!(ready.report().credential_source(), "ANTHROPIC_API_KEY");
         assert!(
-            ready.stored_key.is_none(),
-            "the framework reads the variable itself"
+            matches!(&ready.prepared, Prepared::Anthropic { key } if key == "sk-ant-from-env"),
+            "preparation retains the checked environment credential"
         );
     }
 

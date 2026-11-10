@@ -8,6 +8,7 @@
 //!
 //! | Piece | Role |
 //! |-------|------|
+//! | [`SessionAccounts`] | `/login`, `/account`, `/logout`, and `/usage` over the shared connection-setup service. |
 //! | [`CommandRegistry`] | The `/commands` the terminal runs locally. Ships `/help`; other features register theirs. |
 //! | [`AgentRequest`] | What a command hands the agent's input system when its effect belongs to the agent's graph. The terminal never learns what one means; the capability that registered the command reads it. |
 //! | [`CommandDispatch`] | An [`IOProvider`](polaris::plugins::IOProvider) decorator that executes dispatched commands and answers them **before** the agent's `receive` returns, advertises the set to the panel, and validates `@` mentions on ordinary prompts crossing the channel. |
@@ -47,6 +48,7 @@
 //! waiting, and a front end with no decorator at all ends the turn with the
 //! reason rather than calling the model.
 
+pub mod account_commands;
 pub mod attachments;
 pub mod background;
 pub mod commands;
@@ -76,6 +78,7 @@ use polaris_tui::ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::run::StatusEmitter;
 
+pub use account_commands::{SessionAccounts, connection_status};
 pub use attachments::{
     ATTACHMENT_BYTES_MAX, AttachmentStore, ClipboardImages, StoredAttachment, WorkspaceAttachments,
     model_accepts_images, user_message,

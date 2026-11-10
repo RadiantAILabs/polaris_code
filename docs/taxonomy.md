@@ -77,6 +77,10 @@ control flow.
 (`CommandRegistry`, `CommandDispatch`, `WorkspaceFiles`, `LiveTranscript`),
 `src/exec/` (`ExecIOPlugin`), and
 `src/agents/human_approval.rs` (`InteractiveApprovalPlugin`).
+Connection capabilities live in `src/connection.rs` (`ConnectionPlugin`,
+`ConnectionRuntime`), `src/onboarding/` (`SetupService`), and `src/chatgpt/`
+(sign-in, account storage, and the plan-backed provider); shared security helpers
+live in `src/redaction.rs` and `src/private_file.rs`.
 
 The swappable capabilities this app contributes as Polaris plugins:
 

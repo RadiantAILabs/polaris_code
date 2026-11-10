@@ -5,8 +5,22 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+Requires `polaris-tui` 0.4.0 and `polaris-ai` 0.9.3. Release `polaris-tui` 0.4.0 first.
+The next `polaris_code` release must be 0.5.0 because of the breaking API changes below.
+
 ### Added
 - Harbor adapter (`evals/packs/terminal_bench_harbor`): the agent keyword `image_input` (`auto`, `on` or `off`) is passed as `--image-input`, so a job can say whether the model takes images. Release 0.4.5 or later understands the flag.
+- ChatGPT provider with browser sign-in, account-specific models, and eligible ChatGPT plan usage.
+- Guided connection setup and in-session `/account`, `/login`, `/logout`, and `/usage` commands for switching providers and managing accounts. The active connection appears in the status row and `/status`.
+
+### Changed
+
+- `polaris login` without `--with-api-key` opens the full-screen setup. Line-based setup (`--with-api-key`, `accounts::run`) does not offer ChatGPT.
+- Connection setup saves provider, model, and region defaults while preserving a compatible saved user model. Scripted `--with-api-key` login requires an explicit provider.
+- `credentials.toml` is refused when it is a symlink on read as well as on write, and on Unix when it is not owned by the current user.
+- Project `.env` files may no longer set `BROWSER` or `PATH`. If a variable is absent from the launching environment, its presence in `.env` stops startup before any entries are applied; existing shell values still win. Set these variables in your shell before starting `polaris`.
+- For embedders, `SessionSettings::catalog()` now returns an owned `ModelCatalog` instead of a reference; `StoredCredentials` and `providers::Lookup` now require `Sync`; `Provider::ChatGpt` is added and `Provider::ALL` is now `[Provider; 5]`; `ReadyProvider::install` and `ReadyProvider::install_with_options` now return `ConnectionRuntime`.
+- For embedders, `accounts::register_login_command` is deprecated. New public APIs include the `connection` and `onboarding` modules, `terminal::SessionAccounts`, and `accounts::run_from_args_with_defaults`. `polaris-tui` adds `dialogs`, `TuiPanel::is_modal`, `TuiHandle::request_clipboard_copy`, `ConversationPanelPlugin::with_dialogs`, and `ConversationPanelPlugin::with_status_context`.
 
 ## [0.4.5] - 2026-11-10
 
@@ -39,15 +53,18 @@ Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 
 ### Added
+
 - A model reply cut off at the output limit is continued instead of being treated as the final answer, up to three times per turn. The final answer of a `-p` run joins the continued parts.
 - A `-p` run asks the model to go on once when a reply calls no tool. `POLARIS_CODE_UNATTENDED_NUDGES` sets the number; `0` turns it off. Interactive sessions and embedding hosts are unchanged unless they opt in through `ContinuationPolicy`.
 - The model sees the first and last 5,000 characters of each long shell output stream, with the end read from the overflow file when the capture was cut. Secrets are redacted before the output is shortened. `ObservationPolicy` on `PolicySnapshot` sets the size.
 
 ### Changed
+
 - Foreground `run_command` calls in a `-p` run time out after 600 seconds by default instead of 120. Interactive sessions keep 120, and `run_in_background` keeps its 3,600-second default.
 - A `-p` run that grants edits or commands no longer routes question-shaped prompts (`find …`, `where is …`) to the read-only question topology.
 
 ### Fixed
+
 - `--context-window` now sizes context projection and compaction in CLI sessions. The CLI replaced the session policy with unsized defaults after the agent had sized it, so compaction always started at the 60,000-token default.
 
 ## [0.4.2] - 2026-11-08
@@ -55,6 +72,7 @@ Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 
 ### Fixed
+
 - `Cargo.lock` now locks every Polaris crate under `polaris-ai` at 0.9.1. The 0.4.1 lockfile locked `polaris-ai` 0.9.1 but kept `polaris_internal`, `polaris_model_providers` and the other Polaris crates at 0.9.0, so `cargo install polaris_code --locked` built 0.4.1 without the OpenAI history fix below.
 
 ## [0.4.1] - 2026-11-08
@@ -62,6 +80,7 @@ Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 
 ### Changed
+
 - Uses `polaris-ai` 0.9.1. It fixes HTTP 400 errors from `--provider openai` and Bedrock `openai.*` models when an earlier model reply in the history had two or more text blocks. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are unchanged at 0.3.0. Its lockfile still locked `polaris_model_providers` 0.9.0, so builds with `--locked` do not get this fix; use 0.4.2.
 - `--trajectory-path` and `RunTrajectory` no longer write the file for each tool result or message. They are queued in memory and written by the next model call or by `finish`, so they never block an async worker. A hard kill can lose the tool results and messages recorded since the last model call.
 
@@ -70,6 +89,7 @@ Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.1.
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.0.
 
 ### Added
+
 - `--provider openai-chat` for OpenAI-compatible Chat Completions endpoints, including arbitrary vendor model ids.
 - `--reasoning-effort` / `POLARIS_CODE_REASONING_EFFORT` / `reasoning_effort` pins effort on every model request, including auxiliary calls. The experimental Bedrock variable is retired with a startup migration error.
 - `--context-window` / `POLARIS_CODE_CONTEXT_WINDOW` / `context_window` sizes projection and compaction after reserving output and prompt overhead.
@@ -92,6 +112,7 @@ Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.0.
 - Harbor adapter (`evals/packs/terminal_bench_harbor`): the agent keyword `version=` installs a pinned release of that musl archive (Linux x86-64 task images only, checksum checked, optional `sha256=` digest pin) instead of uploading a local `binary=`. New keywords `provider`, `base_url`, `reasoning_effort`, `context_window`, `max_output_tokens` and `unattended`. Harbor's token and cost fields come from the native ATIF trajectory. `unattended=true` together with `allow_command` is refused when the agent is created. CI runs the adapter tests against Harbor 0.24.0.
 
 ### Changed
+
 - Uses `polaris-ai` 0.9.0. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are released as 0.3.0 against it.
 - `polaris_cosmos` now depends on `async-trait` 0.1, `toml` 0.8 and `tokio` 1 (features `macros`, `rt`, `sync`, `time`). The single `polaris-ai` is unchanged.
 - A spend cap now applies per call. When a session's `TokenMeter` carries a cap (`TokenMeter::set_task_cost_cap`), the agent reserves the most each model request could cost before sending it, replaces the reservation with the billed usage when the reply ends, and ends the call with a failure beginning `cost-cap:`, without contacting the model, when the reservation does not fit in what is left. The reservation is given back only when the provider refused the request with an authentication, rate-limit or invalid-request error; a request cut off in flight, one that fails any other way, and one whose reply does not report both token counts are charged at their estimate. The operator's `--max-cost-usd` and `--max-tokens` still set no such cap.
@@ -103,6 +124,7 @@ Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.0.
 Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.
 
 ### Added
+
 - Approval picker: an approval request opens a picker in place of the input, with the command once and a numbered list of answers. One key press answers (a digit, the answer's own key, or `Enter`); `Esc` and `Ctrl-C` deny; `Tab` adds a one-line note; `?` shows the full prompt. Text typed while the picker is open is dropped, so it can neither answer the approval nor start a turn.
 - `polaris-tui` exports `APPROVAL_SUBJECT`, `APPROVAL_CONTEXT` and `APPROVAL_NOTE`. With `APPROVAL_SUBJECT` the panel refuses a confirming answer until the whole command has been drawn, and accepts only a denial for a command over 64 KiB. `APPROVAL_CONTEXT` is a display hint only; `confirmed` and `approval_choice` still carry the answer.
 - Approval notes: a note on an allow is sent as `approval_note`, recorded with the human decision, and added to that call's tool result as `User note on approval: ...` (control characters removed, cut to 1 KiB, secrets redacted). A note on a denial is the reason (`deny: <note>`). A note never changes the grant, and session grants do not carry it to later calls.
@@ -114,6 +136,7 @@ Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.
 - `CodeGraphPlugin::with_boot_index`, `tools::boot_index_wanted(headless, dir)` and `tools::looks_like_project`. An interactive `polaris` run outside a project skips the boot code index and says so; headless runs still index.
 
 ### Changed
+
 - `CodeAgentPlugin` no longer asks a person on its own. Hosts must add `InteractiveApprovalPlugin` or supply their own `HumanApproval`; otherwise every call that needs a person is denied.
 - `polaris-tui` replaces typed `y`, `n` and `no: reason` approval answers with the picker. Press `Tab` to enter a reason or note.
 - `polaris-ai` moves from 0.7.1 to 0.8.0. Hosts must upgrade their framework dependency too; all public types exposing framework types now use 0.8.0.
@@ -128,6 +151,7 @@ Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.
 - Successful tool results longer than a line (other than diffs) collapse to a one-line summary; failures, denials and non-zero exits stay expanded.
 
 ### Fixed
+
 - Approval text wraps by grapheme cluster, the way the terminal draws it, so an emoji or other multi-character grapheme can no longer push the end of a command out of view and still count as shown.
 - Approval answer labels are bounded in size before they are laid out, so a very long label no longer slows every frame.
 - The `p` (prefix) answer is left out when the prefix is very long, instead of showing an oversized label.
@@ -143,6 +167,7 @@ Requires `polaris-tui` 0.2.0 and `polaris-ai` 0.8.0.
 Requires `polaris-tui` 0.1.1.
 
 ### Added
+
 - Graph tab: shows the agent graph live, with the running node marked (`GraphPanelPlugin`, `GraphViewPlugin`, `GraphFeed`).
 - Smooth scrolling in the transcript, with redraws grouped at 60 fps.
 - Built-in Bedrock model list (`config::BUILTIN_BEDROCK_MODELS`).
@@ -153,6 +178,7 @@ Requires `polaris-tui` 0.1.1.
 - TUI keys: Esc interrupts, Ctrl-G opens `$EDITOR`, Ctrl-N browses the transcript, Shift-Tab steps the permission mode; `--notify`.
 
 ### Changed
+
 - The Logs tab is folded into the Ctrl-O node timeline; default tabs are Conversation, Graph, Help.
 - Ctrl-C first returns to the live bottom when the transcript is scrolled up.
 - Default model is `claude-sonnet-5-5`, on Bedrock too.
@@ -161,16 +187,19 @@ Requires `polaris-tui` 0.1.1.
 - Public API changes in `CommandOutcome`, `RetryPolicy`, `PermissionPolicy` and approvals (see PR #1).
 
 ### Fixed
+
 - Homebrew Linux archive runtime linkage.
 
 ## [0.1.1] - 2026-10-29
 
 ### Added
+
 - The `polaris` command and Homebrew installation.
 
 ## [0.1.0] - 2026-10-29
 
 ### Added
+
 - First public release of `polaris_code` and its supporting crates.
 
 [Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.5...HEAD

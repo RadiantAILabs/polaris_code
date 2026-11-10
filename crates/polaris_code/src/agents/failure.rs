@@ -207,6 +207,10 @@ pub fn classify(error: &GenerationError) -> FailureKind {
             {
                 return FailureKind::Timeout;
             }
+            // An exhausted ChatGPT plan needs the user to act; never retry it.
+            if crate::chatgpt::responses::is_plan_limit(error) {
+                return FailureKind::Other;
+            }
             if let Some(kind) = source.as_deref().and_then(classify_bedrock) {
                 return kind;
             }
@@ -357,7 +361,11 @@ pub fn describe(error: &GenerationError, model_id: &str, attempts: Attempts) -> 
         } => (*status, Wire::parse(message)),
         _ => (None, Wire::parse("")),
     };
-    let tag = tag(status, wire.error_type.as_deref());
+    let error_type = wire.error_type.as_deref().or_else(|| {
+        crate::chatgpt::responses::is_plan_limit(error)
+            .then_some(crate::chatgpt::responses::PLAN_LIMIT_CODE)
+    });
+    let tag = tag(status, error_type);
     let detail = oneline(&match error {
         GenerationError::Provider { .. } => wire.message.clone(),
         GenerationError::Http(text)

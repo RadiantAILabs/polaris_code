@@ -138,13 +138,10 @@ cargo install polaris_code --locked
 
 ### Start a session
 
-Save a key once, then launch Polaris in your project. `polaris login` asks
-which provider you use, reads its key with the input hidden, stores it where
-only you can read it, and makes that provider your default:
+Launch Polaris Code in your project. On first use you will be prompted to
+configure your model provider.
 
 ```bash
-polaris login            # Anthropic, OpenAI or AWS Bedrock
-polaris login status     # which providers have credentials, and from where
 cd your-project
 polaris .
 ```
@@ -179,7 +176,7 @@ ATIF trajectory export.
 
 ### Choose a provider
 
-Select a provider with `--provider anthropic|openai|openai-chat|bedrock` or the
+Select a provider with `--provider chatgpt|openai|openai-chat|anthropic|bedrock` or the
 `POLARIS_CODE_PROVIDER` environment variable. OpenAI uses `OPENAI_API_KEY`, and
 `OPENAI_BASE_URL` points it at an OpenAI-compatible server (Ollama, LM Studio,
 vLLM, a gateway). Bedrock uses the AWS SDK credential chain:

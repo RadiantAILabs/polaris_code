@@ -66,6 +66,14 @@ pub trait TuiPanel: Send + 'static {
         self.id()
     }
 
+    /// Whether this panel owns the screen and input, regardless of focus.
+    ///
+    /// The shell suspends navigation while modal, but Ctrl-Q and Ctrl-S still work.
+    /// Returning `false` restores the previous focus and layout.
+    fn is_modal(&self) -> bool {
+        false
+    }
+
     /// Attach this shell's runtime handle before [`init`](Self::init).
     ///
     /// Panels that need an interactive terminal round trip may retain a clone

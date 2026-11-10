@@ -18,11 +18,12 @@ mod status_command;
 /// Resolved launch inputs and the files that supplied them.
 ///
 /// Credential values remain private and are never included in diagnostic output.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Startup {
     files: Vec<PathBuf>,
     config_directory: Option<PathBuf>,
     config_dir_explicit: bool,
+    provider_explicit: bool,
     profile: Option<String>,
     dotenv: Option<PathBuf>,
     settings: Settings,
@@ -31,6 +32,26 @@ pub(crate) struct Startup {
 }
 
 impl Startup {
+    pub(crate) fn provider_is_explicit(&self) -> bool {
+        self.provider_explicit
+    }
+
+    pub(crate) fn connection_catalog(
+        &self,
+        ready: &polaris_code::providers::ReadyProvider,
+    ) -> polaris_code::config::ModelCatalog {
+        let provider = ready.report().provider();
+        let catalog = ready.model_catalog(&polaris_code::providers::process_env);
+        let catalog = if provider.accepts_declared_models() {
+            self.catalog(catalog)
+        } else {
+            catalog
+        };
+        provider
+            .launch_catalog(catalog, None)
+            .restricted_to_providers(&[provider.registry_name()])
+    }
+
     /// The user's trust decisions for the project being opened.
     pub(crate) fn trust(&self) -> &ProjectTrust {
         &self.trust
@@ -47,9 +68,16 @@ impl Startup {
         &self,
         fallback: polaris_code::config::ModelCatalog,
     ) -> polaris_code::config::ModelCatalog {
+        self.catalog_with_env(fallback, &polaris_code::providers::process_env)
+    }
+
+    fn catalog_with_env(
+        &self,
+        fallback: polaris_code::config::ModelCatalog,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> polaris_code::config::ModelCatalog {
         let lookup = |name: &str| {
-            std::env::var(name)
-                .ok()
+            env(name)
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| {
                     let key = KEYS.iter().find(|key| key.env == name)?;
@@ -72,9 +100,11 @@ impl Startup {
         settings: &polaris_code::terminal::SessionSettings,
         navigation: &polaris_code::terminal::SessionNavigation,
         workspace: &Path,
-        report: polaris_code::providers::ProviderReport,
+        connection: polaris_code::connection::ConnectionRuntime,
     ) -> Result<(), polaris_code::terminal::CommandError> {
-        status_command::register(commands, settings, navigation, workspace, self, report)
+        status_command::register(commands, settings, navigation, workspace, self, move || {
+            connection.report()
+        })
     }
 }
 
@@ -150,14 +180,17 @@ pub(crate) fn load() -> (super::Cli, Startup) {
     let path = cwd.join(".env");
     let dotenv = match read_dotenv(&cwd).unwrap_or_else(|err| fail(err)) {
         Some(file) => {
-            let is_set = |key: &str| std::env::var_os(key).is_some();
+            // Match dotenvy's preservation check: a non-Unicode value would
+            // otherwise be replaced by the project file.
+            let is_set = |key: &str| std::env::var(key).is_ok();
             // The launch directory is project-controlled. Refuse before applying
             // anything, so the file cannot choose where the user's own
-            // configuration, credentials and trust decisions are read from.
+            // configuration, credentials and trust decisions are read from,
+            // or which programs connection setup launches.
             if let Some(key) = reserved_key(&file.entries, is_set) {
                 fail(format!(
-                    "{}: the environment file may not set {key}; set it in your shell or in \
-                     your user configuration instead",
+                    "{}: the environment file may not set {key}; set it in your shell before \
+                     starting polaris instead",
                     path.display()
                 ));
             }
@@ -180,9 +213,11 @@ pub(crate) fn load() -> (super::Cli, Startup) {
 }
 
 /// Variables a project's `.env` may not set: they choose where user-owned
-/// configuration lives or what permissions a session opens with, so only the
-/// user may set them.
+/// configuration lives, what permissions a session opens with, or which programs
+/// connection setup launches, so only the user may set them.
 const RESERVED_ENVIRONMENT: &[&str] = &[
+    "BROWSER",
+    "PATH",
     "POLARIS_CONFIG_DIR",
     "XDG_CONFIG_HOME",
     "HOME",
@@ -287,6 +322,9 @@ fn load_from(
             "profile `{profile}` was not found in the user or project configuration"
         ));
     }
+    startup.provider_explicit = startup.settings.contains_key("provider")
+        || environment.contains_key(std::ffi::OsStr::new("POLARIS_CODE_PROVIDER"))
+        || preliminary.value_source("provider") == Some(clap::parser::ValueSource::CommandLine);
     let resolved = resolve(&startup.settings, &environment, &preliminary);
     let mut command = command();
     for key in KEYS {
@@ -391,28 +429,87 @@ pub(crate) fn user_config_path() -> Result<PathBuf, SettingsError> {
 }
 
 /// Persist one validated user setting, preserving unrelated TOML content.
+/// A provider change clears a saved model belonging to another provider.
 pub(crate) fn set_user_value(key: &str, value: &str) -> Result<(), SettingsError> {
     set_value(&user_config_path()?, key, value)
 }
 
+/// Save a connection without replacing a compatible model preference with a
+/// project or provider default.
+pub(crate) fn save_connection_defaults(
+    result: &polaris_code::onboarding::SetupResult,
+) -> Result<(), SettingsError> {
+    save_connection_at(&user_config_path()?, result)
+}
+
+fn save_connection_at(
+    path: &Path,
+    result: &polaris_code::onboarding::SetupResult,
+) -> Result<(), SettingsError> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(SettingsError::Symlink(path.to_path_buf()));
+    }
+    let settings = read_config(path, None)
+        .map_err(SettingsError::Existing)?
+        .map(|file| file.base)
+        .unwrap_or_default();
+    let user = Startup {
+        settings,
+        ..Startup::default()
+    };
+    let provider = result.ready.report().provider();
+    let catalog = result.ready.model_catalog(&|_| None);
+    let catalog = if provider.accepts_declared_models() {
+        user.catalog_with_env(catalog, &|_| None)
+    } else {
+        catalog
+    };
+    let catalog = provider
+        .launch_catalog(catalog, None)
+        .restricted_to_providers(&[provider.registry_name()]);
+    let model = user
+        .settings
+        .get("model")
+        .and_then(|setting| {
+            catalog
+                .resolve_noting(&provider.qualify_model(&setting.value))
+                .ok()
+        })
+        .map_or_else(|| result.model.clone(), |model| model.id);
+    let mut values = vec![
+        ("provider", result.ready.report().provider().flag()),
+        ("model", model.as_str()),
+    ];
+    if let Some(region) = &result.region {
+        values.push(("region", region));
+    }
+    set_values(path, &values)
+}
+
 fn set_value(path: &Path, key: &str, value: &str) -> Result<(), SettingsError> {
+    set_values(path, &[(key, value)])
+}
+
+fn set_values(path: &Path, values: &[(&str, &str)]) -> Result<(), SettingsError> {
     use std::io::Write;
 
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |source| SettingsError::Io { path, source }
     };
-    if !KEYS.iter().any(|known| known.name == key) {
-        return Err(SettingsError::UnknownKey {
+    for &(key, value) in values {
+        if !KEYS.iter().any(|known| known.name == key) {
+            return Err(SettingsError::UnknownKey {
+                path: path.to_path_buf(),
+                key: key.to_string(),
+            });
+        }
+        validate(key, value).map_err(|reason| SettingsError::InvalidValue {
             path: path.to_path_buf(),
             key: key.to_string(),
-        });
+            reason,
+        })?;
     }
-    validate(key, value).map_err(|reason| SettingsError::InvalidValue {
-        path: path.to_path_buf(),
-        key: key.to_string(),
-        reason,
-    })?;
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(SettingsError::Symlink(path.to_path_buf()));
     }
@@ -427,11 +524,30 @@ fn set_value(path: &Path, key: &str, value: &str) -> Result<(), SettingsError> {
             .map_err(|err| SettingsError::Existing(format!("{}: {err}", path.display())))?,
         None => DocumentMut::new(),
     };
-    let mut replacement = toml_edit::Value::from(value);
-    if let Some(old) = document.get(key).and_then(Item::as_value) {
-        *replacement.decor_mut() = old.decor().clone();
+    let previous_provider = document
+        .get("provider")
+        .and_then(Item::as_str)
+        .and_then(|value| polaris_code::providers::Provider::from_str(value, true).ok());
+    for &(key, value) in values {
+        let mut replacement = toml_edit::Value::from(value);
+        if let Some(old) = document.get(key).and_then(Item::as_value) {
+            *replacement.decor_mut() = old.decor().clone();
+        }
+        document[key] = Item::Value(replacement);
     }
-    document[key] = Item::Value(replacement);
+    if !values.iter().any(|(key, _)| *key == "model")
+        && let Some((_, value)) = values.iter().find(|(key, _)| *key == "provider")
+        && let Ok(provider) = polaris_code::providers::Provider::from_str(value, true)
+        && document
+            .get("model")
+            .and_then(Item::as_str)
+            .is_some_and(|model| match model.split_once('/') {
+                Some((prefix, _)) => prefix != provider.registry_name(),
+                None => previous_provider.is_some_and(|previous| previous != provider),
+            })
+    {
+        document.remove("model");
+    }
     let parent = path.parent().ok_or_else(|| SettingsError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other("configuration path has no parent"),
@@ -1055,6 +1171,37 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_cannot_choose_browser_or_executable_search_path() {
+        let fixture = Fixture::new();
+        for key in ["BROWSER", "PATH"] {
+            std::fs::write(
+                fixture.workspace.join(".env"),
+                format!("OPENAI_API_KEY=test-key\n{key}=./project-helper\n"),
+            )
+            .unwrap();
+            let file = read_dotenv(&fixture.workspace).unwrap().unwrap();
+            assert_eq!(reserved_key(&file.entries, |_| false), Some(key));
+            // A shell value (including an empty one) wins over the file.
+            assert_eq!(reserved_key(&file.entries, |name| name == key), None);
+        }
+        std::fs::write(
+            fixture.workspace.join(".env"),
+            "BROWSER=./project-helper\nPATH=./project-bin\n",
+        )
+        .unwrap();
+        let file = read_dotenv(&fixture.workspace).unwrap().unwrap();
+        assert_eq!(
+            reserved_key(&file.entries, |key| key == "PATH"),
+            Some("BROWSER")
+        );
+        assert_eq!(
+            reserved_key(&file.entries, |key| key == "BROWSER"),
+            Some("PATH")
+        );
+        assert_eq!(reserved_key(&file.entries, |_| true), None);
+    }
+
+    #[test]
     fn an_oversized_or_special_startup_file_is_refused() {
         let fixture = Fixture::new();
         let oversized = vec![b'#'; usize::try_from(MAX_FILE_BYTES).unwrap() + 1];
@@ -1379,5 +1526,138 @@ mod tests {
         let catalog = startup.catalog(fallback());
         assert_eq!(catalog.default_model(), "openai/mine");
         assert_eq!(catalog.models(), ["openai/mine", "openai/other"]);
+    }
+
+    #[test]
+    fn scripted_provider_change_removes_only_an_incompatible_model() {
+        use polaris_code::providers::Provider;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider = 'anthropic'\nmodel = 'anthropic/previous'\nmax_turns = 7\n",
+        )
+        .expect("previous connection preferences");
+
+        set_value(&path, "provider", "openai").expect("scripted provider default is saved");
+        let saved = read_config(&path, None)
+            .expect("valid settings")
+            .expect("settings exist");
+        assert!(
+            !saved.base.contains_key("model"),
+            "a model from the previous provider cannot break the next launch"
+        );
+        assert_eq!(
+            saved.base["max_turns"].value, "7",
+            "unrelated settings are preserved"
+        );
+        let startup = Startup {
+            settings: saved.base,
+            ..Startup::default()
+        };
+        let catalog = startup
+            .catalog_with_env(Provider::OpenAi.catalog(&|_| None), &|_| None)
+            .restricted_to_providers(&[Provider::OpenAi.registry_name()]);
+        assert!(
+            catalog.select(None).is_ok(),
+            "the next launch resolves a model for the new provider"
+        );
+
+        set_value(&path, "model", "openai/custom-model").expect("compatible user model is saved");
+        set_value(&path, "provider", "openai").expect("same-provider key rotation");
+        let saved = read_config(&path, None)
+            .expect("valid settings")
+            .expect("settings exist");
+        assert_eq!(
+            saved.base["model"].value, "openai/custom-model",
+            "compatible model preferences survive key rotation"
+        );
+    }
+
+    #[test]
+    fn scripted_provider_change_uses_previous_provider_for_bare_models() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("config.toml");
+        for (initial, expected_model) in [
+            (
+                "provider = 'anthropic'\nmodel = 'claude-sonnet-4-6'\n",
+                None,
+            ),
+            ("provider = 'openai'\nmodel = 'gpt-5.5'\n", Some("gpt-5.5")),
+            ("model = 'unknown-owner'\n", Some("unknown-owner")),
+            (
+                "provider = 'anthropic'\nmodel = 'openai/custom-model'\n",
+                Some("openai/custom-model"),
+            ),
+        ] {
+            std::fs::write(&path, initial).expect("previous connection preferences");
+            set_value(&path, "provider", "openai").expect("scripted provider default is saved");
+            let saved = read_config(&path, None)
+                .expect("valid settings")
+                .expect("settings exist");
+            assert_eq!(
+                saved
+                    .base
+                    .get("model")
+                    .map(|setting| setting.value.as_str()),
+                expected_model,
+                "bare models follow their explicit previous provider, while qualified models own their namespace: {initial}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_a_connection_preserves_a_compatible_user_model() {
+        use polaris_code::config::ModelCatalog;
+        use polaris_code::credentials::CredentialStore;
+        use polaris_code::onboarding::SetupResult;
+        use polaris_code::providers::{self, Provider};
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let path = root.path().join("config.toml");
+        let ready = providers::prepare(
+            Provider::OpenAi,
+            None,
+            &|key| (key == "OPENAI_API_KEY").then(|| "test-key".into()),
+            &None::<CredentialStore>,
+        )
+        .await
+        .expect("test provider");
+        let result = SetupResult {
+            ready,
+            model: "openai/project-default".into(),
+            catalog: ModelCatalog::pinned("openai/project-default"),
+            region: None,
+            notice: String::new(),
+        };
+        std::fs::write(&path, "provider = 'openai'\nmodel = 'openai/user-model'\nmodels = ['openai/user-model']\nmax_turns = 7\n").expect("user preferences");
+        save_connection_at(&path, &result).expect("save connection defaults");
+        let saved = read_config(&path, None)
+            .expect("valid config")
+            .expect("config exists");
+        assert_eq!(
+            saved.base["model"].value, "openai/user-model",
+            "project defaults must not replace a compatible saved model"
+        );
+        assert_eq!(
+            saved.base["max_turns"].value, "7",
+            "unrelated preferences remain intact"
+        );
+
+        std::fs::write(&path, "provider = 'anthropic'\nmodel = 'anthropic/other'\n")
+            .expect("different provider preferences");
+        save_connection_at(&path, &result).expect("save switched provider");
+        let saved = read_config(&path, None)
+            .expect("valid config")
+            .expect("config exists");
+        assert_eq!(
+            saved.base["provider"].value, "openai",
+            "the selected provider is saved"
+        );
+        assert_eq!(
+            saved.base["model"].value, result.model,
+            "a model from another provider is replaced"
+        );
     }
 }

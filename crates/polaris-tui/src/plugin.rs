@@ -136,6 +136,11 @@ impl Plugin for TuiPlugin {
 
 /// Runtime handle for the TUI shell, including interactive editor handoffs.
 ///
+/// In-repository consumers:
+///
+/// - `ConversationPanel` uses it for external editor handoffs.
+/// - `TuiPlugin::cleanup` uses it to shut down and join the runtime.
+///
 /// # Provided By
 /// [`TuiPlugin`] publishes this API during `ready()` and attaches a clone to
 /// each panel through [`TuiPanel::attach_runtime`](crate::TuiPanel::attach_runtime).
@@ -144,6 +149,7 @@ impl Plugin for TuiPlugin {
 /// | Method | Purpose |
 /// |--------|---------|
 /// | [`run_in_terminal`](Self::run_in_terminal) | Execute an interactive child with terminal modes suspended and restored. |
+/// | [`request_clipboard_copy`](Self::request_clipboard_copy) | Ask the user's terminal to copy text without interleaving rendering. |
 /// | [`shutdown`](Self::shutdown) | Request cooperative shutdown, including stopping an active child. |
 /// | [`wait`](Self::wait) | Join the runtime task; only the first caller takes the join handle. |
 ///
@@ -166,6 +172,10 @@ impl Plugin for TuiPlugin {
 ///
 /// let mut server = Server::new();
 /// server.add_plugins(TuiPlugin::default());
+/// // TuiPlugin publishes its constructed handle during ready():
+/// fn provider_ready(server: &mut Server, handle: TuiHandle) {
+///     server.insert_api(handle);
+/// }
 /// // In a consumer's ready(), after TuiPlugin is ready:
 /// # fn consumer_ready(server: &Server) {
 /// if let Some(handle) = server.api::<TuiHandle>() {
@@ -214,7 +224,37 @@ impl TuiHandle {
     pub async fn run_in_terminal(&self, command: Command) -> io::Result<ExitStatus> {
         let (reply, result) = oneshot::channel();
         self.terminal_tx
-            .send(TerminalRequest { command, reply })
+            .send(TerminalRequest::Run { command, reply })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime stopped"))?;
+        result
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime stopped"))?
+    }
+
+    /// Ask the user's terminal to copy text, including when connected over SSH.
+    ///
+    /// The runtime serializes this request with rendering and terminal handoffs.
+    /// Success means the request was written; the terminal may require approval
+    /// or ignore it. Call outside panel event handlers and await the result.
+    /// Dropping this future before dispatch cancels the queued request.
+    ///
+    /// ```
+    /// # async fn example(handle: &polaris_tui::TuiHandle) -> std::io::Result<()> {
+    /// handle.request_clipboard_copy("Text to copy").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an IO error if the runtime is unavailable or the terminal write fails.
+    pub async fn request_clipboard_copy(&self, text: impl Into<String>) -> io::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.terminal_tx
+            .send(TerminalRequest::Clipboard {
+                text: text.into(),
+                reply,
+            })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime stopped"))?;
         result

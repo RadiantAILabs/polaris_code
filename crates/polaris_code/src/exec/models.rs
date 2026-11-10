@@ -101,7 +101,10 @@ mod tests {
         assert!(!json.contains('\n'), "one line: {json}");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(value["schema"], "polaris.models.v1");
-        assert_eq!(value["providers"].as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            value["providers"].as_array().map(Vec::len),
+            Some(crate::providers::Provider::ALL.len())
+        );
         let chat = &value["providers"][3];
         assert_eq!(chat["provider"], "openai-chat");
         assert_eq!(chat["credentials"]["status"], "missing");

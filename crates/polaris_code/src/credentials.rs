@@ -16,20 +16,21 @@
 //!
 //! A stored key is the last resort: an environment variable, which includes a
 //! `.env` file in the launch folder, always wins (see [`crate::providers`]).
-//! The file is written atomically, never through a symlink, and refused when it
-//! is readable by anyone but its owner — a key that others can read is no
+//! The file is written atomically and durably, never read or written through a
+//! symlink, and on Unix refused unless it is a regular file owned by the
+//! current user and readable by nobody else — a key that others can read is no
 //! longer private, so using it silently would hide that.
 //!
 //! Nothing in this module prints a key. [`mask_key`] is the only way one is
 //! ever shown, and it shows the last four characters at most.
 
 use std::fmt;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::config_dir;
+use crate::private_file::{self, Refusal};
 use crate::providers::Provider;
 
 /// The file inside the user configuration directory that holds the credentials.
@@ -65,7 +66,7 @@ pub enum CredentialError {
         /// Its permission bits.
         mode: u32,
     },
-    /// The path is a symbolic link, which a write will not replace.
+    /// The path is a symbolic link, which is neither read nor replaced.
     Symlink {
         /// The path involved.
         path: PathBuf,
@@ -119,7 +120,7 @@ impl std::error::Error for CredentialError {
 /// Where a run looks for credentials when its environment has none.
 ///
 /// A trait, so the startup check can be run against a stand-in.
-pub trait StoredCredentials {
+pub trait StoredCredentials: Sync {
     /// The stored key for a provider that takes one, if there is one.
     ///
     /// # Errors
@@ -226,34 +227,27 @@ impl CredentialStore {
         Ok(true)
     }
 
+    /// Map a file error, keeping the specific refusals callers can act on.
     fn io(&self, source: std::io::Error) -> CredentialError {
-        CredentialError::Io {
-            path: self.path.clone(),
-            source,
+        let path = self.path.clone();
+        match private_file::refusal(&source) {
+            Some(Refusal::Exposed(mode)) => CredentialError::TooOpen { path, mode },
+            Some(Refusal::Symlink) => CredentialError::Symlink { path },
+            _ => CredentialError::Io { path, source },
         }
     }
 
     /// The parsed file, or `None` when there is not one yet.
     fn read(&self) -> Result<Option<DocumentMut>, CredentialError> {
-        let metadata = match std::fs::metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(self.io(source)),
+        let Some(bytes) = private_file::read(&self.path).map_err(|source| self.io(source))? else {
+            return Ok(None);
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = metadata.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(CredentialError::TooOpen {
-                    path: self.path.clone(),
-                    mode,
-                });
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = metadata;
-        let text = std::fs::read_to_string(&self.path).map_err(|source| self.io(source))?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            self.io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "credentials file is not valid UTF-8",
+            ))
+        })?;
         text.parse::<DocumentMut>().map(Some).map_err(|err| {
             // Parser diagnostics include the source line, which may hold a key.
             // Retain only its location; even Debug and source chains stay safe.
@@ -284,47 +278,16 @@ impl CredentialStore {
     }
 
     fn update(&self, change: impl FnOnce(&mut DocumentMut)) -> Result<(), CredentialError> {
-        if std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err(CredentialError::Symlink {
-                path: self.path.clone(),
-            });
-        }
         let mut document = self.read()?.unwrap_or_default();
         change(&mut document);
         self.write(&document)
     }
 
     /// Replace the file with `document`, atomically and readable by its owner
-    /// only: a temporary file in the same directory is written, then renamed.
+    /// only.
     fn write(&self, document: &DocumentMut) -> Result<(), CredentialError> {
-        let parent = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        create_private_dir(parent).map_err(|source| self.io(source))?;
-        let mut temporary = tempfile::Builder::new()
-            .prefix(".credentials-")
-            .tempfile_in(parent)
-            .map_err(|source| self.io(source))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            temporary
-                .as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|source| self.io(source))?;
-        }
-        temporary
-            .write_all(document.to_string().as_bytes())
-            .and_then(|()| temporary.as_file().sync_all())
-            .map_err(|source| self.io(source))?;
-        temporary
-            .persist(&self.path)
-            .map_err(|err| self.io(err.error))?;
-        Ok(())
+        private_file::write(&self.path, document.to_string().as_bytes())
+            .map_err(|source| self.io(source))
     }
 }
 
@@ -341,7 +304,7 @@ impl StoredCredentials for CredentialStore {
 /// `value` without surrounding whitespace, or the reason it cannot be stored:
 /// empty, absurdly long, or holding whitespace or control characters, none of
 /// which a real key or profile name has.
-fn checked(what: &'static str, value: &str) -> Result<String, CredentialError> {
+pub(crate) fn checked(what: &'static str, value: &str) -> Result<String, CredentialError> {
     let value = value.trim();
     let reason = if value.is_empty() {
         Some("is empty")
@@ -366,18 +329,6 @@ fn set_field(document: &mut DocumentMut, table: &str, field: &str, text: &str) {
     if let Some(table) = entry.as_table_like_mut() {
         table.insert(field, value(text));
     }
-}
-
-/// Create `dir` and any missing parents, readable by their owner only.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(dir)
 }
 
 /// A key as it may be shown: its last four characters, never more.

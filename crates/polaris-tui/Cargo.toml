@@ -28,7 +28,7 @@ polaris.workspace = true
 # fragile. Calls to the unstable API stay inside `widgets` and the
 # conversation panel; nothing re-exports it.
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["osc52"] }
 tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
