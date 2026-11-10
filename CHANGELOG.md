@@ -8,6 +8,9 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 ### Added
 - Harbor adapter (`evals/packs/terminal_bench_harbor`): the agent keyword `image_input` (`auto`, `on` or `off`) is passed as `--image-input`, so a job can say whether the model takes images. Release 0.4.5 or later understands the flag.
 
+### Fixed
+- Amazon Bedrock refused every request (`content_filter`, empty reply) because of the first step of the built-in system prompt ("REASON in text before every action …"). The step now reads "EXPLAIN: in a sentence or two, …", which Bedrock accepts.
+
 ## [0.4.5] - 2026-11-10
 
 Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.3.

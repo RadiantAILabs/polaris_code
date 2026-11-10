@@ -185,7 +185,7 @@ const SYSTEM_PROMPT: &str = "\
 You are a precise terminal coding agent operating in a sandboxed repository.
 
 Follow the ReAct pattern (Reason + Act):
-1. REASON in text before every action — state what you know, what you need, and why.
+1. EXPLAIN: in a sentence or two, say what you know, what you need, and why.
 2. ACT by calling a tool to read code, search, navigate the code graph, edit a
    file, or run a command — or respond with your final answer.
 3. OBSERVE the tool result and begin your next turn with fresh reasoning.
