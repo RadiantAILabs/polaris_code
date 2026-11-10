@@ -13,12 +13,15 @@
 //!
 //! # What the tool checks, in order
 //!
-//! 1. **Containment.** The path resolves through the same code as `read_file`
-//!    (`CodeTools::resolve_call`), against the session's
+//! 1. **Containment.** The path resolves with the same containment logic as
+//!    `read_file` (the one [`CodeToolsConfig`] applies), against the session's
 //!    [`CallRoot`]: `..`, absolute paths and symlinks that leave the working
-//!    directory are refused with `escapes sandbox`.
+//!    directory are refused with `escapes sandbox`. The check runs again after
+//!    the file is opened, and the opened file must be the one the path names
+//!    then, so a file swapped for a symlink in between is refused.
 //! 2. **Kind.** The path must be a regular file. A directory, a pipe or a
-//!    device is refused before it is opened.
+//!    device is refused before it is opened, and the opened file is judged
+//!    again.
 //! 3. **Size.** [`IMAGE_BYTES_MAX`] on the file, checked before reading, and
 //!    the read itself is capped one byte past it, so a file that grows between
 //!    the check and the read is still refused rather than loaded.
@@ -45,7 +48,7 @@
 //! `read_file`, and has the same reach: any image file inside the working
 //! directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use polaris::models::llm::{DocumentSource, ImageBlock};
 use polaris::system::plugin::{
@@ -92,14 +95,17 @@ enum Kind {
 /// ```
 /// use polaris_code::tools::{ViewedImage, VIEW_IMAGE};
 ///
+/// # fn main() -> Result<(), serde_json::Error> {
 /// let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0";
 /// let image = ViewedImage::new("shots/a.png", "image/png", png);
 /// assert_eq!(image.summary(), "[image shots/a.png, PNG, 29 B]");
 ///
 /// // The dispatch accepts it from `view_image`, and from no other tool.
-/// let value = serde_json::to_value(&image).unwrap();
+/// let value = serde_json::to_value(&image)?;
 /// assert!(ViewedImage::from_result(VIEW_IMAGE, &value).is_some());
 /// assert!(ViewedImage::from_result("mcp__server__shot", &value).is_none());
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +119,10 @@ pub struct ViewedImage {
 
 impl ViewedImage {
     /// An image read from `path`, with its MIME type and raw bytes.
+    ///
+    /// Construction is unchecked: the type, the size and the bytes are taken
+    /// as given. [`from_result`](Self::from_result) is the validating entry
+    /// point, and the one the dispatch uses.
     #[must_use]
     pub fn new(path: impl Into<String>, media_type: &str, data: &[u8]) -> Self {
         Self {
@@ -147,7 +157,8 @@ impl ViewedImage {
     /// The model-facing image block.
     ///
     /// `None` only when the payload names a type this host does not send, which
-    /// [`from_result`](Self::from_result) already refuses.
+    /// [`from_result`](Self::from_result) already refuses. It does not check
+    /// the size or the encoding; take the value from `from_result`.
     #[must_use]
     pub fn into_block(self) -> Option<ImageBlock> {
         Some(ImageBlock {
@@ -171,6 +182,7 @@ impl ViewedImage {
 }
 
 /// The `view_image` toolset.
+#[derive(Debug)]
 pub struct ViewImageTools {
     config: CodeToolsConfig,
 }
@@ -186,6 +198,67 @@ impl ViewImageTools {
     /// The path the tool will open, or the refusal that explains why not.
     fn resolve(&self, call: &Option<CallRoot>, path: &str) -> Result<PathBuf, ToolError> {
         self.config.resolve_call(call, path)
+    }
+
+    /// Opens `resolved`, which [`resolve`](Self::resolve) returned for `path`,
+    /// and returns the file only if it is a regular file within the size cap
+    /// that `path` still names inside the sandbox.
+    ///
+    /// Resolving and then opening by path leaves a gap in which another process
+    /// can swap the file, or a parent directory, for a symlink to an outside
+    /// image. So the opened file is judged from its own handle, then `path` is
+    /// resolved again and must name the same file (same device and inode on
+    /// unix; the same resolved path elsewhere).
+    ///
+    /// This does not close every race. The last check still goes through the
+    /// path, so a parent directory swapped at exactly the moment of that
+    /// comparison is not caught; closing that needs `openat` with
+    /// `RESOLVE_BENEATH`. And the open uses neither `O_NOFOLLOW` nor
+    /// `O_NONBLOCK` (they need `libc`, which this crate does not depend on), so
+    /// a pipe swapped in after the first look can block the open. In neither
+    /// case is anything read before the checks pass.
+    async fn open_checked(
+        &self,
+        call: &Option<CallRoot>,
+        path: &str,
+        resolved: &Path,
+    ) -> Result<tokio::fs::File, ToolError> {
+        // Look before opening: a pipe or device would block the open, and a
+        // directory has no bytes to show. This goes by path, so it only spares
+        // the open; the opened file is judged below.
+        let looked = tokio::fs::metadata(resolved)
+            .await
+            .map_err(|err| io_failure(VIEW_IMAGE, path, &err))?;
+        check_kind_and_size(path, &looked)?;
+        let file = tokio::fs::File::open(resolved)
+            .await
+            .map_err(|err| io_failure(VIEW_IMAGE, path, &err))?;
+        let opened = file
+            .metadata()
+            .await
+            .map_err(|err| io_failure(VIEW_IMAGE, path, &err))?;
+        check_kind_and_size(path, &opened)?;
+
+        let now = self.resolve(call, path)?;
+        #[cfg(unix)]
+        let unchanged = {
+            use std::os::unix::fs::MetadataExt as _;
+            // Not following a symlink: a path that has become one is not the
+            // file that was opened.
+            let named = tokio::fs::symlink_metadata(&now)
+                .await
+                .map_err(|err| io_failure(VIEW_IMAGE, path, &err))?;
+            (opened.dev(), opened.ino()) == (named.dev(), named.ino())
+        };
+        #[cfg(not(unix))]
+        let unchanged = now == resolved;
+        if !unchanged {
+            return Err(refusal(
+                path,
+                "changed while it was being opened, so it was not read. Call view_image again.",
+            ));
+        }
+        Ok(file)
     }
 }
 
@@ -205,39 +278,8 @@ impl ViewImageTools {
         #[context] call_root: Option<CallRoot>,
     ) -> Result<ViewedImage, ToolError> {
         let resolved = self.resolve(&call_root, &path)?;
-        // Look before opening: a pipe or device would block the open, and a
-        // directory has no bytes to show.
-        let metadata = tokio::fs::metadata(&resolved)
-            .await
-            .map_err(|err| io_failure(VIEW_IMAGE, &path, &err))?;
-        if metadata.is_dir() {
-            return Err(refusal(
-                &path,
-                "is a directory, not an image file. Call list_files to see what it holds.",
-            ));
-        }
-        if !metadata.is_file() {
-            return Err(refusal(
-                &path,
-                "is not a regular file, so it cannot be read.",
-            ));
-        }
-        if metadata.len() > IMAGE_BYTES_MAX {
-            return Err(too_large(&path, metadata.len()));
-        }
-        let file = tokio::fs::File::open(&resolved)
-            .await
-            .map_err(|err| io_failure(VIEW_IMAGE, &path, &err))?;
-        // One byte past the cap: a file that grew since the check above is
-        // refused instead of read to the end.
-        let mut data = Vec::new();
-        file.take(IMAGE_BYTES_MAX + 1)
-            .read_to_end(&mut data)
-            .await
-            .map_err(|err| io_failure(VIEW_IMAGE, &path, &err))?;
-        if data.len() as u64 > IMAGE_BYTES_MAX {
-            return Err(too_large(&path, data.len() as u64));
-        }
+        let file = self.open_checked(&call_root, &path, &resolved).await?;
+        let data = read_capped(file, &path).await?;
         let Some((_, mime)) = sniff_image(&data) else {
             return Err(refusal(
                 &path,
@@ -247,6 +289,40 @@ impl ViewImageTools {
         };
         Ok(ViewedImage::new(path, mime, &data))
     }
+}
+
+/// Refuses what is not a regular file, or is over [`IMAGE_BYTES_MAX`].
+fn check_kind_and_size(path: &str, metadata: &std::fs::Metadata) -> Result<(), ToolError> {
+    if metadata.is_dir() {
+        return Err(refusal(
+            path,
+            "is a directory, not an image file. Call list_files to see what it holds.",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(refusal(
+            path,
+            "is not a regular file, so it cannot be read.",
+        ));
+    }
+    if metadata.len() > IMAGE_BYTES_MAX {
+        return Err(too_large(path, metadata.len()));
+    }
+    Ok(())
+}
+
+/// Reads `file` to its end, but not past one byte over [`IMAGE_BYTES_MAX`]: a
+/// file that grew since the size check is refused instead of read in full.
+async fn read_capped(file: tokio::fs::File, path: &str) -> Result<Vec<u8>, ToolError> {
+    let mut data = Vec::new();
+    file.take(IMAGE_BYTES_MAX + 1)
+        .read_to_end(&mut data)
+        .await
+        .map_err(|err| io_failure(VIEW_IMAGE, path, &err))?;
+    if data.len() as u64 > IMAGE_BYTES_MAX {
+        return Err(too_large(path, data.len() as u64));
+    }
+    Ok(data)
 }
 
 /// A refusal of `path`, phrased `view_image 'path' <reason>`.
@@ -325,6 +401,7 @@ fn too_large(path: &str, bytes: u64) -> ToolError {
 ///     .add_plugins(ToolsPlugin)
 ///     .add_plugins(ViewImageToolsPlugin::new(CodeToolsConfig::new(".")));
 /// ```
+#[derive(Debug)]
 pub struct ViewImageToolsPlugin {
     config: CodeToolsConfig,
 }
@@ -560,7 +637,7 @@ mod tests {
             "it says what to do: {refused}"
         );
 
-        // One byte under the cap is fine.
+        // A file of exactly the cap is fine.
         let mut limit = PNG_1PX.to_vec();
         limit.resize(IMAGE_BYTES_MAX as usize, 0);
         std::fs::write(dir.path().join("limit.png"), &limit).unwrap();
@@ -578,14 +655,25 @@ mod tests {
         assert!(refused.contains("nothing-here.png"), "{refused}");
     }
 
+    /// Makes a named pipe at `path`, or says on stderr that this host cannot
+    /// and returns `false`, so a caller skips instead of passing silently.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) -> bool {
+        let made = std::process::Command::new("mkfifo").arg(path).status();
+        let ok = made.is_ok_and(|status| status.success());
+        if !ok {
+            eprintln!("skipped: mkfifo is not available, so no pipe could be made");
+        }
+        ok
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pipe_is_refused_without_being_opened() {
         let dir = workspace();
         let fifo = dir.path().join("pipe.png");
-        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
-        if !made.is_ok_and(|status| status.success()) {
-            return; // no mkfifo here; the check is the same one a directory takes
+        if !make_fifo(&fifo) {
+            return; // the check is the same one a directory takes
         }
         let refused =
             tokio::time::timeout(std::time::Duration::from_secs(5), view(&dir, "pipe.png"))
@@ -593,6 +681,161 @@ mod tests {
                 .expect("a pipe must not block the tool")
                 .unwrap_err();
         assert!(refused.contains("not a regular file"), "{refused}");
+    }
+
+    // The next tests stand in for the race: the tool has resolved a path, and
+    // another process then replaces what it names. `open_checked` is the code
+    // that runs next, so it is called with the path resolved beforehand.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_swapped_for_a_symlink_out_of_the_working_directory_is_refused() {
+        let outer = tempfile::tempdir().unwrap();
+        let inside = outer.path().join("work");
+        std::fs::create_dir_all(inside.join("sub")).unwrap();
+        std::fs::write(outer.path().join("secret.png"), PNG_1PX).unwrap();
+        std::fs::write(inside.join("shot.png"), PNG_1PX).unwrap();
+        std::fs::write(inside.join("sub/shot.png"), PNG_1PX).unwrap();
+        let toolset = ViewImageTools::new(CodeToolsConfig::new(&inside));
+        let call = Some(CallRoot::new(&inside));
+
+        // The file itself becomes a link to an image outside.
+        let resolved = toolset.resolve(&call, "shot.png").unwrap();
+        std::fs::remove_file(&resolved).unwrap();
+        std::os::unix::fs::symlink(outer.path().join("secret.png"), &resolved).unwrap();
+        let refused = toolset
+            .open_checked(&call, "shot.png", &resolved)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("escapes sandbox"), "{refused}");
+
+        // A parent directory becomes a link to a directory holding such an image.
+        std::fs::write(outer.path().join("shot.png"), PNG_1PX).unwrap();
+        let resolved = toolset.resolve(&call, "sub/shot.png").unwrap();
+        std::fs::rename(inside.join("sub"), inside.join("sub-moved")).unwrap();
+        std::os::unix::fs::symlink(outer.path(), inside.join("sub")).unwrap();
+        let refused = toolset
+            .open_checked(&call, "sub/shot.png", &resolved)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("escapes sandbox"), "{refused}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_swapped_for_a_pipe_is_refused_without_blocking() {
+        let dir = workspace();
+        let toolset = tools(&dir);
+        let call = root(&dir);
+        let resolved = toolset.resolve(&call, "shots/a.png").unwrap();
+        std::fs::remove_file(&resolved).unwrap();
+        if !make_fifo(&resolved) {
+            return;
+        }
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            toolset.open_checked(&call, "shots/a.png", &resolved),
+        )
+        .await
+        .expect("a pipe must not block the open")
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("not a regular file"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_opened_file_that_the_path_no_longer_names_is_refused() {
+        let dir = workspace();
+        std::fs::write(dir.path().join("shots/b.png"), PNG_1PX).unwrap();
+        let toolset = tools(&dir);
+        let call = root(&dir);
+        let opened = toolset.resolve(&call, "shots/a.png").unwrap();
+
+        // Same bytes, different file: the path now names b.png.
+        let refused = toolset
+            .open_checked(&call, "shots/b.png", &opened)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("changed while it was being opened"),
+            "{refused}"
+        );
+        // Nothing changed: the file is returned.
+        toolset
+            .open_checked(&call, "shots/a.png", &opened)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_read_stops_past_the_cap_for_a_file_that_grew_after_the_size_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grown.png");
+        let mut data = PNG_1PX.to_vec();
+
+        data.resize(IMAGE_BYTES_MAX as usize + 4096, 0);
+        std::fs::write(&path, &data).unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let refused = read_capped(file, "grown.png")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("images are capped at 3.8 MB"), "{refused}");
+
+        data.resize(IMAGE_BYTES_MAX as usize, 0);
+        std::fs::write(&path, &data).unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let read = read_capped(file, "grown.png").await.unwrap();
+        assert_eq!(
+            read.len() as u64,
+            IMAGE_BYTES_MAX,
+            "exactly the cap is read"
+        );
+    }
+
+    #[test]
+    fn an_image_of_exactly_the_cap_is_believed() {
+        let bytes = vec![0_u8; IMAGE_BYTES_MAX as usize];
+        let image = ViewedImage::new("a.png", "image/png", &bytes);
+        assert_eq!(
+            image.data.len(),
+            ENCODED_BYTES_MAX,
+            "the byte cap encodes to the provider's limit exactly"
+        );
+        let value = serde_json::to_value(&image).unwrap();
+        assert!(ViewedImage::from_result(VIEW_IMAGE, &value).is_some());
+    }
+
+    #[test]
+    fn definitions_expose_view_image_without_its_call_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register_toolset(tools(&dir));
+        let defs = registry.definitions();
+        let def = defs
+            .iter()
+            .find(|d| d.name == VIEW_IMAGE)
+            .unwrap_or_else(|| panic!("missing tool {VIEW_IMAGE}"));
+
+        let props = &def.parameters["properties"];
+        assert_eq!(props["path"]["type"], "string", "{:?}", def.parameters);
+        let required = def.parameters["required"]
+            .as_array()
+            .expect("required list");
+        assert!(required.iter().any(|name| name == "path"), "{required:?}");
+        assert!(
+            props.get("call_root").is_none(),
+            "the call context is not a model parameter: {:?}",
+            def.parameters
+        );
+        assert!(
+            def.description.contains("read_file") && def.description.contains("3.8 MB"),
+            "{}",
+            def.description
+        );
     }
 
     #[test]
