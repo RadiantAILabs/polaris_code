@@ -184,15 +184,17 @@ works and a text file called `x.png` is refused. It is registered only when the
 model takes images; see [`image_input`](configuration.md).
 
 The model gets a picture. The person watching gets one short line, because the
-encoded picture is large and means nothing to a reader. The line is the same in
-the activity block, the conversation and the recorded trajectory:
+encoded picture is large and means nothing to a reader. The live activity block,
+conversation and Session RDF/ABox tool-call record show:
 
 ```
 [image shots/a.png, PNG, 34.0 KB]
 ```
 
-The path is redacted like any other text. The picture is not scanned; see
-[agent safety](agent-safety.md#known-gaps).
+Resumed history shows `[image tool result]`. Saved session history and ATIF
+exports (`--trajectory-path`, under `extra.image`) retain the whole encoded image.
+The path in the summary is redacted like any other text. The picture is not
+scanned for secrets; see [agent safety](agent-safety.md#known-gaps).
 
 A refusal is ordinary error text that ends in what to do next:
 

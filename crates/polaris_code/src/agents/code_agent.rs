@@ -1608,7 +1608,8 @@ fn redact_tool_output(redactor: SecretRedactor, tool: &str, output: String) -> S
 }
 
 /// The picture `view_image` returned, as the result block's content, with the
-/// one line shown for it everywhere else; `None` when `value` is not one.
+/// summary shown live and recorded in the Session ABox; `None` when `value`
+/// is not one.
 ///
 /// Both result lanes call this first, so there is one rule for when the model
 /// receives an image. It is `Some` only when the tool is `view_image` **and**
@@ -1618,10 +1619,11 @@ fn redact_tool_output(redactor: SecretRedactor, tool: &str, output: String) -> S
 /// ordinary text result. Everything that gets `None` keeps the text path and its
 /// secret redaction.
 ///
-/// The line is `[image a.png, PNG, 34.0 KB]`. It is what the transcript, the log
-/// and `record_tool_call` get, so the encoded picture is in the provider-bound
-/// block alone. It is redacted like any other text, because the path in it is
-/// the model's own string.
+/// The line is `[image a.png, PNG, 34.0 KB]`. The transcript, log and Session
+/// RDF/ABox `record_tool_call` get this summary. Saved session history and ATIF
+/// exports (`--trajectory-path`, under `extra.image`) keep the whole encoded
+/// image, without secret scanning. The summary is redacted because its path is
+/// model text.
 fn viewed_image_result(
     redactor: SecretRedactor,
     tool: &str,
@@ -2816,6 +2818,9 @@ mod tests {
             let (_, shown) = viewed_image_result(SecretRedactor::new(true), VIEW_IMAGE, &value)
                 .expect("a picture");
             assert!(!shown.contains("sk-proj-0Aa1"), "{shown}");
+            let line = shown.lines().next().expect("image summary");
+            assert!(line.starts_with("[image "), "{shown}");
+            assert!(line.ends_with(" PNG, 29 B]"), "{shown}");
         }
     }
 
