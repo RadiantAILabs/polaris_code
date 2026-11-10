@@ -86,8 +86,8 @@ on an image file says that this model takes text only. `auto` is on for Claude
 models reached through Anthropic or Bedrock and off for every other route,
 including `--provider openai` and `--provider openai-chat`, because a text-only
 model rejects a request that carries an image. Set `on` for a vision model behind
-`openai-chat` once the build uses `polaris-ai` 0.9.3 or later, which is the first
-version that sends an image tool result to Chat Completions. Do not set `on` for
+`openai-chat`; since 0.4.5 the build uses `polaris-ai` 0.9.3, the first version
+that sends an image tool result to Chat Completions. Do not set `on` for
 `--provider openai`: the Responses API provider still refuses image tool results,
 so the turn would fail when the model calls `view_image`. The choice is made
 once at startup from the model the session starts on; `/model` does not change
