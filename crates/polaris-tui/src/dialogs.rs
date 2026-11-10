@@ -27,7 +27,7 @@ const MAX_INPUT_BYTES: usize = 16 * 1024;
 const SCROLL_ROWS: u16 = 3;
 
 /// A choice label, description, and optional shortcut.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct DialogChoice {
     /// Label shown after the choice number, starting at 1.
@@ -580,7 +580,7 @@ impl DialogHost {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 }
 
@@ -599,9 +599,21 @@ mod tests {
             let host = host.clone();
             async move { host.present(dialog).await }
         });
-        tokio::task::yield_now().await;
-        assert!(host.is_active(), "dialog opens once the task yields");
+        wait_for(|| host.state().active.is_some()).await;
         (host, task)
+    }
+
+    async fn wait_for(condition: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            condition(),
+            "dialog reaches the expected state within 100 yields"
+        );
     }
 
     fn choices(labels: &[(&str, &str, Option<char>)]) -> DialogContent {
@@ -650,12 +662,6 @@ mod tests {
             .chunks(usize::from(width.max(1)))
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
-    }
-
-    fn scrolls(host: &DialogHost) -> (u16, u16) {
-        let state = host.state();
-        let active = state.active.as_ref().expect("dialog is open");
-        (active.body_scroll, active.detail_scroll)
     }
 
     #[tokio::test]
@@ -909,7 +915,7 @@ mod tests {
                 .await
             }
         });
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().active.is_some()).await;
         let at = |ms| t0 + std::time::Duration::from_millis(ms);
         host.handle_event_at(&key(KeyCode::Char('1')), at(100));
         host.handle_event_at(&key(KeyCode::Enter), at(300));
@@ -956,7 +962,7 @@ mod tests {
                 .await
             }
         });
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().active.is_some()).await;
         let repeated = at + std::time::Duration::from_millis(100);
         host.handle_event_at(&key(KeyCode::Char('2')), repeated);
         assert!(
@@ -975,49 +981,90 @@ mod tests {
 
     #[tokio::test]
     async fn page_keys_scroll_the_overflowing_body_then_the_detail() {
+        let numbered = |label, count| {
+            (1..=count)
+                .map(|line| format!("{label} {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let (host, task) = open(
             Dialog::new(
                 "Review",
-                "Line of body text. ".repeat(60),
+                numbered("Body", 20),
                 choices(&[("Done", "", None)]),
             )
-            .with_detail("Link", format!("https://example.com/{}", "a".repeat(2000))),
+            .with_detail("Notes", numbered("Detail", 80)),
         )
         .await;
-        draw(&host, 40, 16);
+        let before = screen(&host, 40, 16).join("\n");
+        assert!(
+            before.contains("Body 01"),
+            "body starts at the first line: {before}"
+        );
+        assert!(!before.contains("Body 20"), "body overflows: {before}");
         host.handle_event(&key(KeyCode::PageDown));
+        let after = screen(&host, 40, 16).join("\n");
+        assert!(
+            !after.contains("Body 01"),
+            "PgDn hides the first body line: {after}"
+        );
         assert_eq!(
-            scrolls(&host),
-            (SCROLL_ROWS, 0),
-            "PgDn scrolls the overflowing body"
+            after
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Body ")),
+            Some("Body 04"),
+            "PgDn advances three body lines: {after}"
         );
         host.handle_event(&TuiEvent::Key(KeyEvent::new(
             KeyCode::PageDown,
             KeyModifiers::SHIFT,
         )));
-        assert_eq!(
-            scrolls(&host),
-            (SCROLL_ROWS, SCROLL_ROWS),
-            "Shift+PgDn scrolls the detail"
-        );
         host.handle_event(&TuiEvent::Mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
         }));
-        assert_eq!(
-            scrolls(&host),
-            (0, SCROLL_ROWS),
-            "the wheel scrolls like page keys"
+        let after = screen(&host, 40, 16).join("\n");
+        assert!(
+            after.contains("Body 01"),
+            "wheel restores the first body line: {after}"
         );
-        draw(&host, 120, 60);
-        let (body, detail) = scrolls(&host);
-        host.handle_event(&key(KeyCode::PageDown));
+        let before = screen(&host, 120, 60).join("\n");
+        assert!(
+            before.contains("Body 20"),
+            "the taller screen fits the body: {before}"
+        );
+        assert!(
+            !before.contains("Detail 01"),
+            "Shift+PgDn scrolled the detail: {before}"
+        );
         assert_eq!(
-            scrolls(&host),
-            (body, detail + SCROLL_ROWS),
-            "PgDn scrolls the detail once the body fits"
+            before
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Detail ")),
+            Some("Detail 04"),
+            "detail starts three lines down: {before}"
+        );
+        host.handle_event(&key(KeyCode::PageDown));
+        let after = screen(&host, 120, 60).join("\n");
+        assert!(
+            after.contains("Body 01"),
+            "body stays at the start: {after}"
+        );
+        assert!(
+            !after.contains("Detail 04"),
+            "PgDn hides the previous detail line: {after}"
+        );
+        assert_eq!(
+            after
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Detail ")),
+            Some("Detail 07"),
+            "PgDn advances the detail when the body fits: {after}"
         );
         host.handle_event(&key(KeyCode::Esc));
         assert!(
@@ -1279,10 +1326,10 @@ mod tests {
                 .await
             }
         });
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().active.is_some()).await;
         assert!(screen(&host, 80, 24).join("\n").contains("First page"));
         host.handle_event(&key(KeyCode::Enter));
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().retained.is_some()).await;
         assert!(
             host.is_active(),
             "the workflow stays modal between requests"
@@ -1293,7 +1340,7 @@ mod tests {
             "gap input is consumed"
         );
         next.send(()).unwrap();
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().active.is_some()).await;
         let screen = screen(&host, 80, 24).join("\n");
         assert!(screen.contains("Second page"));
         assert!(!screen.contains("First page"));
@@ -1321,9 +1368,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         });
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().active.is_some()).await;
         host.handle_event(&key(KeyCode::Esc));
-        tokio::task::yield_now().await;
+        wait_for(|| host.state().retained.is_some()).await;
         assert!(host.is_active());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());

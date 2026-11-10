@@ -234,9 +234,10 @@ impl SetupService {
     /// Returns `Ok(None)` on cancellation; the active session is not changed.
     ///
     /// # Errors
-    /// This method does not return setup failures: storage, authentication,
-    /// and provider errors are offered for retry in the dialog. Cancelling
-    /// returns `Ok(None)`.
+    /// [`SetupError`] covers credential storage, `ChatGPT` authentication,
+    /// provider preparation, and model selection failures. These failures
+    /// are currently caught and offered for retry in the dialog; cancelling
+    /// returns `Ok(None)` rather than propagating the error.
     pub async fn connect(
         &self,
         initial: Option<Provider>,
@@ -372,9 +373,8 @@ impl SetupService {
                     }
                 };
                 if !use_existing {
-                    let variable = provider.key_var().expect("API key provider");
-                    let override_note = if (self.env)(variable)
-                        .is_some_and(|v| !v.trim().is_empty())
+                    let override_note = if let Some(variable) = provider.key_var()
+                        && (self.env)(variable).is_some_and(|value| !value.trim().is_empty())
                     {
                         format!(
                             "\n\nThe {variable} environment variable takes priority over this key. Unset it to use the key you enter here."

@@ -608,12 +608,12 @@ impl ProviderReport {
         if let Some(endpoint) = &self.endpoint {
             parts.push(format!("endpoint {endpoint}"));
         }
-        let usage = if self.credential_source == "signed out" {
-            "signed out".to_string()
+        let usage = if self.credential_source == SIGNED_OUT_SOURCE {
+            SIGNED_OUT_SOURCE.to_string()
         } else if self.provider == Provider::ChatGpt {
             let account = self
                 .credential_source
-                .strip_prefix("ChatGPT account ")
+                .strip_prefix(CHATGPT_ACCOUNT_SOURCE_PREFIX)
                 .unwrap_or(&self.credential_source);
             format!("using ChatGPT account usage ({account})")
         } else if self.credential_source == STORED_KEY_SOURCE {
@@ -829,6 +829,10 @@ enum KeyOrigin {
 
 /// What the report says for a key `polaris login` stored.
 const STORED_KEY_SOURCE: &str = "stored key (polaris login)";
+/// What the report says when no connection is active.
+const SIGNED_OUT_SOURCE: &str = "signed out";
+/// Prefix identifying a connected `ChatGPT` account in the report.
+const CHATGPT_ACCOUNT_SOURCE_PREFIX: &str = "ChatGPT account ";
 
 /// Find `provider`'s key: its variable first, then the credentials file.
 fn resolve_key(
@@ -900,6 +904,11 @@ fn ready_with_key(
 /// add it together with another registration of `openai`, such as
 /// [`OpenAiPlugin`](polaris::models::OpenAiPlugin), [`ReadyProvider::install`],
 /// or [`crate::connection::ConnectionPlugin::with_switching`].
+///
+/// # Extends
+///
+/// Registers the `openai` provider in the [`ModelRegistry`] owned by
+/// [`ModelsPlugin`](polaris::models::ModelsPlugin), serving `openai/<model>`.
 ///
 /// # Example
 ///
@@ -1287,7 +1296,7 @@ pub(crate) async fn prepare_chatgpt_account(
             Provider::ChatGpt,
             None,
             None,
-            format!("ChatGPT account {}", account.label),
+            format!("{CHATGPT_ACCOUNT_SOURCE_PREFIX}{}", account.label),
         ),
     })
 }

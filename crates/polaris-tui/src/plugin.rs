@@ -136,6 +136,11 @@ impl Plugin for TuiPlugin {
 
 /// Runtime handle for the TUI shell, including interactive editor handoffs.
 ///
+/// In-repository consumers:
+///
+/// - `ConversationPanel` uses it for external editor handoffs.
+/// - `TuiPlugin::cleanup` uses it to shut down and join the runtime.
+///
 /// # Provided By
 /// [`TuiPlugin`] publishes this API during `ready()` and attaches a clone to
 /// each panel through [`TuiPanel::attach_runtime`](crate::TuiPanel::attach_runtime).
@@ -167,6 +172,10 @@ impl Plugin for TuiPlugin {
 ///
 /// let mut server = Server::new();
 /// server.add_plugins(TuiPlugin::default());
+/// // TuiPlugin publishes its constructed handle during ready():
+/// fn provider_ready(server: &mut Server, handle: TuiHandle) {
+///     server.insert_api(handle);
+/// }
 /// // In a consumer's ready(), after TuiPlugin is ready:
 /// # fn consumer_ready(server: &Server) {
 /// if let Some(handle) = server.api::<TuiHandle>() {
