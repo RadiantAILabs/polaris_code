@@ -5,14 +5,19 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-10
+
+Requires `polaris-tui` 0.3.0 and `polaris-ai` 0.9.3.
+
 ### Added
 - A `view_image` tool lets the agent look at a PNG, JPEG, GIF or WEBP file in the working directory, in every front end including `-p`. The model receives the picture; the live conversation, activity block and Session RDF/ABox tool-call record show a short line such as `[image shots/a.png, PNG, 34.0 KB]`. Saved session history and ATIF exports (`--trajectory-path`, under `extra.image`) retain the whole encoded image. The type is read from the file's first bytes, not its name. A file over 3,750,000 bytes, or one that is not one of those four types, is refused with a message that says what to do next. It follows `read_file`'s path rules, changes nothing and asks no one. Pictures are not scanned for secrets, unlike text results. A permission rule names one tool, so a rule that protects an image path needs a `view_image` rule as well as a `read_file` rule.
-- `--image-input` / `POLARIS_CODE_IMAGE_INPUT` / `image_input` (`auto`, `on` or `off`) says whether the model takes images. `auto`, the default, is on for Claude models reached through Anthropic or Bedrock and off for every other route, including `--provider openai` and `--provider openai-chat`. When it is off, `view_image` is not offered. The choice is made once from the model the session starts on; `/model` does not change it. `--provider openai-chat` needs `polaris-ai` 0.9.3 or later before an image tool result reaches the endpoint, so set `on` there only with that version.
+- `--image-input` / `POLARIS_CODE_IMAGE_INPUT` / `image_input` (`auto`, `on` or `off`) says whether the model takes images. `auto`, the default, is on for Claude models reached through Anthropic or Bedrock and off for every other route, including `--provider openai` and `--provider openai-chat`. When it is off, `view_image` is not offered. The choice is made once from the model the session starts on; `/model` does not change it. For a vision model behind `--provider openai-chat`, set `on`: this release uses `polaris-ai` 0.9.3, which sends the image to Chat Completions. Do not set `on` for `--provider openai`, whose Responses API provider still refuses image tool results.
 - For embedders, `ViewImageToolsPlugin` registers the tool, and `CodeToolsConfig::with_image_input` sets the wording of `read_file`'s refusal of an image file.
 
 ### Changed
 - `read_file` and `read_span` on an image file now return an error that names the type and size instead of "stream did not contain valid UTF-8". With image input on it ends with the `view_image` call to make; with it off it says the model takes text only.
 - Bedrock Claude model ids (`anthropic.claude-…`) and `claude-fable-…` ids are now recognised as models that take images, for composer attachments as well.
+- Uses `polaris-ai` 0.9.3. Its Chat Completions provider no longer fails on an image tool result: the `tool` message carries a note, and the image follows in a user message after the tool messages, labeled with the call's id. `Cargo.lock` locks every Polaris crate under `polaris-ai` at 0.9.3. `polaris-tui`, `polaris_cosmos` and `polaris_ontrace` are unchanged at 0.3.0.
 
 ## [0.4.4] - 2026-11-09
 
@@ -165,7 +170,8 @@ Requires `polaris-tui` 0.1.1.
 ### Added
 - First public release of `polaris_code` and its supporting crates.
 
-[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/RadiantAILabs/polaris_code/compare/v0.4.1...v0.4.2

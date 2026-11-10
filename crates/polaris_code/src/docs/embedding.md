@@ -26,8 +26,8 @@ Add these direct dependencies to the application that runs the full example:
 
 ```toml
 [dependencies]
-polaris_code = "0.4.4"
-polaris = { package = "polaris-ai", version = "0.9.1", default-features = false, features = ["anthropic"] }
+polaris_code = "0.4.5"
+polaris = { package = "polaris-ai", version = "0.9.3", default-features = false, features = ["anthropic"] }
 polaris_ontrace = { version = "0.3.0", default-features = false, features = ["oxigraph"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
