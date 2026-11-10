@@ -117,6 +117,7 @@ The trait's full surface:
 pub trait TuiPanel: Send + 'static {
     fn id(&self) -> &str;
     fn title(&self) -> &str { self.id() }
+    fn is_modal(&self) -> bool { false }
     fn init(&mut self) {}
     fn tick(&mut self) {}
     fn handle_event(&mut self, event: &TuiEvent) -> EventOutcome { EventOutcome::Continue }
@@ -129,6 +130,11 @@ pub trait TuiPanel: Send + 'static {
 `Tick`, `Resize`, and focus transitions are broadcast to every panel
 regardless of layout. A panel therefore never needs its own "am I focused?"
 gate around input handling.
+
+A panel can temporarily return `true` from `is_modal` to own the full screen
+and keyboard, mouse, and paste input. The shell hides its tabs and status line
+and suspends navigation until the modal closes, then restores the previous
+focus and layout. `Ctrl-Q` and terminal selection remain available.
 
 Panels are `Send`; the runtime owns them on the TUI task. State that needs
 to be shared with the rest of the server should live behind an `Arc` /

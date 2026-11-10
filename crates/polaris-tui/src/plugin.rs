@@ -144,6 +144,7 @@ impl Plugin for TuiPlugin {
 /// | Method | Purpose |
 /// |--------|---------|
 /// | [`run_in_terminal`](Self::run_in_terminal) | Execute an interactive child with terminal modes suspended and restored. |
+/// | [`request_clipboard_copy`](Self::request_clipboard_copy) | Ask the user's terminal to copy text without interleaving rendering. |
 /// | [`shutdown`](Self::shutdown) | Request cooperative shutdown, including stopping an active child. |
 /// | [`wait`](Self::wait) | Join the runtime task; only the first caller takes the join handle. |
 ///
@@ -214,7 +215,37 @@ impl TuiHandle {
     pub async fn run_in_terminal(&self, command: Command) -> io::Result<ExitStatus> {
         let (reply, result) = oneshot::channel();
         self.terminal_tx
-            .send(TerminalRequest { command, reply })
+            .send(TerminalRequest::Run { command, reply })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime stopped"))?;
+        result
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime stopped"))?
+    }
+
+    /// Ask the user's terminal to copy text, including when connected over SSH.
+    ///
+    /// The runtime serializes this request with rendering and terminal handoffs.
+    /// Success means the request was written; the terminal may require approval
+    /// or ignore it. Call outside panel event handlers and await the result.
+    /// Dropping this future before dispatch cancels the queued request.
+    ///
+    /// ```
+    /// # async fn example(handle: &polaris_tui::TuiHandle) -> std::io::Result<()> {
+    /// handle.request_clipboard_copy("Text to copy").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an IO error if the runtime is unavailable or the terminal write fails.
+    pub async fn request_clipboard_copy(&self, text: impl Into<String>) -> io::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.terminal_tx
+            .send(TerminalRequest::Clipboard {
+                text: text.into(),
+                reply,
+            })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI runtime stopped"))?;
         result

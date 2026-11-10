@@ -106,7 +106,28 @@ impl AppShell {
     /// focused panel (a background panel must not see keystrokes meant for
     /// the active one), while `Tick`/`Resize` broadcast so every panel can
     /// keep its clock and layout state in sync.
+    ///
+    /// While a panel is modal it receives every key, mouse and paste event
+    /// instead, regardless of focus; only the exit chords in
+    /// [`handle_exit_key`](Self::handle_exit_key) are intercepted first, so
+    /// focus and layout chords cannot move the user away from it.
     pub(crate) fn handle_event(&mut self, event: TuiEvent) -> ShellOutcome {
+        if let Some(index) = self.panels.iter().position(|panel| panel.is_modal()) {
+            if let TuiEvent::Key(key) = &event
+                && let Some(outcome) = self.handle_exit_key(*key)
+            {
+                return outcome;
+            }
+            if matches!(
+                event,
+                TuiEvent::Key(_) | TuiEvent::Mouse(_) | TuiEvent::Paste(_)
+            ) {
+                return match self.panels[index].handle_event(&event) {
+                    EventOutcome::Quit => ShellOutcome::Quit,
+                    _ => ShellOutcome::Continue,
+                };
+            }
+        }
         // Inviolable chords are intercepted before panels see them. Everything
         // else the shell binds is *offered* to the focused panel first and only
         // applied if the panel declines it — see `handle_fallback_key`.
@@ -154,22 +175,16 @@ impl AppShell {
     /// (`Ctrl-Q`), a way out of a focused panel (`Alt+1..9`), and the terminal's
     /// own selection (`Ctrl-S`). A panel that consumed every event would
     /// otherwise trap the user in the process with no way to quit or switch
-    /// away, so these are deliberately not offered to panels at all.
+    /// away, so these are deliberately not offered to panels at all. A modal
+    /// panel keeps only the exit chords; see [`handle_event`](Self::handle_event).
     ///
     /// Returns `Some` if the chord was intercepted (panels must not see it).
     fn handle_inviolable_key(&mut self, key: KeyEvent) -> Option<ShellOutcome> {
+        if let Some(outcome) = self.handle_exit_key(key) {
+            return Some(outcome);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match (key.code, ctrl) {
-            (KeyCode::Char('q'), true) => Some(ShellOutcome::Quit),
-            // Ctrl-S toggles "selection mode": release mouse capture so the
-            // terminal's own drag-select + copy take over, then re-grab it.
-            // Only meaningful when the host enabled mouse capture — otherwise
-            // the mouse was never grabbed and native selection always works, so
-            // the chord falls through (no interception).
-            (KeyCode::Char('s'), true) if self.mouse_enabled => {
-                self.mouse_captured = !self.mouse_captured;
-                Some(ShellOutcome::ToggleMouse)
-            }
             (KeyCode::Char('l'), true) => {
                 self.layout = match self.layout {
                     LayoutMode::Single => LayoutMode::Tiled,
@@ -188,6 +203,28 @@ impl AppShell {
                     self.set_focus(idx - 1);
                 }
                 Some(ShellOutcome::Continue)
+            }
+            _ => None,
+        }
+    }
+
+    /// Chords that leave the process or the shell's mouse capture, intercepted
+    /// even while a panel is modal: `Ctrl-Q` quits and `Ctrl-S` toggles
+    /// terminal selection.
+    fn handle_exit_key(&mut self, key: KeyEvent) -> Option<ShellOutcome> {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('q') => Some(ShellOutcome::Quit),
+            // Ctrl-S toggles "selection mode": release mouse capture so the
+            // terminal's own drag-select + copy take over, then re-grab it.
+            // Only meaningful when the host enabled mouse capture — otherwise
+            // the mouse was never grabbed and native selection always works, so
+            // the chord falls through (no interception).
+            KeyCode::Char('s') if self.mouse_enabled => {
+                self.mouse_captured = !self.mouse_captured;
+                Some(ShellOutcome::ToggleMouse)
             }
             _ => None,
         }
@@ -241,6 +278,10 @@ impl AppShell {
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame<'_>) {
+        if let Some(panel) = self.panels.iter_mut().find(|panel| panel.is_modal()) {
+            panel.render(frame, frame.area());
+            return;
+        }
         let Chrome {
             tabs,
             workspace,
@@ -464,6 +505,142 @@ mod tests {
             ..TuiConfig::default()
         };
         (AppShell::new(panels, &config), a, b)
+    }
+
+    #[tokio::test]
+    async fn clickable_dialog_preserves_native_mouse_selection() {
+        use crate::dialogs::{Dialog, DialogChoice, DialogContent, DialogHost};
+        for mouse in [false, true] {
+            let (mut shell, counts, _) = shell_with_config(LayoutMode::Single, mouse);
+            let host = DialogHost::default();
+            shell.panels[0] = Box::new(host.wrap(RecordingPanel {
+                name: "dialog",
+                counts,
+                key_outcome: EventOutcome::Continue,
+            }));
+            assert!(!shell.mouse_captured());
+            let task = tokio::spawn({
+                let host = host.clone();
+                async move {
+                    host.present(
+                        Dialog::new(
+                            "Sign in",
+                            "",
+                            DialogContent::Choices(vec![DialogChoice::new("Copy link", "")]),
+                        )
+                        .with_detail("Link", "https://example.com/")
+                        .with_detail_choice(0),
+                    )
+                    .await
+                }
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !shell.mouse_captured(),
+                "clickable link preserves native selection"
+            );
+            host.handle_event(&TuiEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )));
+            assert!(task.await.unwrap().is_none());
+            assert!(
+                !shell.mouse_captured(),
+                "closing restores the user's selection mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modal_owns_screen_and_input_then_restores_focus() {
+        use crate::dialogs::{Dialog, DialogAnswer, DialogContent, DialogHost};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for layout in [LayoutMode::Single, LayoutMode::Tiled] {
+            let (mut shell, a, b) = shell_with_two_panels(layout);
+            let host = DialogHost::default();
+            shell.panels[0] = Box::new(host.wrap(RecordingPanel {
+                name: "setup",
+                counts: a.clone(),
+                key_outcome: EventOutcome::Continue,
+            }));
+            shell.set_focus(1);
+            let task = tokio::spawn({
+                let host = host.clone();
+                async move {
+                    host.present(Dialog::new(
+                        "Private setup",
+                        "Enter a value",
+                        DialogContent::Input {
+                            initial: String::new(),
+                            secret: true,
+                            error: None,
+                        },
+                    ))
+                    .await
+                }
+            });
+            tokio::task::yield_now().await;
+            let mut terminal =
+                Terminal::new(TestBackend::new(80, 24)).expect("test terminal is created");
+            terminal
+                .draw(|frame| shell.render(frame))
+                .expect("shell draws");
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                rendered.contains("Private setup"),
+                "dialog fills the screen"
+            );
+            assert!(!rendered.contains("tab/shift-tab"), "status line is hidden");
+            assert!(!rendered.contains("1 setup"), "tab bar is hidden");
+            assert_eq!(
+                shell.handle_event(chord(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+                ShellOutcome::Quit,
+                "Ctrl-Q still quits while modal"
+            );
+            for event in [
+                chord(KeyCode::Char('2'), KeyModifiers::ALT),
+                chord(KeyCode::Char('l'), KeyModifiers::CONTROL),
+                chord(KeyCode::Tab, KeyModifiers::NONE),
+            ] {
+                shell.handle_event(event);
+            }
+            assert_eq!(shell.focused, 1, "focus chords are suspended while modal");
+            assert_eq!(
+                shell.layout, layout,
+                "layout chord is suspended while modal"
+            );
+            shell.handle_event(TuiEvent::Paste("private".into()));
+            shell.handle_event(plain_key('4'));
+            shell.handle_event(chord(KeyCode::Enter, KeyModifiers::NONE));
+            let answer = task.await.expect("dialog task completes");
+            assert!(
+                matches!(answer, Some(DialogAnswer::Input(value)) if value == "private4"),
+                "modal receives paste and keys"
+            );
+            assert_eq!(
+                a.keys.load(Ordering::Relaxed),
+                0,
+                "wrapped panel saw no keys"
+            );
+            assert_eq!(
+                b.keys.load(Ordering::Relaxed),
+                0,
+                "focused panel saw no keys"
+            );
+            shell.handle_event(plain_key('x'));
+            assert_eq!(
+                b.keys.load(Ordering::Relaxed),
+                1,
+                "focused panel receives keys once the modal closes"
+            );
+        }
     }
 
     fn plain_key(c: char) -> TuiEvent {

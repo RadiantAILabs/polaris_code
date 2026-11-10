@@ -550,7 +550,7 @@ impl ScrollableTranscript {
 /// copying its private wrapping algorithm or retaining O(width * rows) cells.
 /// The cell grid exists while this runs, so callers stay within
 /// [`WRAP_CACHE_CELL_BUDGET`].
-fn wrapped_rows(line: &Line<'static>, width: u16, height: u16) -> Vec<Line<'static>> {
+pub(crate) fn wrapped_rows(line: &Line<'static>, width: u16, height: u16) -> Vec<Line<'static>> {
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
     Paragraph::new(line.clone())

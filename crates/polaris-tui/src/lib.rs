@@ -8,6 +8,9 @@
 //!
 //! `TuiRegistry` holds *in-process trait objects*: plugins add panels to it
 //! during their build phase.
+//! [`dialogs::DialogHost`] adds private modal prompts to a panel. Terminal
+//! clipboard requests go through [`TuiHandle::request_clipboard_copy`] so they
+//! share the renderer's terminal owner.
 //!
 //! # Quick Start
 //!
@@ -94,7 +97,10 @@ mod panel;
 mod plugin;
 mod registry;
 mod runtime;
+mod stray;
+mod text;
 
+pub mod dialogs;
 pub mod nav;
 pub mod widgets;
 

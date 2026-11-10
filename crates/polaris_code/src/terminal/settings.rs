@@ -20,7 +20,7 @@ static APPROVAL_GENERATION: AtomicU64 = AtomicU64::new(1);
 use polaris_tui::commands::CommandSpec;
 
 use crate::agents::{PermissionCeiling, PermissionMode};
-use crate::config::ModelCatalog;
+use crate::config::{ModelCatalog, ModelSelectionError};
 
 use super::{CommandError, CommandOutcome, CommandRegistry};
 
@@ -61,7 +61,7 @@ pub struct SessionSettings {
     /// what was *requested*: a record that names an un-run model is worse than
     /// one that names none, so the host's accounting reads this.
     served: Arc<RwLock<Option<String>>>,
-    catalog: Arc<ModelCatalog>,
+    catalog: Arc<RwLock<ModelCatalog>>,
     apply_at_turn_boundary: bool,
 }
 
@@ -84,7 +84,7 @@ impl SessionSettings {
             )),
             ceiling: Arc::new(OnceLock::new()),
             served: Arc::new(RwLock::new(None)),
-            catalog: Arc::new(catalog.clone()),
+            catalog: Arc::new(RwLock::new(catalog.clone())),
             apply_at_turn_boundary: true,
         }
     }
@@ -161,8 +161,11 @@ impl SessionSettings {
 
     /// The models this session may select between.
     #[must_use]
-    pub fn catalog(&self) -> &ModelCatalog {
-        &self.catalog
+    pub fn catalog(&self) -> ModelCatalog {
+        self.catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Record the model a turn is about to run on.
@@ -240,24 +243,87 @@ impl SessionSettings {
         offered[next]
     }
 
+    /// Replace the selected model and catalog, keeping the session's permissions.
+    /// Call between turns, before activating the prepared connection.
+    ///
+    /// # Errors
+    /// Returns an error without changing settings if the catalog cannot resolve the model.
+    pub fn set_connection(
+        &self,
+        model: String,
+        catalog: ModelCatalog,
+    ) -> Result<(), ModelSelectionError> {
+        let model = catalog.resolve_noting(&model)?.id;
+        *self.catalog.write().unwrap_or_else(|err| err.into_inner()) = catalog;
+        self.inner
+            .write()
+            .unwrap_or_else(|err| err.into_inner())
+            .model_id = model;
+        Ok(())
+    }
+
     /// Register `/model` and `/permission` with finite picker choices.
     ///
     /// `/model`'s choices are the catalog, so the chooser offers what the host
     /// is configured to reach rather than the single model it happens to be on.
+    /// Choices are captured at registration. Hosts that replace the catalog
+    /// with [`Self::set_connection`] should use [`Self::register_with_dialogs`],
+    /// whose picker reads the current catalog each time it opens.
     ///
     /// Under a ceiling the `/permission` spec advertises only the postures that
     /// can actually be entered, and says which ceiling narrowed it — so a user
     /// who cannot raise their permissions reads that from the command popup
     /// rather than discovering it by being refused.
+    ///
+    /// # Errors
+    /// Returns [`CommandError`] if a command is already registered.
     pub fn register(&self, commands: &CommandRegistry) -> Result<(), CommandError> {
-        let model_choices = self.catalog.models().to_vec();
+        self.register_impl(commands, None)
+    }
+
+    /// Register `/model` with a picker for the current catalog, and `/permission`.
+    /// Model IDs passed directly to `/model` are checked against the same catalog.
+    ///
+    /// # Errors
+    /// Returns [`CommandError`] if a command is already registered.
+    pub fn register_with_dialogs(
+        &self,
+        commands: &CommandRegistry,
+        dialogs: polaris_tui::dialogs::DialogHost,
+    ) -> Result<(), CommandError> {
+        self.register_impl(commands, Some(dialogs))
+    }
+
+    fn register_impl(
+        &self,
+        commands: &CommandRegistry,
+        dialogs: Option<polaris_tui::dialogs::DialogHost>,
+    ) -> Result<(), CommandError> {
         let model_settings = self.clone();
-        commands.register_sync(
-            CommandSpec::new("model", "Show or select the session model")
-                .with_usage("[provider/model]")
-                .with_choices(model_choices),
-            move |_, args| model_settings.model_command(args),
-        )?;
+        if let Some(dialogs) = dialogs {
+            commands.register(
+                CommandSpec::new("model", "Choose a model for the active connection")
+                    .with_usage("[provider/model]"),
+                Arc::new(move |ctx| {
+                    let settings = model_settings.clone();
+                    let dialogs = dialogs.clone();
+                    let args = ctx.args.to_string();
+                    Box::pin(async move {
+                        if !args.trim().is_empty() {
+                            return settings.model_command(&args);
+                        }
+                        settings.choose_model(dialogs).await
+                    })
+                }),
+            )?;
+        } else {
+            commands.register_sync(
+                CommandSpec::new("model", "Show or select the session model")
+                    .with_usage("[provider/model]")
+                    .with_choices(self.catalog().models().to_vec()),
+                move |_, args| model_settings.model_command(args),
+            )?;
+        }
 
         let offered = self.offered_modes();
         let description = match self.ceiling.get() {
@@ -276,12 +342,53 @@ impl SessionSettings {
         )
     }
 
+    async fn choose_model(&self, dialogs: polaris_tui::dialogs::DialogHost) -> CommandOutcome {
+        use polaris_tui::dialogs::{Dialog, DialogAnswer, DialogChoice, DialogContent};
+        let catalog = self.catalog();
+        let active = self.snapshot().model_id;
+        let choices = catalog
+            .models()
+            .iter()
+            .map(|id| {
+                let label = catalog.display_name(id);
+                DialogChoice::new(
+                    label,
+                    if id == &active {
+                        if label == id {
+                            "Active model".into()
+                        } else {
+                            format!("{id} · Active model")
+                        }
+                    } else if label == id {
+                        String::new()
+                    } else {
+                        id.clone()
+                    },
+                )
+            })
+            .collect();
+        match dialogs
+            .present(Dialog::new(
+                "Choose a model",
+                "Models available through your active connection.",
+                DialogContent::Choices(choices),
+            ))
+            .await
+        {
+            Some(DialogAnswer::Choice(index)) => catalog.models().get(index).map_or_else(
+                || CommandOutcome::Error("invalid model selection".into()),
+                |id| self.model_command(id),
+            ),
+            _ => CommandOutcome::Reply("Model unchanged.".into()),
+        }
+    }
+
     fn model_command(&self, args: &str) -> CommandOutcome {
         let requested = args.trim();
         if requested.is_empty() {
             let active = self.snapshot().model_id;
             let listed = self
-                .catalog
+                .catalog()
                 .models()
                 .iter()
                 .map(|id| {
@@ -298,7 +405,7 @@ impl SessionSettings {
         // Resolved against the catalog, so an unknown name is refused here with
         // the set that would have worked — never carried into a turn to fail as
         // a provider error at the first token.
-        let resolved = match self.catalog.resolve_noting(requested) {
+        let resolved = match self.catalog().resolve_noting(requested) {
             Ok(resolved) => resolved,
             Err(err) => {
                 return CommandOutcome::Error(format!("{err}; the active model was not changed"));
@@ -378,5 +485,52 @@ fn offered_list(offered: &[&'static str]) -> String {
         None => "none".to_string(),
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_connection_rejects_unknown_model_and_keeps_permissions() {
+        let catalog = ModelCatalog::pinned("openai/old");
+        let settings = SessionSettings::new("openai/old", PermissionMode::Plan, &catalog);
+        let error = settings
+            .set_connection(
+                "openai/missing".into(),
+                ModelCatalog::pinned("openai/available"),
+            )
+            .expect_err("a model outside the new catalog is refused");
+        assert!(
+            matches!(error, ModelSelectionError::Unknown { .. }),
+            "the refusal names an unknown model: {error:?}"
+        );
+        assert_eq!(
+            settings.snapshot().model_id,
+            "openai/old",
+            "a refused connection keeps the model"
+        );
+        assert_eq!(
+            settings.catalog().models(),
+            &["openai/old"],
+            "a refused connection keeps the catalog"
+        );
+        settings
+            .set_connection(
+                "openai/available".into(),
+                ModelCatalog::pinned("openai/available"),
+            )
+            .expect("a model in the new catalog is accepted");
+        assert_eq!(
+            settings.snapshot().model_id,
+            "openai/available",
+            "an accepted connection selects its model"
+        );
+        assert_eq!(
+            settings.snapshot().permission_mode,
+            PermissionMode::Plan,
+            "switching connection keeps the permission mode"
+        );
     }
 }

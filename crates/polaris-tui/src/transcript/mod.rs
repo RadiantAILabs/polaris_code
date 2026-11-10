@@ -16,33 +16,7 @@ const MAX_BYTES: usize = 64 * 1024;
 /// mechanism reused everywhere rather than a diff-specific special case.
 const DIFF_PREVIEW_ROWS: usize = 24;
 
-/// Remove terminal controls before parsing, including C1 and bidi overrides.
-/// Keep newlines and expand tabs so code indentation survives ratatui rendering.
-pub(crate) fn safe_text(text: &str) -> String {
-    let mut result = String::new();
-    let mut column = 0;
-    for ch in text.chars() {
-        match ch {
-            '\n' => {
-                result.push(ch);
-                column = 0;
-            }
-            '\t' => {
-                let spaces = 4 - column % 4;
-                result.extend(std::iter::repeat_n(' ', spaces));
-                column += spaces;
-            }
-            ch if ch.is_control()
-                || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}' | '\u{2028}' | '\u{2029}' | '\u{feff}') =>
-                {}
-            ch => {
-                result.push(ch);
-                column += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            }
-        }
-    }
-    result
-}
+use crate::text::safe_text;
 
 pub(crate) fn body_lines(text: &str, markdown: bool, expanded: bool) -> Vec<Line<'static>> {
     let end = text.floor_char_boundary(MAX_BYTES.min(text.len()));

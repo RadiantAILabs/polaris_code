@@ -34,6 +34,7 @@ pub(crate) mod editor;
 #[cfg(feature = "panels")]
 pub(crate) mod history;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -519,6 +520,57 @@ impl Composer {
                 .text
                 .grapheme_indices(true)
                 .any(|(offset, _)| offset == at)
+    }
+
+    /// Apply a single-line field's editing key, readline style.
+    ///
+    /// Covers character and word motion, Home/End and `Ctrl-A`/`Ctrl-E`,
+    /// Backspace/Delete and their word forms, `Ctrl-U`/`Ctrl-K` line kills, and
+    /// typing. A typed control character, or one that would take the text past
+    /// `max_bytes`, is dropped. Returns `false` for keys that are not editing
+    /// keys, such as Enter, Esc and Up, so the caller can handle them.
+    pub(crate) fn edit_line(&mut self, key: KeyEvent, max_bytes: usize) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
+        match (key.code, ctrl, alt) {
+            (KeyCode::Left, _, true) | (KeyCode::Char('b'), false, true) => {
+                self.seek(self.prev_word());
+            }
+            (KeyCode::Right, _, true) | (KeyCode::Char('f'), false, true) => {
+                self.seek(self.next_word());
+            }
+            (KeyCode::Left, false, false) | (KeyCode::Char('b'), true, false) => self.move_left(),
+            (KeyCode::Right, false, false) | (KeyCode::Char('f'), true, false) => {
+                self.move_right();
+            }
+            (KeyCode::Home, ..) | (KeyCode::Char('a'), true, false) => self.move_line_start(),
+            (KeyCode::End, ..) | (KeyCode::Char('e'), true, false) => self.move_line_end(),
+            (KeyCode::Backspace, false, true) | (KeyCode::Char('w'), true, false) => {
+                self.delete_range(self.prev_word(), self.cursor);
+            }
+            (KeyCode::Delete, false, true) | (KeyCode::Char('d'), false, true) => {
+                self.delete_range(self.cursor, self.next_word());
+            }
+            (KeyCode::Backspace, false, false) => self.backspace(),
+            (KeyCode::Delete, false, false) | (KeyCode::Char('d'), true, false) => {
+                self.delete_forward();
+            }
+            (KeyCode::Char('u'), true, false) => {
+                self.delete_range(self.line_start(self.cursor), self.cursor);
+            }
+            (KeyCode::Char('k'), true, false) => {
+                self.delete_range(self.cursor, self.line_end(self.cursor));
+            }
+            (KeyCode::Char(c), false, false) => {
+                if !c.is_control() && self.text.len() + c.len_utf8() <= max_bytes {
+                    self.insert_char(c);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 }
 

@@ -6,6 +6,7 @@ use crate::event::TuiEvent;
 use crate::notify::{Notification, RESTORE_TITLE};
 use crate::panel::TuiPanel;
 use crossterm::ExecutableCommand;
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -14,8 +15,8 @@ use crossterm::event::{
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
 };
 use parking_lot::Mutex;
 use ratatui::Terminal;
@@ -25,9 +26,15 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 
-pub(crate) struct TerminalRequest {
-    pub(crate) command: Command,
-    pub(crate) reply: oneshot::Sender<io::Result<ExitStatus>>,
+pub(crate) enum TerminalRequest {
+    Run {
+        command: Command,
+        reply: oneshot::Sender<io::Result<ExitStatus>>,
+    },
+    Clipboard {
+        text: String,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 /// Shutdown receiver owned by the runtime.
@@ -151,6 +158,17 @@ pub(crate) async fn run(
     result.and(modes.suspend())
 }
 
+fn draw_frame<W: Write>(terminal: &mut Term<W>, shell: &mut AppShell) -> io::Result<()> {
+    terminal.backend_mut().execute(BeginSynchronizedUpdate)?;
+    let drawn = terminal.draw(|frame| shell.render(frame)).map(|_| ());
+    // End the update even when rendering fails, so the terminal cannot freeze.
+    let ended = terminal
+        .backend_mut()
+        .execute(EndSynchronizedUpdate)
+        .map(|_| ());
+    drawn.and(ended)
+}
+
 async fn event_loop<W: Write>(
     terminal: &mut Term<W>,
     modes: &mut TerminalModes,
@@ -162,7 +180,7 @@ async fn event_loop<W: Write>(
 ) -> io::Result<()> {
     let mut shell = AppShell::new(panels, config);
     shell.init_panels();
-    terminal.draw(|frame| shell.render(frame))?;
+    draw_frame(terminal, &mut shell)?;
     let mut frames = FrameSchedule::new(source.now());
     loop {
         if *shutdown.rx.borrow() {
@@ -172,27 +190,38 @@ async fn event_loop<W: Write>(
             biased;
             _ = shutdown.rx.changed() => break,
             Some(request) = requests.recv() => {
-                if request.reply.is_closed() { continue; }
-                // No input future is polled while this operation owns the
-                // terminal. Unlike EventStream, there is no background reader
-                // that can race a drop and steal the editor's first keystroke.
-                let result = terminal_round_trip(modes, request.command, &mut shutdown.rx).await;
-                let restored = result.restored;
-                let _ = request.reply.send(result.child);
-                restored?;
-                terminal.clear()?;
-                terminal.autoresize()?;
-                let size = terminal.size()?;
-                shell.handle_event(TuiEvent::Resize { cols: size.width, rows: size.height });
-                shell.tick();
-                deliver_notifications(modes, &mut shell);
-                terminal.draw(|frame| shell.render(frame))?;
-                frames.rendered(source.now());
-            }
+                match request {
+                    TerminalRequest::Clipboard { text, reply } => {
+                        if reply.is_closed() { continue; }
+                        let result = terminal.backend_mut()
+                            .execute(CopyToClipboard::to_clipboard_from(text))
+                            .map(|_| ());
+                        let _ = reply.send(result);
+                    }
+                    TerminalRequest::Run { command, reply } => {
+                        if reply.is_closed() { continue; }
+                        // No input future is polled while this operation owns the
+                        // terminal. Unlike EventStream, there is no background reader
+                        // that can race a drop and steal the editor's first keystroke.
+                        let result = terminal_round_trip(modes, command, &mut shutdown.rx).await;
+                        let restored = result.restored;
+                        let _ = reply.send(result.child);
+                        restored?;
+                        terminal.clear()?;
+                        terminal.autoresize()?;
+                        let size = terminal.size()?;
+                        shell.handle_event(TuiEvent::Resize { cols: size.width, rows: size.height });
+                        shell.tick();
+                        deliver_notifications(modes, &mut shell);
+                        draw_frame(terminal, &mut shell)?;
+                        frames.rendered(source.now());
+                    }
+                }
+            },
             // A due frame wins over more input, so continuous wheel traffic
             // cannot starve painting. Shutdown and child handoffs stay first.
             _ = source.sleep_until(frames.next), if frames.dirty => {
-                terminal.draw(|frame| shell.render(frame))?;
+                draw_frame(terminal, &mut shell)?;
                 frames.rendered(source.now());
             }
             _ = source.tick() => {
@@ -567,6 +596,7 @@ mod tests {
     use std::pin::Pin;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
 
     #[test]
@@ -714,12 +744,34 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedOutput {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        fail_writes: Arc<AtomicBool>,
+    }
+
+    impl Write for CapturedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_writes.load(Ordering::Relaxed) {
+                return Err(io::Error::other("injected terminal write failure"));
+            }
+            self.bytes.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// The production [`event_loop`] over a probe panel, with fake time, fake
     /// input and a terminal that writes to memory.
     struct Rig {
         fake: Fake,
         log: Arc<Mutex<ProbeLog>>,
         shutdown: watch::Sender<bool>,
+        handle: crate::TuiHandle,
+        output: CapturedOutput,
         event_loop: Pin<Box<dyn Future<Output = io::Result<()>>>>,
     }
 
@@ -729,16 +781,18 @@ mod tests {
             let fake = Fake::new();
             let log = Arc::new(Mutex::new(ProbeLog::default()));
             let (shutdown, shutdown_rx) = watch::channel(false);
+            let (handle, requests) = crate::plugin::test_handle();
+            let output = CapturedOutput::default();
+            let writer = output.clone();
             let panels: Vec<Box<dyn TuiPanel>> = vec![Box::new(Probe(log.clone()))];
             let source = fake.clone();
             let event_loop = Box::pin(async move {
-                let backend = CrosstermBackend::new(Vec::new());
+                let backend = CrosstermBackend::new(writer);
                 let options = TerminalOptions {
                     viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
                 };
                 let mut terminal = Terminal::with_options(backend, options)?;
                 let mut modes = TerminalModes::default();
-                let (_requests_tx, requests) = mpsc::channel(1);
                 event_loop(
                     &mut terminal,
                     &mut modes,
@@ -754,6 +808,8 @@ mod tests {
                 fake,
                 log,
                 shutdown,
+                handle,
+                output,
                 event_loop,
             };
             assert!(rig.step().is_pending());
@@ -785,6 +841,84 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    #[tokio::test]
+    async fn clipboard_requests_use_the_runtime_writer_and_skip_cancelled_requests() {
+        let mut rig = Rig::start();
+        let handle = rig.handle.clone();
+        let mut copy = Box::pin(handle.request_clipboard_copy("hello"));
+        assert!(
+            futures::poll!(&mut copy).is_pending(),
+            "copy waits for the runtime"
+        );
+        assert!(
+            rig.step().is_pending(),
+            "the runtime keeps running after copying"
+        );
+        assert!(
+            matches!(futures::poll!(&mut copy), Poll::Ready(Ok(()))),
+            "copy acknowledges the completed terminal write"
+        );
+        let sequence = b"\x1b]52;c;aGVsbG8=\x1b\\";
+        assert!(
+            rig.output
+                .bytes
+                .lock()
+                .windows(sequence.len())
+                .any(|bytes| bytes == sequence),
+            "clipboard protocol is written intact through the rendering backend"
+        );
+
+        let before = rig.output.bytes.lock().len();
+        let mut cancelled = Box::pin(handle.request_clipboard_copy("cancelled"));
+        assert!(
+            futures::poll!(&mut cancelled).is_pending(),
+            "the queued copy waits for dispatch"
+        );
+        drop(cancelled);
+        assert!(
+            rig.step().is_pending(),
+            "cancelling a copy keeps the runtime running"
+        );
+        assert_eq!(
+            rig.output.bytes.lock().len(),
+            before,
+            "cancelled requests write no clipboard bytes"
+        );
+
+        rig.output.fail_writes.store(true, Ordering::Relaxed);
+        let mut failed = Box::pin(handle.request_clipboard_copy("failed"));
+        assert!(
+            futures::poll!(&mut failed).is_pending(),
+            "copy waits for dispatch before reporting write errors"
+        );
+        assert!(
+            rig.step().is_pending(),
+            "a failed clipboard request does not stop the runtime"
+        );
+        assert!(
+            matches!(futures::poll!(&mut failed), Poll::Ready(Err(error)) if error.to_string() == "injected terminal write failure"),
+            "terminal write failures reach the caller"
+        );
+        rig.output.fail_writes.store(false, Ordering::Relaxed);
+
+        rig.shutdown
+            .send(true)
+            .expect("runtime shutdown is requested");
+        assert!(
+            matches!(rig.step(), Poll::Ready(Ok(()))),
+            "runtime stops cooperatively"
+        );
+        let error = handle
+            .request_clipboard_copy("after shutdown")
+            .await
+            .expect_err("a stopped runtime rejects clipboard requests");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe,
+            "the failure identifies the unavailable runtime"
+        );
     }
 
     #[test]
@@ -1036,12 +1170,15 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let TerminalRequest::Run { command, reply } = request else {
+                panic!("editor requests a terminal handoff");
+            };
             let mut terminal = FakeTerminal::default();
             let (_tx, mut shutdown) = watch::channel(false);
-            let result = terminal_round_trip(&mut terminal, request.command, &mut shutdown).await;
+            let result = terminal_round_trip(&mut terminal, command, &mut shutdown).await;
             result.restored.unwrap();
             assert_eq!(terminal.transitions, ["suspend", "resume"]);
-            request.reply.send(result.child).unwrap();
+            reply.send(result.child).unwrap();
             let result = draft.await.unwrap();
             match expected {
                 Some(text) => assert_eq!(result.unwrap(), text),

@@ -364,7 +364,8 @@ use crate::panels::LogBuffer;
 use crate::panels::approval_picker::{Answer, ApprovalPicker, COMFORTABLE_ROWS, Outcome};
 use crate::panels::logs::FRAMEWORK_TARGET_PREFIX;
 use crate::registry::TuiRegistry;
-use crate::transcript::{body_lines, preview_lines, safe_text};
+use crate::text::safe_text;
+use crate::transcript::{body_lines, preview_lines};
 use crate::widgets::ScrollableTranscript;
 use crate::{EditorCommand, PromptHistoryConfig, TuiHandle};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -1020,6 +1021,9 @@ impl DeliveryFailure {
 
 /// Chat transcript + input prompt for [`TuiIOProvider`].
 pub struct ConversationPanel {
+    /// Host text shown first in the status row; see
+    /// [`ConversationPanelPlugin::with_status_context`].
+    status_context: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     browse: navigation::BrowseState,
     transcript: VecDeque<IOMessage>,
     /// The draft being edited. Owns its own caret; see [`Composer`] for why the
@@ -1237,6 +1241,7 @@ impl ConversationPanel {
     ) -> Self {
         Self {
             browse: navigation::BrowseState::default(),
+            status_context: None,
             transcript: VecDeque::new(),
             composer: Composer::new(),
             history: None,
@@ -1912,6 +1917,9 @@ impl ConversationPanel {
         let mut spans = lead;
 
         let mut facts = Vec::new();
+        if let Some(context) = &self.status_context {
+            facts.push(safe_text(&context()));
+        }
         if error.is_none() {
             if let Some(model) = &self.report.model {
                 facts.push(safe_text(model));
@@ -1980,17 +1988,11 @@ impl ConversationPanel {
         } else {
             format!("ctrl-o: {} steps", self.timeline.len())
         });
-        let mut first = true;
         for fact in facts {
-            let piece = if first {
-                format!("  {fact}")
-            } else {
-                format!(" · {fact}")
-            };
+            let piece = format!(" · {fact}");
             let piece_width = unicode_width::UnicodeWidthStr::width(piece.as_str());
             if used + piece_width <= width {
                 used += piece_width;
-                first = false;
                 spans.push(Span::styled(piece, dim));
             }
         }
@@ -3516,10 +3518,8 @@ impl TuiPanel for ConversationPanel {
         self.drain_mention_results();
         self.drain_attachment_results();
         self.drain_browse_results();
-        // The meta line is shown only once a status/token message has arrived,
-        // so panels that don't drive that protocol look like a plain
-        // transcript + input. When hidden, its row collapses to zero height.
-        let meta_height = u16::from(self.meta_active);
+        let show_meta = self.meta_active || self.status_context.is_some();
+        let meta_height = u16::from(show_meta);
         // Approval and delivery banners take a row each, only while they have
         // something to report; the block collapses to zero height otherwise.
         let mut banner_lines = self.banner_lines();
@@ -3645,7 +3645,7 @@ impl TuiPanel for ConversationPanel {
             }
         }
 
-        if self.meta_active {
+        if show_meta {
             frame.render_widget(
                 Paragraph::new(self.meta_line_for_width(chunks[1].width)),
                 chunks[1],
@@ -4077,6 +4077,8 @@ impl ConversationPanel {
 /// `Res<UserIO>` or `ResMut<UserIO>` will receive a `UserIO` cloning the
 /// same `Arc<TuiIOProvider>`.
 pub struct ConversationPanelPlugin {
+    dialogs: Option<crate::dialogs::DialogHost>,
+    status_context: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     buffer: usize,
     log_buffer: Option<LogBuffer>,
     completion_source: Option<Arc<dyn CompletionSource>>,
@@ -4100,6 +4102,8 @@ type IoDecorator = Arc<dyn Fn(Arc<TuiIOProvider>) -> UserIO + Send + Sync>;
 impl Default for ConversationPanelPlugin {
     fn default() -> Self {
         Self {
+            dialogs: None,
+            status_context: None,
             buffer: DEFAULT_CHANNEL_BUFFER,
             log_buffer: None,
             completion_source: None,
@@ -4130,6 +4134,26 @@ impl std::fmt::Debug for ConversationPanelPlugin {
 }
 
 impl ConversationPanelPlugin {
+    /// Show host text first in the status row below the input.
+    ///
+    /// The row is shown even before status messages arrive. The callback runs
+    /// on every frame, so it must return quickly and never block.
+    #[must_use]
+    pub fn with_status_context(
+        mut self,
+        context: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.status_context = Some(Arc::new(context));
+        self
+    }
+
+    /// Display dialogs from this host as modals over the conversation.
+    /// Answers return to the host through [`crate::dialogs::DialogHost::present`].
+    #[must_use]
+    pub fn with_dialogs(mut self, dialogs: crate::dialogs::DialogHost) -> Self {
+        self.dialogs = Some(dialogs);
+        self
+    }
     /// Dim hint shown in the empty input, such as "Ask Polaris…". Without
     /// one the panel shows [`DEFAULT_PLACEHOLDER`].
     #[must_use]
@@ -4352,6 +4376,7 @@ impl Plugin for ConversationPanelPlugin {
 
     fn build(&self, server: &mut Server) {
         let (provider, mut panel) = TuiIOProvider::new_with_panel(self.buffer);
+        panel.status_context = self.status_context.clone();
         if let Some(history) = &self.history {
             panel = panel.with_history(history.clone());
         }
@@ -4386,10 +4411,14 @@ impl Plugin for ConversationPanelPlugin {
             }
             None => server.register_local(move || UserIO::new(factory_provider.clone())),
         }
-        server
+        let registry = server
             .api::<TuiRegistry>()
-            .expect("TuiPlugin must be added before ConversationPanelPlugin")
-            .add_panel(panel);
+            .expect("TuiPlugin must be added before ConversationPanelPlugin");
+        if let Some(dialogs) = &self.dialogs {
+            registry.add_panel(dialogs.wrap(panel));
+        } else {
+            registry.add_panel(panel);
+        }
     }
 
     fn access(&self) -> PluginAccess {

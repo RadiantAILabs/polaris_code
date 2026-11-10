@@ -83,3 +83,9 @@ empty list is not offered `task_output` or the other shell tools. Neither adds a
 API: for the tools above, two sessions on one server differ only in the
 `AgentConfig` they were created with, and in the `TokenMeter` when one of them
 carries a spend cap.
+
+[`ConnectionPlugin`](crate::connection::ConnectionPlugin) extends `ModelRegistry`.
+Retain its [`ConnectionRuntime`](crate::connection::ConnectionRuntime) handle for
+[`SessionAccounts`](crate::terminal::SessionAccounts) to switch connections
+between turns. [`SetupService`](crate::onboarding::SetupService) collects
+credentials through private dialogs and prepares a connection before activation.

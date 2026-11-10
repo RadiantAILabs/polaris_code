@@ -26,7 +26,7 @@ provider, access pattern, and a real-shape consuming system per the
 
 | Resource | Scope | What it exposes |
 |----------|-------|-----------------|
-| [`ProviderReport`](crate::providers::ProviderReport) | Global | What the provider that passed the launch check is running as: which provider, the AWS region or custom endpoint when there is one, and where its credentials came from — a variable name, stored login key, or an AWS source, never the credential. `/status` reads this launch report directly. `line()` renders the one-line form a session opens with. Installed by the binary from [`ReadyProvider::report`](crate::providers::ReadyProvider::report); a host that builds its own server installs none. Global because one provider serves every session in the process. |
+| [`ProviderReport`](crate::providers::ProviderReport) | Global | What the provider that passed the launch check is running as: which provider, the AWS region or custom endpoint when there is one, and where its credentials came from — a variable name, stored login key, or an AWS source, never the credential. `line()` renders the one-line form a `--print` run reports. Installed by the binary from [`ReadyProvider::report`](crate::providers::ReadyProvider::report); a host that builds its own server installs none. Global because it records the launch; an interactive session that switches connection reads the live report from [`ConnectionRuntime::report`](crate::connection::ConnectionRuntime::report), which `/status` uses. |
 
 # Safety
 

@@ -78,7 +78,7 @@
 //! One key press answers, so a word typed into the composer when the picker
 //! opens could approve something. A key that can answer (Enter, a digit or an
 //! alias such as `y`) is ignored while other keys were pressed less than
-//! [`QUIET`] earlier. Moving, scrolling, `Tab` and `Esc` are never ignored.
+//! [`QUIET`](crate::stray::QUIET) earlier. Moving, scrolling, `Tab` and `Esc` are never ignored.
 //!
 //! [`APPROVAL_SUBJECT`]: super::conversation::APPROVAL_SUBJECT
 
@@ -86,14 +86,15 @@ use super::conversation::{
     ApprovalChoice, bounded_label, bounded_safe_text, cell_width, hard_wrap,
 };
 use crate::composer::Composer;
-use crate::transcript::safe_text;
+use crate::stray::StrayGuard;
+use crate::text::safe_text;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Most bytes of the command or the full prompt that are looked at. The rest
@@ -101,8 +102,6 @@ use unicode_segmentation::UnicodeSegmentation;
 pub(super) const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Most bytes of a note.
 const MAX_NOTE_BYTES: usize = 1024;
-/// How long a key that could answer is ignored after another key press.
-const QUIET: Duration = Duration::from_millis(400);
 /// Columns the list draws before a label: the pointer, the digit and spaces.
 const LABEL_INDENT: usize = 5;
 /// Rows that show the borders, one answer and one row of the command: the
@@ -293,8 +292,8 @@ pub(crate) struct ApprovalPicker {
     refused: bool,
     /// The note field while it is open.
     note: Option<Composer>,
-    /// When the last key that could not answer was pressed.
-    stray: Option<Instant>,
+    /// Ignores answer keys typed too soon after other keys.
+    stray: StrayGuard,
 }
 
 impl ApprovalPicker {
@@ -374,7 +373,7 @@ impl ApprovalPicker {
             cramped: false,
             refused: false,
             note: None,
-            stray: last_key,
+            stray: StrayGuard::new(last_key),
         }
     }
 
@@ -387,7 +386,7 @@ impl ApprovalPicker {
     /// Accept answer keys now, as if nothing had been typed before.
     #[cfg(test)]
     pub(crate) fn settle(&mut self) {
-        self.stray = None;
+        self.stray = StrayGuard::default();
     }
 
     /// Whether the note field is open.
@@ -506,38 +505,15 @@ impl ApprovalPicker {
             (KeyCode::Down, false, false) => self.step(1),
             (KeyCode::PageUp, false, false) => self.page(-1),
             (KeyCode::PageDown, false, false) => self.page(1),
-            (code, ..) => {
+            _ => {
                 let Some(note) = self.note.as_mut() else {
                     return Outcome::NotMine;
                 };
-                match (code, ctrl, alt) {
-                    (KeyCode::Left, false, false) => note.move_left(),
-                    (KeyCode::Right, false, false) => note.move_right(),
-                    (KeyCode::Home, false, false) | (KeyCode::Char('a'), true, false) => {
-                        note.move_line_start();
-                    }
-                    (KeyCode::End, false, false) | (KeyCode::Char('e'), true, false) => {
-                        note.move_line_end();
-                    }
-                    (KeyCode::Backspace, false, false) => note.backspace(),
-                    (KeyCode::Delete, false, false) => note.delete_forward(),
-                    (KeyCode::Char('u'), true, false) => {
-                        let at = note.cursor();
-                        let start = note.line_start(at);
-                        note.delete_range(start, at);
-                    }
-                    (KeyCode::Char('w'), true, false) => {
-                        let (from, to) = (note.prev_word(), note.cursor());
-                        note.delete_range(from, to);
-                    }
-                    (KeyCode::Char(c), false, false) => {
-                        if !c.is_control() && note.text().len() + c.len_utf8() <= MAX_NOTE_BYTES {
-                            note.insert_char(c);
-                        }
-                    }
-                    _ => return Outcome::NotMine,
+                if note.edit_line(key, MAX_NOTE_BYTES) {
+                    Outcome::Consumed
+                } else {
+                    Outcome::NotMine
                 }
-                Outcome::Consumed
             }
         }
     }
@@ -582,23 +558,20 @@ impl ApprovalPicker {
 
     /// Record a key that was not an answer, so the next answer key waits.
     fn stray(&mut self, now: Instant) -> Outcome {
-        self.stray = Some(now);
+        self.stray.stray(now);
         Outcome::Consumed
     }
 
     /// Answer with item `index`. `guard` is the time of an answer key that
-    /// must wait out [`QUIET`]; the note field passes `None`.
+    /// must wait out [`QUIET`](crate::stray::QUIET); the note field passes `None`.
     ///
     /// A confirming answer is refused, and the picker left as it is, while the
     /// command has not been seen. Denying is never refused.
     fn answer(&mut self, index: usize, note: Option<&str>, guard: Option<Instant>) -> Outcome {
-        if let Some(now) = guard {
-            let quiet = self
-                .stray
-                .is_none_or(|at| now.saturating_duration_since(at) >= QUIET);
-            if !quiet {
-                return self.stray(now);
-            }
+        if let Some(now) = guard
+            && !self.stray.admits(now)
+        {
+            return Outcome::Consumed;
         }
         let item = &self.items[index];
         if item.confirmed && self.blocked().is_some() {
@@ -1171,6 +1144,7 @@ mod tests {
     use crossterm::event::{KeyEventKind, KeyEventState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::time::Duration;
     use unicode_width::UnicodeWidthStr;
 
     fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
