@@ -146,6 +146,10 @@ A documented entry point that hides a constraint is worse than none, so:
   The same config also carries the per-session settings `with_system_prompt`,
   `with_command_globs` and `with_max_output_tokens`, described under
   [Running several isolated calls on one server](#running-several-isolated-calls-on-one-server).
+  `main.rs` sets `with_system_prompt` from `--system-prompt` and
+  `--append-system-prompt`; to add text rather than replace the prompt, pass
+  [`built_in_system_prompt`](crate::agents::built_in_system_prompt) followed by
+  your text.
 * **Terminal behaviour is front-end policy, not agent behaviour.** `/commands`,
   `@` mentions, session switching, rewind, background tasks and turn steering
   are wired by `main.rs` out of [`terminal`](crate::terminal) parts. An embedder

@@ -7,6 +7,7 @@ All notable changes to `polaris_code` are recorded here. Versions follow
 
 ### Added
 - Harbor adapter (`evals/packs/terminal_bench_harbor`): the agent keyword `image_input` (`auto`, `on` or `off`) is passed as `--image-input`, so a job can say whether the model takes images. Release 0.4.5 or later understands the flag.
+- `--system-prompt`, `--system-prompt-file`, `--append-system-prompt` and `--append-system-prompt-file` replace or add to the built-in system prompt, as in Claude Code. The project's `AGENTS.md`/`CLAUDE.md` block is still added after it. `polaris_code::agents::built_in_system_prompt` returns the built-in prompt for embedders.
 
 ### Fixed
 - Amazon Bedrock refused every request (`content_filter`, empty reply) because of the first step of the built-in system prompt ("REASON in text before every action …"). The step now reads "EXPLAIN: in a sentence or two, …", which Bedrock accepts.

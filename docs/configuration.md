@@ -94,6 +94,16 @@ once at startup from the model the session starts on; `/model` does not change
 it, so start with `--image-input off` if you plan to switch to a text-only model.
 It does not affect images attached in the composer, which check the model in use.
 
+`--system-prompt <PROMPT>` replaces the built-in system prompt, and
+`--append-system-prompt <PROMPT>` adds text after it (or after the replacement,
+when both are given). `--system-prompt-file <PATH>` and
+`--append-system-prompt-file <PATH>` read the same text from a file; each cannot
+be combined with its text form. In every case the project's
+`AGENTS.md`/`CLAUDE.md` block is still added at the end, and an empty prompt or
+an unreadable file stops startup. These four are CLI-only: a repository's
+`polaris.toml` cannot change the agent's instructions. They apply to the main
+session; helper agents keep their role's prompt.
+
 `--dangerously-skip-permissions` and `--trajectory-path` are CLI-only, require
 `-p`, and cannot be enabled by configuration or environment. See
 [unattended runs](unattended-runs.md) for model limits and effort semantics.

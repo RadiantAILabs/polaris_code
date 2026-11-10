@@ -47,7 +47,7 @@ use polaris_code::agents::continuation::DEFAULT_UNATTENDED_NUDGES;
 use polaris_code::agents::policy::RetryPolicy;
 use polaris_code::agents::{
     AgentConfig, CodeAgent, CodeAgentPlugin, DEFAULT_MAX_TURNS, PermissionCeiling, PermissionMode,
-    PolicySnapshot, UnattendedGrants, load_seed_ontologies,
+    PolicySnapshot, UnattendedGrants, built_in_system_prompt, load_seed_ontologies,
 };
 use polaris_code::cosmos::composition::CompositionPolicy;
 use polaris_code::cosmos::default_loop::DefaultLoopTopologyPackPlugin;
@@ -688,6 +688,26 @@ struct Cli {
     /// Custom non-empty values pass through; unsupported values fail visibly.
     #[arg(long, env = "POLARIS_CODE_REASONING_EFFORT", value_name = "EFFORT")]
     reasoning_effort: Option<polaris::models::llm::ReasoningEffort>,
+    /// Replace the built-in system prompt with this text. The project's
+    /// `AGENTS.md`/`CLAUDE.md` block is still added after it. Helper agents keep
+    /// their role's prompt.
+    #[arg(long, value_name = "PROMPT", conflicts_with = "system_prompt_file")]
+    system_prompt: Option<String>,
+    /// Like `--system-prompt`, but read the text from a file.
+    #[arg(long, value_name = "PATH")]
+    system_prompt_file: Option<PathBuf>,
+    /// Add this text after the system prompt: the built-in one, or the one
+    /// `--system-prompt` gives. The project's `AGENTS.md`/`CLAUDE.md` block
+    /// comes after both.
+    #[arg(
+        long,
+        value_name = "PROMPT",
+        conflicts_with = "append_system_prompt_file"
+    )]
+    append_system_prompt: Option<String>,
+    /// Like `--append-system-prompt`, but read the text from a file.
+    #[arg(long, value_name = "PATH")]
+    append_system_prompt_file: Option<PathBuf>,
     /// Write native ATIF JSON to a fresh file during this unattended run.
     /// Parent directories must exist. Contains full prompts and model outputs.
     #[arg(
@@ -729,6 +749,50 @@ fn run_max_turns(cli: &Cli) -> usize {
         } else {
             DEFAULT_MAX_TURNS
         })
+}
+
+/// Where the text of one prompt option comes from: the option itself or a file.
+fn prompt_text(
+    text: Option<&str>,
+    file: Option<&std::path::Path>,
+    flag: &str,
+) -> Result<Option<String>, String> {
+    let text = match (text, file) {
+        (Some(text), _) => text.to_owned(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|err| format!("{flag}-file {}: {err}", path.display()))?,
+        (None, None) => return Ok(None),
+    };
+    if text.trim().is_empty() {
+        return Err(format!("{flag} is empty"));
+    }
+    Ok(Some(text))
+}
+
+/// The system prompt the options ask for, or `None` to keep the built-in one.
+///
+/// `--system-prompt` replaces the built-in prompt; `--append-system-prompt` adds
+/// text after whichever prompt is in use. Both go through
+/// [`AgentConfig::with_system_prompt`], so the project grounding block is still
+/// added after the result.
+fn configured_system_prompt(cli: &Cli) -> Result<Option<String>, String> {
+    let base = prompt_text(
+        cli.system_prompt.as_deref(),
+        cli.system_prompt_file.as_deref(),
+        "--system-prompt",
+    )?;
+    let extra = prompt_text(
+        cli.append_system_prompt.as_deref(),
+        cli.append_system_prompt_file.as_deref(),
+        "--append-system-prompt",
+    )?;
+    Ok(match (base, extra) {
+        (base, Some(extra)) => Some(format!(
+            "{}\n\n{extra}",
+            base.as_deref().unwrap_or(built_in_system_prompt())
+        )),
+        (base, None) => base,
+    })
 }
 
 fn validate_context_window(
@@ -1280,6 +1344,11 @@ async fn main() {
         .with_prompt_cache(prompt_cache)
         .with_max_output_tokens(max_output_tokens);
     agent_config.context_window = cli.context_window;
+    match configured_system_prompt(&cli) {
+        Ok(Some(prompt)) => agent_config = agent_config.with_system_prompt(prompt),
+        Ok(None) => {}
+        Err(why) => fatal(headless, &why),
+    }
     // Everything this run writes that is not the user's work goes under one
     // directory, and that directory is invisible to git. Otherwise the agent's
     // own transcript rides along in whatever is built from the working tree —
@@ -2623,6 +2692,83 @@ mod tests {
         let mut argv = vec!["polaris"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv).expect("the command line parses")
+    }
+
+    #[test]
+    fn no_prompt_option_keeps_the_built_in_prompt() {
+        assert_eq!(configured_system_prompt(&cli(&[])), Ok(None));
+    }
+
+    #[test]
+    fn system_prompt_replaces_the_built_in_prompt() {
+        let prompt = configured_system_prompt(&cli(&["--system-prompt", "Review only."]));
+        assert_eq!(prompt, Ok(Some("Review only.".to_owned())));
+    }
+
+    #[test]
+    fn append_system_prompt_follows_the_built_in_prompt() {
+        let prompt = configured_system_prompt(&cli(&["--append-system-prompt", "Be brief."]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt, format!("{}\n\nBe brief.", built_in_system_prompt()));
+    }
+
+    #[test]
+    fn append_system_prompt_follows_a_replaced_prompt() {
+        let prompt = configured_system_prompt(&cli(&[
+            "--system-prompt",
+            "Review only.",
+            "--append-system-prompt",
+            "Be brief.",
+        ]));
+        assert_eq!(prompt, Ok(Some("Review only.\n\nBe brief.".to_owned())));
+    }
+
+    #[test]
+    fn prompt_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.md");
+        let extra = dir.path().join("extra.md");
+        std::fs::write(&base, "From a file.").unwrap();
+        std::fs::write(&extra, "Also from a file.").unwrap();
+        let prompt = configured_system_prompt(&cli(&[
+            "--system-prompt-file",
+            base.to_str().unwrap(),
+            "--append-system-prompt-file",
+            extra.to_str().unwrap(),
+        ]));
+        assert_eq!(
+            prompt,
+            Ok(Some("From a file.\n\nAlso from a file.".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_empty_or_unreadable_prompt_is_refused() {
+        assert_eq!(
+            configured_system_prompt(&cli(&["--system-prompt", "  \n"])),
+            Err("--system-prompt is empty".to_owned())
+        );
+        let missing = configured_system_prompt(&cli(&[
+            "--append-system-prompt-file",
+            "/nonexistent/polaris-prompt.md",
+        ]))
+        .unwrap_err();
+        assert!(
+            missing.starts_with("--append-system-prompt-file /nonexistent/polaris-prompt.md:"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_and_its_file_form_cannot_be_combined() {
+        for (flag, file_flag) in [
+            ("--system-prompt", "--system-prompt-file"),
+            ("--append-system-prompt", "--append-system-prompt-file"),
+        ] {
+            let parsed = Cli::try_parse_from(["polaris", flag, "text", file_flag, "prompt.md"]);
+            assert!(parsed.is_err(), "{flag} with {file_flag} parsed");
+        }
     }
 
     fn resolve(args: &[&str]) -> Result<(PermissionMode, Option<PermissionCeiling>), String> {
