@@ -24,9 +24,10 @@ environment-only. Permission rule files are separate; `polaris.toml` does not
 accept a `[permissions]` section.
 
 The accepted keys are `provider`, `model`, `models`, `region`, `permission_mode`,
-`permission_ceiling`, `max_cost_usd`, `max_tokens`, `max_turns`, and
-`max_output_tokens`, `context_window`, and `reasoning_effort`, in the file's base table and in each `[profiles.<name>]`
-table. Anything else is an unknown key. Credentials are never accepted.
+`permission_ceiling`, `max_cost_usd`, `max_tokens`, `max_turns`,
+`max_output_tokens`, `context_window`, `image_input`, and `reasoning_effort`, in
+the file's base table and in each `[profiles.<name>]` table. Anything else is an
+unknown key. Credentials are never accepted.
 
 ```toml
 provider = "anthropic"
@@ -62,6 +63,7 @@ from both is an error. Flags and environment still take precedence.
 | `max_turns` | `--max-turns` | `POLARIS_CODE_MAX_TURNS` |
 | `max_output_tokens` | `--max-output-tokens` | `POLARIS_CODE_MAX_OUTPUT_TOKENS` |
 | `context_window` | `--context-window` | `POLARIS_CODE_CONTEXT_WINDOW` |
+| `image_input` | `--image-input` | `POLARIS_CODE_IMAGE_INPUT` |
 | `reasoning_effort` | `--reasoning-effort` | `POLARIS_CODE_REASONING_EFFORT` |
 | — | — | `POLARIS_CODE_UNATTENDED_NUDGES` (see below) |
 
@@ -74,6 +76,23 @@ Permission modes are `confirm`, `auto-edit`, `auto`, or `plan`. An interactive
 mode above the configured ceiling is refused. Permission mode and ceiling
 settings are interactive-only and are refused for unattended runs, including when
 set in a file.
+
+`image_input` says whether the model takes images: `on`, `off` or `auto` (the
+default). Quote the value in TOML (`image_input = "on"`). When it is on, the
+agent has the `view_image` tool, which shows it a PNG, JPEG, GIF or WEBP file
+from the working directory; see [tool results](tool-results.md#pictures). When it is off, the
+tool is not registered, so the model cannot ask for a picture, and `read_file`
+on an image file says that this model takes text only. `auto` is on for Claude
+models reached through Anthropic or Bedrock and off for every other route,
+including `--provider openai` and `--provider openai-chat`, because a text-only
+model rejects a request that carries an image. Set `on` for a vision model behind
+`openai-chat` once the build uses `polaris-ai` 0.9.3 or later, which is the first
+version that sends an image tool result to Chat Completions. Do not set `on` for
+`--provider openai`: the Responses API provider still refuses image tool results,
+so the turn would fail when the model calls `view_image`. The choice is made
+once at startup from the model the session starts on; `/model` does not change
+it, so start with `--image-input off` if you plan to switch to a text-only model.
+It does not affect images attached in the composer, which check the model in use.
 
 `--dangerously-skip-permissions` and `--trajectory-path` are CLI-only, require
 `-p`, and cannot be enabled by configuration or environment. See

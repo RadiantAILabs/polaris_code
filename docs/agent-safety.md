@@ -37,8 +37,8 @@ call. The order of the permission checks is in
 
 ### 1. File sandbox (working-directory containment)
 
-- **Protects against:** file tools (`read_file`, `edit_file`, `create_file`,
-  `search`, `glob`) reaching paths outside the working directory, through `..`,
+- **Protects against:** file tools (`read_file`, `view_image`, `edit_file`,
+  `create_file`, `search`, `glob`) reaching paths outside the working directory, through `..`,
   absolute paths or symlinks. `CodeToolsConfig::resolve_path` in
   [`tools/code.rs`](../crates/polaris_code/src/tools/code.rs) canonicalizes
   the path and refuses it with `escapes sandbox`. `@` mentions of outside paths
@@ -100,7 +100,8 @@ workspace rewind does not restore outside paths. See [unattended runs](unattende
   See [`secret-redaction.md`](secret-redaction.md).
 - **Does not protect against:** a model that wants a secret. Encoding the
   bytes first (`base64 .env`) defeats it. Tool arguments and model output are
-  not redacted. It is not a permission boundary.
+  not redacted. Pictures from `view_image` are not scanned. It is not a
+  permission boundary.
 
 ### 6. Run cost ceiling
 
@@ -146,8 +147,15 @@ Follow the plugin rules in [`philosophy.md`](philosophy.md) and
   trust a project, mark a server read-only or change the sandbox root. Only an
   operator flag, a user setting or a person's answer may do that.
 - **Keep results within their size budgets.** Read and MCP results are capped
-  at 32 KiB, shell output at 64 KiB. Cap bytes read from files, networks and
-  child processes before parsing. Follow [`tool-results.md`](tool-results.md).
+  at 32 KiB, shell output at 64 KiB, and a picture at 3,750,000 bytes. Cap
+  bytes read from files, networks and child processes before parsing. Follow
+  [`tool-results.md`](tool-results.md).
+- **Build a non-text result only in its own tool.** `view_image` is the one
+  tool whose result becomes a picture. The dispatch accepts a picture only when
+  the tool name matches and the result has that tool's typed shape, so file
+  text, a web page or an MCP result that looks like it stays text and is
+  redacted. A new kind of result follows the same rule, in one helper used by
+  both result lanes, and has a test for a forged payload from another tool.
 - **Stay inside the sandbox.** Resolve every path through
   `CodeToolsConfig::resolve_path`. Do not open a path the model gave you
   directly.
@@ -201,6 +209,17 @@ These are true of the current code. Do not describe them as covered.
   `--max-tokens` has no ceiling.
 - **Rewind covers two tools only.** Shell and MCP changes cannot be undone with
   `/rewind`.
+- **Pictures are not scanned for secrets.** `view_image` sends the file's bytes
+  to the model provider as they are. A screenshot of a credential reaches the
+  provider. The text line shown to the person (`[image a.png, PNG, 34.0 KB]`)
+  is redacted, the picture is not. See
+  [`secret-redaction.md`](secret-redaction.md).
+- **Permission rules name tools.** A deny rule for `read_file` on
+  `private/*` does not cover `view_image`; a rule that protects an image path
+  must also name `view_image`. See [`permission-modes.md`](permission-modes.md).
+- **Image input is decided once, at startup.** `--image-input auto` looks at the
+  model the session starts on. `/model` to a model that takes only text does not
+  remove `view_image`; start with `--image-input off` if you plan to switch.
 
 ## Reviewer checklist
 

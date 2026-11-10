@@ -63,7 +63,8 @@ own policy validator; tools have no dependency on agent permission state.
 Where a call works is the same kind of boundary. [`CallRoot`](crate::tools::CallRoot)
 is a tool-context value, not an API or a resource: the agent's tool lanes insert
 the session's working directory for every call. The file tools (`read_file`,
-`read_span`, `edit_file`, `create_file`, `list_files`, `search`, `glob`),
+`read_span`, `view_image`, `edit_file`, `create_file`, `list_files`, `search`,
+`glob`),
 `run_command` and `run_in_background` follow it, and a toolset used without one
 keeps the directory it was built with. A background task carries the root it
 started under: `task_output` and `stop_task` called with a root see only tasks

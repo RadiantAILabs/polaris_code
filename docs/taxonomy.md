@@ -31,6 +31,7 @@ composition and capability seams, while the upper layer is the agent design.**
 `src/trajectory.rs` (`RunTrajectory`, ATIF export; see
 [`unattended-runs.md`](unattended-runs.md)),
 `src/config.rs` (`ModelCatalog`), `src/sparql.rs`,
+`src/images.rs` (`ImageInput` and image rules shared by attachments and `view_image`),
 `src/run.rs` (`drive_turn`/`drive_until`, `persist_turn`,
 `stop_signal`/`shutdown_driver`),
 `src/cosmos/host.rs` (the selection point's lifecycle); and the dependency
@@ -70,6 +71,7 @@ control flow.
 
 **Files:** `src/tools/code.rs` (`CodeToolsPlugin`), `src/tools/code_graph.rs`
 (`CodeGraphPlugin`), `src/tools/memory.rs` (`MemoryToolsPlugin`),
+`src/tools/view_image.rs` (`ViewImageToolsPlugin`),
 `src/tools/web.rs` (`WebToolsPlugin`), `src/progress.rs` (`ProgressMiddlewarePlugin`),
 `src/graph_view.rs` (`GraphViewPlugin`, feeding the Graph tab; see [`graph-tab.md`](graph-tab.md)), `src/terminal/`
 (`CommandRegistry`, `CommandDispatch`, `WorkspaceFiles`, `LiveTranscript`),
@@ -85,7 +87,8 @@ The swappable capabilities this app contributes as Polaris plugins:
   interrupted prompts. Without an approver, calls that need a person are
   denied. The composition root installs it for interactive sessions.
 
-- **Toolsets.** Sandboxed file tools (`CodeTools`), the deterministic Rust
+- **Toolsets.** Sandboxed file tools (`CodeTools`), image viewing
+  (`ViewImageToolsPlugin`: `view_image`), the deterministic Rust
   indexer + SPARQL-backed symbol queries (`CodeGraphTools` / `ConceptTools`),
   reflective memory (`MemoryTools`), and the model's own route to a background
   shell run (`TaskTools`: `run_in_background`, `task_output`, `stop_task`),

@@ -64,6 +64,7 @@ use polaris_code::exec::{
     ExecIOPlugin, ExecIOProvider, InventoryReport, ModelsReport, OutputFormat, RunReport,
     stream_json_line, usage_message,
 };
+use polaris_code::images::ImageInput;
 use polaris_code::progress::ProgressMiddlewarePlugin;
 use polaris_code::providers::{self, ModelListing, Provider};
 use polaris_code::run;
@@ -76,7 +77,7 @@ use polaris_code::terminal::{
 };
 use polaris_code::tools::{
     CodeGraphPlugin, CodeToolsConfig, CodeToolsPlugin, GraphSearchMode, MemoryToolsPlugin,
-    TaskToolsPlugin, WebToolsPlugin,
+    TaskToolsPlugin, ViewImageToolsPlugin, WebToolsPlugin,
 };
 use polaris_code::usage::{RunCeiling, TaskCostLimit, TokenMeter};
 use polaris_cosmos::evidence::TopologyEvidencePlugin;
@@ -184,6 +185,10 @@ ENVIRONMENT:
                                explicit unrestricted container mode.
     POLARIS_CODE_CONTEXT_WINDOW
                                Explicit model input-plus-output capacity.
+    POLARIS_CODE_IMAGE_INPUT   Whether the model takes images: on | off | auto;
+                               `--image-input` wins. On registers `view_image`.
+                               Default: auto, which is on for Claude models
+                               through Anthropic or Bedrock, off otherwise.
     POLARIS_CODE_REASONING_EFFORT
                                Effort pinned on every model call; unset keeps
                                provider/model defaults.
@@ -665,6 +670,19 @@ struct Cli {
     /// and prompt overhead before sizing context projection and compaction.
     #[arg(long, env = "POLARIS_CODE_CONTEXT_WINDOW", value_name = "TOKENS")]
     context_window: Option<NonZeroU32>,
+    /// Whether the model takes images: `on`, `off` or `auto`. On gives the agent
+    /// the `view_image` tool; off leaves it out, and `read_file` then says that
+    /// an image file cannot be read. `auto` is on for Claude models through
+    /// Anthropic or Bedrock and off for every other route. Decided once, from the
+    /// model the session starts on.
+    #[arg(
+        long,
+        env = "POLARIS_CODE_IMAGE_INPUT",
+        value_enum,
+        default_value = "auto",
+        value_name = "MODE"
+    )]
+    image_input: ImageInput,
     /// Pin reasoning effort on every model call, including summaries and
     /// reviewers. Known levels: none, minimal, low, medium, high, xhigh, max.
     /// Custom non-empty values pass through; unsupported values fail visibly.
@@ -949,6 +967,18 @@ fn add_topology_packs(server: &mut Server) {
         // turn never reads the catalog, and the registration carries no author
         // priors (`cosmos::default_loop`).
         .add_plugins(DefaultLoopTopologyPackPlugin);
+}
+
+/// Registers `view_image` when the model takes images, and nothing otherwise.
+///
+/// Looking at a picture is its own capability. Without it the model has no way
+/// to ask for one, so a text-only route never receives an image block it would
+/// reject. `config` is the one the file tools were built with, so both see the
+/// same working directory and the same path containment.
+fn add_image_tools(server: &mut Server, image_input: bool, config: CodeToolsConfig) {
+    if image_input {
+        server.add_plugins(ViewImageToolsPlugin::new(config));
+    }
 }
 
 /// Seals a catalog holding only the topology packs, with no model provider,
@@ -1240,6 +1270,10 @@ async fn main() {
     if let Err(why) = validate_context_window(cli.context_window, max_output_tokens) {
         fatal(headless, why);
     }
+    // Whether the model takes images, decided once from the model the run
+    // starts on. It gates the `view_image` tool below and what `read_file`
+    // says about an image file.
+    let image_input = cli.image_input.accepts(&model_id);
     let mut agent_config = AgentConfig::new(model_id, working_dir.clone())
         .with_graph_search(graph_search)
         .with_unrestricted_file_paths(cli.dangerously_skip_permissions)
@@ -1424,15 +1458,15 @@ async fn main() {
     if let Some(trace) = &trajectory {
         server.insert_global(trace.clone());
     }
+    let code_tools = CodeToolsConfig::new(&working_dir)
+        .with_edit_journal(edit_journal.clone())
+        .with_unrestricted_paths(cli.dangerously_skip_permissions)
+        .with_image_input(image_input);
     server
         // Tools: file primitives, the SPARQL store + tools, the code graph, shell.
         .add_plugins(ToolsPlugin)
         .add_plugins(mcp)
-        .add_plugins(CodeToolsPlugin::new(
-            CodeToolsConfig::new(&working_dir)
-                .with_edit_journal(edit_journal.clone())
-                .with_unrestricted_paths(cli.dangerously_skip_permissions),
-        ))
+        .add_plugins(CodeToolsPlugin::new(code_tools.clone()))
         .add_plugins(OxigraphPlugin::in_memory().with_tools(true))
         .add_plugins(
             CodeGraphPlugin::new(&working_dir)
@@ -1495,6 +1529,7 @@ async fn main() {
         // themselves are named once, in `add_topology_packs` below.
         .add_plugins(TopologyEvidencePlugin::new(coding_policy::evidence_config()))
         .add_plugins(CodingTaskQueuePlugin::new(coding_tasks.clone()));
+    add_image_tools(&mut server, image_input, code_tools);
     add_topology_packs(&mut server);
 
     // Front-end IO: exactly one of these two, never both. The non-interactive
@@ -2944,6 +2979,70 @@ mod tests {
         let parsed = cli(&["--context-window", "32768", "--max-output-tokens", "4096"]);
         assert_eq!(parsed.context_window.unwrap().get(), 32768);
         assert_eq!(parsed.max_output_tokens.unwrap().get(), 4096);
+    }
+
+    #[test]
+    fn image_input_defaults_to_auto_and_takes_on_off_or_auto() {
+        use polaris_code::images::ImageInput;
+
+        assert_eq!(cli(&[]).image_input, ImageInput::Auto);
+        for (word, want) in [
+            ("on", ImageInput::On),
+            ("off", ImageInput::Off),
+            ("auto", ImageInput::Auto),
+        ] {
+            assert_eq!(cli(&["--image-input", word]).image_input, want, "{word}");
+        }
+        for word in ["yes", "true", "1", ""] {
+            assert_eq!(
+                Cli::try_parse_from(["polaris", "--image-input", word])
+                    .err()
+                    .unwrap_or_else(|| panic!("{word:?} is not a mode"))
+                    .kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{word:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_follows_the_model_the_run_starts_on() {
+        let auto = cli(&[]).image_input;
+        assert!(auto.accepts("anthropic/claude-sonnet-5-5"));
+        assert!(auto.accepts("aws.bedrock/global.anthropic.claude-sonnet-5-5"));
+        assert!(!auto.accepts("openai-chat/gpt-5.5"));
+        assert!(!auto.accepts("openai/gpt-5.5"));
+        // A stated choice wins whatever the model.
+        assert!(
+            cli(&["--image-input", "on"])
+                .image_input
+                .accepts("openai-chat/local-vlm")
+        );
+        assert!(
+            !cli(&["--image-input", "off"])
+                .image_input
+                .accepts("anthropic/claude-sonnet-5-5")
+        );
+    }
+
+    #[tokio::test]
+    async fn view_image_is_registered_only_when_the_model_takes_images() {
+        use polaris::tools::ToolRegistry;
+
+        for (image_input, registered) in [(true, true), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut server = Server::new();
+            server.add_plugins(ToolsPlugin);
+            add_image_tools(
+                &mut server,
+                image_input,
+                CodeToolsConfig::new(dir.path()).with_image_input(image_input),
+            );
+            server.finish().await.unwrap();
+            let ctx = server.create_context();
+            let tools = ctx.get_resource::<ToolRegistry>().unwrap();
+            assert_eq!(tools.has("view_image"), registered, "{image_input}");
+        }
     }
 
     #[test]

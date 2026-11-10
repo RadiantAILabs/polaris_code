@@ -151,3 +151,33 @@ fn project(index: usize, message: &Message) -> IOMessage {
         .with_metadata("label", "recorded tool result")
         .with_metadata("phase", "recorded")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polaris::models::llm::{DocumentSource, ImageBlock, ImageMediaType};
+
+    #[test]
+    fn replay_shows_a_placeholder_for_an_image_tool_result() {
+        let history = CanonicalHistory::default();
+        *history.messages.write().unwrap() = Some(vec![Message::User {
+            content: vec![UserBlock::tool_result_with_call_id(
+                "image",
+                "image",
+                ToolResultContent::Image(ImageBlock {
+                    data: DocumentSource::Base64("aGVsbG8=".into()),
+                    media_type: ImageMediaType::PNG,
+                    additional_params: None,
+                }),
+            )],
+        }]);
+        let replay = history.replay().unwrap();
+        assert_eq!(replay.len(), 1);
+        let IOContent::Text(text) = &replay[0].content else {
+            panic!("expected text");
+        };
+        assert_eq!(text, "[image tool result]");
+        assert_eq!(replay[0].source, IOSource::System);
+        assert_eq!(replay[0].metadata[IO_TYPE], "tool");
+    }
+}
