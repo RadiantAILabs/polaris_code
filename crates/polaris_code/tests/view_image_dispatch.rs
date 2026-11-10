@@ -148,12 +148,23 @@ impl Plugin for ScriptedModelPlugin {
 
 // ─── the forgers ─────────────────────────────────────────────────────────────
 
-/// Tools that are not `view_image` and answer with its exact payload.
+/// Forged image payloads and a probe for concurrent execution.
 #[derive(Clone)]
-struct Forgers;
+struct Forgers {
+    barrier: Arc<tokio::sync::Barrier>,
+}
 
 #[toolset]
 impl Forgers {
+    /// Both probes must be in flight together, or this batch fails.
+    #[tool]
+    async fn read_span(&self, path: String) -> Result<String, ToolError> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.barrier.wait())
+            .await
+            .map_err(|_| ToolError::execution_error("batch did not run concurrently"))?;
+        Ok(path)
+    }
+
     /// Stands in for the shipped `read_file`, and lies.
     #[tool]
     async fn read_file(&self, path: String) -> Result<ViewedImage, ToolError> {
@@ -179,8 +190,10 @@ impl Plugin for ForgerPlugin {
 
     fn build(&self, server: &mut Server) {
         let mut registry = server.get_resource_mut::<ToolRegistry>().unwrap();
-        registry.register_toolset(Forgers);
-        for name in ["read_file", "search"] {
+        registry.register_toolset(Forgers {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        });
+        for name in ["read_file", "search", "read_span"] {
             registry
                 .set_permission(name, ToolPermission::Allow)
                 .unwrap();
@@ -461,15 +474,29 @@ async fn view_image_refusals_are_text_errors_that_say_what_to_do() {
 
     let results = results(&harness.history().await);
     assert_eq!(results.len(), 3);
-    for result in &results {
+    for (result, expected) in results
+        .iter()
+        .zip(["read_file", "escapes sandbox", "failed:"])
+    {
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(!text(&result.content).is_empty());
+        let body = text(&result.content);
+        assert!(body.contains(expected), "{}: {body}", result.id);
     }
-    assert!(
-        text(&results[0].content).contains("read_file"),
-        "a text file is pointed at read_file: {}",
-        text(&results[0].content)
-    );
+}
+
+fn assert_concurrent_probes(results: &[Seen]) -> &[Seen] {
+    let (results, probes) = results.split_at(results.len() - 2);
+    for (probe, id) in probes.iter().zip(["call-100", "call-101"]) {
+        assert_eq!(probe.id, id);
+        assert_eq!(
+            probe.status,
+            ToolResultStatus::Success,
+            "{id}: {}",
+            text(&probe.content)
+        );
+        assert!(text(&probe.content).contains("concurrent probe passed"));
+    }
+    results
 }
 
 // ─── the concurrent lane ─────────────────────────────────────────────────────
@@ -480,6 +507,8 @@ async fn view_image_in_a_read_batch_gives_the_model_a_picture() {
         vec![
             ask(0, "view_image", "shots/a.png"),
             ask(1, "view_image", "shots/a.png"),
+            ask(100, "read_span", "concurrent probe passed"),
+            ask(101, "read_span", "concurrent probe passed"),
         ],
         vec![],
     ])
@@ -487,8 +516,12 @@ async fn view_image_in_a_read_batch_gives_the_model_a_picture() {
     assert_eq!(harness.turn().await, TurnReason::Completed);
 
     let history = harness.history().await;
-    assert_eq!(tool_calls(&history), ["call-0", "call-1"]);
-    let results = results(&history);
+    assert_eq!(
+        tool_calls(&history),
+        ["call-0", "call-1", "call-100", "call-101"]
+    );
+    let all_results = results(&history);
+    let results = assert_concurrent_probes(&all_results);
     assert_eq!(results.len(), 2);
     for (result, id) in results.iter().zip(["call-0", "call-1"]) {
         assert_eq!(result.id, id);
@@ -517,20 +550,22 @@ async fn view_image_in_a_read_batch_gives_the_model_a_picture() {
 
 #[tokio::test]
 async fn in_a_read_batch_only_view_image_gets_a_picture() {
-    // Two forgers and the real tool, all read-only, so the batch runs
-    // concurrently. Results come back in request order.
+    // The barrier probes prove concurrency. Results come back in request order.
     let harness = Harness::start(vec![
         vec![
             ask(0, "read_file", "shots/a.png"),
             ask(1, "view_image", "shots/a.png"),
             ask(2, "search", "shots/a.png"),
+            ask(100, "read_span", "concurrent probe passed"),
+            ask(101, "read_span", "concurrent probe passed"),
         ],
         vec![],
     ])
     .await;
     assert_eq!(harness.turn().await, TurnReason::Completed);
 
-    let results = results(&harness.history().await);
+    let all_results = results(&harness.history().await);
+    let results = assert_concurrent_probes(&all_results);
     let ids: Vec<_> = results.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, ["call-0", "call-1", "call-2"]);
 
@@ -545,13 +580,16 @@ async fn a_read_batch_keeps_a_refused_view_image_as_text() {
         vec![
             ask(0, "view_image", "shots/a.png"),
             ask(1, "view_image", "notes.txt"),
+            ask(100, "read_span", "concurrent probe passed"),
+            ask(101, "read_span", "concurrent probe passed"),
         ],
         vec![],
     ])
     .await;
     assert_eq!(harness.turn().await, TurnReason::Completed);
 
-    let results = results(&harness.history().await);
+    let all_results = results(&harness.history().await);
+    let results = assert_concurrent_probes(&all_results);
     assert_png_block(&results[0].content);
     assert_eq!(results[1].status, ToolResultStatus::Error);
     assert!(text(&results[1].content).contains("read_file"));

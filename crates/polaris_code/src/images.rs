@@ -388,6 +388,8 @@ mod tests {
     #[test]
     fn byte_counts_read_the_way_ls_would() {
         assert_eq!(fmt_bytes(900), "900 B");
+        assert_eq!(fmt_bytes(999), "999 B");
+        assert_eq!(fmt_bytes(1_000), "1.0 KB");
         assert_eq!(fmt_bytes(34_000), "34.0 KB");
         assert_eq!(fmt_bytes(IMAGE_BYTES_MAX), "3.8 MB");
     }

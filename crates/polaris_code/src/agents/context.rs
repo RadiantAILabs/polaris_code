@@ -1117,7 +1117,9 @@ pub(crate) async fn finish_compaction(mut state: ResMut<LoopState>) -> LoopState
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polaris::models::llm::{ReasoningBlock, ToolCall};
+    use polaris::models::llm::{
+        DocumentSource, ImageBlock, ImageMediaType, ReasoningBlock, ToolCall,
+    };
 
     #[test]
     fn push_does_not_write_the_trajectory_file() {
@@ -1565,6 +1567,32 @@ mod tests {
             0,
             "no compaction under the trigger"
         );
+    }
+
+    #[test]
+    fn image_tool_results_keep_their_payload_and_image_estimate_during_compaction() {
+        let message = Message::User {
+            content: vec![UserBlock::tool_result_with_call_id(
+                "image",
+                "image",
+                ToolResultContent::Image(ImageBlock {
+                    data: DocumentSource::Base64("aGVsbG8=".into()),
+                    media_type: ImageMediaType::PNG,
+                    additional_params: None,
+                }),
+            )],
+        };
+        assert!(!is_stubbable(&message));
+        let original = serde_json::to_value(&message).unwrap();
+        let mut messages = vec![message];
+        let reasoning = ReasoningHistory::default();
+        assert_eq!(est_tokens(&messages, 1.0, reasoning), IMAGE_CHARS);
+        assert_eq!(
+            compact_tool_results(&mut messages, Some(1), 1, 0, 1.0, reasoning),
+            0
+        );
+        stub_message(&mut messages[0]);
+        assert_eq!(serde_json::to_value(&messages[0]).unwrap(), original);
     }
 
     #[test]
